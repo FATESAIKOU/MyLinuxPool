@@ -42,6 +42,7 @@ jobs:
         run: |
           ROOT_PASS=$(openssl rand -base64 15 | head -c 20)
 
+          echo $ROOT_PASS
           echo $FATESAIKOU_KEYS
           echo $SSHPROXY_KEYS
           echo ${{ github.event.inputs.label }}
@@ -56,16 +57,16 @@ jobs:
                   --region ${{ github.event.inputs.region }} \
                   --type ${{ github.event.inputs.type }} \
                   --image ${{ github.event.inputs.image }} \
-                  --root_pass $ROOT_PASS\
-                  --json
-                  # --metadata.user_data $(cat ./cloud_config.yaml | envsubst | base64)
+                  --root_pass $ROOT_PASS \
+                  --json \
+                  --metadata.user_data "$(cat ./cloud_config.yaml | envsubst | base64)"
           )
 
           # Write the Linode info to github variable
-          gh variable set linode_info $(echo $linode_cli_ret | jq)
+          gh variable set linode_info "$(echo $linode_cli_ret | jq)"
 
           # Write the root password to github variable
-          gh variable set root_pass $ROOT_PASS
+          gh variable set root_pass "$ROOT_PASS"
         env:
           FATESAIKOU_KEYS: ${{ secrets.FATESAIKOU_KEYS }}
           SSHPROXY_KEYS: ${{ secrets.SSHPROXY_KEYS }}
