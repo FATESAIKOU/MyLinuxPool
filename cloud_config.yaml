@@ -19,3 +19,11 @@ packages:
 - rclone
 - python3
 - nodejs
+
+write_files:
+- content: |
+    ${FATESAIKOU_BASHRC}
+  path: /home/fatesaikou/.bashrc
+- content: |
+    ${FATESAIKOU_TMUXCONF}
+  path: /home/fatesaikou/.tmux.conf
