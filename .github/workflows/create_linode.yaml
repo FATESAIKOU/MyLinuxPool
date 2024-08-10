@@ -1,0 +1,57 @@
+on:
+  workflow_dispatch:
+    inputs:
+      label:
+        type: string
+        description: instance label
+        required: false
+        default: fws
+      region:
+        type: string
+        description: instance region
+        required: false
+        default: ap-northeast
+      type:
+        type: string
+        description: instance type
+        required: false
+        default: g6-nanode-1
+      image:
+        type: string
+        description: instance image
+        required: false
+        default: linode/ubuntu24.04
+      
+jobs:
+  create_linode:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install the Linode CLI
+        uses: linode/action-linode-cli@v1
+        with:
+          token: ${{ secrets.LINODE_TOKEN }}
+
+      - name: Create a Linode instance
+        run: |
+          ROOT_PASS=$(openssl rand -base64 15 | head -c 20)
+
+          linode_cli_ret=$(
+              linode-cli linodes create \
+                  --no-defaults \
+                  --label ${{ github.event.inputs.label }} \
+                  --region ${{ github.event.inputs.region }} \
+                  --type ${{ github.event.inputs.type }} \
+                  --image ${{ github.event.inputs.image }} \
+                  --root_pass $ROOT_PASS\
+                  --json \
+                  --metadata.user_data $(cat ./cloud_config.yaml | envsubst | base64)
+          )
+
+          # Write the Linode info to github variable
+          gh variable set linode_info $(echo $linode_cli_ret | jq)
+
+          # Write the root password to github variable
+          gh variable set root_pass $ROOT_PASS
+        env:
+          FATESAIKOU_KEYS: ${{ secrets.FATESAIKOU_KEYS }}
+          SSHPROXY_KEYS: ${{ secrets.SSHPROXY_KEYS }}
