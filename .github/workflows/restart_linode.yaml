@@ -30,7 +30,8 @@ jobs:
     with:
       label: ${{ github.event.inputs.label }}
       region: ${{ github.event.inputs.region }}
-    
+    secrets: inherit
+
   create_linode:
     needs: [delete_linode]
     if: always()
@@ -40,3 +41,4 @@ jobs:
       region: ${{ github.event.inputs.region }}
       type: ${{ github.event.inputs.type }}
       image: ${{ github.event.inputs.image }}
+    secrets: inherit
