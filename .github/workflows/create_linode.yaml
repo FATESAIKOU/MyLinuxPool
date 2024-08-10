@@ -64,3 +64,4 @@ jobs:
         env:
           FATESAIKOU_KEYS: ${{ secrets.FATESAIKOU_KEYS }}
           SSHPROXY_KEYS: ${{ secrets.SSHPROXY_KEYS }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
