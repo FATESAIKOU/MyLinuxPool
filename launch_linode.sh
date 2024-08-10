@@ -16,7 +16,7 @@ linode_cli_ret=$(
         --image linode/ubuntu24.04 \
         --root_pass $ROOT_PASS\
         --json \
-        --metadata.user_data $(. ./set_authorized_keys.sh && cat ./cloud_config.yaml | envsubst | base64)
+        --metadata.user_data $(. ./set_authorized_keys.sh && cat ./cloud_config.yaml | envsubst | base64 | tr -d '\n')
 )
 
 # label

@@ -49,7 +49,7 @@ jobs:
           echo ${{ github.event.inputs.region }}
           echo ${{ github.event.inputs.type }}
           echo ${{ github.event.inputs.image }}
-          echo $(cat ./cloud_config.yaml | envsubst | base64)
+          echo $(cat ./cloud_config.yaml | envsubst | base64 | tr -d '\n')
 
           linode_cli_ret=$(
               linode-cli linodes create \
@@ -60,7 +60,7 @@ jobs:
                   --image ${{ github.event.inputs.image }} \
                   --root_pass $ROOT_PASS \
                   --json \
-                  --metadata.user_data "$(cat ./cloud_config.yaml | envsubst | base64)"
+                  --metadata.user_data "$(cat ./cloud_config.yaml | envsubst | base64 | tr -d '\n')"
           )
 
           # Write the Linode info to github variable
