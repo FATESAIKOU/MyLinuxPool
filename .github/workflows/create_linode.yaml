@@ -57,10 +57,10 @@ jobs:
           echo $linode_cli_ret
 
           # Write the Linode info to github variable
-          gh variable set linode_info "$(echo $linode_cli_ret | jq)"
+          gh variable set linode_info -b "$(echo $linode_cli_ret | jq)"
 
           # Write the root password to github variable
-          gh variable set root_pass "$ROOT_PASS"
+          gh variable set root_pass -b "$ROOT_PASS"
         env:
           FATESAIKOU_KEYS: ${{ secrets.FATESAIKOU_KEYS }}
           SSHPROXY_KEYS: ${{ secrets.SSHPROXY_KEYS }}
