@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 
-LABEL="${1:-test}"
+LABEL="${1:-fws}"
 TYPE="${2:-g6-nanode-1}"
 REGION="${3:-ap-northeast}"
 IMAGE="${4:-linode/ubuntu24.04}"
