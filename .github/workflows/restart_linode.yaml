@@ -1,0 +1,42 @@
+name: Create linode
+
+on:
+  workflow_dispatch:
+    inputs:
+      label:
+        type: string
+        description: instance label
+        required: true
+        default: fws
+      region:
+        type: string
+        description: instance region
+        required: true
+        default: ap-northeast
+      type:
+        type: string
+        description: instance type
+        required: true
+        default: g6-nanode-1
+      image:
+        type: string
+        description: instance image
+        required: true
+        default: linode/ubuntu24.04
+
+jobs:
+  delete_linode:
+    uses: ./.github/workflows/delete_linode.yaml
+    with:
+      label: ${{ github.event.inputs.label }}
+      region: ${{ github.event.inputs.region }}
+    
+  create_linode:
+    needs: [delete_linode]
+    if: always()
+    uses: ./.github/workflows/create_linode.yaml
+    with:
+      label: ${{ github.event.inputs.label }}
+      region: ${{ github.event.inputs.region }}
+      type: ${{ github.event.inputs.type }}
+      image: ${{ github.event.inputs.image }}
