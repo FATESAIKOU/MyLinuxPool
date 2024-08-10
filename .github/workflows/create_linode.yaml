@@ -28,9 +28,7 @@ jobs:
   create_linode:
     name: create linode
     runs-on: ubuntu-latest
-    permissions:
-      actions: write
-      contents: write
+    permissions: write-all
     steps:
       - uses: actions/checkout@v4
 
