@@ -29,19 +29,7 @@ jobs:
     name: create linode
     runs-on: ubuntu-latest
     permissions:
-      actions: write
-      attestations: write
-      checks: write
-      contents: write
-      deployments: write
-      discussions: write
-      issues: write
-      packages: write
-      pages: write
-      pull-requests: write
-      repository-projects: write
-      security-events: write
-      statuses: write
+      contents: read
     steps:
     - uses: actions/checkout@v4
 
@@ -68,12 +56,11 @@ jobs:
 
         echo $linode_cli_ret
 
-        # Write the Linode info to github variable
-        gh variable set linode_info -b "$(echo $linode_cli_ret | jq)"
-
-        # Write the root password to github variable
-        gh variable set root_pass -b "$ROOT_PASS"
+        # echo the output to the console
+        echo "<<<<<Linode instance created>>>>>"
+        echo $linode_cli_ret | jq
+        echo "<<<<<ROOT_PASS>>>>>"
+        echo "$ROOT_PASS"
       env:
         FATESAIKOU_KEYS: ${{ secrets.FATESAIKOU_KEYS }}
         SSHPROXY_KEYS: ${{ secrets.SSHPROXY_KEYS }}
-        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
