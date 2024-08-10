@@ -78,14 +78,18 @@ jobs:
 
         echo $linode_cli_ret
 
-        echo $FATESAIKOU_BASHRC
-        echo $FATESAIKOU_TMUXCONF
-
         # echo the output to the console
         echo "<<<<<Linode instance created>>>>>"
         echo $linode_cli_ret | jq
         echo "<<<<<ROOT_PASS>>>>>"
         echo "$ROOT_PASS"
+
+        # Wait until the Linode is ready(port 22 is open)
+        linode_ip=$(echo $linode_cli_ret | jq -r '.[0] | .ipv4 | .[0]')
+        while ! nc -z $linode_ip 22; do
+            echo "Waiting for the Linode to be ready..."
+            sleep 5
+        done
       env:
         FATESAIKOU_KEYS: ${{ secrets.FATESAIKOU_KEYS }}
         SSHPROXY_KEYS: ${{ secrets.SSHPROXY_KEYS }}
