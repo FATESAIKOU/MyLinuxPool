@@ -64,6 +64,10 @@ jobs:
       run: |
         ROOT_PASS=$(openssl rand -base64 15 | tr -d '\n' | head -c 20)
 
+        # Prepare base64 file strings
+        export FATESAIKOU_BASHRC_BASE64=$(cat ${{ vars.FATESAIKOU_BASHRC }} | base64 | tr -d '\n')
+        export FATESAIKOU_TMUXCONF_BASE64=$(cat ${{ vars.FATESAIKOU_TMUXCONF }} | base64 | tr -d '\n')
+
         linode_cli_ret=$(
             linode-cli linodes create \
                 --no-defaults \
@@ -93,5 +97,3 @@ jobs:
       env:
         FATESAIKOU_KEYS: ${{ secrets.FATESAIKOU_KEYS }}
         SSHPROXY_KEYS: ${{ secrets.SSHPROXY_KEYS }}
-        FATESAIKOU_BASHRC: ${{ vars.FATESAIKOU_BASHRC }}
-        FATESAIKOU_TMUXCONF: ${{ vars.FATESAIKOU_TMUXCONF }}

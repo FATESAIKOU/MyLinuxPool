@@ -21,9 +21,11 @@ packages:
 - nodejs
 
 write_files:
-- content: |
-    ${FATESAIKOU_BASHRC}
-  path: /.bashrc
-- content: |
-    ${FATESAIKOU_TMUXCONF}
-  path: /.tmux.conf
+- content: ${FATESAIKOU_BASHRC_BASE64}
+  path: /home/fatesaikou/.bashrc_base64
+- content: ${FATESAIKOU_TMUXCONF_BASE64}
+  path: /home/fatesaikou/.tmux.conf_base64
+
+runcmd:
+- cat /home/fatesaikou/.bashrc_base64 | base64 -d > /home/fatesaikou/.bashrc
+- cat /home/fatesaikou/.tmux.conf_base64 | base64 -d > /home/fatesaikou/.tmux.conf
