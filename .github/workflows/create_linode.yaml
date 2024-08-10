@@ -35,7 +35,6 @@ jobs:
       contents: write
       deployments: write
       discussions: write
-      id-token: read
       issues: write
       metadata: read
       packages: write
