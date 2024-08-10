@@ -49,6 +49,7 @@ jobs:
           echo ${{ github.event.inputs.region }}
           echo ${{ github.event.inputs.type }}
           echo ${{ github.event.inputs.image }}
+          echo $(cat ./cloud_config.yaml | envsubst | base64)
 
           linode_cli_ret=$(
               linode-cli linodes create \
