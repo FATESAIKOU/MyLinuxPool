@@ -86,7 +86,7 @@ jobs:
 
         # Wait until the Linode is ready(port 22 is open)
         linode_ip=$(echo $linode_cli_ret | jq -r '.[0] | .ipv4 | .[0]')
-        while ! nc -z $linode_ip 22; do
+        while ! nc -w 1 -z $linode_ip 22; do
             echo "Waiting for the Linode to be ready..."
             sleep 5
         done
