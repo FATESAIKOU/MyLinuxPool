@@ -23,7 +23,7 @@ packages:
 write_files:
 - content: |
     ${FATESAIKOU_BASHRC}
-  path: /home/fatesaikou/.bashrc
+  path: /.bashrc
 - content: |
     ${FATESAIKOU_TMUXCONF}
-  path: /home/fatesaikou/.tmux.conf
+  path: /.tmux.conf
