@@ -36,7 +36,6 @@ jobs:
       deployments: write
       discussions: write
       issues: write
-      metadata: read
       packages: write
       pages: write
       pull-requests: write
