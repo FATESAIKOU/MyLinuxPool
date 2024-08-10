@@ -40,16 +40,7 @@ jobs:
 
       - name: Create a Linode instance
         run: |
-          ROOT_PASS=$(openssl rand -base64 15 | head -c 20)
-
-          echo $ROOT_PASS
-          echo $FATESAIKOU_KEYS
-          echo $SSHPROXY_KEYS
-          echo ${{ github.event.inputs.label }}
-          echo ${{ github.event.inputs.region }}
-          echo ${{ github.event.inputs.type }}
-          echo ${{ github.event.inputs.image }}
-          echo $(cat ./cloud_config.yaml | envsubst | base64 | tr -d '\n')
+          ROOT_PASS=$(openssl rand -base64 15 | tr -d '\n' | head -c 20)
 
           linode_cli_ret=$(
               linode-cli linodes create \
@@ -62,6 +53,8 @@ jobs:
                   --json \
                   --metadata.user_data "$(cat ./cloud_config.yaml | envsubst | base64 | tr -d '\n')"
           )
+
+          echo $linode_cli_ret
 
           # Write the Linode info to github variable
           gh variable set linode_info "$(echo $linode_cli_ret | jq)"
