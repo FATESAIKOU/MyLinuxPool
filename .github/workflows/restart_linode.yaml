@@ -1,4 +1,4 @@
-name: Create linode
+name: Restart linode
 
 on:
   workflow_dispatch:
