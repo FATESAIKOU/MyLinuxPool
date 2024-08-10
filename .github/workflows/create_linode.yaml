@@ -42,6 +42,13 @@ jobs:
         run: |
           ROOT_PASS=$(openssl rand -base64 15 | head -c 20)
 
+          echo $FATESAIKOU_KEYS
+          echo $SSHPROXY_KEYS
+          echo ${{ github.event.inputs.label }}
+          echo ${{ github.event.inputs.region }}
+          echo ${{ github.event.inputs.type }}
+          echo ${{ github.event.inputs.image }}
+
           linode_cli_ret=$(
               linode-cli linodes create \
                   --no-defaults \
