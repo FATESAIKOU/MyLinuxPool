@@ -78,6 +78,9 @@ jobs:
 
         echo $linode_cli_ret
 
+        echo $FATESAIKOU_BASHRC
+        echo $FATESAIKOU_TMUXCONF
+
         # echo the output to the console
         echo "<<<<<Linode instance created>>>>>"
         echo $linode_cli_ret | jq
