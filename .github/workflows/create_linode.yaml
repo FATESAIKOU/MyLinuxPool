@@ -71,6 +71,11 @@ jobs:
         FATESAIKOU_TMP_PASS=$(openssl rand -base64 15 | tr -d '\n' | head -c 20)
         SSHPROXY_TMP_PASS=$(openssl rand -base64 15 | tr -d '\n' | head -c 20)
 
+        # Mask TMP_PASS
+        echo "::add-mask::$ROOT_PASS"
+        echo "::add-mask::$FATESAIKOU_TMP_PASS"
+        echo "::add-mask::$SSHPROXY_TMP_PASS"
+
         # Export to github env
         echo "ROOT_PASS=$ROOT_PASS" >> $GITHUB_ENV
         echo "FATESAIKOU_TMP_PASS=$FATESAIKOU_TMP_PASS" >> $GITHUB_ENV
@@ -123,7 +128,7 @@ jobs:
         ROOT_PASS: ${{ env.ROOT_PASS }}
         LINODE_IP: ${{ env.LINODE_IP }}
       run: |
-        EXEC_CMD="sshpass -p $ROOT_PASS ssh -o StrictHostKeyChecking=no root@$LINODE_IP 'su fatesaikou && cd ~;'"
+        EXEC_CMD="sshpass -p $ROOT_PASS ssh -o StrictHostKeyChecking=no root@$LINODE_IP"
         SCP_CMD="sshpass -p $ROOT_PASS scp -o StrictHostKeyChecking=no"
 
         (
