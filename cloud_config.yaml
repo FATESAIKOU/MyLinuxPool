@@ -20,12 +20,6 @@ packages:
 - python3
 - nodejs
 
-write_files:
-- content: ${FATESAIKOU_BASHRC_BASE64}
-  path: /fatesaikou_bashrc_base64
-- content: ${FATESAIKOU_TMUXCONF_BASE64}
-  path: /fatesaikou_tmux.conf_base64
-
 runcmd:
-- cat /fatesaikou_bashrc_base64 | base64 -d > /home/fatesaikou/.bashrc
-- cat /fatesaikou_bashrc_base64 | base64 -d > /home/fatesaikou/.tmux.conf
+- echo "${FATESAIKOU_BASHRC_BASE64}" | base64 -d > /home/fatesaikou/.bashrc
+- echo "${FATESAIKOU_TMUXCONF_BASE64}" | base64 -d > /home/fatesaikou/.tmux.conf
