@@ -31,7 +31,6 @@ jobs:
       label: ${{ github.event.inputs.label }}
       region: ${{ github.event.inputs.region }}
     secrets: inherit
-    continue-on-error: true
 
   create_linode:
     needs: [delete_linode]
