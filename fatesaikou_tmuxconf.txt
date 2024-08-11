@@ -1,0 +1,54 @@
+set -g terminal-overrides 'xterm*:smcup@:rmcup@'
+set -g default-terminal "screen-256color"
+# General configuration.
+# $ tmux show-options -g
+set -g history-limit 5000
+set -g base-index 1
+set -g display-time 5000
+set -g repeat-time 1000
+set -g status-keys vi
+#set -g status-utf8 on
+set -g status-bg black
+set -g status-fg white
+set -g status-justify left
+set -g status-interval 1
+set -g status-left-length 15
+set -g status-right-length 55
+set -g status-left "#[fg=white,bright,bg=blue] Session #[fg=yellow,bright,bg=blue]#S #[default] |" # session-name
+set -g status-right "#[fg=red,bright][ #[fg=cyan]#(cd ~/miiicasa;git branch --no-color | sed -e '/^[^*]/d' -e 's/* //') #[fg=red]]#[default] #[fg=yellow,bright] %Y-%m-%d #[fg=green]%H:%M:%S #[default]#[fg=magenta,bright]#[default]"
+
+# Configuration for each window.
+# $ tmux show-window-options -g
+#setw -g utf8 on
+setw -g window-status-format " #I$ #W "
+setw -g window-status-current-format " #I$ #W "
+
+# Customization for key bindings.
+# Check it using "C-a + ?".
+## Make tmux like screen, using Ctrl+A
+unbind C-b
+set -g prefix ^A
+bind b send-prefix
+
+## Use h and v for splitting.
+unbind %
+unbind '"'
+bind v split-window -h
+bind | split-window -h
+bind h split-window -v
+bind - split-window -v
+
+## Use a for renaming the window prompt.
+unbind ','
+bind ` command-prompt -I '#W' "rename-window '%%'"
+
+# list of tmux plugin
+set -g @plugin 'tmux-plugins/tpm'
+set -g @plugin 'tmux-plugins/tmux-sensible'
+
+# Other examples:
+set -g @plugin 'tmux-plugins/tmux-resurrect'
+set -g @plugin 'tmux-plugins/tmux-continuum'
+set -g @continuum-restore 'no'
+# Initialize TMUX plugin manager (keep this line at the very bottom of tmux.conf)
+run '~/.tmux/plugins/tpm/tpm'
