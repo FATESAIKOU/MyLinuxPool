@@ -148,11 +148,8 @@ jobs:
         EXEC_CMD="sshpass -p $FATESAIKOU_TMP_PASS ssh -t -o StrictHostKeyChecking=no fatesaikou@$LINODE_IP"
 
         # Initialize vim
-        echo "Hello World!"
         $EXEC_CMD "git clone https://github.com/VundleVim/Vundle.vim.git ~/.vim/bundle/Vundle.vim"
-        echo "Hello World!!"
-        $EXEC_CMD "vim -E -s -u ~/.vimrc +PluginInstall +qall"
-        echo "Hello World!!!"
+        $EXEC_CMD "vim -E -s -u ~/.vimrc +PluginInstall +qall || exit 0" # Allow all errors
 
         # Initialize tmux
         $EXEC_CMD "git clone https://github.com/tmux-plugins/tpm ~/.tmux/plugins/tpm"
