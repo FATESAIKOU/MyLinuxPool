@@ -68,6 +68,8 @@ jobs:
         export FATESAIKOU_BASHRC_BASE64=$(echo $FATESAIKOU_BASHRC | base64 | tr -d '\n')
         export FATESAIKOU_TMUXCONF_BASE64=$(echo $FATESAIKOU_TMUXCONF | base64 | tr -d '\n')
 
+        getconf ARG_MAX
+
         linode_cli_ret=$(
             linode-cli linodes create \
                 --no-defaults \
