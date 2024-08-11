@@ -21,9 +21,10 @@ packages:
 - nodejs
 
 runcmd:
+- # Disable root login
 - sed -i '/PermitRootLogin/d' /etc/ssh/sshd_config
 - echo "PermitRootLogin no" >> /etc/ssh/sshd_config
 - systemctl restart sshd
-- echo '${FATESAIKOU_BASHRC_BASE64}' | base64 -d > /home/fatesaikou/.bashrc
-- echo '${FATESAIKOU_TMUXCONF_BASE64}' | base64 -d > /home/fatesaikou/.tmux.conf
+- # Copy synced files
+${SYNC_FILE_CMDS}
 - chown -R fatesaikou:fatesaikou /home/fatesaikou/
