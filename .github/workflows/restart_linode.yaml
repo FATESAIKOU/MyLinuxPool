@@ -36,6 +36,7 @@ jobs:
   create_linode:
     needs: [delete_linode]
     uses: ./.github/workflows/create_linode.yaml
+    if: ${{ always() }}
     with:
       label: ${{ github.event.inputs.label }}
       region: ${{ github.event.inputs.region }}
