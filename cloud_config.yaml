@@ -5,9 +5,13 @@ users:
   sudo: ALL=(ALL) NOPASSWD:ALL
   shell: /bin/bash
   ssh_authorized_keys: ${FATESAIKOU_KEYS}
+  lock_passwd: false
+  passwd: ${FATESAIKOU_TMP_PASSHASH}
 - name: sshproxy
   shell: /bin/bash
   ssh_authorized_keys: ${SSHPROXY_KEYS}
+  lock_passwd: false
+  passwd: ${SSHPROXY_TMP_PASSHASH}
 
 package_update: true
 package_upgrade: true

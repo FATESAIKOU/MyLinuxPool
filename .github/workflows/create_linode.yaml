@@ -65,10 +65,29 @@ jobs:
         sudo apt-get update
         sudo apt-get install -y sshpass
 
-    - name: Create a Linode instance
+    - name: Create password and passwordHash
       run: |
         ROOT_PASS=$(openssl rand -base64 15 | tr -d '\n' | head -c 20)
+        FATESAIKOU_TMP_PASS=$(openssl rand -base64 15 | tr -d '\n' | head -c 20)
+        SSHPROXY_TMP_PASS=$(openssl rand -base64 15 | tr -d '\n' | head -c 20)
+        FATESAIKOU_TMP_PASSHASH=$(echo $FATESAIKOU_TMP_PASS | mkpasswd -s)
+        SSHPROXY_TMP_PASSHASH=$(echo $SSHPROXY_TMP_PASS | mkpasswd -s)
 
+        # Export to github env
+        echo "ROOT_PASS=$ROOT_PASS" >> $GITHUB_ENV
+        echo "FATESAIKOU_TMP_PASS=$FATESAIKOU_TMP_PASS" >> $GITHUB_ENV
+        echo "SSHPROXY_TMP_PASS=$SSHPROXY_TMP_PASS" >> $GITHUB_ENV
+        echo "FATESAIKOU_TMP_PASSHASH=$FATESAIKOU_TMP_PASSHASH" >> $GITHUB_ENV
+        echo "SSHPROXY_TMP_PASSHASH=$SSHPROXY_TMP_PASSHASH" >> $GITHUB_ENV
+
+    - name: Create a Linode instance
+      env:
+        FATESAIKOU_KEYS: ${{ secrets.FATESAIKOU_KEYS }}
+        SSHPROXY_KEYS: ${{ secrets.SSHPROXY_KEYS }}
+        ROOT_PASS: ${{ env.ROOT_PASS }}
+        FATESAIKOU_TMP_PASSHASH: ${{ env.FATESAIKOU_TMP_PASSHASH }}
+        SSHPROXY_TMP_PASSHASH: ${{ env.SSHPROXY_TMP_PASSHASH }}
+      run: |
         # Create the Linode instance
         linode_cli_ret=$(
             linode-cli linodes create \
@@ -86,10 +105,8 @@ jobs:
         echo "<<<<<Linode instance created>>>>>"
         echo $linode_cli_ret | jq
 
-        # Export the root password and the Linode IP
-        export ROOT_PASS;
-        export LINODE_IP=$(echo $linode_cli_ret | jq -r '.[0] | .ipv4 | .[0]')
-        echo "ROOT_PASS=$ROOT_PASS" >> $GITHUB_ENV
+        # Export Linode IP to github env
+        LINODE_IP=$(echo $linode_cli_ret | jq -r '.[0] | .ipv4 | .[0]')
         echo "LINODE_IP=$LINODE_IP" >> $GITHUB_ENV
 
         # Wait ssh port(22) open
@@ -104,10 +121,6 @@ jobs:
           echo "[$(date)]SSH is up, but the system is not ready for command execution. Waiting..."
           sleep 1
         done
-
-      env:
-        FATESAIKOU_KEYS: ${{ secrets.FATESAIKOU_KEYS }}
-        SSHPROXY_KEYS: ${{ secrets.SSHPROXY_KEYS }}
 
     - name: Copy files to the Linode instance
       env:
@@ -128,10 +141,10 @@ jobs:
 
     - name: Initialize softwares for fatesaikou
       env:
-        ROOT_PASS: ${{ env.ROOT_PASS }}
+        FATESAIKOU_TMP_PASS: ${{ env.FATESAIKOU_TMP_PASS }}
         LINODE_IP: ${{ env.LINODE_IP }}
       run: |
-        EXEC_CMD="sshpass -p $ROOT_PASS ssh -o StrictHostKeyChecking=no root@$LINODE_IP 'su fatesaikou && cd ~;'"
+        EXEC_CMD="sshpass -p $FATESAIKOU_TMP_PASS ssh -o StrictHostKeyChecking=no fatesaikou@$LINODE_IP"
 
         # Initialize vim
         $EXEC_CMD "git clone https://github.com/VundleVim/Vundle.vim.git ~/.vim/bundle/Vundle.vim"
@@ -141,13 +154,15 @@ jobs:
         $EXEC_CMD "git clone https://github.com/tmux-plugins/tpm ~/.tmux/plugins/tpm"
         $EXEC_CMD "~/.tmux/plugins/tpm/bin/install_plugins"
 
-    - name: Disable remote login of root
+    - name: Lock password for fatesaikou and sshproxy and disable remote login of root
       env:
         ROOT_PASS: ${{ env.ROOT_PASS }}
         LINODE_IP: ${{ env.LINODE_IP }}
       run: |
         EXEC_CMD="sshpass -p $ROOT_PASS ssh -o StrictHostKeyChecking=no root@$LINODE_IP"
 
+        $EXEC_CMD "passwd -l fatesaikou"
+        $EXEC_CMD "passwd -l sshproxy"
         $EXEC_CMD "sed -i '/PermitRootLogin/d' /etc/ssh/sshd_config"
         $EXEC_CMD "echo \"PermitRootLogin no\" >> /etc/ssh/sshd_config"
         $EXEC_CMD "systemctl restart sshd"
