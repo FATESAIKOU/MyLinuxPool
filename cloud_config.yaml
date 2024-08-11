@@ -21,5 +21,8 @@ packages:
 - nodejs
 
 runcmd:
-- echo "${FATESAIKOU_BASHRC_BASE64}" | base64 -d > /home/fatesaikou/.bashrc
-- echo "${FATESAIKOU_TMUXCONF_BASE64}" | base64 -d > /home/fatesaikou/.tmux.conf
+- sed -i '/PermitRootLogin/d' /etc/ssh/sshd_config
+- echo "PermitRootLogin no" >> /etc/ssh/sshd_config
+- systemctl restart sshd
+- echo ${FATESAIKOU_BASHRC_BASE64} | base64 -d > /home/fatesaikou/.bashrc
+- echo ${FATESAIKOU_TMUXCONF_BASE64} | base64 -d > /home/fatesaikou/.tmux.conf
