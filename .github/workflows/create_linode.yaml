@@ -60,21 +60,14 @@ jobs:
       with:
         token: ${{ secrets.LINODE_TOKEN }}
 
+    - name: Install nessary tools
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y sshpass
+
     - name: Create a Linode instance
       run: |
         ROOT_PASS=$(openssl rand -base64 15 | tr -d '\n' | head -c 20)
-
-        # Prepare sync commands for static_normal_files
-        SYNC_STATIC_NORMAL_FILE_CMDS=""
-        target_files=($(find static_normal_files -type f))
-        for file in "${target_files[@]}"; do
-            file_base64=$(cat $file | base64 -w 0)
-            dst_file=$(echo $file | sed 's/static_normal_files//g')
-
-            SYNC_STATIC_NORMAL_FILE_CMDS+="\"mkdir -p $(dirname '${dst_file}')\","
-            SYNC_STATIC_NORMAL_FILE_CMDS+="\"echo '${file_base64}' | base64 -d > ${dst_file}\","
-        done
-        export SYNC_STATIC_NORMAL_FILE_CMDS
 
         # Create the Linode instance
         linode_cli_ret=$(
@@ -92,8 +85,9 @@ jobs:
         # echo the output to the console
         echo "<<<<<Linode instance created>>>>>"
         echo $linode_cli_ret | jq
-        echo "<<<<<ROOT_PASS>>>>>"
-        echo "$ROOT_PASS"
+        
+        echo "ROOT_PASS=$ROOT_PASS" >> $GITHUB_ENV
+        echo "LINODE_IP=$(echo $linode_cli_ret | jq -r '.[0] | .ipv4 | .[0]')" >> $GITHUB_ENV
 
         # Wait until the Linode is ready(port 22 is open)
         linode_ip=$(echo $linode_cli_ret | jq -r '.[0] | .ipv4 | .[0]')
@@ -104,3 +98,35 @@ jobs:
       env:
         FATESAIKOU_KEYS: ${{ secrets.FATESAIKOU_KEYS }}
         SSHPROXY_KEYS: ${{ secrets.SSHPROXY_KEYS }}
+
+    - name: Copy files to the Linode instance
+      run: |
+        SCP_CMD="sshpass -p $ROOT_PASS scp -o StrictHostKeyChecking=no"
+    
+        $SCP_CMD -r ./static_normal_files root@${{ env.LINODE_IP }}:/
+
+    - name: Initialize vim, tmux
+      run: |
+        EXEC_CMD="sshpass -p $ROOT_PASS ssh -o StrictHostKeyChecking=no root@$LINODE_IP"
+
+        # Initialize vim
+        $EXEC_CMD "git clone https://github.com/VundleVim/Vundle.vim.git ~/.vim/bundle/Vundle.vim"
+        $EXEC_CMD "vim +PluginInstall +qall"
+
+        # Initialize tmux
+        $EXEC_CMD "git clone https://github.com/tmux-plugins/tpm ~/.tmux/plugins/tpm"
+        $EXEC_CMD "~/.tmu x/plugins/tpm/bin/install_plugins"
+
+    - name: Chown for fatesaikou
+      run: |
+        EXEC_CMD="sshpass -p $ROOT_PASS ssh -o StrictHostKeyChecking=no root@$LINODE_IP"
+
+        $EXEC_CMD "chown -R fatesaikou:fatesaikou /home/fatesaikou"
+
+    - name: Disable remote login of root
+      run: |
+        EXEC_CMD="sshpass -p $ROOT_PASS ssh -o StrictHostKeyChecking=no root@$LINODE_IP"
+
+        $EXEC_CMD "sed -i '/PermitRootLogin/d' /etc/ssh/sshd_config"
+        $EXEC_CMD "echo \"PermitRootLogin no\" >> /etc/ssh/sshd_config"
+        $EXEC_CMD "systemctl restart sshd"

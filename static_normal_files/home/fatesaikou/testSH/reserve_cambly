@@ -1,0 +1,24 @@
+#!/usr/bin/env bash
+
+TUTORID="${1:-5d5cd26a3b3622c844ddc6f6}" # Default for test
+START="${2:-2692959400}" # Far future for test
+
+CSRF_TOKEN="pyVn0SaprPEuqN6do4tf0iK7TENIQ-TNBs"
+SESSION_ID="eyJ0b2tlbiI6Ik5yWEs5ZFoxOUowcmJBc050SlcvOEVBQytUM2tsYlA5In0.ZlWggw.aZxbrN1JiWP02F80KTKihJyvJK8"
+
+curl 'https://www.cambly.com/api/lessons_v2?viewAs=student' \
+  -H 'content-type: application/json; charset=UTF-8' \
+  -H 'cookie: csrfToken='${CSRF_TOKEN}'; session='${SESSION_ID}';' \
+  -H 'x-csrf: '${CSRF_TOKEN} \
+  --data-raw '{
+    "schedulingType":"reserved",
+    "classSize":1,
+    "tutorId":"'$TUTORID'",
+    "studentId":"5eb01ab14ba40f9077729efc",
+    "scheduledStartAt":'$START'000,
+    "scheduledEndAt":'$((START + 1800))'000,
+    "topic":""
+  }'
+
+
+

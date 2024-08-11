@@ -1,0 +1,84 @@
+#!/usr/bin/env bash
+
+get_time_cands () {
+    local HOUR=3600
+    local DAY=$(( $HOUR * 24 ))
+    local WEEK=$(( $DAY * 7 ))
+
+    PIVOT_WEEK=$(( ( $(date +"%s") - $DAY * 4 ) / $WEEK * $WEEK + $DAY * 4 + $WEEK - 9 * $HOUR ))
+
+    local AVA_DATES=( $(( $PIVOT_WEEK )) $(( $PIVOT_WEEK + $DAY * 1 )) $(( $PIVOT_WEEK + $DAY * 3 )) )
+    local AVA_TIMES=( $(( $HOUR * 19 + 1800 )) $(( $HOUR * 20 )) $(( $HOUR * 19 )) $(( $HOUR * 20 + 1800)) )
+
+    cands_times=()
+    for d in "${AVA_DATES[@]}"
+    do
+        for t in "${AVA_TIMES[@]}"
+        do
+            cands_times+=($(( $d + $t )))
+        done
+    done
+}
+
+check_reserved_date () {
+    local target_hour_cnt=$(( $1 / 3600 ))
+    local tutors=(${@:2})
+    local tu
+
+    for tu in "${tutors[@]}"
+    do
+        local reserved_time=$(cat ~/Downloads/$tu.cambly_status)
+        local reserved_hour_cnt=$(( ${reserved_time:-0} / 3600 ))
+
+        local hour_diff=$(( $target_hour_cnt - $reserved_hour_cnt ))
+        if [[ ${hour_diff#-} -lt 12 ]]
+        then
+            echo "[Reserved][$tu][$( date -d @$reserved_time)]"
+            return 1
+        fi
+    done
+
+    return 0
+}
+
+get_time_cands
+
+#TUTORS=("5bf5462ce417d3002bf4bc44" "5cbd38e506ff1a00455f87d4" "5d5cd26a3b3622c844ddc6f6")
+TUTORS=("5d5cd26a3b3622c844ddc6f6")
+
+for tu in "${TUTORS[@]}"
+do
+    echo "[Start][$tu]"
+    touch ~/Downloads/$tu.cambly_status
+    p_time=$(cat ~/Downloads/$tu.cambly_status)
+
+    # If reserved this week, continue
+    if [[ $p_time > $PIVOT_WEEK ]]
+    then
+        echo "[Already Reserved][$tu][$(date -d @$p_time)][$(date -d @$PIVOT_WEEK)]"
+        continue
+    fi
+
+    for ti in "${cands_times[@]}"
+    do
+        # If has reservation at the same day, continue
+        check_reserved_date $ti "${TUTORS[@]}"
+        if [[ $? -eq 1 ]]
+        then
+            continue
+        fi
+
+        res=$(reserve_cambly $tu $ti 2>/dev/null)
+        scheduledEndAt=$(echo "$res" | jq '.result.scheduledEndAt')
+        sta=$(echo "$res" | jq '.status')
+
+        echo $tu, $ti, ".result.scheduledEndAt: $scheduledEndAt, status: $sta"
+        if [[ $scheduledEndAt != 'null' && $sta == 'null' ]]
+        then
+            echo $ti > ~/Downloads/$tu.cambly_status
+            break
+        else
+            echo $res
+        fi
+    done
+done
