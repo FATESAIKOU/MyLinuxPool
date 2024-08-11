@@ -20,11 +20,12 @@ packages:
 - python3
 - nodejs
 
-runcmd:
-- # Disable root login
-- sed -i '/PermitRootLogin/d' /etc/ssh/sshd_config
-- echo "PermitRootLogin no" >> /etc/ssh/sshd_config
-- systemctl restart sshd
-- # Copy synced files
-${SYNC_FILE_CMDS}
-- chown -R fatesaikou:fatesaikou /home/fatesaikou/
+runcmd: [
+  # Disable root login"
+  "sed -i '/PermitRootLogin/d' /etc/ssh/sshd_config",
+  "echo \"PermitRootLogin no\" >> /etc/ssh/sshd_config",
+  "systemctl restart sshd",
+  # Copy synced files
+  ${SYNC_FILE_CMDS}
+  "chown -R fatesaikou:fatesaikou /home/fatesaikou/"
+]
