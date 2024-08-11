@@ -114,6 +114,7 @@ jobs:
         ROOT_PASS: ${{ env.ROOT_PASS }}
         LINODE_IP: ${{ env.LINODE_IP }}
       run: |
+        EXEC_CMD="sshpass -p $ROOT_PASS ssh -o StrictHostKeyChecking=no root@$LINODE_IP 'su fatesaikou && cd ~;'"
         SCP_CMD="sshpass -p $ROOT_PASS scp -o StrictHostKeyChecking=no"
 
         (
@@ -121,12 +122,16 @@ jobs:
           $SCP_CMD -r * root@$LINODE_IP:/
         )
 
-    - name: Initialize vim, tmux
+        # Chown for fatesaikou and sshproxy
+        $EXEC_CMD "chown -R fatesaikou:fatesaikou /home/fatesaikou"
+        $EXEC_CMD "chown -R sshproxy:sshproxy /home/sshproxy"
+
+    - name: Initialize softwares for fatesaikou
       env:
         ROOT_PASS: ${{ env.ROOT_PASS }}
         LINODE_IP: ${{ env.LINODE_IP }}
       run: |
-        EXEC_CMD="sshpass -p $ROOT_PASS ssh -o StrictHostKeyChecking=no root@$LINODE_IP"
+        EXEC_CMD="sshpass -p $ROOT_PASS ssh -o StrictHostKeyChecking=no root@$LINODE_IP 'su fatesaikou && cd ~;'"
 
         # Initialize vim
         $EXEC_CMD "git clone https://github.com/VundleVim/Vundle.vim.git ~/.vim/bundle/Vundle.vim"
@@ -135,15 +140,6 @@ jobs:
         # Initialize tmux
         $EXEC_CMD "git clone https://github.com/tmux-plugins/tpm ~/.tmux/plugins/tpm"
         $EXEC_CMD "~/.tmux/plugins/tpm/bin/install_plugins"
-
-    - name: Chown for fatesaikou
-      env:
-        ROOT_PASS: ${{ env.ROOT_PASS }}
-        LINODE_IP: ${{ env.LINODE_IP }}
-      run: |
-        EXEC_CMD="sshpass -p $ROOT_PASS ssh -o StrictHostKeyChecking=no root@$LINODE_IP"
-
-        $EXEC_CMD "chown -R fatesaikou:fatesaikou /home/fatesaikou"
 
     - name: Disable remote login of root
       env:
