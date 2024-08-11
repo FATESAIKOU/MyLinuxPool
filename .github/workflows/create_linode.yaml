@@ -70,9 +70,9 @@ jobs:
 
         echo "--------------------------------------------"
         echo "FATESAIKOU_BASHRC: size"
-        echo $FATESAIKOU_BASHRC | wc -l
+        echo $FATESAIKOU_BASHRC | wc
         echo "FATESAIKOU_TMUXCONF_BASE64: size"
-        echo $FATESAIKOU_TMUXCONF | wc -l
+        echo $FATESAIKOU_TMUXCONF | wc
  
         echo "ARG_MAX"
         getconf ARG_MAX
