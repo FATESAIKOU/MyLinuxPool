@@ -98,5 +98,5 @@ jobs:
       env:
         FATESAIKOU_KEYS: ${{ secrets.FATESAIKOU_KEYS }}
         SSHPROXY_KEYS: ${{ secrets.SSHPROXY_KEYS }}
-        FATESAIKOU_BASHRC: ${{ secrets.FATESAIKOU_BASHRC }}
-        FATESAIKOU_TMUXCONF: ${{ secrets.FATESAIKOU_TMUXCONF }}
+        FATESAIKOU_BASHRC: ${{ vars.FATESAIKOU_BASHRC }}
+        FATESAIKOU_TMUXCONF: ${{ vars.FATESAIKOU_TMUXCONF }}
