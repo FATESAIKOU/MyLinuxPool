@@ -153,13 +153,13 @@ jobs:
         done
 
         $EXEC_CMD "
-            # Initialize vim
-            git clone https://github.com/VundleVim/Vundle.vim.git ~/.vim/bundle/Vundle.vim;
-            vim -E -s -u ~/.vimrc +PluginInstall +qall || exit 0;
+          # Initialize vim
+          git clone https://github.com/VundleVim/Vundle.vim.git ~/.vim/bundle/Vundle.vim;
+          vim -E -s -u ~/.vimrc +PluginInstall +qall || exit 0;
 
-            # Initialize tmux
-            git clone https://github.com/tmux-plugins/tpm ~/.tmux/plugins/tpm;
-            ~/.tmux/plugins/tpm/bin/install_plugins;
+          # Initialize tmux
+          git clone https://github.com/tmux-plugins/tpm ~/.tmux/plugins/tpm;
+          ~/.tmux/plugins/tpm/bin/install_plugins;
         "
 
     - name: Lock password for fatesaikou and sshproxy and disable remote login of root
@@ -174,8 +174,11 @@ jobs:
           sleep 1
         done
 
-        $EXEC_CMD "passwd -l fatesaikou"
-        $EXEC_CMD "passwd -l sshproxy"
-        $EXEC_CMD "sed -i '/PermitRootLogin/d' /etc/ssh/sshd_config"
-        $EXEC_CMD "echo \"PermitRootLogin no\" >> /etc/ssh/sshd_config"
-        $EXEC_CMD "systemctl restart sshd"
+        $EXEC_CMD "
+          passwd -l fatesaikou
+          passwd -l sshproxy
+          sed -i '/PermitRootLogin/d' /etc/ssh/sshd_config
+          echo \"PermitRootLogin no\" >> /etc/ssh/sshd_config
+          systemctl reload ssh.service
+        "
+
