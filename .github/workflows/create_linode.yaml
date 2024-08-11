@@ -85,30 +85,46 @@ jobs:
         # echo the output to the console
         echo "<<<<<Linode instance created>>>>>"
         echo $linode_cli_ret | jq
-        
-        echo "ROOT_PASS=$ROOT_PASS" >> $GITHUB_ENV
-        echo "LINODE_IP=$(echo $linode_cli_ret | jq -r '.[0] | .ipv4 | .[0]')" >> $GITHUB_ENV
 
-        # Wait until the Linode is ready(port 22 is open)
-        linode_ip=$(echo $linode_cli_ret | jq -r '.[0] | .ipv4 | .[0]')
-        while ! nc -w 1 -z $linode_ip 22; do
-            echo "Waiting for the Linode to be ready..."
-            sleep 5
+        # Export the root password and the Linode IP
+        export ROOT_PASS;
+        export LINODE_IP=$(echo $linode_cli_ret | jq -r '.[0] | .ipv4 | .[0]')
+        echo "ROOT_PASS=$ROOT_PASS" >> $GITHUB_ENV
+        echo "LINODE_IP=$LINODE_IP" >> $GITHUB_ENV
+
+        # Wait ssh port(22) open
+        while ! nc -w 1 -z $LINODE_IP 22; do
+          echo "[$(date)] Waiting for the Linode to be ready..."
+          sleep 1
         done
+
+        # Wait ssh service is up
+        EXEC_CMD="sshpass -p $ROOT_PASS ssh -o StrictHostKeyChecking=no root@$LINODE_IP"
+        while [ "$($EXEC_CMD "echo 'success'" 2>/dev/null)" != "success" ]; do
+          echo "[$(date)]SSH is up, but the system is not ready for command execution. Waiting..."
+          sleep 1
+        done
+
       env:
         FATESAIKOU_KEYS: ${{ secrets.FATESAIKOU_KEYS }}
         SSHPROXY_KEYS: ${{ secrets.SSHPROXY_KEYS }}
 
     - name: Copy files to the Linode instance
+      env:
+        ROOT_PASS: ${{ env.ROOT_PASS }}
+        LINODE_IP: ${{ env.LINODE_IP }}
       run: |
         SCP_CMD="sshpass -p $ROOT_PASS scp -o StrictHostKeyChecking=no"
 
         (
           cd static_normal_files
-          $SCP_CMD -r . root@${{ env.LINODE_IP }}:/
+          $SCP_CMD -r * root@$LINODE_IP:/
         )
 
     - name: Initialize vim, tmux
+      env:
+        ROOT_PASS: ${{ env.ROOT_PASS }}
+        LINODE_IP: ${{ env.LINODE_IP }}
       run: |
         EXEC_CMD="sshpass -p $ROOT_PASS ssh -o StrictHostKeyChecking=no root@$LINODE_IP"
 
@@ -121,12 +137,18 @@ jobs:
         $EXEC_CMD "~/.tmux/plugins/tpm/bin/install_plugins"
 
     - name: Chown for fatesaikou
+      env:
+        ROOT_PASS: ${{ env.ROOT_PASS }}
+        LINODE_IP: ${{ env.LINODE_IP }}
       run: |
         EXEC_CMD="sshpass -p $ROOT_PASS ssh -o StrictHostKeyChecking=no root@$LINODE_IP"
 
         $EXEC_CMD "chown -R fatesaikou:fatesaikou /home/fatesaikou"
 
     - name: Disable remote login of root
+      env:
+        ROOT_PASS: ${{ env.ROOT_PASS }}
+        LINODE_IP: ${{ env.LINODE_IP }}
       run: |
         EXEC_CMD="sshpass -p $ROOT_PASS ssh -o StrictHostKeyChecking=no root@$LINODE_IP"
 
