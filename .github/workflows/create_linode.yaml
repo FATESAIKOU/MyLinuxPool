@@ -71,7 +71,7 @@ jobs:
             file_base64=$(cat $file | base64 -w 0)
             dst_file=$(echo $file | sed 's/sync_files//g')
 
-            SYNC_FILE_CMDS+="echo '${file_base64}' | base64 -d > ${dst_file}\n"
+            SYNC_FILE_CMDS+="- echo '${file_base64}' | base64 -d > ${dst_file}\n"
         done
         export SYNC_FILE_CMDS
 
