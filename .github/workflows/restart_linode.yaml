@@ -31,10 +31,10 @@ jobs:
       label: ${{ github.event.inputs.label }}
       region: ${{ github.event.inputs.region }}
     secrets: inherit
+    continue-on-error: true
 
   create_linode:
     needs: [delete_linode]
-    if: always()
     uses: ./.github/workflows/create_linode.yaml
     with:
       label: ${{ github.event.inputs.label }}
