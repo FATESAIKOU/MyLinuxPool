@@ -26,6 +26,7 @@ write_files:
 - content: ${FATESAIKOU_TMUXCONF_BASE64}
   path: /tmp/fatesaikou_tmux.conf_base64
 
-# runcmd:
-# - cat /home/fatesaikou/.bashrc_base64 | base64 -d > /home/fatesaikou/.bashrc
-# - cat /home/fatesaikou/.tmux.conf_base64 | base64 -d > /home/fatesaikou/.tmux.conf
+runcmd:
+- su fatesaikou
+- cat /tmp/fatesaikou_bashrc_base64 | base64 -d > /home/fatesaikou/.bashrc
+- cat /tmp/fatesaikou_bashrc_base64 | base64 -d > /home/fatesaikou/.tmux.conf
