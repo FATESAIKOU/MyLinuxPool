@@ -1,8 +1,8 @@
 #cloud-config
 users:
 - name: fatesaikou
-  groups: sudo
-  sudo: ALL=(ALL) NOPASSWD:ALL
+  # groups: sudo
+  # sudo: ALL=(ALL) NOPASSWD:ALL
   shell: /bin/bash
   ssh_authorized_keys: ${FATESAIKOU_KEYS}
 - name: sshproxy
@@ -20,12 +20,12 @@ packages:
 - python3
 - nodejs
 
-write_files:
-- content: ${FATESAIKOU_BASHRC_BASE64}
-  path: /home/fatesaikou/.bashrc_base64
-- content: ${FATESAIKOU_TMUXCONF_BASE64}
-  path: /home/fatesaikou/.tmux.conf_base64
+# write_files:
+# - content: ${FATESAIKOU_BASHRC_BASE64}
+#   path: /home/fatesaikou/.bashrc_base64
+# - content: ${FATESAIKOU_TMUXCONF_BASE64}
+#   path: /home/fatesaikou/.tmux.conf_base64
 
-runcmd:
-- cat /home/fatesaikou/.bashrc_base64 | base64 -d > /home/fatesaikou/.bashrc
-- cat /home/fatesaikou/.tmux.conf_base64 | base64 -d > /home/fatesaikou/.tmux.conf
+# runcmd:
+# - cat /home/fatesaikou/.bashrc_base64 | base64 -d > /home/fatesaikou/.bashrc
+# - cat /home/fatesaikou/.tmux.conf_base64 | base64 -d > /home/fatesaikou/.tmux.conf
