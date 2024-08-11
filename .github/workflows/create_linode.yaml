@@ -145,19 +145,19 @@ jobs:
         FATESAIKOU_TMP_PASS: ${{ env.FATESAIKOU_TMP_PASS }}
         LINODE_IP: ${{ env.LINODE_IP }}
       run: |
-        EXEC_CMD="sshpass -p $FATESAIKOU_TMP_PASS ssh -o StrictHostKeyChecking=no fatesaikou@$LINODE_IP"
-
-        # Initialize tmux
-        echo "Hello world!"
-        $EXEC_CMD "git clone https://github.com/tmux-plugins/tpm ~/.tmux/plugins/tpm"
-        echo "Hello world!!"
-        $EXEC_CMD "~/.tmux/plugins/tpm/bin/install_plugins"
-        echo "Hello world!!!"
+        EXEC_CMD="sshpass -p $FATESAIKOU_TMP_PASS ssh -t -o StrictHostKeyChecking=no fatesaikou@$LINODE_IP"
 
         # Initialize vim
+        echo "Hello world!"
         $EXEC_CMD "git clone https://github.com/VundleVim/Vundle.vim.git ~/.vim/bundle/Vundle.vim"
+        echo "Hello world!!"
+        $EXEC_CMD "vim -E +PluginInstall +qall 1>/dev/null 2>&1 || exit 0" # allow all errors
+
+        # Initialize tmux
+        echo "Hello world!!!"
+        $EXEC_CMD "git clone https://github.com/tmux-plugins/tpm ~/.tmux/plugins/tpm"
         echo "Hello world!!!!"
-        $EXEC_CMD "vim -E +PluginInstall +qall"
+        $EXEC_CMD "~/.tmux/plugins/tpm/bin/install_plugins"
         echo "Hello world!!!!!"
 
     - name: Lock password for fatesaikou and sshproxy and disable remote login of root
