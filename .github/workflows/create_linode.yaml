@@ -110,16 +110,10 @@ jobs:
         LINODE_IP=$(echo $linode_cli_ret | jq -r '.[0] | .ipv4 | .[0]')
         echo "LINODE_IP=$LINODE_IP" >> $GITHUB_ENV
 
-        # Wait ssh port(22) open
-        while ! nc -w 1 -z $LINODE_IP 22; do
-          echo "[$(date)] Waiting for the Linode to be ready..."
-          sleep 1
-        done
-
         # Wait ssh service is up
         EXEC_CMD="sshpass -p $ROOT_PASS ssh -o StrictHostKeyChecking=no root@$LINODE_IP"
         while [ "$($EXEC_CMD "echo 'success'" 2>/dev/null)" != "success" ]; do
-          echo "[$(date)]SSH is up, but the system is not ready for command execution. Waiting..."
+          echo "[$(date)] Waiting SSH..."
           sleep 1
         done
 
@@ -148,7 +142,7 @@ jobs:
         EXEC_CMD="sshpass -p $FATESAIKOU_TMP_PASS ssh -o StrictHostKeyChecking=no fatesaikou@$LINODE_IP"
 
         while [ "$($EXEC_CMD "echo 'success'" 2>/dev/null)" != "success" ]; do
-          echo "[$(date)]SSH is up, but the system is not ready for command execution. Waiting..."
+          echo "[$(date)] Waiting SSH..."
           sleep 1
         done
 
@@ -170,7 +164,7 @@ jobs:
         EXEC_CMD="sshpass -p $ROOT_PASS ssh -o StrictHostKeyChecking=no root@$LINODE_IP"
 
         while [ "$($EXEC_CMD "echo 'success'" 2>/dev/null)" != "success" ]; do
-          echo "[$(date)]SSH is up, but the system is not ready for command execution. Waiting..."
+          echo "[$(date)] Waiting SSH..."
           sleep 1
         done
 
