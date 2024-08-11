@@ -86,7 +86,7 @@ jobs:
         echo "<<<<<ROOT_PASS>>>>>"
         echo "$ROOT_PASS"
         echo "<<<<<metadata.user_data(raw)>>>>>"
-        echo "$(cat ./cloud_config.yaml | envsubst"
+        echo "$(cat ./cloud_config.yaml | envsubst)"
 
         # Wait until the Linode is ready(port 22 is open)
         linode_ip=$(echo $linode_cli_ret | jq -r '.[0] | .ipv4 | .[0]')
