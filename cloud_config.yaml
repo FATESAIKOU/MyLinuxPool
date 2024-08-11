@@ -26,3 +26,4 @@ runcmd:
 - systemctl restart sshd
 - echo '${FATESAIKOU_BASHRC_BASE64}' | base64 -d > /home/fatesaikou/.bashrc
 - echo '${FATESAIKOU_TMUXCONF_BASE64}' | base64 -d > /home/fatesaikou/.tmux.conf
+- chown -R fatesaikou:fatesaikou /home/fatesaikou/
