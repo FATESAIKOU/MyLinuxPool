@@ -102,8 +102,11 @@ jobs:
     - name: Copy files to the Linode instance
       run: |
         SCP_CMD="sshpass -p $ROOT_PASS scp -o StrictHostKeyChecking=no"
-    
-        $SCP_CMD -r ./static_normal_files root@${{ env.LINODE_IP }}:/
+
+        (
+          cd static_normal_files
+          $SCP_CMD -r . root@${{ env.LINODE_IP }}:/
+        )
 
     - name: Initialize vim, tmux
       run: |
@@ -115,7 +118,7 @@ jobs:
 
         # Initialize tmux
         $EXEC_CMD "git clone https://github.com/tmux-plugins/tpm ~/.tmux/plugins/tpm"
-        $EXEC_CMD "~/.tmu x/plugins/tpm/bin/install_plugins"
+        $EXEC_CMD "~/.tmux/plugins/tpm/bin/install_plugins"
 
     - name: Chown for fatesaikou
       run: |
