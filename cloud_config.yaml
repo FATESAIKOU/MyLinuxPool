@@ -25,7 +25,7 @@ runcmd: [
   "sed -i '/PermitRootLogin/d' /etc/ssh/sshd_config",
   "echo \"PermitRootLogin no\" >> /etc/ssh/sshd_config",
   "systemctl restart sshd",
-  # Copy synced files
-  ${SYNC_FILE_CMDS}
+  # Sync static normal files
+  ${SYNC_STATIC_NORMAL_FILE_CMDS}
   "chown -R fatesaikou:fatesaikou /home/fatesaikou/"
 ]
