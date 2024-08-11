@@ -65,8 +65,8 @@ jobs:
         ROOT_PASS=$(openssl rand -base64 15 | tr -d '\n' | head -c 20)
 
         # Prepare base64 file strings
-        export FATESAIKOU_BASHRC_BASE64=$(cat $FATESAIKOU_BASHRC | base64 | tr -d '\n')
-        export FATESAIKOU_TMUXCONF_BASE64=$(cat $FATESAIKOU_TMUXCONF | base64 | tr -d '\n')
+        export FATESAIKOU_BASHRC_BASE64=$(echo $FATESAIKOU_BASHRC | base64 | tr -d '\n')
+        export FATESAIKOU_TMUXCONF_BASE64=$(echo $FATESAIKOU_TMUXCONF | base64 | tr -d '\n')
 
         echo $FATESAIKOU_BASHRC_BASE64
         echo $FATESAIKOU_TMUXCONF_BASE64
