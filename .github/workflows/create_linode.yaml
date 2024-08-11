@@ -145,15 +145,22 @@ jobs:
         FATESAIKOU_TMP_PASS: ${{ env.FATESAIKOU_TMP_PASS }}
         LINODE_IP: ${{ env.LINODE_IP }}
       run: |
-        EXEC_CMD="sshpass -p $FATESAIKOU_TMP_PASS ssh -t -o StrictHostKeyChecking=no fatesaikou@$LINODE_IP"
+        EXEC_CMD="sshpass -p $FATESAIKOU_TMP_PASS ssh -o StrictHostKeyChecking=no fatesaikou@$LINODE_IP"
 
-        # Initialize vim
-        $EXEC_CMD "git clone https://github.com/VundleVim/Vundle.vim.git ~/.vim/bundle/Vundle.vim"
-        $EXEC_CMD "vim -E -s -u ~/.vimrc +PluginInstall +qall || exit 0" # Allow all errors
+        while [ "$($EXEC_CMD "echo 'success'" 2>/dev/null)" != "success" ]; do
+          echo "[$(date)]SSH is up, but the system is not ready for command execution. Waiting..."
+          sleep 1
+        done
 
-        # Initialize tmux
-        $EXEC_CMD "git clone https://github.com/tmux-plugins/tpm ~/.tmux/plugins/tpm"
-        $EXEC_CMD "~/.tmux/plugins/tpm/bin/install_plugins"
+        $EXEC_CMD "
+            # Initialize vim
+            git clone https://github.com/VundleVim/Vundle.vim.git ~/.vim/bundle/Vundle.vim;
+            vim -E -s -u ~/.vimrc +PluginInstall +qall || exit 0;
+
+            # Initialize tmux
+            git clone https://github.com/tmux-plugins/tpm ~/.tmux/plugins/tpm;
+            ~/.tmux/plugins/tpm/bin/install_plugins;
+        "
 
     - name: Lock password for fatesaikou and sshproxy and disable remote login of root
       env:
@@ -161,6 +168,11 @@ jobs:
         LINODE_IP: ${{ env.LINODE_IP }}
       run: |
         EXEC_CMD="sshpass -p $ROOT_PASS ssh -o StrictHostKeyChecking=no root@$LINODE_IP"
+
+        while [ "$($EXEC_CMD "echo 'success'" 2>/dev/null)" != "success" ]; do
+          echo "[$(date)]SSH is up, but the system is not ready for command execution. Waiting..."
+          sleep 1
+        done
 
         $EXEC_CMD "passwd -l fatesaikou"
         $EXEC_CMD "passwd -l sshproxy"
