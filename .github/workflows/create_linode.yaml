@@ -79,6 +79,8 @@ jobs:
         cfs=($(find static_secret_files -type f -name '*.crypted'))
         for cf in "${cfs[@]}"; do
           dst_file=${cf/static_secret_files/to_sync_files}
+          dst_file=${dst_file%.crypted}
+
           mkdir -p $(dirname $dst_file)
 
           echo "Decrypting $cf..."
