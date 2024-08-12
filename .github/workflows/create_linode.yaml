@@ -92,9 +92,9 @@ jobs:
         SSHPROXY_TMP_PASS=$(openssl rand -base64 15 | tr -d '\n' | head -c 20)
 
         # Mask TMP_PASS
-        echo "::add-mask::$ROOT_PASS"
-        echo "::add-mask::$FATESAIKOU_TMP_PASS"
-        echo "::add-mask::$SSHPROXY_TMP_PASS"
+        # echo "::add-mask::$ROOT_PASS"
+        # echo "::add-mask::$FATESAIKOU_TMP_PASS"
+        # echo "::add-mask::$SSHPROXY_TMP_PASS"
 
         # Export to github env
         echo "ROOT_PASS=$ROOT_PASS" >> $GITHUB_ENV
@@ -185,10 +185,10 @@ jobs:
         done
 
         $EXEC_CMD "
-          passwd -l fatesaikou
-          passwd -l sshproxy
-          sed -i '/PermitRootLogin/d' /etc/ssh/sshd_config
-          echo \"PermitRootLogin no\" >> /etc/ssh/sshd_config
-          systemctl reload ssh.service
+          # passwd -l fatesaikou
+          # passwd -l sshproxy
+          # sed -i '/PermitRootLogin/d' /etc/ssh/sshd_config
+          # echo \"PermitRootLogin no\" >> /etc/ssh/sshd_config
+          # systemctl reload ssh.service
         "
 
