@@ -4,12 +4,10 @@ users:
   groups: sudo
   sudo: ALL=(ALL) NOPASSWD:ALL
   shell: /bin/bash
-  ssh_authorized_keys: ${FATESAIKOU_KEYS}
   lock_passwd: false
   plain_text_passwd: ${FATESAIKOU_TMP_PASS}
 - name: sshproxy
   shell: /bin/bash
-  ssh_authorized_keys: ${SSHPROXY_KEYS}
   lock_passwd: false
   plain_text_passwd: ${SSHPROXY_TMP_PASS}
 

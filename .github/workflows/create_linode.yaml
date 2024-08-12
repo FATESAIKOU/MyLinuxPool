@@ -83,8 +83,6 @@ jobs:
 
     - name: Create a Linode instance
       env:
-        FATESAIKOU_KEYS: ${{ secrets.FATESAIKOU_KEYS }}
-        SSHPROXY_KEYS: ${{ secrets.SSHPROXY_KEYS }}
         ROOT_PASS: ${{ env.ROOT_PASS }}
         FATESAIKOU_TMP_PASS: ${{ env.FATESAIKOU_TMP_PASS }}
         SSHPROXY_TMP_PASS: ${{ env.SSHPROXY_TMP_PASS }}
