@@ -82,7 +82,7 @@ jobs:
           mkdir -p $(dirname $dst_file)
 
           echo "Decrypting $cf..."
-          cat $cf | ./scripts/decrypt.sh $FILE_CRYPTO_KEY > $dst_file
+          cat $cf | ./scripts/decryptStdin.sh $FILE_CRYPTO_KEY > $dst_file
         done
 
     - name: Generate tmp password
