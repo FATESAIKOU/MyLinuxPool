@@ -115,6 +115,22 @@ jobs:
           sleep 1
         done
 
+    - name: Prepare files to sync
+      env:
+        FILE_CRYPTO_KEY: ${{ secrets.FILE_CRYPTO_KEY }}
+      run: |
+        mkdir to_sync_files
+
+        # normal files
+        cp -r static_normal_files/* to_sync_files/
+
+        # crypted files
+        cfs=($(find static_secret_files -type f -name '*.crypted'))
+        for cf in "${cfs[@]}"; do
+          echo "Decrypting $cf..."
+          cat $cf | ./scripts/decrypt.sh $FILE_CRYPTO_KEY > ${cf/static_secret_files/to_sync_files}
+        done
+
     - name: Copy files to the Linode instance
       env:
         ROOT_PASS: ${{ env.ROOT_PASS }}
@@ -123,10 +139,8 @@ jobs:
         EXEC_CMD="sshpass -p $ROOT_PASS ssh -o StrictHostKeyChecking=no root@$LINODE_IP"
         SCP_CMD="sshpass -p $ROOT_PASS scp -o StrictHostKeyChecking=no"
 
-        (
-          cd static_normal_files
-          $SCP_CMD -r * root@$LINODE_IP:/
-        )
+        $SCP_CMD -r to_sync_files/* root@$LINODE_IP:/
+        rm -rf to_sync_files
 
         # Chown for fatesaikou and sshproxy
         $EXEC_CMD "chown -R fatesaikou:fatesaikou /home/fatesaikou"
