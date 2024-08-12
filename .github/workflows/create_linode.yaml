@@ -65,6 +65,26 @@ jobs:
         sudo apt-get update
         sudo apt-get install -y sshpass
 
+    - name: Build file bundle for Linode
+      env:
+        FILE_CRYPTO_KEY: ${{ secrets.FILE_CRYPTO_KEY }}
+      run: |
+        # create file base dir
+        mkdir to_sync_files
+
+        # copy normal files to to_sync_files
+        cp -r static_normal_files/* to_sync_files/
+
+        # decrypt secret files and copy to to_sync_files
+        cfs=($(find static_secret_files -type f -name '*.crypted'))
+        for cf in "${cfs[@]}"; do
+          dst_file=${cf/static_secret_files/to_sync_files}
+          mkdir -p $(dirname $dst_file)
+
+          echo "Decrypting $cf..."
+          cat $cf | ./scripts/decrypt.sh $FILE_CRYPTO_KEY > $dst_file
+        done
+
     - name: Generate tmp password
       run: |
         ROOT_PASS=$(openssl rand -base64 15 | tr -d '\n' | head -c 20)
@@ -113,22 +133,6 @@ jobs:
         while [ "$($EXEC_CMD "echo 'success'" 2>/dev/null)" != "success" ]; do
           echo "[$(date)] Waiting SSH..."
           sleep 1
-        done
-
-    - name: Prepare files to sync
-      env:
-        FILE_CRYPTO_KEY: ${{ secrets.FILE_CRYPTO_KEY }}
-      run: |
-        mkdir to_sync_files
-
-        # normal files
-        cp -r static_normal_files/* to_sync_files/
-
-        # crypted files
-        cfs=($(find static_secret_files -type f -name '*.crypted'))
-        for cf in "${cfs[@]}"; do
-          echo "Decrypting $cf..."
-          cat $cf | ./scripts/decrypt.sh $FILE_CRYPTO_KEY > ${cf/static_secret_files/to_sync_files}
         done
 
     - name: Copy files to the Linode instance
