@@ -177,10 +177,13 @@ jobs:
     - name: Switch DNS and update hosts
       id: switch_dns
       env:
+        ROOT_PASS: ${{ env.ROOT_PASS }}
         LINODE_IP: ${{ env.LINODE_IP }}
         CSIE_IO_TOKEN: ${{ secrets.CSIE_IO_TOKEN }}
         CSIE_IO_HOST: ${{ vars.CSIE_IO_HOST }}
       run: |
+        EXEC_CMD="sshpass -p $ROOT_PASS ssh -o ConnectTimeout=1 -o StrictHostKeyChecking=no root@$LINODE_IP"
+
         # Get current ip from csie.io and echo to github env
         CURRENT_IP=$(dig +short $CSIE_IO_HOST.csie.io)
         echo "CURRENT_IP=$CURRENT_IP" >> $GITHUB_ENV
@@ -190,14 +193,13 @@ jobs:
         ehco '' # just for output a newline
 
         # Wait ssh service is up
-        EXEC_CMD="sshpass -p $ROOT_PASS ssh -o ConnectTimeout=1 -o StrictHostKeyChecking=no root@$LINODE_IP"
         while [ "$($EXEC_CMD "echo 'success'" 2>/dev/null)" != "success" ]; do
           echo "[$(date)] Waiting SSH..."
           sleep 1
         done
 
         # Watch sshproxy with 5 min timeout
-        TIMEOUT_SEC=300
+        TIMEOUT_SEC=5
         PROXYED_ENTRY_PORT='2223' # cms
 
         current_time=$(date +%s)
