@@ -181,6 +181,7 @@ jobs:
         CSIE_IO_HOST: ${{ vars.CSIE_IO_HOST }}
       run: |
         # Get current ip from csie.io and echo to github env
+        CURRENT_IP=$(dig +short $CSIE_IO_HOST)
         echo "CURRENT_IP=$CURRENT_IP" >> $GITHUB_ENV
 
         # Switch DNS
