@@ -204,8 +204,6 @@ jobs:
 
         current_time=$(date +%s)
         while true; do
-            exit 1 # for test
-
             echo -n "[$(date)][$LINODE_IP][$PROXYED_ENTRY_PORT] "
             $EXEC_CMD "nc -z -v localhost $PROXYED_ENTRY_PORT; exit $?"
 
