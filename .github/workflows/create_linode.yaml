@@ -182,11 +182,10 @@ jobs:
       run: |
         # Get current ip from csie.io and echo to github env
         CURRENT_IP=$(dig +short $CSIE_IO_HOST.csie.io)
-        echo "CURRENT_ID=$CURRENT_IP"
         echo "CURRENT_IP=$CURRENT_IP" >> $GITHUB_ENV
 
         # Switch DNS
-        curl -v "https://csie.io/update?hn=$CSIE_IO_HOST&token=$CSIE_IO_TOKEN&ip=$LINODE_IP"
+        curl "https://csie.io/update?hn=$CSIE_IO_HOST&token=$CSIE_IO_TOKEN&ip=$LINODE_IP"
 
         # Watch sshproxy with 5 min timeout
         TIMEOUT_SEC=300
@@ -214,12 +213,12 @@ jobs:
 
     # if switch fail and env.CURRENT_IP is not empty, then set back
     - name: Set back DNS if switch fail
-      if: env.CURRENT_IP != ''
+      if: ${{ env.CURRENT_IP }} != ''
       env:
         CSIE_IO_TOKEN: ${{ secrets.CSIE_IO_TOKEN }}
         CSIE_IO_HOST: ${{ vars.CSIE_IO_HOST }}
         CURRENT_IP: ${{ env.CURRENT_IP }}
-      run: curl -v "https://csie.io/update?hn=$CSIE_IO_HOST&token=$CSIE_IO_TOKEN&ip=$CURRENT_IP"
+      run: curl "https://csie.io/update?hn=$CSIE_IO_HOST&token=$CSIE_IO_TOKEN&ip=$CURRENT_IP"
 
     - name: Lock password for fatesaikou and sshproxy and disable remote login of root
       env:
