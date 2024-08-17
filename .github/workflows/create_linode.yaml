@@ -187,6 +187,7 @@ jobs:
 
         # Switch DNS
         curl -s "https://csie.io/update?hn=$CSIE_IO_HOST&token=$CSIE_IO_TOKEN&ip=$LINODE_IP"
+        ehco '' # just for output a newline
 
         # Wait ssh service is up
         EXEC_CMD="sshpass -p $ROOT_PASS ssh -o ConnectTimeout=1 -o StrictHostKeyChecking=no root@$LINODE_IP"
