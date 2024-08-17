@@ -197,13 +197,12 @@ jobs:
 
         # Watch sshproxy with 5 min timeout
         TIMEOUT_SEC=300
-        PROXYED_ENTRY_PORT=$2
-        TEST_CMD="sshpass -p $ROOT_PASS ssh -o StrictHostKeyChecking=no -o LogLevel=ERROR root@$LINODE_IP 'nc -z -v localhost $PROXYED_ENTRY_PORT'"
+        PROXYED_ENTRY_PORT='2223' # cms
 
         current_time=$(date +%s)
         while true; do
             echo -n "[$(date)][$LINODE_IP][$PROXYED_ENTRY_PORT] "
-            $TEST_CMD
+            $EXEC_CMD "nc -z -v localhost $PROXYED_ENTRY_PORT"
 
             # if connected, then break
             if [ $? -eq 0 ]; then
