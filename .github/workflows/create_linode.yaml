@@ -213,7 +213,7 @@ jobs:
 
     # if switch fail and env.CURRENT_IP is not empty, then set back
     - name: Set back DNS if switch fail
-      if: failure() && env.CURRENT_IP != ''
+      if: failure() && ${{ env.CURRENT_IP }} != ''
       env:
         CSIE_IO_TOKEN: ${{ secrets.CSIE_IO_TOKEN }}
         CSIE_IO_HOST: ${{ vars.CSIE_IO_HOST }}
