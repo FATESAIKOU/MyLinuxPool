@@ -190,7 +190,7 @@ jobs:
 
         # Switch DNS
         curl -s "https://csie.io/update?hn=$CSIE_IO_HOST&token=$CSIE_IO_TOKEN&ip=$LINODE_IP"
-        ehco '' # just for output a newline
+        echo '' # just for output a newline
 
         # Wait ssh service is up
         while [ "$($EXEC_CMD "echo 'success'" 2>/dev/null)" != "success" ]; do
