@@ -174,6 +174,42 @@ jobs:
           ~/.tmux/plugins/tpm/bin/install_plugins;
         "
 
+    - name: Switch DNS and update hosts
+      env:
+        LINODE_IP: ${{ env.LINODE_IP }}
+        CSIE_IO_TOKEN: ${{ secrets.CSIE_IO_TOKEN }}
+        CSIE_IO_HOST: ${{ vars.CSIE_IO_HOST }}
+      run: |
+        # Get current ip from csie.io
+        CURRENT_IP=$(dig +short $CSIE_IO_HOST.csie.io)
+
+        # Switch DNS
+        curl https://csie.io/update?hn=$CSIE_IO_HOST&token=$CSIE_IO_TOKEN&ip=$LINODE_IP
+
+        # Watch sshproxy with 5 min timeout
+        TIMEOUT_SEC=300
+        PROXYED_ENTRY_PORT=$2
+        TEST_CMD="sshpass -p $ROOT_PASS ssh -o StrictHostKeyChecking=no -o LogLevel=ERROR root@$LINODE_IP 'nc -z -v localhost $PROXYED_ENTRY_PORT'"
+
+        current_time=$(date +%s)
+        while true; do
+            echo -n "[$(date)][$LINODE_IP][$PROXYED_ENTRY_PORT] "
+            $TEST_CMD
+
+            # if connected, then break
+            if [ $? -eq 0 ]; then
+                break
+            fi
+
+            # if timeout, set ip back, then break
+            if [ $(($(date +%s) - $current_time)) -ge $TIMEOUT_SEC ]; then
+                curl https://csie.io/update?hn=$CSIE_IO_HOST&token=$CSIE_IO_TOKEN&ip=$CURRENT_IP
+                break
+            fi
+
+            sleep 1
+        done
+
     - name: Lock password for fatesaikou and sshproxy and disable remote login of root
       env:
         ROOT_PASS: ${{ env.ROOT_PASS }}
