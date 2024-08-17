@@ -202,7 +202,7 @@ jobs:
         current_time=$(date +%s)
         while true; do
             echo -n "[$(date)][$LINODE_IP][$PROXYED_ENTRY_PORT] "
-            $EXEC_CMD "nc -z -v localhost $PROXYED_ENTRY_PORT"
+            $EXEC_CMD "nc -z -v localhost $PROXYED_ENTRY_PORT; exit $?"
 
             # if connected, then break
             if [ $? -eq 0 ]; then
