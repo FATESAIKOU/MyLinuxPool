@@ -155,9 +155,6 @@ jobs:
         EXEC_CMD="sshpass -p $ROOT_PASS ssh -o StrictHostKeyChecking=no root@$LINODE_IP"
 
         $EXEC_CMD "
-          flock -w 20 /var/lib/apt/lists/lock -c 'apt-get update'
-          flock -w 20 /var/lib/apt/lists/lock -c 'apt-get install -y git vim tmux curl unzip'
-
           # Install awscli
           curl \"https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip\" -o \"/tmp/awscliv2.zip\"
           unzip /tmp/awscliv2.zip

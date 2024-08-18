@@ -21,3 +21,5 @@ packages:
 - rclone
 - python3
 - nodejs
+- curl
+- unzip
