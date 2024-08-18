@@ -1,28 +1,6 @@
 name: Create linode
 
 on:
-  workflow_dispatch:
-    inputs:
-      label:
-        type: string
-        description: instance label
-        required: true
-        default: fws-preview
-      region:
-        type: string
-        description: instance region
-        required: true
-        default: ap-northeast
-      type:
-        type: string
-        description: instance type
-        required: true
-        default: g6-nanode-1
-      image:
-        type: string
-        description: instance image
-        required: true
-        default: linode/ubuntu24.04
   workflow_call:
     inputs:
       label:
@@ -123,10 +101,10 @@ jobs:
         linode_cli_ret=$(
             linode-cli linodes create \
                 --no-defaults \
-                --label ${{ github.event.inputs.label }} \
-                --region ${{ github.event.inputs.region }} \
-                --type ${{ github.event.inputs.type }} \
-                --image ${{ github.event.inputs.image }} \
+                --label ${{ inputs.label }} \
+                --region ${{ inputs.region }} \
+                --type ${{ inputs.type }} \
+                --image ${{ inputs.image }} \
                 --root_pass $ROOT_PASS \
                 --json \
                 --metadata.user_data "$(cat ./cloud_config.yaml | envsubst | base64 | tr -d '\n')"
