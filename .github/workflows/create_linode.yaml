@@ -156,8 +156,13 @@ jobs:
 
         $EXEC_CMD "
           # Install with apt
-          sudo flock /var/lib/apt/lists/lock apt-get update
-          sudo flock /var/lib/apt/lists/lock apt-get install -y git vim tmux curl unzip
+          while sudo fuser /var/lib/apt/lists/lock >/dev/null 2>&1; do
+            echo "Waiting for apt lock to be released..."
+            sleep 1
+          done
+
+          apt-get update
+          apt-get install -y git vim tmux curl unzip
 
           # Install awscli
           curl \"https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip\" -o \"/tmp/awscliv2.zip\"
