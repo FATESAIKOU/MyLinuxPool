@@ -35,6 +35,9 @@ jobs:
   create_linode:
     needs: [delete_linode]
     uses: ./.github/workflows/create_linode.yaml
+    permissions:
+      contents: read
+      id-token: write
     if: ${{ always() }}
     with:
       label: ${{ github.event.inputs.label }}
