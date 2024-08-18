@@ -83,7 +83,7 @@ jobs:
         cp -r static_normal_files/* to_sync_files/
 
         # download volatile files from s3
-        aws s3 sync s3://fws-volatile-data to_sync_files --recursive
+        aws s3 cp s3://fws-volatile-data to_sync_files --recursive
 
         # decrypt secret files and copy to to_sync_files
         cfs=($(find static_secret_files -type f -name '*.crypted'))
