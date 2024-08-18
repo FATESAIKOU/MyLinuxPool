@@ -46,7 +46,7 @@ jobs:
     secrets: inherit
 
   promote_preview_linode:
-    needs: [create_linode]
+    needs: [delete_linode]
     uses: ./.github/workflows/promote_preview_linode.yaml
     with:
       label: ${{ github.event.inputs.label }}
