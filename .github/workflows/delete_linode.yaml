@@ -8,11 +8,6 @@ on:
         description: instance label
         required: true
         default: fws
-      region:
-        type: string
-        description: instance region
-        required: true
-        default: ap-northeast
       
 jobs:
   delete_linode:
