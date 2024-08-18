@@ -1,4 +1,4 @@
-name: cicd test
+name: CICD test
 
 on:
   workflow_dispatch:
