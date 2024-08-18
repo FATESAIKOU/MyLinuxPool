@@ -161,8 +161,7 @@ jobs:
             sleep 1
           done
 
-          apt-get update
-          apt-get install -y git vim tmux curl unzip
+          apt-get update && apt-get install -y git vim tmux curl unzip
 
           # Install awscli
           curl \"https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip\" -o \"/tmp/awscliv2.zip\"
