@@ -155,9 +155,15 @@ jobs:
         EXEC_CMD="sshpass -p $ROOT_PASS ssh -o StrictHostKeyChecking=no root@$LINODE_IP"
 
         $EXEC_CMD "
+          # Wait /usr/bin/unzip exist
+          while [ ! -f /usr/bin/unzip ]; do
+            echo 'Waiting unzip...'
+            sleep 1
+          done
+
           # Install awscli
           curl \"https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip\" -o \"/tmp/awscliv2.zip\"
-          unzip /tmp/awscliv2.zip
+          /usr/bin/unzip /tmp/awscliv2.zip
           ./aws/install
         "
 

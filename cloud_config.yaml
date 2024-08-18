@@ -15,11 +15,11 @@ package_update: true
 package_upgrade: true
 
 packages:
+- curl
+- unzip
 - vim
 - tmux
 - git
 - rclone
 - python3
 - nodejs
-- curl
-- unzip
