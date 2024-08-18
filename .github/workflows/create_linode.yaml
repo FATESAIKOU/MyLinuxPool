@@ -194,7 +194,7 @@ jobs:
           ./aws/install
         "
 
-    - name: Install extra software and tools(fatesaikou)(asdf, nodejs, python, golang)
+    - name: Install extra software and tools(fatesaikou)(asdf, nodejs, python, golang, anime-downloader)
       env:
         FATESAIKOU_TMP_PASS: ${{ env.FATESAIKOU_TMP_PASS }}
         LINODE_IP: ${{ env.LINODE_IP }}
@@ -222,6 +222,11 @@ jobs:
           asdf plugin-add golang
           asdf install golang 1.23.0
           asdf global golang 1.23.0
+
+          # Install anime-downloader
+          mkdir -p ~/anime-downloader/anime
+          cd ~/anime-downloader
+          git clone https://github.com/FATESAIKOU/GOAnimateRestoreAutomator.git
         "
 
     - name: Initialize softwares(fatesaikou)(vim, tmux)
