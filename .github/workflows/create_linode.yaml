@@ -147,26 +147,6 @@ jobs:
           sleep 1
         done
 
-    - name: Install nessary dependencies
-      env:
-        ROOT_PASS: ${{ env.ROOT_PASS }}
-        LINODE_IP: ${{ env.LINODE_IP }}
-      run: |
-        EXEC_CMD="sshpass -p $ROOT_PASS ssh -o StrictHostKeyChecking=no root@$LINODE_IP"
-
-        $EXEC_CMD "
-          # Wait /usr/bin/unzip exist
-          while [ ! -f /usr/bin/unzip ]; do
-            echo 'Waiting /usr/bin/unzip exist...'
-            sleep 1
-          done
-
-          # Install awscli
-          curl \"https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip\" -o \"/tmp/awscliv2.zip\"
-          /usr/bin/unzip /tmp/awscliv2.zip
-          ./aws/install
-        "
-
     - name: Copy files to the Linode instance
       env:
         ROOT_PASS: ${{ env.ROOT_PASS }}
@@ -194,7 +174,27 @@ jobs:
         $EXEC_CMD "chown -R fatesaikou:fatesaikou /home/fatesaikou"
         $EXEC_CMD "chown -R sshproxy:sshproxy /home/sshproxy"
 
-    - name: Install language supports for fatesaikou
+    - name: Install extra software and tools([without apt] aws cli)
+      env:
+        ROOT_PASS: ${{ env.ROOT_PASS }}
+        LINODE_IP: ${{ env.LINODE_IP }}
+      run: |
+        EXEC_CMD="sshpass -p $ROOT_PASS ssh -o StrictHostKeyChecking=no root@$LINODE_IP"
+
+        $EXEC_CMD "
+          # Wait /usr/bin/unzip exist
+          while [ ! -f /usr/bin/unzip ]; do
+            echo 'Waiting /usr/bin/unzip exist...'
+            sleep 1
+          done
+
+          # Install awscli
+          curl \"https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip\" -o \"/tmp/awscliv2.zip\"
+          /usr/bin/unzip /tmp/awscliv2.zip
+          ./aws/install
+        "
+
+    - name: Install extra software and tools(fatesaikou)(asdf, nodejs, python, golang)
       env:
         FATESAIKOU_TMP_PASS: ${{ env.FATESAIKOU_TMP_PASS }}
         LINODE_IP: ${{ env.LINODE_IP }}
@@ -204,7 +204,7 @@ jobs:
         $EXEC_CMD "
           # Install asdf
           git clone https://github.com/asdf-vm/asdf.git ~/.asdf --branch v0.14.0
-          echo '. $HOME/.asdf/asdf.sh' >> ~/.bashrc
+          chmod u+x \"\$HOME/.asdf/asdf.sh\"
 
           # Install nodejs
           asdf plugin-add nodejs
@@ -222,7 +222,7 @@ jobs:
           asdf global golang 1.23.0
         "
 
-    - name: Initialize softwares for fatesaikou
+    - name: Initialize softwares(fatesaikou)(vim, tmux)
       env:
         FATESAIKOU_TMP_PASS: ${{ env.FATESAIKOU_TMP_PASS }}
         LINODE_IP: ${{ env.LINODE_IP }}
