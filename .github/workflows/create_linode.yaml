@@ -138,6 +138,24 @@ jobs:
           sleep 1
         done
 
+    - name: Install nessary dependencies
+      env:
+        ROOT_PASS: ${{ env.ROOT_PASS }}
+        LINODE_IP: ${{ env.LINODE_IP }}
+      run: |
+        EXEC_CMD="sshpass -p $ROOT_PASS ssh -o StrictHostKeyChecking=no root@$LINODE_IP"
+
+        $EXEC_CMD "
+          # Install with apt
+          apt-get update
+          apt-get install -y git vim tmux curl unzip
+
+          # Install awscli
+          curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "/tmp/awscliv2.zip"
+          unzip /tmp/awscliv2.zip
+          ./aws/install
+        "
+
     - name: Copy files to the Linode instance
       env:
         ROOT_PASS: ${{ env.ROOT_PASS }}
@@ -152,6 +170,34 @@ jobs:
         # Chown for fatesaikou and sshproxy
         $EXEC_CMD "chown -R fatesaikou:fatesaikou /home/fatesaikou"
         $EXEC_CMD "chown -R sshproxy:sshproxy /home/sshproxy"
+
+    - name: Install language supports for fatesaikou
+      env:
+        FATESAIKOU_TMP_PASS: ${{ env.FATESAIKOU_TMP_PASS }}
+        LINODE_IP: ${{ env.LINODE_IP }}
+      run: |
+        EXEC_CMD="sshpass -p $FATESAIKOU_TMP_PASS ssh -o StrictHostKeyChecking=no fatesaikou@$LINODE_IP"
+
+        $EXEC_CMD "
+          # Install asdf
+          git clone https://github.com/asdf-vm/asdf.git ~/.asdf --branch v0.14.0
+          echo '. $HOME/.asdf/asdf.sh' >> ~/.bashrc
+
+          # Install nodejs
+          asdf plugin-add nodejs
+          asdf install nodejs 22.2.0
+          asdf global nodejs 22.2.0
+
+          # Install python
+          asdf plugin-add python
+          asdf install python 3.12.0
+          asdf global python 3.12.0
+
+          # Install golang
+          asdf plugin-add golang
+          asdf install golang 1.23.0
+          asdf global golang 1.23.0
+        "
 
     - name: Initialize softwares for fatesaikou
       env:
