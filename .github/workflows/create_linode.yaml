@@ -155,13 +155,8 @@ jobs:
         EXEC_CMD="sshpass -p $ROOT_PASS ssh -o StrictHostKeyChecking=no root@$LINODE_IP"
 
         $EXEC_CMD "
-          # Install with apt
-          while sudo fuser /var/lib/apt/lists/lock >/dev/null 2>&1; do
-            echo "Waiting for apt lock to be released..."
-            sleep 1
-          done
-
-          apt-get update && apt-get install -y git vim tmux curl unzip
+          flock -w 20 /var/lib/apt/lists/lock -c 'apt-get update'
+          flock -w 20 /var/lib/apt/lists/lock -c 'apt-get install -y git vim tmux curl unzip'
 
           # Install awscli
           curl \"https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip\" -o \"/tmp/awscliv2.zip\"
@@ -191,7 +186,7 @@ jobs:
           echo "[$(date)] Waiting SSH..."
           sleep 1
         done
-        
+
         # Chown for fatesaikou and sshproxy
         $EXEC_CMD "chown -R fatesaikou:fatesaikou /home/fatesaikou"
         $EXEC_CMD "chown -R sshproxy:sshproxy /home/sshproxy"
