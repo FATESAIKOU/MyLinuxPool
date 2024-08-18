@@ -1,0 +1,31 @@
+name: cicd test
+
+on:
+  workflow_dispatch:
+
+jobs:
+  cicd_test:
+    name: cicd test
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        role-to-assume: arn:aws:iam::084437056934:role/fwsVolatileDataOperator
+        aws-region: ap-northeast-1
+
+    - name: Test s3 permissions
+      run: |
+        echo "Before upload"
+        aws s3 ls s3://fws-volatile-data --recursive
+
+        echo "Uploading test.txt"
+        echo "Hello, world!" > /tmp/test.txt
+        aws s3 cp /tmp/test.txt s3://fws-volatile-data/test.txt
+        aws s3 ls s3://fws-volatile-data --recursive
+
+        echo "Deleting test.txt"
+        aws s3 rm s3://fws-volatile-data/test.txt
+        aws s3 ls s3://fws-volatile-data --recursive
