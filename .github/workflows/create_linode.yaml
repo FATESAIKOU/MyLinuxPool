@@ -246,6 +246,28 @@ jobs:
           ~/.tmux/plugins/tpm/bin/install_plugins;
         "
 
+    - name: Add crontab jobs(fatesaikou)
+      env:
+        FATESAIKOU_TMP_PASS: ${{ env.FATESAIKOU_TMP_PASS }}
+        LINODE_IP: ${{ env.LINODE_IP }}
+      run: |
+        EXEC_CMD="sshpass -p $FATESAIKOU_TMP_PASS ssh -o StrictHostKeyChecking=no fatesaikou@$LINODE_IP"
+
+        while [ "$($EXEC_CMD "echo 'success'" 2>/dev/null)" != "success" ]; do
+          echo "[$(date)] Waiting SSH..."
+          sleep 1
+        done
+
+        $EXEC_CMD "
+          crontab_entries=(
+            '@hourly aws s3 cp /home/fatesaikou/volatileData/ s3://fws-volatile-data/home/fatesaikou/volatileData/ --recursive'
+          )
+
+          for entry in \"\${crontab_entries[@]}\"; do
+            (crontab -l; echo \"\$entry\") | crontab -
+          done
+        "
+
     - name: Switch DNS and update hosts
       id: switch_dns
       env:
