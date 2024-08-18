@@ -56,6 +56,12 @@ jobs:
     steps:
     - uses: actions/checkout@v4
 
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        role-to-assume: arn:aws:iam::084437056934:role/fwsVolatileDataOperator
+        aws-region: ap-northeast-1
+
     - name: Install the Linode CLI
       uses: linode/action-linode-cli@v1
       with:
@@ -75,6 +81,9 @@ jobs:
 
         # copy normal files to to_sync_files
         cp -r static_normal_files/* to_sync_files/
+
+        # download volatile files from s3
+        aws s3 sync s3://fws-volatile-data to_sync_files --recursive
 
         # decrypt secret files and copy to to_sync_files
         cfs=($(find static_secret_files -type f -name '*.crypted'))
@@ -161,8 +170,14 @@ jobs:
         ROOT_PASS: ${{ env.ROOT_PASS }}
         LINODE_IP: ${{ env.LINODE_IP }}
       run: |
-        EXEC_CMD="sshpass -p $ROOT_PASS ssh -o StrictHostKeyChecking=no root@$LINODE_IP"
+        EXEC_CMD="sshpass -p $ROOT_PASS ssh -o ConnectTimeout=1 -o StrictHostKeyChecking=no root@$LINODE_IP"
         SCP_CMD="sshpass -p $ROOT_PASS scp -o StrictHostKeyChecking=no"
+
+        # Wait ssh service is up
+        while [ "$($EXEC_CMD "echo 'success'" 2>/dev/null)" != "success" ]; do
+          echo "[$(date)] Waiting SSH..."
+          sleep 1
+        done
 
         $SCP_CMD -r to_sync_files/* root@$LINODE_IP:/
         rm -rf to_sync_files
