@@ -25,23 +25,22 @@ on:
         default: linode/ubuntu24.04
 
 jobs:
-  delete_linode:
-    uses: ./.github/workflows/delete_linode.yaml
-    with:
-      label: ${{ github.event.inputs.label }}
-      region: ${{ github.event.inputs.region }}
-    secrets: inherit
-
   create_linode:
-    needs: [delete_linode]
     uses: ./.github/workflows/create_linode.yaml
     permissions:
       contents: read
       id-token: write
-    if: ${{ always() }}
     with:
       label: ${{ github.event.inputs.label }}
       region: ${{ github.event.inputs.region }}
       type: ${{ github.event.inputs.type }}
       image: ${{ github.event.inputs.image }}
+    secrets: inherit
+
+  delete_linode:
+    needs: [create_linode]
+    uses: ./.github/workflows/delete_linode.yaml
+    with:
+      label: ${{ github.event.inputs.label }}
+      region: ${{ github.event.inputs.region }}
     secrets: inherit
