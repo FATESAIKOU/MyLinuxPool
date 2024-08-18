@@ -7,7 +7,7 @@ on:
         type: string
         description: instance label
         required: true
-        default: fws
+        default: fws-preview
       region:
         type: string
         description: instance region
@@ -29,7 +29,7 @@ on:
         type: string
         description: instance label
         required: true
-        default: fws
+        default: fws-preview
       region:
         type: string
         description: instance region

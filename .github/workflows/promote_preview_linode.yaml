@@ -1,0 +1,59 @@
+name: Delete linode
+
+on:
+  workflow_dispatch:
+    inputs:
+      label:
+        type: string
+        description: instance label
+        required: true
+        default: fws
+      preview_label:
+        type: string
+        description: preview instance label
+        required: true
+        default: fws-preview
+      region:
+        type: string
+        description: instance region
+        required: true
+        default: ap-northeast
+  workflow_call:
+    inputs:
+      label:
+        type: string
+        description: instance label
+        required: true
+        default: fws
+      preview_label:
+        type: string
+        description: preview instance label
+        required: true
+        default: fws-preview
+      region:
+        type: string
+        description: instance region
+        required: true
+        default: ap-northeast
+
+jobs:
+  delete_linode:
+    name: delete linode
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Install the Linode CLI
+      uses: linode/action-linode-cli@v1
+      with:
+        token: ${{ secrets.LINODE_TOKEN }}
+
+    - name: Promote a Linode instance
+      run: |
+        PREVIEW_LABEL="${{ github.event.inputs.preview_label }}"
+        linode_id=$(linode-cli linodes list --json | jq -r ".[] | select(.label == \"$PREVIEW_LABEL\") | .id")
+
+        LABEL="${{ github.event.inputs.label }}"
+        linode-cli linodes update $linode_id --label $LABEL

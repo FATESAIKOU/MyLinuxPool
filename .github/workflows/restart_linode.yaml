@@ -31,7 +31,7 @@ jobs:
       contents: read
       id-token: write
     with:
-      label: ${{ github.event.inputs.label }}
+      label: ${{ github.event.inputs.label }}-preview
       region: ${{ github.event.inputs.region }}
       type: ${{ github.event.inputs.type }}
       image: ${{ github.event.inputs.image }}
@@ -42,5 +42,14 @@ jobs:
     uses: ./.github/workflows/delete_linode.yaml
     with:
       label: ${{ github.event.inputs.label }}
+      region: ${{ github.event.inputs.region }}
+    secrets: inherit
+
+  promote_preview_linode:
+    needs: [create_linode]
+    uses: ./.github/workflows/promote_preview_linode.yaml
+    with:
+      label: ${{ github.event.inputs.label }}
+      preview_label: ${{ github.event.inputs.label }}-preview
       region: ${{ github.event.inputs.region }}
     secrets: inherit
