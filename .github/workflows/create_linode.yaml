@@ -156,8 +156,8 @@ jobs:
 
         $EXEC_CMD "
           # Install with apt
-          apt-get update
-          apt-get install -y git vim tmux curl unzip
+          sudo flock /var/lib/apt/lists/lock apt-get update
+          sudo flock /var/lib/apt/lists/lock apt-get install -y git vim tmux curl unzip
 
           # Install awscli
           curl \"https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip\" -o \"/tmp/awscliv2.zip\"
