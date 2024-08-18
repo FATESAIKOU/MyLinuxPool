@@ -206,6 +206,12 @@ jobs:
           git clone https://github.com/asdf-vm/asdf.git ~/.asdf --branch v0.14.0
           chmod u+x \"\$HOME/.asdf/asdf.sh\"
 
+          echo "start init asdf"
+          type asdf
+          . \"\$HOME/.asdf/asdf.sh\"
+          type asdf
+          echo "end init asdf"
+
           # Install nodejs
           asdf plugin-add nodejs
           asdf install nodejs 22.2.0
