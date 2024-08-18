@@ -229,7 +229,7 @@ jobs:
           git clone https://github.com/FATESAIKOU/GOAnimateRestoreAutomator.git
         "
 
-    - name: Initialize softwares(fatesaikou)(vim, tmux)
+    - name: Initialize softwares(fatesaikou)(vim, tmux, anime-downloader(playwright))
       env:
         FATESAIKOU_TMP_PASS: ${{ env.FATESAIKOU_TMP_PASS }}
         LINODE_IP: ${{ env.LINODE_IP }}
@@ -249,6 +249,10 @@ jobs:
           # Initialize tmux
           git clone https://github.com/tmux-plugins/tpm ~/.tmux/plugins/tpm;
           ~/.tmux/plugins/tpm/bin/install_plugins;
+
+          # Initialize anime-downloader(playwright)
+          pip install pytest-playwright
+          playwright install
         "
 
     - name: Add crontab jobs(fatesaikou)
