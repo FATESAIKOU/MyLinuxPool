@@ -142,15 +142,11 @@ jobs:
         $SCP_CMD -r to_sync_files/* root@$LINODE_IP:/
         rm -rf to_sync_files
 
-        # Wait ssh service is up
-        while [ "$($EXEC_CMD "echo 'success'" 2>/dev/null)" != "success" ]; do
-          echo "[$(date)] Waiting SSH..."
-          sleep 1
-        done
-
         # Chown for fatesaikou and sshproxy
-        $EXEC_CMD "chown -R fatesaikou:fatesaikou /home/fatesaikou"
-        $EXEC_CMD "chown -R sshproxy:sshproxy /home/sshproxy"
+        $EXEC_CMD "
+          chown -R fatesaikou:fatesaikou /home/fatesaikou
+          chown -R sshproxy:sshproxy /home/sshproxy
+        "
 
     - name: Install extra software and tools([without apt] aws cli)
       env:
@@ -158,6 +154,12 @@ jobs:
         LINODE_IP: ${{ env.LINODE_IP }}
       run: |
         EXEC_CMD="sshpass -p $ROOT_PASS ssh -o StrictHostKeyChecking=no root@$LINODE_IP"
+
+        # Wait ssh service is up
+        while [ "$($EXEC_CMD "echo 'success'" 2>/dev/null)" != "success" ]; do
+          echo "[$(date)] Waiting SSH..."
+          sleep 1
+        done
 
         $EXEC_CMD "
           # Wait /usr/bin/unzip exist
@@ -178,6 +180,12 @@ jobs:
         LINODE_IP: ${{ env.LINODE_IP }}
       run: |
         EXEC_CMD="sshpass -p $FATESAIKOU_TMP_PASS ssh -o StrictHostKeyChecking=no fatesaikou@$LINODE_IP"
+
+        # Wait ssh service is up
+        while [ "$($EXEC_CMD "echo 'success'" 2>/dev/null)" != "success" ]; do
+          echo "[$(date)] Waiting SSH..."
+          sleep 1
+        done
 
         $EXEC_CMD "
           # Install asdf
@@ -214,6 +222,7 @@ jobs:
       run: |
         EXEC_CMD="sshpass -p $FATESAIKOU_TMP_PASS ssh -o StrictHostKeyChecking=no fatesaikou@$LINODE_IP"
 
+        # Wait ssh service is up
         while [ "$($EXEC_CMD "echo 'success'" 2>/dev/null)" != "success" ]; do
           echo "[$(date)] Waiting SSH..."
           sleep 1
@@ -240,6 +249,7 @@ jobs:
       run: |
         EXEC_CMD="sshpass -p $FATESAIKOU_TMP_PASS ssh -o StrictHostKeyChecking=no fatesaikou@$LINODE_IP"
 
+        # Wait ssh service is up
         while [ "$($EXEC_CMD "echo 'success'" 2>/dev/null)" != "success" ]; do
           echo "[$(date)] Waiting SSH..."
           sleep 1
@@ -318,6 +328,7 @@ jobs:
       run: |
         EXEC_CMD="sshpass -p $ROOT_PASS ssh -o StrictHostKeyChecking=no root@$LINODE_IP"
 
+        # Wait ssh service is up
         while [ "$($EXEC_CMD "echo 'success'" 2>/dev/null)" != "success" ]; do
           echo "[$(date)] Waiting SSH..."
           sleep 1
