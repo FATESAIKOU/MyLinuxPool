@@ -28,4 +28,9 @@ jobs:
         LABEL="${{ inputs.label }}"
 
         linode_id=$(linode-cli linodes list --json | jq -r ".[] | select(.label == \"$LABEL\") | .id")
-        linode-cli linodes rm "$linode_id"
+        # if linode_id is not empty, delete the linode
+        if [ -n "$linode_id" ]; then
+          linode-cli linodes rm "$linode_id"
+        else
+          echo "No Linode found with label $LABEL"
+        fi
