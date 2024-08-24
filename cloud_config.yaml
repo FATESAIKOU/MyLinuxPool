@@ -24,4 +24,5 @@ packages:
 - git
 - rclone
 - python3
+- python3-pip
 - nodejs

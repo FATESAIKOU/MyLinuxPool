@@ -199,10 +199,11 @@ jobs:
           asdf install nodejs 22.2.0
           asdf global nodejs 22.2.0
 
+          # Skip, because python 3.12.0 is always required compile from source
           # Install python
-          asdf plugin-add python
-          asdf install python 3.12.0
-          asdf global python 3.12.0
+          #asdf plugin-add python
+          #asdf install python 3.12.0
+          #asdf global python 3.12.0
 
           # Install golang
           asdf plugin-add golang
@@ -230,12 +231,12 @@ jobs:
 
         $EXEC_CMD "
           # Initialize vim
-          git clone https://github.com/VundleVim/Vundle.vim.git ~/.vim/bundle/Vundle.vim;
-          vim -E -s -u ~/.vimrc +PluginInstall +qall || exit 0;
+          git clone https://github.com/VundleVim/Vundle.vim.git ~/.vim/bundle/Vundle.vim
+          vim -E -s -u ~/.vimrc +PluginInstall +qall
 
           # Initialize tmux
-          git clone https://github.com/tmux-plugins/tpm ~/.tmux/plugins/tpm;
-          ~/.tmux/plugins/tpm/bin/install_plugins;
+          git clone https://github.com/tmux-plugins/tpm ~/.tmux/plugins/tpm
+          ~/.tmux/plugins/tpm/bin/install_plugins
 
           # Initialize anime-downloader(playwright)
           pip install pytest-playwright
