@@ -199,7 +199,7 @@ jobs:
           asdf install nodejs 22.2.0
           asdf global nodejs 22.2.0
 
-          # Skip, because python 3.12.0 is always required compile from source
+          # FIXME: Skip, because python 3.12.0 is always required compile from source
           # Install python
           #asdf plugin-add python
           #asdf install python 3.12.0
@@ -239,7 +239,8 @@ jobs:
           ~/.tmux/plugins/tpm/bin/install_plugins
 
           # Initialize anime-downloader(playwright)
-          pip install pytest-playwright
+          # FIXME: use pip because apt install python3-pytest-playwright
+          pip install pytest-playwright --break-system-packages
           playwright install
         "
 
