@@ -37,12 +37,20 @@ jobs:
       image: ${{ github.event.inputs.image }}
     secrets: inherit
 
-  delete_linode:
+  delete_fws_linode_on_success:
     needs: [create_linode]
+    if: success()
     uses: ./.github/workflows/delete_linode.yaml
     with:
       label: ${{ github.event.inputs.label }}
     secrets: inherit
+
+  delete_preview_linode_on_failure:
+    needs: [create_linode]
+    if: failure()
+    uses: ./.github/workflows/delete_linode.yaml
+    with:
+      label: ${{ github.event.inputs.label }}-preview
 
   promote_preview_linode:
     needs: [delete_linode]
