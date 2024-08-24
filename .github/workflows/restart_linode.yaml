@@ -53,7 +53,7 @@ jobs:
       label: ${{ github.event.inputs.label }}-preview
 
   promote_preview_linode:
-    needs: [delete_linode]
+    needs: [delete_fws_linode_on_success]
     uses: ./.github/workflows/promote_preview_linode.yaml
     with:
       label: ${{ github.event.inputs.label }}
