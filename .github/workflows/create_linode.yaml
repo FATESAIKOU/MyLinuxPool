@@ -239,8 +239,6 @@ jobs:
           ~/.tmux/plugins/tpm/bin/install_plugins
 
           # Initialize anime-downloader(playwright)
-          # FIXME: use pip because apt install python3-pytest-playwright
-          pip install pytest-playwright --break-system-packages
           playwright install
         "
 

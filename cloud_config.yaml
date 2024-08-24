@@ -25,6 +25,7 @@ packages:
 - rclone
 - python3
 - python3-pip
+- python3-pytest
 - nodejs
 # Dependencies for playwright
 - libatk1.0-0t64
