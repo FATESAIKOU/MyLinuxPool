@@ -27,15 +27,13 @@ jobs:
       run: |
         LABEL="${{ inputs.label }}"
 
-        echo "[Debug]: Start delete LABEL=$LABEL" # Debug
-        echo "[Debug]: "$(linode-cli linodes list --json | jq -r ".[] | select(.label == \"fws\") | .id") # Debug
-        echo "[Debug]: "$(linode-cli linodes list --json | jq -r ".[] | select(.label == \"fws-preview\") | .id") # Debug
-
+        echo "Find linode_id for label $LABEL"
         linode_id=$(linode-cli linodes list --json | jq -r ".[] | select(.label == \"$LABEL\") | .id")
 
-        echo "[Debug]: linode_id=$linode_id" # Debug
+        echo "linode_id: $linode_id"
         # if linode_id is not empty, delete the linode
         if [ -n "$linode_id" ]; then
+          echo "Deleting Linode with label $LABEL"
           linode-cli linodes rm "$linode_id"
         else
           echo "No Linode found with label $LABEL"
