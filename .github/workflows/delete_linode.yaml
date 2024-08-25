@@ -28,8 +28,8 @@ jobs:
         LABEL="${{ inputs.label }}"
 
         echo "[Debug]: Start delete LABEL=$LABEL" # Debug
-        echo "[Debug]: $(linode-cli linodes list --json | jq -r ".[] | select(.label == \"fws\") | .id")" # Debug
-        echo "[Debug]: $(linode-cli linodes list --json | jq -r ".[] | select(.label == \"fws-preview\") | .id")" # Debug
+        echo "[Debug]: "$(linode-cli linodes list --json | jq -r ".[] | select(.label == \"fws\") | .id") # Debug
+        echo "[Debug]: "$(linode-cli linodes list --json | jq -r ".[] | select(.label == \"fws-preview\") | .id") # Debug
 
         linode_id=$(linode-cli linodes list --json | jq -r ".[] | select(.label == \"$LABEL\") | .id")
 
