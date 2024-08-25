@@ -241,7 +241,8 @@ jobs:
           # Initialize anime-downloader(playwright)
           # FIXME: Skip, because playwright can't install by apt
           sudo pip install pytest-playwright --break-system-packages
-          playwright install
+          sudo playwright install-deps
+          sudo playwright install
         "
 
     - name: Add crontab jobs(fatesaikou)
