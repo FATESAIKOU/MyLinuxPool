@@ -216,7 +216,7 @@ jobs:
           git clone https://github.com/FATESAIKOU/GOAnimateRestoreAutomator.git
         "
 
-    - name: Initialize softwares(fatesaikou)(vim, tmux, anime-downloader(playwright))
+    - name: Initialize softwares(fatesaikou)(vim, tmux, anime-downloader(webtorrent-cli))
       env:
         FATESAIKOU_TMP_PASS: ${{ env.FATESAIKOU_TMP_PASS }}
         LINODE_IP: ${{ env.LINODE_IP }}
@@ -238,11 +238,8 @@ jobs:
           git clone https://github.com/tmux-plugins/tpm ~/.tmux/plugins/tpm
           ~/.tmux/plugins/tpm/bin/install_plugins
 
-          # Initialize anime-downloader(playwright)
-          # FIXME: Skip, because playwright can't install by apt
-          sudo pip install pytest-playwright --break-system-packages
-          sudo playwright install-deps
-          sudo playwright install
+          # Initialize anime-downloader(webtorrent-cli)
+          npm install webtorrent-cli -g
         "
 
     - name: Add crontab jobs(fatesaikou)
