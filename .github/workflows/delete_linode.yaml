@@ -27,7 +27,10 @@ jobs:
       run: |
         LABEL="${{ inputs.label }}"
 
+        echo "Start delete LABEL=$LABEL"
         linode_id=$(linode-cli linodes list --json | jq -r ".[] | select(.label == \"$LABEL\") | .id")
+
+        echo "linode_id=$linode_id"
         # if linode_id is not empty, delete the linode
         if [ -n "$linode_id" ]; then
           linode-cli linodes rm "$linode_id"
