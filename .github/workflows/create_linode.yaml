@@ -110,6 +110,8 @@ jobs:
                 --metadata.user_data "$(cat ./cloud_config.yaml | envsubst | base64 | tr -d '\n')"
         )
 
+        exit 1 # Debug
+
         # echo the output to the console
         echo "<<<<<Linode instance created>>>>>"
         echo $linode_cli_ret | jq
