@@ -217,7 +217,7 @@ jobs:
           git clone https://github.com/FATESAIKOU/GOAnimateRestoreAutomator.git
         "
 
-    - name: Initialize softwares(fatesaikou)(vim, tmux, anime-downloader(webtorrent-cli))
+    - name: Initialize softwares(fatesaikou)(vim, tmux, anime-downloader(webtorrent-cli), scripts in testSH)
       env:
         FATESAIKOU_TMP_PASS: ${{ env.FATESAIKOU_TMP_PASS }}
         LINODE_IP: ${{ env.LINODE_IP }}
@@ -245,6 +245,9 @@ jobs:
 
           # Initialize anime-downloader(webtorrent-cli)
           npm install webtorrent-cli -g
+
+          # Initialize scripts in testSH
+          chmod u+x ~/testSH/*
         "
 
     - name: Add crontab jobs(fatesaikou)
