@@ -240,7 +240,7 @@ jobs:
           ~/.tmux/plugins/tpm/bin/install_plugins
 
           # Initialize anime-downloader(webtorrent-cli)
-          npm install webtorrent-cli -g
+          bash -c 'npm install webtorrent-cli -g'
         "
 
     - name: Add crontab jobs(fatesaikou)
