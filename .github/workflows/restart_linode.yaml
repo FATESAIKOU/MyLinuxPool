@@ -45,13 +45,13 @@ jobs:
       label: ${{ github.event.inputs.label }}
     secrets: inherit
 
-  delete_preview_linode_on_failure:
-    needs: [create_linode]
-    if: failure()
-    uses: ./.github/workflows/delete_linode.yaml
-    with:
-      label: ${{ github.event.inputs.label }}-preview
-    secrets: inherit
+  # delete_preview_linode_on_failure:
+  #   needs: [create_linode]
+  #   if: failure()
+  #   uses: ./.github/workflows/delete_linode.yaml
+  #   with:
+  #     label: ${{ github.event.inputs.label }}-preview
+  #   secrets: inherit
 
   promote_preview_linode:
     needs: [delete_fws_linode_on_success]
