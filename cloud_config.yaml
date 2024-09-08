@@ -9,7 +9,7 @@ users:
 - name: sshproxy
   shell: /bin/bash
   lock_passwd: false
-  plain_text_passwd: ${SSHPROXY_TMP_PASS}
+  plain_text_passwd: ${SSHPROXY_PASS}
 
 package_update: true
 package_upgrade: true

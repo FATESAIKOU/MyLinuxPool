@@ -76,26 +76,28 @@ jobs:
         done
 
     - name: Generate tmp password
+      env:
+        SSHPROXY_PASS: ${{ secrets.SSHPROXY_PASS }}
       run: |
         ROOT_PASS=$(openssl rand -base64 15 | tr -d '\n' | head -c 20)
         FATESAIKOU_TMP_PASS=$(openssl rand -base64 15 | tr -d '\n' | head -c 20)
-        SSHPROXY_TMP_PASS=$(openssl rand -base64 15 | tr -d '\n' | head -c 20)
+        SSHPROXY_PASS=$SSHPROXY_PASS
 
         # Mask TMP_PASS
         # echo "::add-mask::$ROOT_PASS"
         # echo "::add-mask::$FATESAIKOU_TMP_PASS"
-        # echo "::add-mask::$SSHPROXY_TMP_PASS"
+        # echo "::add-mask::$SSHPROXY_PASS"
 
         # Export to github env
         echo "ROOT_PASS=$ROOT_PASS" >> $GITHUB_ENV
         echo "FATESAIKOU_TMP_PASS=$FATESAIKOU_TMP_PASS" >> $GITHUB_ENV
-        echo "SSHPROXY_TMP_PASS=$SSHPROXY_TMP_PASS" >> $GITHUB_ENV
+        echo "SSHPROXY_PASS=$SSHPROXY_PASS" >> $GITHUB_ENV
 
     - name: Create a Linode instance
       env:
         ROOT_PASS: ${{ env.ROOT_PASS }}
         FATESAIKOU_TMP_PASS: ${{ env.FATESAIKOU_TMP_PASS }}
-        SSHPROXY_TMP_PASS: ${{ env.SSHPROXY_TMP_PASS }}
+        SSHPROXY_PASS: ${{ env.SSHPROXY_PASS }}
       run: |
         # Create the Linode instance
         linode_cli_ret=$(
@@ -329,7 +331,7 @@ jobs:
         CURRENT_IP: ${{ env.CURRENT_IP }}
       run: curl -s "https://csie.io/update?hn=$CSIE_IO_HOST&token=$CSIE_IO_TOKEN&ip=$CURRENT_IP"
 
-    - name: Lock password for fatesaikou and sshproxy and disable remote login of root
+    - name: Lock password for fatesaikou and disable remote login of root
       env:
         ROOT_PASS: ${{ env.ROOT_PASS }}
         LINODE_IP: ${{ env.LINODE_IP }}
@@ -344,7 +346,6 @@ jobs:
 
         $EXEC_CMD "
           passwd -l fatesaikou
-          passwd -l sshproxy
           sed -i '/PermitRootLogin/d' /etc/ssh/sshd_config
           echo \"PermitRootLogin no\" >> /etc/ssh/sshd_config
           systemctl reload ssh.service
