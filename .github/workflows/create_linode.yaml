@@ -331,7 +331,7 @@ jobs:
         CURRENT_IP: ${{ env.CURRENT_IP }}
       run: curl -s "https://csie.io/update?hn=$CSIE_IO_HOST&token=$CSIE_IO_TOKEN&ip=$CURRENT_IP"
 
-    - name: Lock password for fatesaikou and disable remote login of root
+    - name: Lock password for fatesaikou and disable remote login of root and disable shell for sshproxy
       env:
         ROOT_PASS: ${{ env.ROOT_PASS }}
         LINODE_IP: ${{ env.LINODE_IP }}
@@ -346,6 +346,7 @@ jobs:
 
         $EXEC_CMD "
           passwd -l fatesaikou
+          useradd -s /sbin/nologin sshproxy
           sed -i '/PermitRootLogin/d' /etc/ssh/sshd_config
           echo \"PermitRootLogin no\" >> /etc/ssh/sshd_config
           systemctl reload ssh.service
