@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
 
+# Usage: nohup bash -c "/selfCheckSshTunnel.sh localhost 2223 localhost 2222 sshproxy fws.csie.io 22" 1>>/home/fatesaikou/testSH/selfCheckSshTunnel.log 2>&1 &
+
 REVERSE_REMOTE_HOST=$1
 REVERSE_REMOTE_PORT=$2
 REVERSE_LOCAL_HOST=$3
@@ -8,8 +10,8 @@ USER=$5
 HOST=$6
 PORT=$7
 
-SSH_CONTROL_PATH="/tmp/ssh_control_%h_%p_%r"
-SSH_CONTROL_REAL_PATH="/tmp/ssh_control_${HOST}_${PORT}_${USER}"
+SSH_CONTROL_PATH="/tmp/ssh_control_${REVERSE_REMOTE_HOST}:${REVERSE_REMOTE_PORT}:${REVERSE_LOCAL_HOST}:${REVERSE_LOCAL_PORT}_%h_%p_%r"
+SSH_CONTROL_REAL_PATH="/tmp/ssh_control_${REVERSE_REMOTE_HOST}:${REVERSE_REMOTE_PORT}:${REVERSE_LOCAL_HOST}:${REVERSE_LOCAL_PORT}_${HOST}_${PORT}_${USER}"
 
 test_reverse_sshtunnel() {
     reversePortTestCmd="""
@@ -23,15 +25,14 @@ test_reverse_sshtunnel() {
     reversePortTestCmdWithSsh="""
         ssh -o StrictHostKeyChecking=no \
             -o UserKnownHostsFile=/dev/null \
-            -o ConnectTimeout=1 \
+            -o ConnectTimeout=5 \
             -p ${PORT} \
-            ${USER}@${HOST} \
-            ${reversePortTestCmd}
+            ${USER}@${HOST}
     """
 
-    retStr=$($reversePortTestCmdWithSsh 2>/dev/null)
+    retStr=$(echo $reversePortTestCmd | $reversePortTestCmdWithSsh 2>/dev/null)
 
-    # if SSH in retStr return true
+    #if SSH in retStr return true
     if [[ $retStr == *SSH* ]]; then
         echo "true"
     else
@@ -52,7 +53,7 @@ sshProxyCmd="""
         -NfR "${REVERSE_REMOTE_HOST}:${REVERSE_REMOTE_PORT}:${REVERSE_LOCAL_HOST}:${REVERSE_LOCAL_PORT}" \
         -o StrictHostKeyChecking=no \
         -o UserKnownHostsFile=/dev/null \
-        -o ConnectTimeout=1 \
+        -o ConnectTimeout=5 \
         -p ${PORT} \
         ${USER}@${HOST}
 """
@@ -66,5 +67,6 @@ while true; do
         $sshProxyCmd
     fi
 
-    sleep 1
+    sleep 5
 done
+
