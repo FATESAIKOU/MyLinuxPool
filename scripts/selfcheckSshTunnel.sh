@@ -39,6 +39,12 @@ test_reverse_sshtunnel() {
     fi
 }
 
+# cleanup old control socket
+if [ -e "$SSH_CONTROL_REAL_PATH" ]; then
+    ssh -o ControlPath=$SSH_CONTROL_PATH -O exit ${USER}@${HOST}
+    rm -f "$SSH_CONTROL_REAL_PATH"
+fi
+
 # initialize connection
 sshProxyCmd="""
     ssh -o ControlMaster=yes \
