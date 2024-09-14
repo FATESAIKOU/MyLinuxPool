@@ -47,24 +47,26 @@ if [ -e "$SSH_CONTROL_REAL_PATH" ]; then
 fi
 
 # initialize connection
-sshProxyCmd="""
-    ssh -o ControlMaster=yes \
-        -o ControlPath=${SSH_CONTROL_PATH} \
-        -NfR "${REVERSE_REMOTE_HOST}:${REVERSE_REMOTE_PORT}:${REVERSE_LOCAL_HOST}:${REVERSE_LOCAL_PORT}" \
-        -o StrictHostKeyChecking=no \
-        -o UserKnownHostsFile=/dev/null \
-        -o ConnectTimeout=5 \
-        -p ${PORT} \
-        ${USER}@${HOST}
+sshProxyOptions="""
+    -o ControlMaster=yes \
+    -o ControlPath=${SSH_CONTROL_PATH} \
+    -NfR "${REVERSE_REMOTE_HOST}:${REVERSE_REMOTE_PORT}:${REVERSE_LOCAL_HOST}:${REVERSE_LOCAL_PORT}" \
+    -o StrictHostKeyChecking=no \
+    -o UserKnownHostsFile=/dev/null \
+    -o ConnectTimeout=5
 """
 
-$sshProxyCmd
+CURRENT_IP_FOR_TARGETHOST=$(dig +short $HOST @1.1.1.1)
+ssh $sshProxyOptions -p ${PORT} ${USER}@${CURRENT_IP_FOR_TARGETHOST}
 
 while true; do
-    if [ $(test_reverse_sshtunnel) == "false" ]; then
-        ssh -o ControlPath=$SSH_CONTROL_PATH -O exit ${USER}@${HOST}
+    CURRENT_IP_FOR_TARGETHOST=$(dig +short $HOST @1.1.1.1)
+
+    # Reconnect if IP has changed or ssh connection is broken
+    if [ $(test_reverse_sshtunnel) == "false" || "$PREV_IP_FOR_TARGETHOST" != "$CURRENT_IP_FOR_TARGETHOST" ]; then
+        ssh -o ControlPath=$SSH_CONTROL_PATH -O exit ${USER}@${CURRENT_IP_FOR_TARGETHOST}
         rm -f "$SSH_CONTROL_REAL_PATH"
-        $sshProxyCmd
+        ssh $sshProxyOptions -p ${PORT} ${USER}@${CURRENT_IP_FOR_TARGETHOST}
     fi
 
     sleep 5
