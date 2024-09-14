@@ -63,7 +63,7 @@ while true; do
     CURRENT_IP_FOR_TARGETHOST=$(dig +short $HOST @1.1.1.1)
 
     # Reconnect if IP has changed or ssh connection is broken
-    if [ $(test_reverse_sshtunnel) == "false" || "$PREV_IP_FOR_TARGETHOST" != "$CURRENT_IP_FOR_TARGETHOST" ]; then
+    if [[ $(test_reverse_sshtunnel) == "false" || "$PREV_IP_FOR_TARGETHOST" != "$CURRENT_IP_FOR_TARGETHOST" ]]; then
         ssh -o ControlPath=$SSH_CONTROL_PATH -O exit ${USER}@${CURRENT_IP_FOR_TARGETHOST}
         rm -f "$SSH_CONTROL_REAL_PATH"
         ssh $sshProxyOptions -p ${PORT} ${USER}@${CURRENT_IP_FOR_TARGETHOST}
