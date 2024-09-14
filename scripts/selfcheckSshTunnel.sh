@@ -30,7 +30,7 @@ test_reverse_sshtunnel() {
             ${USER}@${HOST}
     """
 
-    retStr=$(echo $reversePortTestCmd | $reversePortTestCmdWithSsh 2>/dev/null)
+    retStr=$($reversePortTestCmdWithSsh "$reversePortTestCmd" 2>/dev/null)
 
     #if SSH in retStr return true
     if [[ $retStr == *SSH* ]]; then
