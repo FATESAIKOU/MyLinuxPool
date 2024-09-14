@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 
-# Usage: nohup bash -c "/selfCheckSshTunnel.sh localhost 2223 localhost 2222 sshproxy fws.csie.io 22" 1>>/home/fatesaikou/testSH/selfCheckSshTunnel.log 2>&1 &
+# Usage: nohup bash -c "cd /home/fatesaikou/testSH && ./selfCheckSwitchableSshTunnel.sh localhost 2223 localhost 2222 sshproxy fws.csie.io 22" 1>>/home/fatesaikou/testSH/selfCheckSwitchableSshTunnel.log 2>&1 &
 
 REVERSE_REMOTE_HOST=$1
 REVERSE_REMOTE_PORT=$2
