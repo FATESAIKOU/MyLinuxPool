@@ -1,0 +1,33 @@
+#!/usr/bin/env bash
+
+DOWNLOAD_LIST=$1
+GDRIVE_PATH=$2
+JOB_CNT=$3
+
+do_download() {
+    link=$1
+    temp_dir=$(mktemp -d)
+    remote_dir=$2
+
+    cd $temp_dir
+    webtorrent "$link"
+    echo ">>>>>>>Download Complete<<<<<<<"
+    ls $temp_dir
+    rclone copy "$temp_dir/*" $remote_dir
+    echo ">>>>>>>Upload Complete<<<<<<<"
+    rm -rf $temp_dir
+}
+
+cnt=0
+magnet_links=($(cat $DOWNLOAD_LIST))
+for magnet_link in "${magnet_links[@]}"; do
+    while [ "$(jobs | wc -l)" -ge "$JOB_CNT" ]; do
+        wait -n
+
+        (( cnt += 1))
+        echo ">>>>>>>Full Complete: $cnt<<<<<<<"
+    done
+    do_download "$magnet_link" &
+done
+
+wait
