@@ -10,7 +10,7 @@ do_download() {
     remote_dir=$2
 
     cd $temp_dir
-    webtorrent "$link"
+    webtorrent "$link" 1>/dev/null 2>&1
     echo ">>>>>>>Download Complete<<<<<<<"
     ls $temp_dir
     rclone copy "$temp_dir/*" $remote_dir
@@ -27,6 +27,7 @@ for magnet_link in "${magnet_links[@]}"; do
         (( cnt += 1))
         echo ">>>>>>>Full Complete: $cnt<<<<<<<"
     done
+    echo ">>>>>>>Start Download: $cnt<<<<<<<"
     do_download "$magnet_link" &
 done
 
