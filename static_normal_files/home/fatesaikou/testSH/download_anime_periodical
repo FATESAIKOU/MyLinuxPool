@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+
+DOWNLOAD_BIN=$1
+DOWNLOAD_CFG=$2
+DOWNLOAD_DIR=$3
+
+while true;
+do
+    echo "=====================$(date)====================";
+    echo "DOWNLOAD_BIN: $DOWNLOAD_BIN";
+    echo "DOWNLOAD_CFG: $DOWNLOAD_CFG";
+    echo "DOWNLOAD_DIR: $DOWNLOAD_DIR";
+    $DOWNLOAD_BIN \
+        "$DOWNLOAD_DIR" \
+        ~/volatileData/error.log \
+        ~/volatileData/GOAnimateRestoreAutomator/real_email_setting.json  \
+        "$DOWNLOAD_CFG";
+    sleep 3600;
+done
