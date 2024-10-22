@@ -267,7 +267,8 @@ jobs:
 
         $EXEC_CMD "
           crontab_entries=(
-            '@hourly aws s3 cp /home/fatesaikou/volatileData/ s3://fws-volatile-data/home/fatesaikou/volatileData/ --recursive'
+            '@hourly aws s3 cp /home/fatesaikou/volatileData/ s3://fws-volatile-data/home/fatesaikou/volatileData/ --recursive',
+            '@hourly rclone copy /home/fatesaikou/anime-downloader/anime self://anime'
           )
 
           for entry in \"\${crontab_entries[@]}\"; do
