@@ -66,7 +66,7 @@ while true; do
 
     # Reconnect if IP has changed or ssh connection is broken
     if [[ $(test_reverse_sshtunnel) == "false" || "$PREV_IP_FOR_TARGETHOST" != "$CURRENT_IP_FOR_TARGETHOST" ]]; then
-        echo "Connection to $HOST:$PORT is broken or IP has changed from $PREV_IP_FOR_TARGETHOST to $CURRENT_IP_FOR_TARGETHOST, Reconnecting..."
+        echo "[$(date)]Connection to $HOST:$PORT is broken or IP has changed from $PREV_IP_FOR_TARGETHOST to $CURRENT_IP_FOR_TARGETHOST, Reconnecting..."
         ssh -o ControlPath=$SSH_CONTROL_PATH -O exit ${USER}@${CURRENT_IP_FOR_TARGETHOST}
 
         SSH_CONTROL_REAL_PATH=$(echo "$SSH_CONTROL_PATH" | sed -e "s/%h/$CURRENT_IP_FOR_TARGETHOST/g" -e "s/%p/$PORT/g" -e "s/%r/$USER/g")
