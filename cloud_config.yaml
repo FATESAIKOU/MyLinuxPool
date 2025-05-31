@@ -27,3 +27,4 @@ packages:
 - python3-pip
 - python3-ipython
 - nodejs
+- grc

@@ -182,3 +182,7 @@ ex ()
 }
 
 . "$HOME/.asdf/asdf.sh"
+
+# Enable GRC (Generic Colouriser) for command output 
+GRC_ALIASES=true
+source $HOME/testSH/grc.sh
