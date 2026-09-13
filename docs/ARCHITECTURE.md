@@ -92,8 +92,8 @@
   ],
   "capabilities": ["docker", "worker-host"],
   "power": {
-    "launch":   { "method": "wol", "via": "fh-proxy",
-                  "mac": "B4:2E:99:FB:63:5E", "broadcast": "192.168.0.255" },
+    "launch":   { "method": "wol-unicast", "via": "fh-proxy",
+                  "mac": "B4:2E:99:FB:63:5E", "target_ip": "192.168.0.136" },
     "shutdown": { "method": "ssh", "command": "sudo systemctl poweroff" }
   }
 }
@@ -193,8 +193,26 @@ Provider 每 30 秒輪詢，實際斷線時間 ≈ 一個輪詢週期 + 一次 s
 ### Launch Fh-l
 
 1. Actions → Gateway → Fh-proxy（依 `NODE_FH_PROXY.hops`）
-2. 在 Fh-proxy 上以 Windows PowerShell 送 magic packet 到 Fh-l 的 MAC
+2. 在 Fh-proxy 的 WSL 內以 `pool-wol` 送 **unicast** magic packet 到 `192.168.0.136:9`
 3. 成功判定 ＝ Gateway 的 `127.0.0.1:2222` 出現（上限 5 分鐘）
+
+> **為什麼是 unicast 而不是 broadcast**（2026-09-13 實機診斷，兩個獨立的斷點）：
+>
+> 1. **Fh-proxy 的 Windows PowerShell 起不來** —— 連經由 `cmd.exe` 呼叫、35 秒都
+>    沒有任何輸出（`cmd.exe` 本身正常，檔案存在）。舊的 `launchfhubuntuForWsl2`
+>    100% 靠 PowerShell 送封包，所以它從來沒有送出過任何東西。
+> 2. **WSL2 的 NAT 會丟掉 broadcast** —— 從 WSL 送 `192.168.0.255` 與
+>    `255.255.255.255`，目標端都收不到；但 **unicast 到 `192.168.0.136` 收得到**
+>    （tcpdump 實測，102-byte magic packet 確實抵達網卡）。
+>    此機為 Windows 10 19045，無法使用 WSL2 的 mirrored networking。
+>
+> 已實機驗證：關機 → unicast magic packet → 成功喚醒。
+> Fh-l 端 `ethtool eno1` 為 `Wake-on: g`、`device/power/wakeup` 為 `enabled`，
+> 且皆能撐過重開機。
+>
+> **前提條件：靜態 ARP 綁定。** unicast 需要送出端能把 IP 解析成 MAC。Fh-l 長時間
+> 關機後 ARP 快取會過期，屆時 unicast 無法送達。因此必須在路由器或 Windows 主機上
+> 為 `192.168.0.136 ↔ b4:2e:99:fb:63:5e` 建立靜態綁定。見 `RUNBOOK.md`。
 
 > **用隧道當成功判定，而不是 ping。** 埠出現代表：機器開機了 ✓ 進了 Ubuntu ✓
 > systemd service 起來了 ✓ 網路通了 ✓。一個判準涵蓋整條鏈。
