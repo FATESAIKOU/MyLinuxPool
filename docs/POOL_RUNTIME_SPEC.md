@@ -76,20 +76,30 @@ pool-tunnel [--name <node-name>] [--once]
    ```
    ssh -M -S <ctl> -o ControlPersist=no -o ExitOnForwardFailure=yes \
        -o ServerAliveInterval=15 -o ServerAliveCountMax=2 \
-       -o StrictHostKeyChecking=accept-new \
-       -N -R <gateway_port>:localhost:22 <tunnel_user>@<gwip>
+       -o StrictHostKeyChecking=accept-new -o AddressFamily=inet \
+       -N -R 127.0.0.1:<gateway_port>:localhost:22 <tunnel_user>@<gwip>
    ```
    - `<ctl>` = `~/.mylinuxpool/run/ctl-gateway.sock`
    - **`ExitOnForwardFailure=yes` 必要**：遠端埠若被殘留連線佔住，
      必須讓 ssh 立刻失敗而不是假裝成功。這正是 autossh 會誤判的情境。
+   - **`-R` 必須明寫 `127.0.0.1:` 作為 bind 位址**（2026-09-13 實機踩到）：
+     只寫 `-R <port>:localhost:22` 時，若 IPv4 已被佔用，sshd 仍會成功綁上
+     `[::1]:<port>`，而 **ssh 視「部分成功」為成功**，`ExitOnForwardFailure`
+     因此不會觸發，隧道被誤判為建立成功。明寫 bind 位址（搭配
+     `AddressFamily=inet`）可讓 IPv4 被佔時乾淨地失敗。
 
 ### 3.2 健康檢測迴圈（每 2 秒）
 
 ```
-timeout 2 ssh -S <ctl> <tunnel_user>@<gwip> "nc -z 127.0.0.1 <gateway_port>"
+timeout 2 ssh -S <ctl> <tunnel_user>@<gwip> \
+  "timeout 1 nc 127.0.0.1 <gateway_port> </dev/null | head -c 4" | grep -q '^SSH-'
 ```
 
-- **逾時或非零 ⇒ 不健康。** 判定門檻就是 2 秒，不要放寬。
+- **逾時、非零、或回應不以 `SSH-` 開頭 ⇒ 不健康。** 門檻就是 2 秒，不要放寬。
+- **必須讀 SSH banner，不可只用 `nc -z`**（2026-09-13 實機踩到）：
+  `nc -z` 只證明「某個東西在聽那個埠」，不證明「那個東西是我們的隧道」。
+  實測中一個冒牌 listener 佔住 IPv4 埠時，`nc -z` 回報成功，健康檢測因此
+  謊報健康。舊版腳本以 SSH banner 判斷這點反而是對的，不要退化。
 - 騎在既有 ControlMaster 上，不重新握手（成本為毫秒等級），
   2 秒門檻才站得住。Gateway 上已確認有 `nc` 與 `timeout`。
 - 連續 **2 次**不健康才重建（單次可能是瞬時抖動），
@@ -118,7 +128,7 @@ pool-resolve gateway --field .generation
 |---|---|---|
 | 1 | 網路中斷後恢復 | 4 秒內偵測到，退避重連，恢復後自行穩定 |
 | 2 | Gateway 換 IP | 30 秒內偵測到並重建，不需人工介入 |
-| 3 | Gateway 端埠被殘留連線佔住 | `ExitOnForwardFailure` 使建立失敗 → 進退避重試，**不可回報健康** |
+| 3 | Gateway 端埠被殘留連線佔住 | 明寫 `-R 127.0.0.1:` 使建立乾淨失敗 → 進退避重試，**不可回報健康**。健康檢測亦須讀 SSH banner，確認對面是自己的隧道而非冒牌 listener |
 | 4 | ControlMaster socket 殘留 | 啟動時若 socket 存在但 `-O check` 失敗，刪除後重建 |
 
 ## 4. `provider/register.sh`

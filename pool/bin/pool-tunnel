@@ -154,8 +154,9 @@ start_master() {
         -o ServerAliveInterval=15
         -o ServerAliveCountMax=2
         -o StrictHostKeyChecking=accept-new
+        -o AddressFamily=inet
         -i "$PRIVATE_KEY" -o IdentitiesOnly=yes
-        -N -R "${MY_PORT}:localhost:22"
+        -N -R "127.0.0.1:${MY_PORT}:localhost:22"
         "${GW_USER}@${GW_IP}"
     )
 
@@ -194,11 +195,18 @@ teardown_master() {
     MASTER_PID=""
 }
 
-# §3.2: ride the existing ControlMaster (no new handshake) and ask the
-# Gateway to check its own loopback port. Timeout or nonzero == unhealthy.
+# §3.2: ride the existing ControlMaster (no new handshake) and read the SSH
+# banner off our own forwarded port on the Gateway — `nc -z` only proves
+# *something* is listening, not that it's our tunnel (a rogue listener on
+# the port would report healthy). Timeout, nonzero, or a non-"SSH-" reply
+# all count as unhealthy; only grep's exit status decides that (PIPESTATUS
+# keeps ssh's own exit code from clobbering a successful banner match under
+# `pipefail`, and an empty/timed-out reply makes grep fail on its own too).
 health_check() {
     timeout "$HEALTH_TIMEOUT" ssh -S "$CTL" "${GW_USER}@${GW_IP}" \
-        "nc -z 127.0.0.1 ${MY_PORT}" >/dev/null 2>&1
+        "timeout 1 nc 127.0.0.1 ${MY_PORT} </dev/null | head -c 4" \
+        | grep -q '^SSH-'
+    return "${PIPESTATUS[1]}"
 }
 
 on_terminate() {
