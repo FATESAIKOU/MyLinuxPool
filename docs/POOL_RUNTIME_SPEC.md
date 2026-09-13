@@ -138,8 +138,13 @@ register.sh --name <node-name> --gateway-port <port> [--role provider]
    把 `pool/bin/*` 複製到 `~/.mylinuxpool/bin/` 並 `chmod +x`。
 4. **金鑰**：若 `~/.ssh/id_pool` 不存在，從 repo 的
    `static_secret_files/home/sshproxy/.ssh/id_rsa.crypted` 以 `FILE_CRYPTO_KEY`
-   解密取得（所有 provider 共用 sshproxy 金鑰，公鑰已在 Gateway 的
-   `authorized_keys` 內）。權限 `600`。
+   解密取得（所有 provider 共用這把 sshproxy 金鑰）。權限 `600`。
+
+   > **不變式（2026-09-13 實機踩到）**：`id_rsa.pub.crypted` 的內容**必須**
+   > 出現在 `authorized_keys.crypted` 之中。這兩個檔案原本是不一致的 ——
+   > repo 佈署了一把私鑰，但它的公鑰不在授權清單裡，導致所有 provider 都
+   > 無法建立隧道（`Permission denied (publickey,password)`）。已修正。
+   > 日後若更換這把共用金鑰，**兩個檔案必須一起更新**，否則整個叢集斷線。
 5. **寫 `~/.mylinuxpool/config`**：`NODE_NAME=<name>`。
 6. **`gh variable set NODE_<NAME>`**：依 `ARCHITECTURE.md` §3 的 schema 組出 JSON。
    已存在則**合併**而非覆蓋（保留既有的 `power` 等欄位）。
