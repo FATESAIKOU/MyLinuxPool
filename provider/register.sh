@@ -24,12 +24,14 @@ log() {
 }
 
 usage() {
-    echo "usage: register.sh --name <node-name> --gateway-port <port> [--role provider]" >&2
+    echo "usage: register.sh --name <node-name> --gateway-port <port> [--role provider] [--branch <name>]" >&2
+    echo "  --branch defaults to 'master'; point it at a dev branch while pool/ is still unmerged" >&2
 }
 
 NAME=""
 GATEWAY_PORT=""
 ROLE="provider"
+BRANCH="master"
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -42,6 +44,9 @@ while [[ $# -gt 0 ]]; do
         --role)
             [[ $# -ge 2 ]] || { usage; exit 2; }
             ROLE="$2"; shift 2 ;;
+        --branch)
+            [[ $# -ge 2 ]] || { usage; exit 2; }
+            BRANCH="$2"; shift 2 ;;
         -h|--help)
             usage; exit 0 ;;
         *)
@@ -173,8 +178,10 @@ step5_config() {
 step6_register_var() {
     log INFO "step 6/9: register ${VAR_NAME} (merge with existing if present)"
 
+    # `gh variable get` doesn't exist on gh 2.45.0 (fh-l's apt version) —
+    # `gh api` has always existed and is equivalent.
     local existing_json
-    if existing_json="$(gh variable get "$VAR_NAME" --repo "$REPO" 2>/dev/null)" \
+    if existing_json="$(gh api "repos/${REPO}/actions/variables/${VAR_NAME}" --jq .value 2>/dev/null)" \
         && printf '%s' "$existing_json" | jq empty >/dev/null 2>&1; then
         log INFO "existing ${VAR_NAME} found, deep-merging"
     else
@@ -213,7 +220,9 @@ step6_register_var() {
             capabilities: ($existing.capabilities // ["docker", "worker-host"])
         }')"
 
-    printf '%s' "$merged" | gh variable set "$VAR_NAME" --repo "$REPO" --body-file -
+    # No --body-file on gh 2.45.0 — `gh variable set` reads the body from
+    # stdin when --body/-b is omitted, which works on old and new gh alike.
+    printf '%s' "$merged" | gh variable set "$VAR_NAME" --repo "$REPO"
     log INFO "wrote ${VAR_NAME}"
 }
 
