@@ -5,7 +5,7 @@
 
 set -uo pipefail
 
-REPO="FATESAIKOU/MyLinuxPool"
+REPO="${POOL_REPO:-FATESAIKOU/MyLinuxPool}"
 STATE_DIR="${HOME}/.mylinuxpool"
 CACHE_DIR="${STATE_DIR}/cache"
 CACHE_TTL=30
@@ -65,8 +65,10 @@ resolve_node() {
 
     mkdir -p "$CACHE_DIR"
 
+    # `gh variable get` needs a gh version newer than what fh-l's apt ships
+    # (2.45.0). `gh api` has existed forever and is equivalent here.
     local out rc
-    out="$(gh variable get "$var" --repo "$REPO" 2>&1)"
+    out="$(gh api "repos/${REPO}/actions/variables/${var}" --jq .value 2>&1)"
     rc=$?
 
     if [[ $rc -eq 0 ]] && printf '%s' "$out" | jq empty >/dev/null 2>&1; then
@@ -81,12 +83,15 @@ resolve_node() {
         return 0
     fi
 
-    if printf '%s' "$out" | grep -qi 'not found'; then
-        log ERROR "pool-resolve: variable $var does not exist: ${out//$'\n'/ }"
+    # `gh api` reports a missing variable as "HTTP 404" on stderr, unlike
+    # `gh variable get`'s "not found" text — must not conflate this with an
+    # auth/network failure, which gets exit 4 instead.
+    if printf '%s' "$out" | grep -q '404'; then
+        log ERROR "pool-resolve: variable $var does not exist (HTTP 404): ${out//$'\n'/ }"
         return 3
     fi
 
-    log ERROR "pool-resolve: failed to read $var: ${out//$'\n'/ }"
+    log ERROR "pool-resolve: failed to read $var via gh api: ${out//$'\n'/ }"
     return 4
 }
 
