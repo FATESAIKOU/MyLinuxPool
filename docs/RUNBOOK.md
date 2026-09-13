@@ -57,18 +57,41 @@ bash provider/register.sh --name fh-l --gateway-port 2222 --branch feat/refactor
 腳本會在 repo 已存在但分支不對時自動 `fetch` + `checkout` 到指定分支，
 不會對錯分支做 `pull`。
 
+`--no-sudo`：這台機器的 sudo 密碼不明或拿不到時使用（例如 fh-proxy）。
+第 1 步不會呼叫 `apt`，改成：
+
+- `jq`、`gh`：從 GitHub releases 抓對應平台的執行檔，裝進 `~/.local/bin`
+  （並把 `~/.local/bin` 冪等地加進 `~/.bashrc` 的 `PATH`，供你手動操作用；
+  `pool-tunnel.service` 另外會被寫入自己的 `Environment=PATH=...`，
+  不依賴 shell rc 檔）
+- `rclone`：provider 本來就用不到（只有 Gateway 的 `dlpw`/`uppw` 要），
+  缺少時只印一則 INFO 跳過
+- `git`／`docker`／`openssh-server`：這三個沒有免 root 的裝法，缺少時會
+  直接報錯並印出需要請人手動 `sudo apt-get install` 的訊息，**不會**靜默略過
+
+第 7 步（sudoers）在 `--no-sudo` 下整步跳過，只印 INFO：這台機器沒辦法被
+遠端 `sudo systemctl poweroff`，`Shutdown Fh-l` 那類電源操作對它不適用——
+但本來就只有常駐型 provider（如 fh-proxy）會走 `--no-sudo`，這類機器本來
+也不需要遠端關機。
+
+> **殘留的例外**：第 8 步的 `loginctl enable-linger` 一般也需要 root。
+> `--no-sudo` 下腳本會先嘗試不帶 sudo執行，若這台主機的 systemd/polkit
+> 版本允許使用者自己開 linger 就會成功；若不允許，腳本會報錯並印出
+> 唯一還需要人工介入一次的指令：`sudo loginctl enable-linger <user>`。
+> 開完之後，其餘所有步驟都不需要再碰 root。
+
 ### 1.3 腳本會做的事（你只需要看它跑完）
 
 | # | 階段 | 內容 |
 |---|---|---|
-| 1 | 前置檢查 | bash、`systemctl --user`、網路；缺 `rclone`/`git`/`gh`/`docker`/`openssh-server` 就以 apt 安裝 |
+| 1 | 前置檢查 | bash、`systemctl --user`、網路；缺 `rclone`/`git`/`gh`/`docker`/`openssh-server` 就以 apt 安裝（`--no-sudo` 下改成使用者層級安裝 `jq`/`gh`，見上） |
 | 2 | gh 認證 | `gh auth login --with-token`（把 `GH_POOL_TOKEN` 寫進 `~/.config/gh/hosts.yml`，權限 600） |
 | 3 | 取得 runtime | clone repo（`--branch` 指定分支，預設 `master`）到 `~/.mylinuxpool/repo`，`pool/bin/*` 複製到 `~/.mylinuxpool/bin/` 並 `chmod +x` |
 | 4 | 金鑰 | 從 `static_secret_files/home/sshproxy/.ssh/id_rsa.crypted` 解密出 `~/.ssh/id_pool`（600）。所有 provider 共用同一把，公鑰已在 Gateway 的 `authorized_keys` |
 | 5 | 身分 | 寫 `~/.mylinuxpool/config`：`NODE_NAME=<name>` |
 | 6 | 登記 | `gh variable set NODE_<NAME>`，內容依 `ARCHITECTURE.md` §3 schema；已存在則合併 |
-| 7 | sudoers | 寫 `/etc/sudoers.d/mylinuxpool`（440）：只放行 `systemctl poweroff` 與 `ethtool`。**這步會互動要 sudo 密碼** |
-| 8 | 常駐 | 安裝 `pool-tunnel.service` 到 user systemd、`enable --now`、`loginctl enable-linger` |
+| 7 | sudoers | 寫 `/etc/sudoers.d/mylinuxpool`（440）：只放行 `systemctl poweroff` 與 `ethtool`。**這步會互動要 sudo 密碼**；`--no-sudo` 下整步跳過 |
+| 8 | 常駐 | 安裝 `pool-tunnel.service` 到 user systemd、`enable --now`、`loginctl enable-linger`；`--no-sudo` 下額外把 `~/.local/bin` 寫進 unit 的 `PATH` |
 | 9 | 驗收 | 從 Gateway 端確認 `127.0.0.1:<gateway-port>` 回得出 SSH banner |
 
 腳本具冪等性：重複執行安全，每一步先檢查現況再動作。**驗收失敗會以非零退出碼結束並印診斷。**

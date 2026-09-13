@@ -24,14 +24,18 @@ log() {
 }
 
 usage() {
-    echo "usage: register.sh --name <node-name> --gateway-port <port> [--role provider] [--branch <name>]" >&2
+    echo "usage: register.sh --name <node-name> --gateway-port <port> [--role provider] [--branch <name>] [--no-sudo]" >&2
     echo "  --branch defaults to 'master'; point it at a dev branch while pool/ is still unmerged" >&2
+    echo "  --no-sudo: no root anywhere — user-level jq/gh install, skip sudoers/poweroff support" >&2
+    echo "             (use when the account's sudo password is unknown/unavailable, e.g. fh-proxy)" >&2
 }
 
 NAME=""
 GATEWAY_PORT=""
 ROLE="provider"
 BRANCH="master"
+NO_SUDO=0
+LOCAL_BIN="${HOME}/.local/bin"
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -47,6 +51,8 @@ while [[ $# -gt 0 ]]; do
         --branch)
             [[ $# -ge 2 ]] || { usage; exit 2; }
             BRANCH="$2"; shift 2 ;;
+        --no-sudo)
+            NO_SUDO=1; shift ;;
         -h|--help)
             usage; exit 0 ;;
         *)
@@ -73,6 +79,75 @@ fi
 
 VAR_NAME="NODE_$(printf '%s' "$NAME" | tr '[:lower:]' '[:upper:]' | tr '-' '_')"
 
+arch_suffix() {
+    case "$(uname -m)" in
+        x86_64) echo amd64 ;;
+        aarch64|arm64) echo arm64 ;;
+        *) uname -m ;;
+    esac
+}
+
+# Idempotently make sure ~/.local/bin is on PATH for future interactive
+# shells. This is purely for human convenience (running gh/jq by hand) —
+# pool-tunnel.service gets its own PATH via step8_systemd, since systemd
+# --user services don't source ~/.bashrc.
+ensure_local_bin_in_path() {
+    mkdir -p "$LOCAL_BIN"
+    local line='export PATH="$HOME/.local/bin:$PATH"'
+    local rcfile="${HOME}/.bashrc"
+    if ! grep -qF "$line" "$rcfile" 2>/dev/null; then
+        printf '\n# added by MyLinuxPool provider/register.sh --no-sudo\n%s\n' "$line" >> "$rcfile"
+        log INFO "added ~/.local/bin to PATH in ${rcfile} (new shells only; current one is patched below)"
+    fi
+    case ":$PATH:" in
+        *":${LOCAL_BIN}:"*) ;;
+        *) export PATH="${LOCAL_BIN}:${PATH}" ;;
+    esac
+}
+
+# Static jq binary from GitHub releases — no root needed, no package manager.
+install_user_jq() {
+    if command -v jq >/dev/null 2>&1; then
+        log INFO "jq already present"
+        return 0
+    fi
+    local arch url
+    arch="$(arch_suffix)"
+    url="https://github.com/jqlang/jq/releases/latest/download/jq-linux-${arch}"
+    log INFO "installing jq to ${LOCAL_BIN} (user-level, from ${url})"
+    curl -fsSL "$url" -o "${LOCAL_BIN}/jq"
+    chmod +x "${LOCAL_BIN}/jq"
+    log INFO "installed jq to ${LOCAL_BIN}/jq"
+}
+
+# gh's release tarball, extracted to ~/.local/bin — no root, no apt repo.
+# Needs jq (installed just above) to read the "latest" tag off the API.
+install_user_gh() {
+    if command -v gh >/dev/null 2>&1; then
+        log INFO "gh already present"
+        return 0
+    fi
+
+    local arch version url tmp_dir
+    arch="$(arch_suffix)"
+    version="$(curl -fsSL https://api.github.com/repos/cli/cli/releases/latest | jq -r '.tag_name // empty')"
+    version="${version#v}"
+    if [[ -z "$version" ]]; then
+        log ERROR "could not determine latest gh release version from the GitHub API"
+        exit 1
+    fi
+
+    url="https://github.com/cli/cli/releases/download/v${version}/gh_${version}_linux_${arch}.tar.gz"
+    log INFO "installing gh ${version} to ${LOCAL_BIN} (user-level, from ${url})"
+    tmp_dir="$(mktemp -d)"
+    curl -fsSL "$url" -o "${tmp_dir}/gh.tar.gz"
+    tar -xzf "${tmp_dir}/gh.tar.gz" -C "$tmp_dir"
+    cp -f "${tmp_dir}/gh_${version}_linux_${arch}/bin/gh" "${LOCAL_BIN}/gh"
+    chmod +x "${LOCAL_BIN}/gh"
+    rm -rf "$tmp_dir"
+    log INFO "installed gh ${version} to ${LOCAL_BIN}/gh"
+}
+
 # ---- step 1: preflight -----------------------------------------------------
 step1_preflight() {
     log INFO "step 1/9: preflight checks"
@@ -89,6 +164,14 @@ step1_preflight() {
         exit 1
     fi
 
+    if [[ "$NO_SUDO" -eq 1 ]]; then
+        step1_preflight_no_sudo
+    else
+        step1_preflight_sudo
+    fi
+}
+
+step1_preflight_sudo() {
     local pkgs=()
     command -v rclone >/dev/null 2>&1 || pkgs+=(rclone)
     command -v git >/dev/null 2>&1 || pkgs+=(git)
@@ -103,6 +186,45 @@ step1_preflight() {
     else
         log INFO "all required packages already present"
     fi
+}
+
+# --no-sudo: only jq/gh have a viable no-root install path (a static
+# binary / a plain tarball). git, docker and openssh-server genuinely need
+# root to install on Ubuntu — if they're missing here, fail loudly with
+# instructions rather than pretend registration can proceed without them.
+# rclone is skipped outright: providers never call it, only the Gateway's
+# dlpw/uppw do.
+step1_preflight_no_sudo() {
+    log INFO "--no-sudo: user-level installs only, no apt/sudo will be used"
+
+    ensure_local_bin_in_path
+
+    local missing_root_pkg=0
+    if ! command -v git >/dev/null 2>&1; then
+        log ERROR "git is missing; --no-sudo cannot install it without root"
+        missing_root_pkg=1
+    fi
+    if ! command -v docker >/dev/null 2>&1; then
+        log ERROR "docker is missing; --no-sudo cannot install it without root"
+        missing_root_pkg=1
+    fi
+    if ! dpkg -s openssh-server >/dev/null 2>&1; then
+        log ERROR "openssh-server is missing; --no-sudo cannot install it without root"
+        missing_root_pkg=1
+    fi
+    if [[ "$missing_root_pkg" -eq 1 ]]; then
+        log ERROR "ask an admin to install the missing package(s) above (e.g. sudo apt-get install <pkg>), then re-run with --no-sudo"
+        exit 1
+    fi
+
+    if command -v rclone >/dev/null 2>&1; then
+        log INFO "rclone already present"
+    else
+        log INFO "skipping rclone: providers don't need it (only the Gateway's dlpw/uppw do)"
+    fi
+
+    install_user_jq
+    install_user_gh
 }
 
 # ---- step 2: gh auth --------------------------------------------------------
@@ -237,6 +359,12 @@ step6_register_var() {
 step7_sudoers() {
     log INFO "step 7/9: sudoers rule for poweroff/ethtool (needs your sudo password)"
 
+    if [[ "$NO_SUDO" -eq 1 ]]; then
+        log INFO "--no-sudo: skipping sudoers rule — this host cannot do 'sudo systemctl poweroff' remotely"
+        log INFO "Shutdown-Fh-l-style power control doesn't apply here; an always-on provider like fh-proxy doesn't need it anyway"
+        return 0
+    fi
+
     local target="/etc/sudoers.d/mylinuxpool"
     local rule="$(whoami) ALL=(root) NOPASSWD: /usr/bin/systemctl poweroff, /usr/sbin/ethtool"
 
@@ -261,26 +389,72 @@ step7_sudoers() {
 }
 
 # ---- step 8: systemd user service + linger -----------------------------------
+
+# systemd --user services get a minimal default PATH that does not include
+# ~/.local/bin — under --no-sudo, pool-resolve/pool-tunnel would silently
+# fail to find jq/gh there. Patch the *installed* unit only, idempotently;
+# the copy in the repo is left untouched.
+patch_unit_path_for_no_sudo() {
+    local unit_dst="$1"
+    local path_line="Environment=PATH=${LOCAL_BIN}:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+
+    if grep -qF "$path_line" "$unit_dst"; then
+        return 0
+    fi
+
+    awk -v line="$path_line" '
+        {print}
+        /^\[Service\]/ && !added {print line; added=1}
+    ' "$unit_dst" > "${unit_dst}.tmp" && mv "${unit_dst}.tmp" "$unit_dst"
+    log INFO "added ~/.local/bin to pool-tunnel.service's PATH (--no-sudo)"
+}
+
+# `loginctl enable-linger` normally needs root. Under --no-sudo we try it
+# bare first (some newer systemd/polkit setups let a user linger themselves)
+# and only fail loudly if that doesn't work — we don't silently pretend it
+# succeeded, since without linger the tunnel dies the moment you log out.
+enable_linger() {
+    local who linger
+    who="$(whoami)"
+    linger="$(loginctl show-user "$who" -p Linger --value 2>/dev/null || echo "")"
+    if [[ "$linger" == "yes" ]]; then
+        log INFO "linger already enabled"
+        return 0
+    fi
+
+    if [[ "$NO_SUDO" -eq 1 ]]; then
+        if loginctl enable-linger "$who" >/dev/null 2>&1; then
+            log INFO "enabled linger for ${who} (no root needed on this host's systemd)"
+            return 0
+        fi
+        log ERROR "could not enable linger for ${who} without root"
+        log ERROR "this one step still needs an admin to run once: sudo loginctl enable-linger ${who}"
+        log ERROR "without it, pool-tunnel stops the moment you log out of this session"
+        exit 1
+    fi
+
+    sudo loginctl enable-linger "$who"
+    log INFO "enabled linger for ${who}"
+}
+
 step8_systemd() {
     log INFO "step 8/9: install pool-tunnel.service and enable linger"
 
     local unit_src="${REPO_DIR}/pool/systemd/pool-tunnel.service"
     local unit_dst_dir="${HOME}/.config/systemd/user"
+    local unit_dst="${unit_dst_dir}/pool-tunnel.service"
 
     mkdir -p "$unit_dst_dir"
-    cp -f "$unit_src" "${unit_dst_dir}/pool-tunnel.service"
+    cp -f "$unit_src" "$unit_dst"
+
+    if [[ "$NO_SUDO" -eq 1 ]]; then
+        patch_unit_path_for_no_sudo "$unit_dst"
+    fi
 
     systemctl --user daemon-reload
     systemctl --user enable --now pool-tunnel.service
 
-    local linger
-    linger="$(loginctl show-user "$(whoami)" -p Linger --value 2>/dev/null || echo "")"
-    if [[ "$linger" != "yes" ]]; then
-        sudo loginctl enable-linger "$(whoami)"
-        log INFO "enabled linger for $(whoami)"
-    else
-        log INFO "linger already enabled"
-    fi
+    enable_linger
 }
 
 # ---- step 9: verify from the Gateway side ------------------------------------
