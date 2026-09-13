@@ -6,3 +6,6 @@ pw
 __pycache__/
 *.pyc
 .tasks/
+crypto_key
+gh_token
+crypto_key.old.bak
