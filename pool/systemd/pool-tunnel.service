@@ -1,0 +1,13 @@
+[Unit]
+Description=MyLinuxPool reverse tunnel to gateway
+After=network-online.target
+
+[Service]
+Type=simple
+ExecStart=%h/.mylinuxpool/bin/pool-tunnel
+Restart=always
+RestartSec=5
+# 不要設 StandardOutput=file，日誌一律走 journald
+
+[Install]
+WantedBy=default.target

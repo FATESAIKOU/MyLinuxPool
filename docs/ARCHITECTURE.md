@@ -68,13 +68,19 @@
   "role": "gateway",
   "ip": "172.104.94.124",
   "user": "fatesaikou",
+  "tunnel_user": "sshproxy",
   "key_secret": "SSH_KEY_GATEWAY",
+  "tunnel_key_secret": "SSH_KEY_SSHPROXY",
   "linode_label": "fws",
   "ports": { "provider": [2220, 2299], "worker": [2300, 2399] },
   "generation": 7,
   "rotated_at": "2026-09-13T08:00:00Z"
 }
 ```
+
+> Gateway 有**兩個**使用者身分，不可混用：`user`（`fatesaikou`）供 Actions 做
+> 管理操作；`tunnel_user`（`sshproxy`）是專門終結反向隧道的受限帳號，
+> provider 與 worker 一律以它登入。
 
 ### NODE_FH_L（provider，含跳板鏈與電源控制）
 

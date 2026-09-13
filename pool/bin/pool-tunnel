@@ -1,0 +1,308 @@
+#!/usr/bin/env bash
+# pool-tunnel — spec: docs/POOL_RUNTIME_SPEC.md §3
+# Supervisor for the reverse SSH tunnel to the Gateway. This is the one
+# component in the whole system that is not allowed to fail quietly.
+#
+# Never calls `gh` directly — all addressing goes through pool-resolve.
+
+set -uo pipefail
+
+STATE_DIR="${HOME}/.mylinuxpool"
+RUN_DIR="${STATE_DIR}/run"
+CTL="${RUN_DIR}/ctl-gateway.sock"
+PRIVATE_KEY="${HOME}/.ssh/id_pool"
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
+POOL_RESOLVE="${SCRIPT_DIR}/pool-resolve"
+
+HEALTH_INTERVAL=2
+HEALTH_TIMEOUT=2
+UNHEALTHY_THRESHOLD=2
+GATEWAY_CHECK_INTERVAL=30
+
+NAME=""
+ONCE=0
+
+# Connection state, populated by resolve_connection_info().
+GW_IP=""
+GW_USER=""
+GW_GEN=""
+MY_PORT=""
+MASTER_PID=""
+
+log() {
+    local level="$1"; shift
+    local ts
+    ts="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    if [[ "$level" == "INFO" ]]; then
+        printf '[%s] %s %s\n' "$ts" "$level" "$*"
+    else
+        printf '[%s] %s %s\n' "$ts" "$level" "$*" >&2
+    fi
+}
+
+usage() {
+    echo "usage: pool-tunnel [--name <node-name>] [--once]" >&2
+}
+
+load_name_from_config() {
+    local cfg="${STATE_DIR}/config" line
+    [[ -f "$cfg" ]] || return 1
+    while IFS= read -r line; do
+        case "$line" in
+            NODE_NAME=*)
+                NAME="${line#NODE_NAME=}"
+                [[ -n "$NAME" ]] && return 0
+                ;;
+        esac
+    done < "$cfg"
+    return 1
+}
+
+next_backoff() {
+    case "$1" in
+        2) echo 4 ;;
+        4) echo 8 ;;
+        8) echo 16 ;;
+        16) echo 30 ;;
+        *) echo 30 ;;
+    esac
+}
+
+# §3.1 steps 1-2: ask pool-resolve (never gh) for our own gateway_port and
+# the Gateway's current ip/tunnel_user/generation.
+resolve_connection_info() {
+    local self_json rc
+
+    self_json="$("$POOL_RESOLVE" "$NAME")"
+    rc=$?
+    if [[ $rc -ne 0 ]]; then
+        log ERROR "pool-resolve ${NAME} failed (exit ${rc})"
+        return 1
+    fi
+
+    MY_PORT="$(printf '%s' "$self_json" | jq -r '.gateway_port // empty')"
+    if [[ -z "$MY_PORT" ]]; then
+        log ERROR "node ${NAME} has no gateway_port defined"
+        return 1
+    fi
+
+    local gw_json
+    gw_json="$("$POOL_RESOLVE" gateway)"
+    rc=$?
+    if [[ $rc -ne 0 ]]; then
+        log ERROR "pool-resolve gateway failed (exit ${rc})"
+        return 1
+    fi
+
+    GW_IP="$(printf '%s' "$gw_json" | jq -r '.ip // empty')"
+    GW_USER="$(printf '%s' "$gw_json" | jq -r '.tunnel_user // empty')"
+    GW_GEN="$(printf '%s' "$gw_json" | jq -r '.generation // empty')"
+
+    if [[ -z "$GW_IP" || -z "$GW_USER" ]]; then
+        log ERROR "gateway node is missing ip/tunnel_user"
+        return 1
+    fi
+
+    return 0
+}
+
+# §3.3: ask whether the Gateway has moved (ip or generation changed).
+# Uses --refresh so this is the one call per 30s cycle that forces a live
+# read; the routine 2s loop above just reads pool-resolve's own cache.
+gateway_changed() {
+    local new_ip new_gen rc
+
+    new_ip="$("$POOL_RESOLVE" gateway --refresh --field .ip)"
+    rc=$?
+    if [[ $rc -ne 0 || -z "$new_ip" || "$new_ip" == "null" ]]; then
+        log WARN "gateway drift check could not refresh (exit ${rc}), will retry next cycle"
+        return 1
+    fi
+
+    new_gen="$("$POOL_RESOLVE" gateway --field .generation)"
+
+    if [[ "$new_ip" != "$GW_IP" || "$new_gen" != "$GW_GEN" ]]; then
+        log INFO "gateway drift detected: ip ${GW_IP}->${new_ip} generation ${GW_GEN}->${new_gen}"
+        GW_IP="$new_ip"
+        GW_GEN="$new_gen"
+        return 0
+    fi
+
+    return 1
+}
+
+# Cheap liveness probe on the local mux socket, independent of GW_IP/GW_USER
+# so it works even right after process start when those aren't known yet
+# (scenario: a stale ControlMaster socket left over from a crashed run).
+control_alive() {
+    [[ -S "$CTL" ]] || return 1
+    ssh -S "$CTL" -O check placeholder >/dev/null 2>&1
+}
+
+# §3.1 step 3 / §3.4 step 3: build the ControlMaster. ExitOnForwardFailure
+# means ssh exits immediately if the remote port is already occupied by a
+# stale connection instead of pretending to succeed — that failure must
+# never be reported as healthy.
+start_master() {
+    rm -f "$CTL"
+
+    local -a cmd=(
+        ssh -M -S "$CTL"
+        -o ControlPersist=no
+        -o ExitOnForwardFailure=yes
+        -o ServerAliveInterval=15
+        -o ServerAliveCountMax=2
+        -o StrictHostKeyChecking=accept-new
+        -i "$PRIVATE_KEY" -o IdentitiesOnly=yes
+        -N -R "${MY_PORT}:localhost:22"
+        "${GW_USER}@${GW_IP}"
+    )
+
+    "${cmd[@]}" </dev/null >/dev/null 2>&1 &
+    MASTER_PID=$!
+
+    local waited=0
+    while (( waited < 10 )); do
+        if ! kill -0 "$MASTER_PID" 2>/dev/null; then
+            wait "$MASTER_PID" 2>/dev/null
+            log ERROR "ssh ControlMaster exited during setup (rc=$?) — remote forward was refused"
+            return 1
+        fi
+        if ssh -S "$CTL" -O check placeholder >/dev/null 2>&1; then
+            return 0
+        fi
+        sleep 1
+        waited=$((waited + 1))
+    done
+
+    log ERROR "timed out waiting for ControlMaster to become ready"
+    kill "$MASTER_PID" 2>/dev/null || true
+    wait "$MASTER_PID" 2>/dev/null || true
+    return 1
+}
+
+teardown_master() {
+    if [[ -S "$CTL" ]]; then
+        ssh -S "$CTL" -O exit placeholder >/dev/null 2>&1 || true
+    fi
+    rm -f "$CTL"
+    if [[ -n "$MASTER_PID" ]]; then
+        kill "$MASTER_PID" 2>/dev/null || true
+        wait "$MASTER_PID" 2>/dev/null || true
+    fi
+    MASTER_PID=""
+}
+
+# §3.2: ride the existing ControlMaster (no new handshake) and ask the
+# Gateway to check its own loopback port. Timeout or nonzero == unhealthy.
+health_check() {
+    timeout "$HEALTH_TIMEOUT" ssh -S "$CTL" "${GW_USER}@${GW_IP}" \
+        "nc -z 127.0.0.1 ${MY_PORT}" >/dev/null 2>&1
+}
+
+on_terminate() {
+    log INFO "received termination signal, tearing down tunnel"
+    teardown_master
+    exit 0
+}
+
+parse_args() {
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --name)
+                [[ $# -ge 2 ]] || { usage; exit 2; }
+                NAME="$2"; shift 2 ;;
+            --once)
+                ONCE=1; shift ;;
+            -h|--help)
+                usage; exit 0 ;;
+            *)
+                log ERROR "unknown argument: $1"
+                usage
+                exit 2 ;;
+        esac
+    done
+}
+
+main() {
+    parse_args "$@"
+
+    if [[ -z "$NAME" ]]; then
+        if ! load_name_from_config; then
+            log ERROR "no --name given and NODE_NAME not found in ${STATE_DIR}/config"
+            exit 2
+        fi
+    fi
+
+    mkdir -p "$RUN_DIR"
+    trap on_terminate TERM INT
+
+    local backoff=2
+    local unhealthy_count=0
+    local last_gw_check=0
+
+    while true; do
+        # §3.5 scenario 4: startup with a leftover/dead ControlMaster socket.
+        if [[ -S "$CTL" ]] && ! control_alive; then
+            log WARN "stale ControlMaster socket at ${CTL}, removing"
+            rm -f "$CTL"
+        fi
+
+        if [[ ! -S "$CTL" ]]; then
+            if ! resolve_connection_info; then
+                log ERROR "could not resolve connection info, backing off ${backoff}s"
+                if [[ "$ONCE" -eq 1 ]]; then
+                    exit 1
+                fi
+                sleep "$backoff"
+                backoff="$(next_backoff "$backoff")"
+                continue
+            fi
+
+            if start_master; then
+                log INFO "tunnel established: ${GW_USER}@${GW_IP} <- :${MY_PORT} (gateway generation ${GW_GEN})"
+                backoff=2
+                unhealthy_count=0
+                last_gw_check=$(date +%s)
+                if [[ "$ONCE" -eq 1 ]]; then
+                    exit 0
+                fi
+            else
+                rm -f "$CTL"
+                log ERROR "tunnel establishment failed, backing off ${backoff}s"
+                if [[ "$ONCE" -eq 1 ]]; then
+                    exit 1
+                fi
+                sleep "$backoff"
+                backoff="$(next_backoff "$backoff")"
+                continue
+            fi
+        fi
+
+        sleep "$HEALTH_INTERVAL"
+
+        if health_check; then
+            unhealthy_count=0
+        else
+            unhealthy_count=$((unhealthy_count + 1))
+            log WARN "health check failed (${unhealthy_count}/${UNHEALTHY_THRESHOLD})"
+            if (( unhealthy_count >= UNHEALTHY_THRESHOLD )); then
+                log ERROR "tunnel unhealthy for ${UNHEALTHY_THRESHOLD} consecutive checks, rebuilding"
+                teardown_master
+                unhealthy_count=0
+            fi
+        fi
+
+        local now=$(date +%s)
+        if (( now - last_gw_check >= GATEWAY_CHECK_INTERVAL )); then
+            last_gw_check=$now
+            if gateway_changed; then
+                log WARN "rebuilding tunnel immediately due to gateway drift"
+                teardown_master
+            fi
+        fi
+    done
+}
+
+main "$@"

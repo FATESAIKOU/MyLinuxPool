@@ -1,0 +1,76 @@
+#!/usr/bin/env python3
+
+import socket
+import sys
+import time
+
+MAGIC_PORTS = (9, 7)
+PACKET_COUNT = 3
+
+
+def log(level, message):
+    stamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    stream = sys.stderr if level in ("WARN", "ERROR") else sys.stdout
+    print(f"[{stamp}] {level} {message}", file=stream, flush=True)
+
+
+def parse_mac(mac):
+    raw = mac.replace(":", "").replace("-", "").replace(".", "")
+    if len(raw) != 12:
+        return None
+    try:
+        return bytes.fromhex(raw)
+    except ValueError:
+        return None
+
+
+def build_packet(mac_bytes):
+    return b"\xff" * 6 + mac_bytes * 16
+
+
+def main(argv):
+    if len(argv) < 3:
+        log("ERROR", "usage: pool-wol <MAC> <target-ip> [<target-ip>...]")
+        return 2
+
+    mac_bytes = parse_mac(argv[1])
+    if mac_bytes is None:
+        log("ERROR", f"invalid MAC address: {argv[1]}")
+        return 2
+
+    targets = argv[2:]
+    packet = build_packet(mac_bytes)
+    sent_any = False
+
+    udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    udp.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+
+    try:
+        for target in targets:
+            for port in MAGIC_PORTS:
+                sent = 0
+                for _ in range(PACKET_COUNT):
+                    try:
+                        udp.sendto(packet, (target, port))
+                        sent += 1
+                    except OSError as exc:
+                        log("WARN", f"send failed to {target}:{port}: {exc}")
+                if sent == PACKET_COUNT:
+                    sent_any = True
+                    log("INFO", f"sent {sent} magic packet(s) to {target}:{port}")
+                elif sent > 0:
+                    sent_any = True
+                    log("WARN", f"sent {sent}/{PACKET_COUNT} magic packet(s) to {target}:{port}")
+                else:
+                    log("ERROR", f"could not send any magic packet to {target}:{port}")
+    finally:
+        udp.close()
+
+    if sent_any:
+        return 0
+    log("ERROR", "no magic packet could be sent to any target")
+    return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))
