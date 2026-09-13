@@ -46,13 +46,24 @@ bash provider/register.sh --name <node-name> --gateway-port <port>
 `--gateway-port` 是它在 Gateway 上佔用的固定埠（provider 段 2220–2299；
 現況：`fh-l` = 2222、`fh-proxy` = 2226）。
 
+`--branch <name>`（預設 `master`）：開發期間 `pool/` 還在功能分支上、尚未併回
+`master` 時，指向該測試分支，例如：
+
+```bash
+bash provider/register.sh --name fh-l --gateway-port 2222 --branch feat/refactor-as-mylinuxpool
+```
+
+正式上線（分支已併回 `master`）之後，不帶 `--branch` 直接跑預設值即可。
+腳本會在 repo 已存在但分支不對時自動 `fetch` + `checkout` 到指定分支，
+不會對錯分支做 `pull`。
+
 ### 1.3 腳本會做的事（你只需要看它跑完）
 
 | # | 階段 | 內容 |
 |---|---|---|
 | 1 | 前置檢查 | bash、`systemctl --user`、網路；缺 `rclone`/`git`/`gh`/`docker`/`openssh-server` 就以 apt 安裝 |
 | 2 | gh 認證 | `gh auth login --with-token`（把 `GH_POOL_TOKEN` 寫進 `~/.config/gh/hosts.yml`，權限 600） |
-| 3 | 取得 runtime | clone repo 到 `~/.mylinuxpool/repo`，`pool/bin/*` 複製到 `~/.mylinuxpool/bin/` 並 `chmod +x` |
+| 3 | 取得 runtime | clone repo（`--branch` 指定分支，預設 `master`）到 `~/.mylinuxpool/repo`，`pool/bin/*` 複製到 `~/.mylinuxpool/bin/` 並 `chmod +x` |
 | 4 | 金鑰 | 從 `static_secret_files/home/sshproxy/.ssh/id_rsa.crypted` 解密出 `~/.ssh/id_pool`（600）。所有 provider 共用同一把，公鑰已在 Gateway 的 `authorized_keys` |
 | 5 | 身分 | 寫 `~/.mylinuxpool/config`：`NODE_NAME=<name>` |
 | 6 | 登記 | `gh variable set NODE_<NAME>`，內容依 `ARCHITECTURE.md` §3 schema；已存在則合併 |

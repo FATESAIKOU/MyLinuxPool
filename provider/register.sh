@@ -126,11 +126,18 @@ step3_fetch_runtime() {
     mkdir -p "$STATE_DIR"
 
     if [[ -d "${REPO_DIR}/.git" ]]; then
-        log INFO "repo already present at ${REPO_DIR}, pulling latest"
+        local current_branch
+        current_branch="$(git -C "$REPO_DIR" rev-parse --abbrev-ref HEAD)"
+        if [[ "$current_branch" != "$BRANCH" ]]; then
+            log INFO "repo at ${REPO_DIR} is on '${current_branch}', switching to '${BRANCH}'"
+            git -C "$REPO_DIR" fetch origin "$BRANCH"
+            git -C "$REPO_DIR" checkout "$BRANCH"
+        fi
+        log INFO "repo already present at ${REPO_DIR}, pulling latest ${BRANCH}"
         git -C "$REPO_DIR" pull --ff-only
     else
-        log INFO "cloning repo into ${REPO_DIR}"
-        gh repo clone "$REPO" "$REPO_DIR"
+        log INFO "cloning repo into ${REPO_DIR} (branch ${BRANCH})"
+        gh repo clone "$REPO" "$REPO_DIR" -- --branch "$BRANCH"
     fi
 
     mkdir -p "$BIN_DIR"
