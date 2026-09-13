@@ -150,15 +150,34 @@ expand_hops() {
                 return $via_rc
             fi
 
-            local via_hops expanded exp_rc
-            via_hops="$(printf '%s' "$via_node" | jq -c '.hops // []')"
-            expanded="$(expand_hops "$via_hops" $((depth + 1)) "${visited},${via}" "$refresh")"
-            exp_rc=$?
-            if [[ $exp_rc -ne 0 ]]; then
-                return $exp_rc
-            fi
+            local has_hops
+            has_hops="$(printf '%s' "$via_node" | jq -r 'has("hops")')"
 
-            result="$(jq -c -n --argjson a "$result" --argjson b "$expanded" '$a + $b')"
+            if [[ "$has_hops" == "true" ]]; then
+                local via_hops expanded exp_rc
+                via_hops="$(printf '%s' "$via_node" | jq -c '.hops')"
+                expanded="$(expand_hops "$via_hops" $((depth + 1)) "${visited},${via}" "$refresh")"
+                exp_rc=$?
+                if [[ $exp_rc -ne 0 ]]; then
+                    return $exp_rc
+                fi
+                result="$(jq -c -n --argjson a "$result" --argjson b "$expanded" '$a + $b')"
+            else
+                # Base case: X has no "hops" of its own — it's the end of
+                # the chain (e.g. the Gateway), so synthesize one hop from
+                # its own connection fields instead of expanding to nothing.
+                # Deliberately `.user`, not `.tunnel_user`: jump chains use
+                # the management identity, reverse tunnels use the
+                # restricted tunnel_user — they must never be mixed.
+                local synth missing
+                synth="$(printf '%s' "$via_node" | jq -c '{host: .ip, port: (.port // 22), user: .user, key_secret: .key_secret}')"
+                missing="$(printf '%s' "$synth" | jq -r 'if (.host == null or .user == null) then "1" else "0" end')"
+                if [[ "$missing" == "1" ]]; then
+                    log ERROR "pool-resolve: via-hop '$via' has neither 'hops' nor ip/user to synthesize a terminal hop"
+                    return 5
+                fi
+                result="$(jq -c -n --argjson a "$result" --argjson h "$synth" '$a + [$h]')"
+            fi
         else
             result="$(jq -c -n --argjson a "$result" --argjson h "$hop" '$a + [$h]')"
         fi

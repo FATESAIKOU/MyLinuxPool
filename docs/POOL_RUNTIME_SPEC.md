@@ -31,7 +31,16 @@ pool-resolve <node-name> [--field <jq-path>] [--expand-hops] [--refresh]
 - 預設輸出該 var 的完整 JSON。
 - `--field`：以 jq path 取單一欄位，輸出純值（例如 `--field .ip`）。
 - `--expand-hops`：輸出**完全展開**的 hop 陣列 JSON。展開規則：
-  - hop 物件若含 `via`，以該名稱遞迴 resolve，並用其 hops 原地取代。
+  - hop 物件若含 `via`，以該名稱遞迴 resolve X。
+    - 若 X 有 `hops` 欄位 → 遞迴展開，原地取代（既有邏輯）。
+    - 若 X 沒有 `hops` 欄位（X 是鏈的終點，例如 Gateway）→ **base
+      case**：從 X 自己的連線欄位合成一段終端 hop：
+      `{ host: X.ip, port: X.port // 22, user: X.user, key_secret: X.key_secret }`。
+      注意用的是 `user`（管理身分），不是 `tunnel_user`（反向隧道專用、
+      不可混用）。X 連 `ip`/`user` 都沒有則視為展開失敗，退出碼 `5`。
+      **不要**為了省這段合成邏輯而反過來給 Gateway 補一個 `hops` 欄位——
+      那會讓 IP 同時存在兩處，rotate 要改兩個地方，違反「改一個 var
+      全叢集自動正確」的設計核心。
   - 最大深度 **5**，超過回傳退出碼 `5`。
   - 需偵測環（A→B→A），回傳退出碼 `5`。
 - `--refresh`：忽略快取強制重讀。
