@@ -8,6 +8,7 @@ set -uo pipefail
 REPO="${POOL_REPO:-FATESAIKOU/MyLinuxPool}"
 STATE_DIR="${HOME}/.mylinuxpool"
 CACHE_DIR="${STATE_DIR}/cache"
+GH_TOKEN_FILE="${STATE_DIR}/gh_token"
 CACHE_TTL=30
 MAX_HOP_DEPTH=5
 
@@ -20,6 +21,26 @@ log() {
     else
         printf '[%s] %s %s\n' "$ts" "$level" "$*" >&2
     fi
+}
+
+# `gh auth login` insists on a `read:org` scope we don't have and don't
+# need — register.sh instead drops the PAT in $GH_TOKEN_FILE (600) and gh
+# itself honors a bare GH_TOKEN env var with no login step at all. Load it
+# here so pool-tunnel.service doesn't need any environment wiring for it.
+load_gh_token() {
+    if [[ -z "${GH_TOKEN:-}" && -f "$GH_TOKEN_FILE" ]]; then
+        GH_TOKEN="$(cat "$GH_TOKEN_FILE")"
+        export GH_TOKEN
+    fi
+}
+
+# Never let a raw gh error blob leak the token into logs.
+redact() {
+    local s="$1"
+    if [[ -n "${GH_TOKEN:-}" ]]; then
+        s="${s//$GH_TOKEN/***REDACTED***}"
+    fi
+    printf '%s' "$s"
 }
 
 usage() {
@@ -78,7 +99,7 @@ resolve_node() {
     fi
 
     if [[ -f "$cache" ]]; then
-        log WARN "pool-resolve: live read of $var failed (${out//$'\n'/ }), using stale cache"
+        log WARN "pool-resolve: live read of $var failed ($(redact "${out//$'\n'/ }")), using stale cache"
         cat "$cache"
         return 0
     fi
@@ -87,11 +108,11 @@ resolve_node() {
     # `gh variable get`'s "not found" text — must not conflate this with an
     # auth/network failure, which gets exit 4 instead.
     if printf '%s' "$out" | grep -q '404'; then
-        log ERROR "pool-resolve: variable $var does not exist (HTTP 404): ${out//$'\n'/ }"
+        log ERROR "pool-resolve: variable $var does not exist (HTTP 404): $(redact "${out//$'\n'/ }")"
         return 3
     fi
 
-    log ERROR "pool-resolve: failed to read $var via gh api: ${out//$'\n'/ }"
+    log ERROR "pool-resolve: failed to read $var via gh api: $(redact "${out//$'\n'/ }")"
     return 4
 }
 
@@ -148,6 +169,8 @@ expand_hops() {
 }
 
 main() {
+    load_gh_token
+
     if [[ $# -lt 1 ]]; then
         usage
         return 2

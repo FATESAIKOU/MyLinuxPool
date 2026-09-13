@@ -11,6 +11,7 @@ REPO_DIR="${STATE_DIR}/repo"
 BIN_DIR="${STATE_DIR}/bin"
 SSH_DIR="${HOME}/.ssh"
 PRIVATE_KEY="${SSH_DIR}/id_pool"
+GH_TOKEN_FILE="${STATE_DIR}/gh_token"
 
 log() {
     local level="$1"; shift
@@ -227,18 +228,32 @@ step1_preflight_no_sudo() {
     install_user_gh
 }
 
-# ---- step 2: gh auth --------------------------------------------------------
-step2_gh_auth() {
-    log INFO "step 2/9: gh auth login"
+# ---- step 2: store gh token --------------------------------------------------
+# `gh auth login --with-token` insists on a `read:org` scope our PAT
+# doesn't have and none of our operations (gh api read, gh variable set,
+# gh repo clone) need — it just fails with "missing required scope
+# 'read:org'". gh honors a bare GH_TOKEN env var with no login step at
+# all, so we drop the token in a file for pool-resolve to pick up later
+# and export it for the rest of this run.
+step2_store_token() {
+    log INFO "step 2/9: store gh token"
 
-    if gh auth status >/dev/null 2>&1; then
-        log INFO "gh already authenticated, skipping"
-        return 0
+    mkdir -p "$STATE_DIR"
+
+    local need_write=1
+    if [[ -f "$GH_TOKEN_FILE" ]] && [[ "$(cat "$GH_TOKEN_FILE")" == "$GH_POOL_TOKEN" ]]; then
+        need_write=0
     fi
 
-    # GH_POOL_TOKEN goes in over stdin, never as a CLI argument (spec §7).
-    printf '%s' "$GH_POOL_TOKEN" | gh auth login --with-token
-    log INFO "gh auth login completed"
+    if [[ "$need_write" -eq 1 ]]; then
+        printf '%s' "$GH_POOL_TOKEN" > "$GH_TOKEN_FILE"
+        log INFO "wrote ${GH_TOKEN_FILE}"
+    else
+        log INFO "${GH_TOKEN_FILE} already up to date, skipping"
+    fi
+    chmod 600 "$GH_TOKEN_FILE"
+
+    export GH_TOKEN="$GH_POOL_TOKEN"
 }
 
 # ---- step 3: fetch runtime ---------------------------------------------------
@@ -494,7 +509,7 @@ step9_verify() {
 
 main() {
     step1_preflight
-    step2_gh_auth
+    step2_store_token
     step3_fetch_runtime
     step4_key
     step5_config

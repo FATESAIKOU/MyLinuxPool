@@ -30,6 +30,13 @@
 
 這是整套系統中**唯一的人工輸入機密**。不要在指令歷史、log 或聊天中留下它們。
 
+> **`GH_POOL_TOKEN` 只需要 repo 權限（Contents: Read、Variables:
+> Read/Write），不要多給。** 實測過：`gh auth login --with-token` 會強制要求
+> `read:org`，我們的操作（`gh api` 讀 variable、`gh variable set`、
+> `gh repo clone`）完全用不到，所以 `register.sh` 根本不呼叫
+> `gh auth login`——見 §1.3 第 2 步與 §3。多給 `read:org` 沒有壞處，但也
+> 沒有必要。
+
 ### 1.2 操作步驟
 
 在新 provider 上：
@@ -85,7 +92,7 @@ bash provider/register.sh --name fh-l --gateway-port 2222 --branch feat/refactor
 | # | 階段 | 內容 |
 |---|---|---|
 | 1 | 前置檢查 | bash、`systemctl --user`、網路；缺 `rclone`/`git`/`gh`/`docker`/`openssh-server` 就以 apt 安裝（`--no-sudo` 下改成使用者層級安裝 `jq`/`gh`，見上） |
-| 2 | gh 認證 | `gh auth login --with-token`（把 `GH_POOL_TOKEN` 寫進 `~/.config/gh/hosts.yml`，權限 600） |
+| 2 | 存 gh token | 把 `GH_POOL_TOKEN` 寫進 `~/.mylinuxpool/gh_token`（600），並 `export GH_TOKEN`；**不呼叫** `gh auth login`（見上方 `read:org` 說明） |
 | 3 | 取得 runtime | clone repo（`--branch` 指定分支，預設 `master`）到 `~/.mylinuxpool/repo`，`pool/bin/*` 複製到 `~/.mylinuxpool/bin/` 並 `chmod +x` |
 | 4 | 金鑰 | 從 `static_secret_files/home/sshproxy/.ssh/id_rsa.crypted` 解密出 `~/.ssh/id_pool`（600）。所有 provider 共用同一把，公鑰已在 Gateway 的 `authorized_keys` |
 | 5 | 身分 | 寫 `~/.mylinuxpool/config`：`NODE_NAME=<name>` |
@@ -189,18 +196,21 @@ git push
 export GH_POOL_TOKEN='<新 token>'
 export FILE_CRYPTO_KEY='...'
 
-# 冪等，可直接整支重跑；它會依序做：gh auth login → git pull → 重裝 bin
+# 冪等，可直接整支重跑；它會依序做：覆寫 ~/.mylinuxpool/gh_token → git pull → 重裝 bin
 bash ~/.mylinuxpool/repo/provider/register.sh \
   --name <node-name> --gateway-port <gateway-port>
 
 systemctl --user restart pool-tunnel   # register.sh 第 8 步會做，手動保險亦可
 ```
 
-對應到 `register.sh` 的**第 2 步（gh auth login）與第 3 步（git pull + 更新 bin）**；
-第 6 步之後的登記與常駐設定若無變動會自動跳過。驗證：
+對應到 `register.sh` 的**第 2 步（把新 token 寫進 `~/.mylinuxpool/gh_token`）與
+第 3 步（git pull + 更新 bin）**；第 6 步之後的登記與常駐設定若無變動會自動跳過。
+`pool-tunnel`／`pool-resolve` 下次執行時會自己從 `~/.mylinuxpool/gh_token` 讀到
+新 token，不需要任何 `gh auth` 狀態要處理。驗證：
 
 ```bash
-gh auth status                                   # 應顯示已登入且 token 有效
+cat ~/.mylinuxpool/gh_token | wc -c              # 確認檔案內容已換成新 token 的長度
+~/.mylinuxpool/bin/pool-resolve gateway --refresh >/dev/null && echo OK
 journalctl --user -u pool-tunnel -n 20 --no-pager
 ```
 
@@ -290,7 +300,7 @@ systemctl --user status pool-tunnel          # 服務是否在跑、重啟幾次
 journalctl --user -u pool-tunnel -n 100 --no-pager
 loginctl show-user "$USER" | grep Linger     # 必須 Linger=yes
 ls -l ~/.mylinuxpool/run/                    # ControlMaster socket 是否殘留
-gh auth status                               # 認證是否過期（見 5.3）
+cat ~/.mylinuxpool/gh_token >/dev/null       # token 檔存在嗎（見 5.3）
 ~/.mylinuxpool/bin/pool-resolve gateway      # 讀得到 var 嗎
 ```
 
@@ -331,26 +341,31 @@ timeout 2 nc -z -v 127.0.0.1 <port>
 7. **GRUB entry 0** —— 若喚醒後進了 Windows 而非 Ubuntu，Launch 的驗收會卡住；
    開機時肉眼確認，或請人進 console 修 `GRUB_DEFAULT`。
 
-### 5.3 gh 認證過期
+### 5.3 gh token 過期或無效
 
 **症狀**：provider 的 `pool-resolve` 回退出碼 `4`（API 失敗且無快取）、
-`pool-tunnel` journal 出現 `HTTP 401`、`gh auth status` 顯示 token invalid。
+`pool-tunnel` journal 出現 `HTTP 401`。**沒有 `gh auth status` 這回事**——
+`register.sh` 不呼叫 `gh auth login`，token 是透過 `GH_TOKEN` 環境變數
+（`pool-resolve` 從 `~/.mylinuxpool/gh_token` 讀入）直接餵給 `gh`。
 
 診斷：
 
 ```bash
-gh auth status
-gh variable get NODE_GATEWAY --repo FATESAIKOU/MyLinuxPool --jq .ip
+cat ~/.mylinuxpool/gh_token | wc -c                         # 確認檔案存在、非空
+GH_TOKEN="$(cat ~/.mylinuxpool/gh_token)" \
+  gh api repos/FATESAIKOU/MyLinuxPool/actions/variables/NODE_GATEWAY --jq .value
 ```
 
-- 若 repo/權限錯誤（403）而非 401 → token 還在，但**權限被拔**或 repo 改名，
-  重新核發並給 `Variables: Read`。
+- 若回報 403 而非 401 → token 還在，但**權限被拔**或 repo 改名，重新核發
+  並給 **repo 權限（Contents: Read、Variables: Read/Write）即可，不需要
+  `read:org`**。
 - 401 → 依 §3 完整走一遍：改 secret → 重新加密 → commit → 各 provider 重跑
-  `register.sh` 的 gh auth login 段。
+  `register.sh`（第 2 步會覆寫 `~/.mylinuxpool/gh_token`）。
 
 > 注意：`pool-tunnel` 自己**不會**直接呼叫 `gh`，一律經 `pool-resolve`；
-> 除錯時若看到「gh 認證過期」，要往 `pool-resolve` 的快取與 provider 上的
-> `~/.config/gh/hosts.yml` 找。
+> 除錯時若看到 token 問題，要往 `pool-resolve` 的快取與 provider 上的
+> `~/.mylinuxpool/gh_token` 找，不是 `~/.config/gh/hosts.yml`（那是
+> `gh auth login` 的產物，這套流程不會建立它）。
 
 ---
 
