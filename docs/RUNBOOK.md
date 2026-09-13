@@ -356,3 +356,83 @@ gh variable get NODE_GATEWAY --repo FATESAIKOU/MyLinuxPool --jq .ip
   它只需要 `nc`/`timeout`/`flock`/`ss`/`jq`）。但 rotate 仍會裝 `gh`／`git`／`rclone`，
   純粹是為了人工排障方便，以及 `dlpw`／`uppw` 需要 `rclone`。
   **舊機（未經 rotate 重建者）上沒有 `gh`**，排障時別預期它存在。
+
+---
+
+## 7. 事故紀錄與教訓（2026-09-13/14 首次實機驗收）
+
+### 7.1 Gateway 全面失聯 —— 兇手是 fail2ban，不是 sshd
+
+**症狀**：Gateway 所有 TCP 埠瞬間回 RST（22、2226 都是），ICMP 正常，
+Linode 顯示 running。從家中兩台機器（Mac 與 fh-l）都連不上。
+
+**誤判過程（值得記住，以免重蹈）**：
+先看到 `systemctl is-active ssh` 回 `inactive` 就判定 sshd 死了，於是重開機、
+重設 root 密碼。**但 Ubuntu 24.04 預設是 socket 啟動（`ssh.socket`），
+`ssh.service` 顯示 inactive 是正常的**，systemd 會按需拉起。那些動作全屬多餘。
+
+**真正的原因**：
+
+```
+table inet f2b-table {
+    set addr-set-sshd {
+        elements = { ..., 138.64.68.94, ... }     ← 家中對外 IP 被封
+    }
+    chain f2b-chain {
+        tcp dport 22 ip saddr @addr-set-sshd reject with icmp port-unreachable
+    }
+}
+```
+
+`reject with icmp port-unreachable` 產生的正是「瞬間 Connection refused」，
+且只擋 tcp/22，所以 ICMP 照樣通 —— 症狀完全吻合。
+
+**診斷指令**（下次先跑這個，不要急著重開機）：
+
+```bash
+nft list ruleset | head -30          # 看 f2b-table 的封鎖清單
+iptables -L INPUT -n --line-numbers  # 舊式規則
+systemctl is-active fail2ban
+```
+
+**解法**：
+
+```bash
+fail2ban-client set sshd unbanip <你的IP>
+```
+
+**已做的預防**：`/etc/fail2ban/jail.d/mylinuxpool-ignore.conf` 已把家中
+對外 IP 加入 `ignoreip`。**此檔目前只存在於現行 Gateway，尚未納入
+`static_normal_files`**——rotate 後會消失，Phase C 必須補上。
+
+### 7.2 Gateway 掛掉會連帶讓 fh-proxy 失聯
+
+fh-proxy 是 NAT 後的 WSL2，**沒有任何 inbound 路徑**：
+
+- Windows 主機 `192.168.0.199` 的 ICMP 與所有常見 TCP 埠（22/135/139/445/
+  3389/5985）皆封閉，ARP 解析得到但完全無法連入
+- WSL2 本身又在 Windows 的 NAT 之後
+
+它唯一的生命線就是那條對外撥出的隧道。隧道一斷，**遠端無法救援**，
+必須有人到機器前面（或用 Google Remote Desktop）。
+
+**這是目前架構最脆弱的一點。** 建議日後在 Windows 側開一個 inbound 通道
+（例如 OpenSSH Server 並限制來源網段），作為隧道之外的第二條路。
+
+### 7.3 LISH 主控台的正確設定方式
+
+`linode-cli sshkeys create` 加的是「SSH Keys」清單（給建立新 Linode 時
+佈署用），**不是** LISH 用的。LISH 讀的是 profile 上另一個欄位：
+
+```bash
+linode-cli profile update --authorized_keys "$(cat ~/.ssh/id_rsa.pub)"
+ssh -t <linode帳號>@lish-<region>.linode.com <linode標籤>
+```
+
+當 SSH 完全進不去時，這是唯一的救命通道，**建議平時就設好**。
+
+### 7.4 共用金鑰的一致性
+
+repo 佈署的 `sshproxy/.ssh/id_rsa.crypted`，其公鑰**必須**出現在
+`authorized_keys.crypted` 裡。首次驗收時這兩者是不一致的，導致所有 provider
+都無法建立隧道。詳見 `POOL_RUNTIME_SPEC.md` §4 的不變式說明。
