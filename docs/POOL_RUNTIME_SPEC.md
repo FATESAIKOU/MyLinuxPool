@@ -260,3 +260,92 @@ step 6 正確 deep-merge，step 9 verified。
 - **fh-proxy 尚未註冊** —— 它在 Gateway 失聯期間重開機，隧道未恢復，
   且無 inbound 路徑，需要本機操作。見 `RUNBOOK.md` §7.2。
 - Phase C（Gateway rotate）與 Phase D（Worker）尚未開始。
+
+## 9. Phase C：Gateway rotate 實作規格
+
+背景與流程見 `ARCHITECTURE.md` §5。本節定義實作契約。
+
+### 9.1 `gateway/cloud-config.yaml`（瘦身版）
+
+cloud-init 只負責「開機後能被 ssh 進來」這件事，其餘交給 `provision.sh`：
+
+- 建立兩個使用者：
+  - `fatesaikou` — `groups: sudo`、`sudo: ALL=(ALL) NOPASSWD:ALL`、shell bash
+  - `sshproxy` — shell bash，**不給 sudo**（它只是隧道終結點）
+  - 兩者的 `ssh_authorized_keys` 由 cloud-init 直接帶入（從 secret 注入），
+    **不要**再用 `plain_text_passwd` —— 純金鑰認證，密碼路徑整條廢除
+- `package_update: true` / `package_upgrade: false`
+  （**不要** upgrade：285 天沒重建的舊機正是因為累積更新債才出事，
+  但在 cloud-init 階段 upgrade 會拖長 rotate 且可能中途失敗。
+  新機用的是最新 image，本來就不需要）
+- 安裝：`curl` `ca-certificates` `git` `jq` `netcat-openbsd` `util-linux`
+  （`flock`）`iproute2`（`ss`）`fail2ban`
+- **不裝**：nodejs、python3-pip、ipython、grc、vim、tmux、gcc、make
+  （Gateway 是純 Gateway，不是工作站）
+
+### 9.2 `gateway/provision.sh`
+
+在新機開機後、由 Actions 以 root 執行。必須冪等。
+
+1. **sshd 硬化**：寫 `/etc/ssh/sshd_config.d/10-mylinuxpool.conf`：
+   ```
+   PasswordAuthentication no
+   PermitRootLogin no
+   KbdInteractiveAuthentication no
+   ```
+   `sshd -t` 驗證通過才 reload。**現行機是 `PasswordAuthentication yes`，
+   這是要一併修掉的既有弱點。**
+2. **fail2ban ignoreip**：從 `POOL_TRUSTED_IPS` var 渲染
+   `/etc/fail2ban/jail.d/mylinuxpool-ignore.conf`：
+   ```
+   [DEFAULT]
+   ignoreip = <POOL_TRUSTED_IPS 的內容>
+   ```
+   > **這一步不可省略。** 2026-09-13 的事故就是 fail2ban 封了家用 IP，
+   > 導致整個叢集失聯 45 分鐘。設定只存在於當時那台機器上，
+   > rotate 後會消失並重演。見 `RUNBOOK.md` §7.1。
+3. **佈署檔案權限**：scp 過來的檔案要修正擁有者與權限 ——
+   `/home/<user>` 遞迴 chown 給對應使用者；
+   **所有私鑰（`id_rsa`、`id_pool`）必須是 `600`**，
+   `authorized_keys` 與 `*.pub` 為 `644`。
+   > 現行機的 `/home/sshproxy/.ssh/id_rsa` 原本是 644（全系統可讀的私鑰），
+   > 是實機發現的既有弱點，新機不可重蹈。
+4. **安裝 runtime**：`docker.io`、`rclone`、`gh`
+   （`gh` 用 apt 即可，Gateway 不跑 `pool-resolve` 所以版本不拘）。
+5. **建立 `~/pool/workers.d/`**（worker 埠登記表的位置，見 `ARCHITECTURE.md` §5）。
+6. **驗收**：`sshd -t` 通過、`fail2ban-client status` 正常、
+   `nc`/`flock`/`ss`/`jq` 皆存在。
+
+### 9.3 `.github/actions/pool-ssh`（composite action）
+
+四條 workflow 共用。職責：
+
+```yaml
+inputs:
+  node:     # 節點名稱，例如 fh-l
+  command:  # 要執行的指令
+  timeout:  # 選填
+```
+
+1. `pool-resolve <node> --expand-hops` 取得完整跳板鏈
+2. 依每一跳的 `key_secret` 從 secrets 取出私鑰，載入暫時的 ssh-agent
+   （**私鑰只進 agent，不落地成檔案**；若必須落地則 `600` 且結束時刪除）
+3. 組出 `ssh -J hop1,hop2,... <最後一跳>` 並執行 `command`
+4. 輸出 stdout/stderr 與退出碼
+
+> Actions runner 本身沒有 `pool-resolve` 的執行環境假設 —— 它需要 `gh` 與
+> `jq`，runner 皆內建。`GH_TOKEN` 由 workflow 以 `secrets.GITHUB_TOKEN` 或
+> `GH_POOL_TOKEN` 提供。
+
+### 9.4 `.github/workflows/rotate-gateway.yml`
+
+`workflow_dispatch`，流程見 `ARCHITECTURE.md` §5 的九個步驟。額外要求：
+
+- **`dry_run` 輸入**（預設 `false`）：為 `true` 時建立 preview 機、佈署、
+  provision、驗收，但**不切換 `NODE_GATEWAY` var、不刪舊機**，
+  最後把 preview 機刪掉。用於安全地驗證整條流程。
+- 切換點（step 5）之後的每一步失敗都必須觸發回滾：var 寫回舊 IP 與
+  舊 generation，並刪除 preview 機。
+- 等待 provider 歸隊（step 6）時，逐一輪詢每個 `role=provider` 的節點的
+  `gateway_port`，全部出現才算成功；上限 180 秒。
+- 孤兒清掃：刪除任何存在超過 2 小時、label 以 `-preview` 結尾的機器。
