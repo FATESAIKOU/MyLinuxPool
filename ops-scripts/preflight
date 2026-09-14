@@ -72,6 +72,24 @@ while IFS= read -r uj; do
 done < <(git ls-files 'shared-configs/*/unit.json')
 ok "unit needs_key 與 files/ 一致"
 
+# 執行位元
+# ssh-tunnel 拆成 client/server 時，新的 install.sh 帶著 644 進版控，
+# 於是 rotate 死在「missing or not executable」。語法檢查看不到檔案模式。
+# 規則：沒有任何地方 source 它的腳本，就一定得能執行。
+NOEXEC=""
+while read -r mode f; do
+    head -c2 "$f" 2>/dev/null | grep -q '#!' || continue
+    [ "$mode" = "100644" ] || continue
+    git grep -qE "source[^|]*$(basename "$f")" -- ":!${f}" >/dev/null 2>&1 && continue
+    NOEXEC="${NOEXEC}${f}
+"
+done < <(git ls-files -s | awk '{print $1, $4}')
+if [ -n "$NOEXEC" ]; then
+    for f in $NOEXEC; do bad "沒人 source 卻不可執行: $f  (git update-index --chmod=+x $f)"; done
+else
+    ok "$(git ls-files -s | awk '{print $4}' | while read -r f; do head -c2 "$f" 2>/dev/null | grep -q '#!' && echo x; done | wc -l | tr -d ' ') 支腳本的執行位元"
+fi
+
 # 舊路徑殘留
 # 散文（docs/、README）談得起舊路徑——它們在解釋為什麼不要那樣寫。
 # 這支腳本自己也帶著那些字串，當然要排除，否則它永遠對自己告警。
