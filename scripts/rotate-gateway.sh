@@ -161,12 +161,25 @@ rotate_wait_for_cloud_init() {
 #   with the forward the provider is currently holding open on the live
 #   Gateway.
 rotate_build_tunnel_probe_cmd() {
-    local new_ip="$1" tunnel_user="$2" probe_port="$3"
-    printf '%s\n' "ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new \
+    local new_ip="$1" tunnel_user="$2" probe_port="$3" host_key="${4:-}"
+    local hostkey_part
+
+    if [[ -n "$host_key" ]]; then
+        # Pin exactly the way pool-tunnel will. A probe that verified the
+        # host differently from the real tunnel would pass on a machine
+        # every provider then refuses — which is the failure it exists to
+        # catch.
+        hostkey_part="KH=\$(mktemp); printf '%s %s\\n' '${new_ip}' '${host_key}' > \$KH; chmod 600 \$KH; \
+ssh -o UserKnownHostsFile=\$KH -o StrictHostKeyChecking=yes"
+    else
+        hostkey_part="KH=\$(mktemp); ssh -o UserKnownHostsFile=\$KH -o StrictHostKeyChecking=accept-new"
+    fi
+
+    printf '%s\n' "${hostkey_part} -o BatchMode=yes \
 -o ExitOnForwardFailure=yes -o AddressFamily=inet -o ConnectTimeout=10 \
 -i \$HOME/.ssh/id_pool -o IdentitiesOnly=yes \
 -R 127.0.0.1:${probe_port}:localhost:22 ${tunnel_user}@${new_ip} \
-'echo TUNNEL_PROBE_OK'"
+'echo TUNNEL_PROBE_OK'; rc=\$?; rm -f \$KH; exit \$rc"
 }
 
 # rotate_carry_worker_claims <user> <old_ip> <new_ip>
