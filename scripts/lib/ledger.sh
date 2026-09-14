@@ -8,24 +8,36 @@
 # step, per docs/LAYOUT.md §3.
 #
 # Empty input, an empty string, or unparseable JSON is the empty ledger
-# `[]`, never an error (STATE_CONTRACT.md §5.3).
+# `[]`, never an error (STATE_CONTRACT.md §5.3). So is any input that is
+# not a worker-ledger shape. POOL_WORKERS is ALWAYS a JSON array
+# (STATE_CONTRACT.md §1): a bare record must never be produced, and never
+# be read back in either. Legal JSON that is not an array of worker
+# records must never be merged in — gh's 404 error object on stdout once
+# became a ledger entry, and the bare-record output shape once polluted
+# the master with a non-array value (2026-09-15 incident).
 
 # _ledger_normalize <workers_json>
-#   Compact JSON array; `[]` for empty/unparseable/non-array input.
-#   A single bare record (e.g. the output of a fresh ledger_add into an
-#   empty ledger) is wrapped into a one-element array.
+#   Compact JSON array; `[]` for anything that is not a worker-ledger
+#   shape. Only an array whose entries ALL look like worker records
+#   (object with a numeric `port` — the unique key, STATE_CONTRACT §1)
+#   is accepted. Rejected (→ `[]`): a bare object (even one with a port),
+#   an array containing a string or a record without a numeric port,
+#   invalid JSON, empty string.
 _ledger_normalize() {
     local out
-    out="$(printf '%s' "${1:-}" | jq -c 'if type == "array" then . elif type == "object" then [.] else [] end' 2>/dev/null)"
+    out="$(printf '%s' "${1:-}" | jq -c '
+        if type == "array" then
+            if all(.[]; (type == "object") and ((.port | type) == "number")) then . else [] end
+        else [] end' 2>/dev/null)"
     printf '%s\n' "${out:-[]}"
 }
 
 # ledger_add <workers_json> <port> <provider> <image> <container> <created_at>
 #   Replaces the entry for <port>, or appends one; prints the array sorted
 #   by port. The port is the unique key (STATE_CONTRACT §1).
-#   Adding into an EMPTY ledger prints the bare record, not a one-element
-#   array — that is the contract shape for a fresh ledger (a later add
-#   re-wraps it via _ledger_normalize).
+#   ALWAYS prints an array — including when the ledger was empty, where
+#   the old code printed a bare record and polluted the master with a
+#   non-array value (STATE_CONTRACT §1; 2026-09-15 incident).
 ledger_add() {
     local workers_json="${1:-}" port="${2:-}"
     local provider="${3:-}" image="${4:-}" container="${5:-}" created_at="${6:-}"
@@ -41,15 +53,10 @@ ledger_add() {
         --arg image "$image" \
         --arg container "$container" \
         --arg created_at "$created_at" \
-        'if length == 0 then
-            {port: $port, provider: $provider, image: $image,
-             container: $container, created_at: $created_at}
-         else
-            ([.[] | objects | select(.port != $port)]
-              + [{port: $port, provider: $provider, image: $image,
-                  container: $container, created_at: $created_at}])
-            | sort_by(.port)
-         end'
+        '([.[] | objects | select(.port != $port)]
+          + [{port: $port, provider: $provider, image: $image,
+              container: $container, created_at: $created_at}])
+         | sort_by(.port)'
 }
 
 # ledger_remove <workers_json> <port>

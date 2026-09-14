@@ -51,6 +51,16 @@ expect_jq() {
     else bad "$1 (jq [$2] was false on [${OUT:-<empty>}])"; fi
 }
 
+# expect_array <label> — the output must be a JSON array. A correct-looking
+# bare object is a data-corruption incident waiting to happen: the workflow
+# writes the return value straight into the POOL_WORKERS variable, so a
+# wrong type pollutes the master far from where it was produced
+# (STATE_CONTRACT.md §1; 2026-09-15 twice).
+expect_array() {
+    if jq -e 'type == "array"' >/dev/null 2>&1 <<<"$OUT"; then ok "$1"
+    else bad "$1 (expected a JSON array, got [${OUT:-<empty>}])"; fi
+}
+
 # expect_rc <label> <expected>
 expect_rc() {
     if [[ "$MISSING" -eq 1 ]]; then
@@ -84,35 +94,47 @@ UNSORTED="[$REC_2301,$REC_2300]"
 echo "ledger_add:"
 run ledger_add '[]' 2301 fh-proxy base mlp-fh-proxy-base-456 2026-09-14T09:00:00Z
 expect_rc "add to empty ledger exits 0" 0
-expect_json_eq "add to empty ledger stores the record" "$REC_2301" "$OUT"
+expect_array "first add to an empty ledger returns an array"
+expect_json_eq "first add to an empty ledger stores the record in an array" "[$REC_2301]" "$OUT"
 first_add="$OUT"
 
 run ledger_add "$first_add" 2300 fh-l default mlp-fh-l-default-123 2026-09-14T08:26:00Z
 expect_rc "adding a lower port exits 0" 0
+expect_array "adding to a non-empty ledger returns an array"
 expect_jq "ports come back ascending" '[.[].port] == [2300, 2301]'
 expect_json_eq "both records present, unchanged" "$FIXTURE" "$OUT"
 two_adds="$OUT"
 
 run ledger_add "$two_adds" 2300 fh-l base mlp-fh-l-base-999 2026-09-14T10:00:00Z
 expect_rc "adding over an existing port exits 0" 0
+expect_array "replacing an existing port returns an array"
 expect_jq "same port replaces instead of duplicating" '([.[].port] | length) == 2 and ([.[].port] | unique | length) == 2'
 expect_json_eq "replaced record carries the new call's fields, other record untouched" "[$REC_2300_REPLACED,$REC_2301]" "$OUT"
 
 echo "ledger_remove:"
 run ledger_remove "$FIXTURE" 2300
 expect_rc "remove an existing port exits 0" 0
+expect_array "remove returns an array"
 expect_json_eq "remaining record is untouched" "[$REC_2301]" "$OUT"
+
+run ledger_remove "[$REC_2301]" 2301
+expect_rc "removing the only record exits 0" 0
+expect_array "removing the only record returns [] (an array, not null)"
+expect_json_eq "removing the only record yields an empty array" '[]' "$OUT"
 
 run ledger_remove "$FIXTURE" 9999
 expect_rc "remove a missing port exits 0" 0
+expect_array "remove of a missing port returns an array"
 expect_json_eq "remove a missing port prints the ledger unchanged" "$FIXTURE" "$OUT"
 
 run ledger_remove '[]' 2300
 expect_rc "remove from [] exits 0" 0
+expect_array "remove from [] returns an array"
 expect_json_eq "remove from [] prints []" '[]' "$OUT"
 
 run ledger_remove '' 2300
 expect_rc "remove from empty string exits 0" 0
+expect_array "remove from empty string returns an array"
 expect_json_eq "empty string behaves as []" '[]' "$OUT"
 
 echo "ledger_find:"
@@ -175,11 +197,47 @@ expect_eq "ledger_ports invalid JSON prints nothing" "" "$OUT"
 echo "empty / invalid input:"
 run ledger_add '' 2302 fh-l default mlp-fh-l-default-777 2026-09-14T11:00:00Z
 expect_rc "add to empty string exits 0" 0
-expect_json_eq "empty string is treated as [] before adding" "$REC_2302" "$OUT"
+expect_array "add to empty string returns an array"
+expect_json_eq "empty string is treated as [] before adding" "[$REC_2302]" "$OUT"
 
 run ledger_add 'not-json{' 2303 fh-l default mlp-fh-l-default-888 2026-09-14T11:00:00Z
 expect_rc "add to invalid JSON exits 0" 0
-expect_json_eq "invalid JSON is treated as [] before adding" "$REC_2303" "$OUT"
+expect_array "add to invalid JSON returns an array"
+expect_json_eq "invalid JSON is treated as [] before adding" "[$REC_2303]" "$OUT"
+
+echo "non-ledger shapes are [] (2026-09-15 incident: gh's 404 object polluted the ledger):"
+# The exact error object `gh api .../variables/POOL_WORKERS --jq .value` prints
+# on stdout when the variable does not exist. It is legal JSON, so it used
+# to pass the "is it JSON" check and its fields were merged into the ledger.
+GH404='{"message":"Not Found","documentation_url":"https://docs.github.com/rest/repos/vars","status":"404"}'
+
+run ledger_add '{"foo":1}' 2303 fh-l default mlp-fh-l-default-888 2026-09-14T11:00:00Z
+expect_rc "a plain JSON object (not an array) exits 0" 0
+expect_array "add over a plain JSON object returns an array"
+expect_json_eq "a plain JSON object is treated as [] before adding" "[$REC_2303]" "$OUT"
+
+run ledger_add '["fh-l","fh-proxy"]' 2303 fh-l default mlp-fh-l-default-888 2026-09-14T11:00:00Z
+expect_rc "an array of strings exits 0" 0
+expect_array "add over an array of strings returns an array"
+expect_json_eq "an array of strings is treated as [] before adding" "[$REC_2303]" "$OUT"
+
+run ledger_add '[{"provider":"fh-l","image":"default"}]' 2303 fh-l default mlp-fh-l-default-888 2026-09-14T11:00:00Z
+expect_rc "an array of records without a port exits 0" 0
+expect_array "add over records without a port returns an array"
+expect_json_eq "records without a numeric port are treated as [] before adding" "[$REC_2303]" "$OUT"
+
+run ledger_add "$GH404" 2303 fh-l default mlp-fh-l-default-888 2026-09-14T11:00:00Z
+expect_rc "the gh 404 error object exits 0" 0
+expect_array "add over the gh 404 object returns an array"
+expect_json_eq "the gh 404 error object is treated as [], not merged in" "[$REC_2303]" "$OUT"
+
+run ledger_ports "$GH404"
+expect_rc "ledger_ports on the gh 404 object exits 0" 0
+expect_eq "gh 404 object yields no ports" "" "$OUT"
+
+run ledger_find "$GH404" 2303
+expect_eq "find in the gh 404 object prints nothing" "" "$OUT"
+expect_nonzero "find in the gh 404 object exits non-zero"
 
 echo
 if [[ "$fail" -eq 0 ]]; then
