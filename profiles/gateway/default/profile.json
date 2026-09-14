@@ -1,0 +1,10 @@
+{
+  "name": "default",
+  "role": "gateway",
+  "shared_config": ["pool-runtime", "ssh-admin", "ssh-tunnel", "rclone",
+                    "standalonescripts", "dotfiles", "gh"],
+  "packages": ["curl", "ca-certificates", "git", "jq", "netcat-openbsd",
+               "util-linux", "iproute2", "fail2ban", "docker.io"],
+  "sshd": { "password_auth": false, "permit_root_login": false },
+  "fail2ban": { "ignoreip_from_var": "POOL_TRUSTED_IPS" }
+}

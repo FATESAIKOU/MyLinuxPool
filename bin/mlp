@@ -11,13 +11,13 @@
 # Plain indexed arrays, `[[ ... ]]`, process substitution and `printf %q`
 # are all fine — those have been in bash since well before 3.2.
 #
-# All node connection info comes from pool/bin/pool-resolve. The one
-# direct `gh api` call in this file (in gather_targets) only enumerates
-# NODE_* variable NAMES — pool-resolve has no "list all nodes" capability
-# and neither does anything else here, so this is the same narrow,
-# already-established exception pool/bin/pool-status uses for the same
-# reason. No connection info (ip/port/user/...) is ever read from `gh`
-# directly — that always goes through pool-resolve.
+# All node connection info comes from shared_config/pool-runtime's
+# pool-resolve. The one direct `gh api` call in this file (in
+# gather_targets) only enumerates NODE_* variable NAMES — pool-resolve has
+# no "list all nodes" capability and neither does anything else here, so
+# this is the same narrow, already-established exception pool-status uses
+# for the same reason. No connection info (ip/port/user/...) is ever read
+# from `gh` directly — that always goes through pool-resolve.
 #
 # HOST KEY TRUST MODEL (2026-09-14 incident — read this before touching
 # any ssh call below):
@@ -48,8 +48,8 @@ set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
-POOL_RESOLVE="${REPO_ROOT}/pool/bin/pool-resolve"
-POOL_STATUS="${REPO_ROOT}/pool/bin/pool-status"
+POOL_RESOLVE="${REPO_ROOT}/shared_config/pool-runtime/files/pool-resolve"
+POOL_STATUS="${REPO_ROOT}/shared_config/pool-runtime/files/pool-status"
 REPO="${POOL_REPO:-FATESAIKOU/MyLinuxPool}"
 
 MLP_STATE_DIR="${HOME}/.mylinuxpool"
@@ -294,7 +294,7 @@ gather_targets() {
     done < <(gh api "repos/${REPO}/actions/variables?per_page=100" --jq '.variables[].name' 2>/dev/null | grep '^NODE_')
 
     local workers_json count i entry wprovider wport wcontainer wname
-    workers_json="$(gw_run '~/pool/bin/pool-port-alloc --list')"
+    workers_json="$(gw_run '~/.mylinuxpool/bin/pool-port-alloc --list')"
     [[ -n "$workers_json" ]] || workers_json='[]'
 
     count="$(printf '%s' "$workers_json" | jq 'length' 2>/dev/null)"
@@ -411,7 +411,7 @@ connect_by_name() {
     if ! open_gateway_master; then
         die "Gateway unreachable (${GW_USER}@${GW_IP})"
     fi
-    workers_json="$(gw_run '~/pool/bin/pool-port-alloc --list')"
+    workers_json="$(gw_run '~/.mylinuxpool/bin/pool-port-alloc --list')"
     close_gateway_master
     [[ -n "$workers_json" ]] || workers_json='[]'
 

@@ -1,0 +1,10 @@
+{
+  "name": "ai-dev",
+  "role": "worker",
+  "shared_config": ["pool-runtime"],
+  "secrets": {
+    "GH_TOKEN": "GH_DEV_TOKEN",
+    "ANTHROPIC_API_KEY": "ANTHROPIC_API_KEY"
+  },
+  "env": { "GIT_AUTHOR_NAME": "mylinuxpool-worker" }
+}

@@ -24,9 +24,9 @@ on:
           - fh-l
           - fh-proxy
       image:
-        description: workers/<image> directory to build
+        description: profiles/worker/<image> directory to build
         required: false
-        default: base
+        default: default
       name:
         description: Optional worker name (defaults to <provider>-<image>-<run id>)
         required: false
@@ -86,14 +86,14 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          dockerfile="workers/${{ inputs.image }}/Dockerfile"
-          profile="workers/${{ inputs.image }}/profile.json"
+          dockerfile="profiles/worker/${{ inputs.image }}/Dockerfile"
+          profile="profiles/worker/${{ inputs.image }}/profile.json"
           if [[ ! -f "$dockerfile" ]]; then
             echo "::error::${dockerfile} not found"
             exit 1
           fi
           if [[ ! -f "$profile" ]]; then
-            echo "::error::${profile} not found — every workers/<image>/ needs a profile.json (spec §10.2b)"
+            echo "::error::${profile} not found — every profiles/worker/<image>/ needs a profile.json (spec §10.2b)"
             exit 1
           fi
           python3 -c 'import json,sys; json.load(open(sys.argv[1]))' "$profile"
@@ -130,7 +130,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          profile="workers/${{ inputs.image }}/profile.json"
+          profile="profiles/worker/${{ inputs.image }}/profile.json"
 
           missing=()
           while IFS=$'\t' read -r container_var secret_name; do
@@ -149,7 +149,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          gw_json="$(pool/bin/pool-resolve gateway)"
+          gw_json="$(shared_config/pool-runtime/files/pool-resolve gateway)"
           {
             echo "ip=$(jq -r '.ip' <<<"$gw_json")"
             echo "user=$(jq -r '.user' <<<"$gw_json")"
@@ -158,15 +158,16 @@ jobs:
             echo "port_hi=$(jq -r '.ports.worker[1]' <<<"$gw_json")"
           } >> "$GITHUB_OUTPUT"
 
-      # pool-port-alloc is installed at ~/pool/bin/ on the Gateway
-      # (provision.sh, spec §9.2 step 4) — call that directly rather than
-      # shipping the script's own text over as a `bash -c` string: under
-      # `-c`, $BASH_SOURCE isn't a real path, which broke pool-port-alloc's
-      # own SCRIPT_DIR-relative lookup of pool-resolve (2026-09-14
-      # incident). The Gateway holds no GitHub credential of its own
-      # (spec §10.2b), so the (non-secret) port range is handed in via
-      # POOL_WORKER_PORT_RANGE instead of letting pool-port-alloc call
-      # pool-resolve/gh remotely — it can't, there either.
+      # pool-port-alloc is installed at ~/.mylinuxpool/bin/ on the Gateway
+      # (shared_config/pool-runtime's install.sh, called from provision.sh)
+      # — call that directly rather than shipping the script's own text
+      # over as a `bash -c` string: under `-c`, $BASH_SOURCE isn't a real
+      # path, which broke pool-port-alloc's own SCRIPT_DIR-relative lookup
+      # of pool-resolve (2026-09-14 incident). The Gateway holds no GitHub
+      # credential of its own (spec §10.2b), so the (non-secret) port range
+      # is handed in via POOL_WORKER_PORT_RANGE instead of letting
+      # pool-port-alloc call pool-resolve/gh remotely — it can't, there
+      # either.
       - name: Build claim-port command
         id: claim_cmd
         shell: bash
@@ -175,7 +176,7 @@ jobs:
           range_q="$(printf '%q' "${{ steps.gateway.outputs.port_lo }} ${{ steps.gateway.outputs.port_hi }}")"
           provider_q="$(printf '%q' "${{ inputs.provider }}")"
           image_q="$(printf '%q' "${{ inputs.image }}")"
-          echo "cmd=POOL_WORKER_PORT_RANGE=${range_q} ~/pool/bin/pool-port-alloc --claim ${provider_q} ${image_q}" >> "$GITHUB_OUTPUT"
+          echo "cmd=POOL_WORKER_PORT_RANGE=${range_q} ~/.mylinuxpool/bin/pool-port-alloc --claim ${provider_q} ${image_q}" >> "$GITHUB_OUTPUT"
 
       - name: Claim a worker port on the Gateway
         id: claim
@@ -218,7 +219,7 @@ jobs:
           command: >-
             git -c credential.https://github.com.helper='!f() { echo username=x-access-token; echo "password=$(cat $HOME/.mylinuxpool/gh_token 2>/dev/null)"; }; f' -C ~/.mylinuxpool/repo fetch origin ${{ github.sha }} &&
             git -C ~/.mylinuxpool/repo checkout ${{ github.sha }} &&
-            docker build -f ~/.mylinuxpool/repo/workers/${{ inputs.image }}/Dockerfile -t ${{ steps.identity.outputs.image_tag }} ~/.mylinuxpool/repo
+            docker build -f ~/.mylinuxpool/repo/profiles/worker/${{ inputs.image }}/Dockerfile -t ${{ steps.identity.outputs.image_tag }} ~/.mylinuxpool/repo
 
       # Everything that touches a secret value happens in this one step —
       # WORKER_KEY, the authorized_keys bundle, and every profile-declared
@@ -242,7 +243,7 @@ jobs:
           # tunnel identity, not an interactive-login one (2026-09-14
           # incident: workers came up with only that key authorized, so
           # the tunnel worked but nobody could actually log in).
-          authorized_keys_crypted="static_secret_files/home/fatesaikou/.ssh/authorized_keys.crypted"
+          authorized_keys_crypted="shared_config/ssh-admin/files/authorized_keys.crypted"
           if [[ ! -f "$authorized_keys_crypted" ]]; then
             echo "::error::${authorized_keys_crypted} not found"
             exit 1
@@ -267,7 +268,7 @@ jobs:
           cmd+=" -e POOL_NODE_NAME=${node_name_q}"
           cmd+=" -e WORKER_KEY=${worker_key_q} -e WORKER_AUTHORIZED_KEYS=${authorized_keys_q}"
 
-          profile="workers/${{ inputs.image }}/profile.json"
+          profile="profiles/worker/${{ inputs.image }}/profile.json"
           while IFS=$'\t' read -r container_var secret_name; do
             [[ -z "$container_var" ]] && continue
             val="$(jq -r --arg n "$secret_name" '.[$n] // empty' <<<"$ALL_SECRETS_JSON")"
@@ -381,4 +382,4 @@ jobs:
         uses: ./.github/actions/pool-ssh
         with:
           node: gateway
-          command: ~/pool/bin/pool-port-alloc --release ${{ steps.port.outputs.port }}
+          command: ~/.mylinuxpool/bin/pool-port-alloc --release ${{ steps.port.outputs.port }}

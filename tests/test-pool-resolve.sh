@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# test-pool-resolve.sh — hermetic tests for pool/bin/pool-resolve
+# test-pool-resolve.sh — hermetic tests for shared_config/pool-runtime's pool-resolve
 # spec: docs/POOL_RUNTIME_SPEC.md §1
 #
 # Hermetic strategy: a fake `gh` is placed first on PATH. pool-resolve only
@@ -11,7 +11,7 @@
 set -uo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-POOL_RESOLVE="${REPO_ROOT}/pool/bin/pool-resolve"
+POOL_RESOLVE="${REPO_ROOT}/shared_config/pool-runtime/files/pool-resolve"
 
 if ! command -v jq >/dev/null 2>&1; then
     echo "ERROR: jq is required but not found on PATH" >&2

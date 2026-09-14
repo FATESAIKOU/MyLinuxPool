@@ -1,0 +1,7 @@
+{
+  "name": "rclone",
+  "description": "rclone 與其設定檔",
+  "needs_key": true,
+  "needs_root": true,
+  "provides": ["rclone"]
+}

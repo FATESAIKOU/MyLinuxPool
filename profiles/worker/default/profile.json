@@ -1,0 +1,7 @@
+{
+  "name": "default",
+  "role": "worker",
+  "shared_config": ["pool-runtime"],
+  "secrets": {},
+  "env": {}
+}

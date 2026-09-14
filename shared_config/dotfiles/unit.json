@@ -1,0 +1,7 @@
+{
+  "name": "dotfiles",
+  "description": ".bashrc .vimrc .tmux.conf",
+  "needs_key": false,
+  "needs_root": false,
+  "provides": []
+}

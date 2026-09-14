@@ -3,7 +3,8 @@
 #
 # Contract with the calling workflow:
 #   - this repo must already be checked out (pool-resolve is read from
-#     $GITHUB_WORKSPACE/pool/bin/, not assumed to be on PATH)
+#     $GITHUB_WORKSPACE/shared_config/pool-runtime/files/, not assumed to
+#     be on PATH)
 #   - GH_TOKEN must be exported (secrets.GITHUB_TOKEN or GH_POOL_TOKEN) so
 #     pool-resolve can read NODE_* vars
 #   - for every key_secret that could appear anywhere in the resolved hop
@@ -26,12 +27,12 @@ NODE="${POOL_SSH_NODE:?POOL_SSH_NODE not set}"
 COMMAND="${POOL_SSH_COMMAND:?POOL_SSH_COMMAND not set}"
 TIMEOUT="${POOL_SSH_TIMEOUT:-10}"
 
-POOL_RESOLVE="${GITHUB_WORKSPACE:-.}/pool/bin/pool-resolve"
+POOL_RESOLVE="${GITHUB_WORKSPACE:-.}/shared_config/pool-runtime/files/pool-resolve"
 if [[ ! -x "$POOL_RESOLVE" ]]; then
     POOL_RESOLVE="$(command -v pool-resolve || true)"
 fi
 if [[ -z "$POOL_RESOLVE" || ! -x "$POOL_RESOLVE" ]]; then
-    log ERROR "pool-resolve not found under \$GITHUB_WORKSPACE/pool/bin or on PATH"
+    log ERROR "pool-resolve not found under \$GITHUB_WORKSPACE/shared_config/pool-runtime/files or on PATH"
     log ERROR "did the workflow check out this repo (actions/checkout) before calling pool-ssh?"
     exit 1
 fi

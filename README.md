@@ -58,11 +58,11 @@ bin/mlp trust-gateway  # Gateway rotate 後第一次連線要跑這個
 | 路徑 | 內容 |
 |---|---|
 | `bin/mlp` | 管理員 CLI（Mac） |
-| `pool/bin/` | 三種角色共用的 runtime |
+| `shared_config/<unit>/` | 可分發安裝單位（`unit.json` + `install.sh` + `files/`），見 `docs/LAYOUT.md` |
+| `profiles/gateway/<name>/` | Gateway 角色的 cloud-config + 宣告要裝哪些 shared_config unit |
+| `profiles/worker/<image>/` | Worker image 的 Dockerfile 與其 `profile.json` |
 | `provider/register.sh` | 新增一台 provider，一輩子跑一次 |
-| `gateway/` | cloud-init 與 provision |
-| `workers/<image>/` | Worker image 與其 `profile.json` |
-| `static_secret_files/` | 加密的機密（對稱式，`FILE_CRYPTO_KEY`） |
+| `gateway/provision.sh` | Gateway 開機後的 provision 腳本 |
 | `docs/` | 見下 |
 
 ## 文件

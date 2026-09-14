@@ -87,7 +87,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          old_json="$(pool/bin/pool-resolve gateway --refresh)"
+          old_json="$(shared_config/pool-runtime/files/pool-resolve gateway --refresh)"
           printf '%s' "$old_json" > "${RUNNER_TEMP}/old_gateway.json"
           {
             echo "old_ip=$(jq -r '.ip' <<<"$old_json")"
@@ -106,7 +106,7 @@ jobs:
           command -v envsubst >/dev/null 2>&1 || sudo apt-get install -y gettext-base
 
           rendered="${RUNNER_TEMP}/cloud-config.yaml"
-          envsubst < gateway/cloud-config.yaml > "$rendered"
+          envsubst < profiles/gateway/default/cloud-config.yaml > "$rendered"
 
           root_pass="$(openssl rand -base64 24 | tr -d '\n')"
           create_json="$(linode-cli linodes create \
@@ -189,62 +189,49 @@ jobs:
               ;;
           esac
 
-      - name: Deploy bundle (static_normal_files + decrypted static_secret_files + pool/bin)
+      # Units now own their files/ (still *.crypted — decryption happens
+      # per-unit, on the Gateway, inside provision.sh's own unit-install
+      # calls) instead of this step flattening/decrypting everything onto
+      # a bare /home tree itself. This is more than a path swap: each
+      # unit's install.sh resolves its files/ and scripts/decryptStdin.sh
+      # relative to its own location under shared_config/, so the whole
+      # tree (plus scripts/, which every unit's decrypt step depends on)
+      # has to land together at the same path provision.sh expects
+      # (REPO_DIR=/home/fatesaikou/.mylinuxpool/repo) — copying it there
+      # still-encrypted, rather than pre-decrypting on the runner, is what
+      # lets provision.sh just call each unit's install.sh unmodified.
+      - name: Deploy shared_config + scripts to the Gateway
+        shell: bash
+        env:
+          PREVIEW_IP: ${{ steps.create_preview.outputs.preview_ip }}
+        run: |
+          set -euo pipefail
+          stage="${RUNNER_TEMP}/repo"
+          mkdir -p "$stage"
+          cp -a shared_config "$stage/"
+          cp -a scripts "$stage/"
+
+          scp -o StrictHostKeyChecking=accept-new -r "$stage" "fatesaikou@${PREVIEW_IP}:/tmp/mlp-repo"
+          ssh -o StrictHostKeyChecking=accept-new "fatesaikou@${PREVIEW_IP}" \
+            'sudo mkdir -p /home/fatesaikou/.mylinuxpool/repo && sudo cp -a /tmp/mlp-repo/. /home/fatesaikou/.mylinuxpool/repo/ && sudo rm -rf /tmp/mlp-repo'
+
+          rm -rf "${RUNNER_TEMP}/repo"
+
+      - name: Run provision.sh on preview
+        id: provision
         shell: bash
         env:
           FILE_CRYPTO_KEY: ${{ secrets.FILE_CRYPTO_KEY }}
           PREVIEW_IP: ${{ steps.create_preview.outputs.preview_ip }}
         run: |
           set -euo pipefail
-          stage="${RUNNER_TEMP}/bundle/home"
-          mkdir -p "$stage"
-
-          # static_normal_files: copied as-is.
-          if [[ -d static_normal_files/home ]]; then
-            cp -a static_normal_files/home/. "$stage/"
-          fi
-
-          # static_secret_files: every *.crypted decrypted next to its
-          # relative path with the suffix stripped. No S3, no AWS — that
-          # whole line is gone.
-          if [[ -d static_secret_files/home ]]; then
-            while IFS= read -r -d '' crypted; do
-              rel="${crypted#static_secret_files/home/}"
-              rel="${rel%.crypted}"
-              dest="${stage}/${rel}"
-              mkdir -p "$(dirname "$dest")"
-              scripts/decryptStdin.sh "$FILE_CRYPTO_KEY" < "$crypted" > "$dest"
-            done < <(find static_secret_files/home -type f -name '*.crypted' -print0)
-          fi
-
-          # pool/bin/* onto the Gateway too (ARCHITECTURE.md §5 step 4) —
-          # pool-port-alloc/pool-resolve need to actually exist there for
-          # create-worker/delete-worker to run them (spec §10.1/§10.4).
-          # Staged under the same home/ tree so the existing scp + `sudo
-          # cp -a` below carries it over for free; provision.sh's own
-          # step then just chmod +x's it (ownership already gets fixed by
-          # provision.sh's per-user chown -R, same as everything else here).
-          mkdir -p "${stage}/fatesaikou/pool/bin"
-          cp -a pool/bin/. "${stage}/fatesaikou/pool/bin/"
-
-          scp -o StrictHostKeyChecking=accept-new -r "$stage" "fatesaikou@${PREVIEW_IP}:/tmp/mlp-bundle-home"
-          ssh -o StrictHostKeyChecking=accept-new "fatesaikou@${PREVIEW_IP}" \
-            'sudo mkdir -p /home && sudo cp -a /tmp/mlp-bundle-home/. /home/ && sudo rm -rf /tmp/mlp-bundle-home'
-
-          rm -rf "${RUNNER_TEMP}/bundle"
-
-      - name: Run provision.sh on preview
-        id: provision
-        shell: bash
-        env:
-          PREVIEW_IP: ${{ steps.create_preview.outputs.preview_ip }}
-        run: |
-          set -euo pipefail
           trusted_ips="$(gh variable get POOL_TRUSTED_IPS --repo "$GH_REPO")"
-          # shell-quote so commas/spaces in the IP list survive re-embedding
-          # into the remote command line.
+          # shell-quote so commas/spaces in the IP list, and the key itself,
+          # survive re-embedding into the remote command line. The key
+          # never gets logged: no -x, and GitHub Actions masks the exact
+          # secret value in any log line regardless.
           ssh -o StrictHostKeyChecking=accept-new "fatesaikou@${PREVIEW_IP}" \
-            "sudo env POOL_TRUSTED_IPS=$(printf '%q' "$trusted_ips") bash -s" < gateway/provision.sh
+            "sudo env POOL_TRUSTED_IPS=$(printf '%q' "$trusted_ips") FILE_CRYPTO_KEY=$(printf '%q' "$FILE_CRYPTO_KEY") bash -s" < gateway/provision.sh
 
       - name: Switch NODE_GATEWAY to the new Gateway
         id: switch_point

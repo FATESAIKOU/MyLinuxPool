@@ -56,18 +56,19 @@ jobs:
             exit 1
           fi
 
-      # pool-port-alloc is installed at ~/pool/bin/ on the Gateway
-      # (provision.sh, spec §9.2 step 4) — call that directly. Piping the
-      # script's own text into `bash -c` was the earlier approach, but
-      # $BASH_SOURCE isn't a real path under `-c`, which broke
-      # pool-port-alloc's own SCRIPT_DIR-relative lookup of pool-resolve
-      # (2026-09-14 incident) — same fix as create-worker.yml.
+      # pool-port-alloc is installed at ~/.mylinuxpool/bin/ on the Gateway
+      # (shared_config/pool-runtime's install.sh, called from
+      # provision.sh) — call that directly. Piping the script's own text
+      # into `bash -c` was the earlier approach, but $BASH_SOURCE isn't a
+      # real path under `-c`, which broke pool-port-alloc's own
+      # SCRIPT_DIR-relative lookup of pool-resolve (2026-09-14 incident) —
+      # same fix as create-worker.yml.
       - name: List worker port claims on the Gateway
         id: list
         uses: ./.github/actions/pool-ssh
         with:
           node: gateway
-          command: ~/pool/bin/pool-port-alloc --list
+          command: ~/.mylinuxpool/bin/pool-port-alloc --list
 
       # The real state of a port is `ss` on the Gateway, not this
       # placeholder (spec §10.1) — but we need it here regardless, to
@@ -121,7 +122,7 @@ jobs:
         uses: ./.github/actions/pool-ssh
         with:
           node: gateway
-          command: ~/pool/bin/pool-port-alloc --release ${{ steps.find.outputs.port }}
+          command: ~/.mylinuxpool/bin/pool-port-alloc --release ${{ steps.find.outputs.port }}
 
       - name: Summary
         shell: bash

@@ -1,0 +1,7 @@
+{
+  "name": "ssh-admin",
+  "description": "fatesaikou 的 ssh 身分（Gateway）",
+  "needs_key": true,
+  "needs_root": false,
+  "provides": []
+}

@@ -1,0 +1,7 @@
+{
+  "name": "gh",
+  "description": "gh 本體 + token 檔 + git credential helper",
+  "needs_key": false,
+  "needs_root": true,
+  "provides": ["gh"]
+}

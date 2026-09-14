@@ -254,6 +254,11 @@ step1_preflight_no_sudo() {
 }
 
 # ---- step 2: store gh token --------------------------------------------------
+# This duplicates part of shared_config/gh/install.sh on purpose instead of
+# calling it: that unit lives inside REPO_DIR, and REPO_DIR doesn't exist
+# yet on a brand-new provider — `gh repo clone` in step 3 needs this very
+# token first. Chicken-and-egg, so this bootstrap step stays inline.
+#
 # `gh auth login --with-token` insists on a `read:org` scope our PAT
 # doesn't have and none of our operations (gh api read, gh variable set,
 # gh repo clone) need — it just fails with "missing required scope
@@ -307,7 +312,7 @@ step2_store_token() {
 
 # ---- step 3: fetch runtime ---------------------------------------------------
 step3_fetch_runtime() {
-    log INFO "step 3/9: fetch runtime (clone/pull repo, install pool/bin)"
+    log INFO "step 3/9: fetch runtime (clone/pull repo, install pool-runtime unit)"
 
     mkdir -p "$STATE_DIR"
 
@@ -326,44 +331,30 @@ step3_fetch_runtime() {
         gh repo clone "$REPO" "$REPO_DIR" -- --branch "$BRANCH"
     fi
 
-    mkdir -p "$BIN_DIR"
-    cp -f "${REPO_DIR}"/pool/bin/* "${BIN_DIR}/"
-    chmod +x "${BIN_DIR}"/*
-    log INFO "installed pool/bin/* into ${BIN_DIR}"
+    # BIN_DIR is what pool-runtime's own install.sh derives as
+    # <home>/.mylinuxpool/bin — kept as our own constant too since step9
+    # invokes pool-resolve directly.
+    "${REPO_DIR}/shared_config/pool-runtime/install.sh" --home "$HOME" --user "$(whoami)"
 }
 
 # ---- step 4: shared sshproxy key + Actions authorized_keys ------------------
 step4_key() {
     log INFO "step 4/9: sshproxy private key + Actions authorized_keys"
 
-    mkdir -p "$SSH_DIR"
-    chmod 700 "$SSH_DIR"
-
-    if [[ -f "$PRIVATE_KEY" ]]; then
-        log INFO "${PRIVATE_KEY} already present, skipping decrypt"
-        chmod 600 "$PRIVATE_KEY"
-    else
-        local crypted="${REPO_DIR}/static_secret_files/home/sshproxy/.ssh/id_rsa.crypted"
-        if [[ ! -f "$crypted" ]]; then
-            log ERROR "encrypted shared key not found at ${crypted}"
-            exit 1
-        fi
-
-        # decryptStdin.sh's interface takes the key as argv[1] (existing repo
-        # convention, see RUNBOOK.md §3.3) — not something this script invents.
-        "${REPO_DIR}/scripts/decryptStdin.sh" "$FILE_CRYPTO_KEY" \
-            < "$crypted" > "$PRIVATE_KEY"
-        chmod 600 "$PRIVATE_KEY"
-        log INFO "decrypted shared sshproxy key to ${PRIVATE_KEY}"
-    fi
+    "${REPO_DIR}/shared_config/ssh-tunnel/install.sh" \
+        --key "$FILE_CRYPTO_KEY" --home "$HOME" --user "$(whoami)"
 
     # Actions reaches this machine directly, as the last hop of its own
     # NODE_<NAME> var, using SSH_KEY_ACTIONS (see docs/ARCHITECTURE.md §3)
     # — without its public half in our own authorized_keys, a freshly
     # registered provider is unreachable past the Gateway. Pull it from
-    # the same encrypted bundle rather than trusting whatever's already
-    # on disk, and only ever add the one line tagged for it.
-    local authorized_keys_crypted="${REPO_DIR}/static_secret_files/home/fatesaikou/.ssh/authorized_keys.crypted"
+    # ssh-admin's encrypted bundle (fatesaikou's FULL identity, Gateway-only
+    # — we only ever take the one line tagged for Actions out of it, never
+    # the private key) rather than trusting whatever's already on disk.
+    mkdir -p "$SSH_DIR"
+    chmod 700 "$SSH_DIR"
+
+    local authorized_keys_crypted="${REPO_DIR}/shared_config/ssh-admin/files/authorized_keys.crypted"
     if [[ ! -f "$authorized_keys_crypted" ]]; then
         log ERROR "encrypted authorized_keys bundle not found at ${authorized_keys_crypted}"
         exit 1
@@ -556,14 +547,18 @@ enable_linger() {
 }
 
 step8_systemd() {
-    log INFO "step 8/9: install pool-tunnel.service and enable linger"
+    log INFO "step 8/9: enable pool-tunnel.service and enable linger"
 
-    local unit_src="${REPO_DIR}/pool/systemd/pool-tunnel.service"
-    local unit_dst_dir="${HOME}/.config/systemd/user"
-    local unit_dst="${unit_dst_dir}/pool-tunnel.service"
+    # pool-runtime's own install.sh (called from step3) already placed the
+    # unit file at ~/.config/systemd/user/pool-tunnel.service — nothing to
+    # copy here anymore, just enable/start it (a role-specific decision
+    # that unit deliberately leaves to its caller).
+    local unit_dst="${HOME}/.config/systemd/user/pool-tunnel.service"
 
-    mkdir -p "$unit_dst_dir"
-    cp -f "$unit_src" "$unit_dst"
+    if [[ ! -f "$unit_dst" ]]; then
+        log ERROR "${unit_dst} not found — step 3 (pool-runtime install) should have placed it"
+        exit 1
+    fi
 
     if [[ "$NO_SUDO" -eq 1 ]]; then
         patch_unit_path_for_no_sudo "$unit_dst"

@@ -1,0 +1,7 @@
+{
+  "name": "standalonescripts",
+  "description": "dlpw uppw — 需要 rclone 才能實際運作（本 unit 只裝檔案，不裝 rclone；請確保 rclone unit 也在同一份 profile 裡）",
+  "needs_key": true,
+  "needs_root": false,
+  "provides": ["dlpw", "uppw"]
+}
