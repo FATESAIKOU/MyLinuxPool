@@ -480,3 +480,31 @@ ssh -t <linode帳號>@lish-<region>.linode.com <linode標籤>
 repo 佈署的 `sshproxy/.ssh/id_rsa.crypted`，其公鑰**必須**出現在
 `authorized_keys.crypted` 裡。首次驗收時這兩者是不一致的，導致所有 provider
 都無法建立隧道。詳見 `POOL_RUNTIME_SPEC.md` §4 的不變式說明。
+
+---
+
+## 8. 改了 provision.sh 之後
+
+`gateway/provision.sh` 的改動**只對下一台 rotate 出來的機器生效**。現行
+Gateway 是用它被建立當下的那個版本 provision 的，不會自動追上。
+
+這是不可變基礎設施的固有性質：好處是可重現（機器狀態完全由程式碼決定），
+代價是「改了 provision 但還沒 rotate」這段期間，跑著的機器與程式碼描述的
+機器不一致。
+
+改完 provision 後選一條：
+
+1. **立刻 rotate** —— 最乾淨，機器與程式碼重新對齊。但要花約 6 分鐘且會有
+   數十秒的隧道中斷。
+2. **手動補齊並記錄** —— 適合小改動或剛 rotate 過不久。補完要在此處記一筆，
+   否則下次有人查「為什麼這台機器上有 X 但 provision.sh 沒裝 X」會很困惑。
+
+### 已知的手動補齊紀錄
+
+| 日期 | 機器 | 補了什麼 | 原因 |
+|---|---|---|---|
+| 2026-09-14 | `fws` (172.105.219.60) | `~/pool/bin/*` | provision.sh 當時還沒有安裝 pool/bin 的步驟（step 4），是 create-worker 首次執行才發現這個缺口。該機於 00:48 rotate 出來，早於修正。 |
+
+> 判斷方式：`pool-status` 若在 Gateway 相關檢查出現 FAIL，先確認現行機器是
+> 用哪個版本的 provision 建的（`NODE_GATEWAY.rotated_at` 對照 git log），
+> 再決定是補齊還是 rotate。
