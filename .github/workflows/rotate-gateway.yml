@@ -298,19 +298,39 @@ jobs:
           fi
           echo "provider tunnel probe succeeded"
 
-      # Before the switch, so a failure here still leaves the live Gateway
-      # in charge. Runs on dry runs too — the copy targets the preview
-      # machine that is about to be deleted, so it costs nothing and keeps
-      # the step exercised instead of only ever running for real.
-      - name: Carry worker port claims to the new Gateway
+      # The ledger used to be copied off the outgoing Gateway here. It has
+      # a master now (POOL_WORKERS), so the new machine is filled from the
+      # repo instead — which also works when the old Gateway is unreachable,
+      # the very situation that most often prompts a rotate.
+      - name: Push the state cache to the new Gateway
+        uses: ./.github/actions/push-state
+        with:
+          gateway-ip: ${{ steps.create_preview.outputs.preview_ip }}
+          host-key: ${{ steps.hostkey.outputs.key }}
+          source: rotate-gateway#${{ github.run_id }}
+          ssh-key: ${{ secrets.SSH_KEY_ACTIONS }}
+
+      # Restore the Gateway-local placeholder cache from the master, so
+      # pool-port-alloc will not hand out a port a running worker still owns.
+      # Targets the preview machine by IP, not `node: gateway` — at this
+      # point NODE_GATEWAY still names the OUTGOING machine, so resolving
+      # by node would restore the claims onto the one being replaced.
+      - name: Restore worker port claims from POOL_WORKERS
         shell: bash
         env:
           PREVIEW_IP: ${{ steps.create_preview.outputs.preview_ip }}
-          OLD_IP: ${{ steps.read_old_gateway.outputs.old_ip }}
         run: |
           set -euo pipefail
-          source scripts/rotate-gateway.sh
-          rotate_carry_worker_claims fatesaikou "$OLD_IP" "$PREVIEW_IP"
+          ssh -o StrictHostKeyChecking=accept-new -o BatchMode=yes -o ConnectTimeout=10 \
+              "fatesaikou@${PREVIEW_IP}" bash -s <<'REMOTE'
+          set -euo pipefail
+          mkdir -p ~/.mylinuxpool/workers.d
+          jq -c '.workers[]' /var/lib/mylinuxpool/state.json | while read -r w; do
+              port="$(printf '%s' "$w" | jq -r .port)"
+              printf '%s\n' "$w" > ~/.mylinuxpool/workers.d/"${port}".json
+          done
+          echo "restored $(ls ~/.mylinuxpool/workers.d/*.json 2>/dev/null | wc -l) claim(s)"
+          REMOTE
 
       - name: Switch NODE_GATEWAY to the new Gateway
         id: switch_point
