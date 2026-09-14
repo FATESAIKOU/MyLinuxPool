@@ -54,11 +54,15 @@ jobs:
         with:
           token: ${{ secrets.LINODE_TOKEN }}
 
-      - name: Start ssh-agent, load Gateway + sshproxy keys
+      - name: Start ssh-agent, load Actions + sshproxy keys
         id: agent
         shell: bash
         env:
-          SSH_KEY_GATEWAY: ${{ secrets.SSH_KEY_GATEWAY }}
+          # SSH_KEY_ACTIONS is Actions' one identity across the whole
+          # cluster (management access to Gateway and every provider) —
+          # not to be confused with SSH_KEY_SSHPROXY, the separate tunnel
+          # identity providers/workers use to reverse-tunnel in.
+          SSH_KEY_ACTIONS: ${{ secrets.SSH_KEY_ACTIONS }}
           SSH_KEY_SSHPROXY: ${{ secrets.SSH_KEY_SSHPROXY }}
         run: |
           set -euo pipefail
@@ -66,7 +70,7 @@ jobs:
           echo "SSH_AUTH_SOCK=${SSH_AUTH_SOCK}" >> "$GITHUB_ENV"
           echo "SSH_AGENT_PID=${SSH_AGENT_PID}" >> "$GITHUB_ENV"
 
-          ssh-add - <<< "$SSH_KEY_GATEWAY"
+          ssh-add - <<< "$SSH_KEY_ACTIONS"
           ssh-add - <<< "$SSH_KEY_SSHPROXY"
 
           # Keys never touch disk: derive each public half straight out of

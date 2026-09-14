@@ -308,9 +308,9 @@ step3_fetch_runtime() {
     log INFO "installed pool/bin/* into ${BIN_DIR}"
 }
 
-# ---- step 4: shared sshproxy key --------------------------------------------
+# ---- step 4: shared sshproxy key + Actions authorized_keys ------------------
 step4_key() {
-    log INFO "step 4/9: sshproxy private key"
+    log INFO "step 4/9: sshproxy private key + Actions authorized_keys"
 
     mkdir -p "$SSH_DIR"
     chmod 700 "$SSH_DIR"
@@ -318,21 +318,52 @@ step4_key() {
     if [[ -f "$PRIVATE_KEY" ]]; then
         log INFO "${PRIVATE_KEY} already present, skipping decrypt"
         chmod 600 "$PRIVATE_KEY"
-        return 0
+    else
+        local crypted="${REPO_DIR}/static_secret_files/home/sshproxy/.ssh/id_rsa.crypted"
+        if [[ ! -f "$crypted" ]]; then
+            log ERROR "encrypted shared key not found at ${crypted}"
+            exit 1
+        fi
+
+        # decryptStdin.sh's interface takes the key as argv[1] (existing repo
+        # convention, see RUNBOOK.md §3.3) — not something this script invents.
+        "${REPO_DIR}/scripts/decryptStdin.sh" "$FILE_CRYPTO_KEY" \
+            < "$crypted" > "$PRIVATE_KEY"
+        chmod 600 "$PRIVATE_KEY"
+        log INFO "decrypted shared sshproxy key to ${PRIVATE_KEY}"
     fi
 
-    local crypted="${REPO_DIR}/static_secret_files/home/sshproxy/.ssh/id_rsa.crypted"
-    if [[ ! -f "$crypted" ]]; then
-        log ERROR "encrypted shared key not found at ${crypted}"
+    # Actions reaches this machine directly, as the last hop of its own
+    # NODE_<NAME> var, using SSH_KEY_ACTIONS (see docs/ARCHITECTURE.md §3)
+    # — without its public half in our own authorized_keys, a freshly
+    # registered provider is unreachable past the Gateway. Pull it from
+    # the same encrypted bundle rather than trusting whatever's already
+    # on disk, and only ever add the one line tagged for it.
+    local authorized_keys_crypted="${REPO_DIR}/static_secret_files/home/fatesaikou/.ssh/authorized_keys.crypted"
+    if [[ ! -f "$authorized_keys_crypted" ]]; then
+        log ERROR "encrypted authorized_keys bundle not found at ${authorized_keys_crypted}"
         exit 1
     fi
 
-    # decryptStdin.sh's interface takes the key as argv[1] (existing repo
-    # convention, see RUNBOOK.md §3.3) — not something this script invents.
-    "${REPO_DIR}/scripts/decryptStdin.sh" "$FILE_CRYPTO_KEY" \
-        < "$crypted" > "$PRIVATE_KEY"
-    chmod 600 "$PRIVATE_KEY"
-    log INFO "decrypted shared sshproxy key to ${PRIVATE_KEY}"
+    local actions_line
+    actions_line="$("${REPO_DIR}/scripts/decryptStdin.sh" "$FILE_CRYPTO_KEY" \
+        < "$authorized_keys_crypted" | grep -F 'mylinuxpool-actions' | head -n1 || true)"
+
+    if [[ -z "$actions_line" ]]; then
+        log ERROR "no line tagged 'mylinuxpool-actions' found in ${authorized_keys_crypted}"
+        exit 1
+    fi
+
+    local authorized_keys="${SSH_DIR}/authorized_keys"
+    touch "$authorized_keys"
+    chmod 600 "$authorized_keys"
+
+    if grep -qF "$actions_line" "$authorized_keys" 2>/dev/null; then
+        log INFO "Actions key already present in ${authorized_keys}, skipping"
+    else
+        printf '%s\n' "$actions_line" >> "$authorized_keys"
+        log INFO "added Actions key to ${authorized_keys}"
+    fi
 }
 
 # ---- step 5: local identity --------------------------------------------------
@@ -360,7 +391,13 @@ step6_register_var() {
 
     local self_user key_secret hops_json merged
     self_user="${USER:-$(whoami)}"
-    key_secret="SSH_KEY_$(printf '%s' "$NAME" | tr '[:lower:]' '[:upper:]' | tr '-' '_')"
+    # key_secret names an IDENTITY, not a destination — Actions uses the
+    # same one key (SSH_KEY_ACTIONS) for management access to every node
+    # in the cluster, so every machine's hop points at it too. A per-
+    # machine SSH_KEY_<NAME> secret was the 2026-09 design mistake that
+    # broke create-worker's 2-hop chains (never provisioned past Gateway's
+    # own single hop) — don't reintroduce it.
+    key_secret="SSH_KEY_ACTIONS"
 
     hops_json="$(jq -n \
         --argjson port "$GATEWAY_PORT" \

@@ -37,12 +37,13 @@ permissions:
 env:
   GH_TOKEN: ${{ secrets.GH_POOL_TOKEN }}
   GH_REPO: ${{ github.repository }}
-  # pool-ssh's agent needs every key_secret that could appear in either
-  # chain this workflow touches (gateway directly, and <provider>'s own
-  # chain, which also passes through gateway).
-  SSH_KEY_GATEWAY: ${{ secrets.SSH_KEY_GATEWAY }}
-  SSH_KEY_FH_L: ${{ secrets.SSH_KEY_FH_L }}
-  SSH_KEY_FH_PROXY: ${{ secrets.SSH_KEY_FH_PROXY }}
+  # Every NODE_* hop's key_secret points at this one Actions identity now
+  # (see docs/ARCHITECTURE.md §3) — pool-ssh's agent only ever needs this
+  # single key regardless of which chain (gateway or <provider>'s, which
+  # also passes through gateway) it's resolving.
+  SSH_KEY_ACTIONS: ${{ secrets.SSH_KEY_ACTIONS }}
+  # Separate tunnel identity, not to be confused with the above — providers
+  # and workers reverse-tunnel in using this, never Actions' own identity.
   SSH_KEY_SSHPROXY: ${{ secrets.SSH_KEY_SSHPROXY }}
   # The only way to look up a secret by a name only known at run time
   # (from profile.json) — GitHub Actions has no `secrets[dynamicName]`.
