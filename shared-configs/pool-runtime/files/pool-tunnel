@@ -161,15 +161,21 @@ resolve_connection_info() {
             sleep 2
         done
         if [[ -z "${pub:-}" ]]; then
-            # Fall back to the frozen address rather than refusing to run:
-            # a tunnel that cannot survive a rotate still beats no tunnel,
-            # and this is what a provider on an older pool-runtime gives us.
+            # Fall back to the address baked in at docker-run time rather
+            # than refusing to run — but stay in follow mode. The usual
+            # reason the file is missing is a boot race: the host has just
+            # come up and its own pool-tunnel has not published yet. That
+            # is temporary, and latching to static here would answer it by
+            # permanently disabling this worker's ability to follow a
+            # rotate. Leaving FOLLOW_GATEWAY set means the 30s check keeps
+            # re-reading the file and converges the moment it appears.
             if [[ -n "${POOL_GATEWAY_HOST:-}" && -n "${POOL_GATEWAY_USER:-}" ]]; then
-                log WARN "no readable Gateway file at ${GATEWAY_FOLLOW_FILE} after 60s — falling back to POOL_GATEWAY_HOST; this tunnel will NOT survive a Gateway rotate"
+                log WARN "no readable Gateway file at ${GATEWAY_FOLLOW_FILE} after 60s — starting from POOL_GATEWAY_HOST and continuing to watch for the file"
                 GW_IP="$POOL_GATEWAY_HOST"
                 GW_USER="$POOL_GATEWAY_USER"
                 GW_GEN=""
-                STATIC_GATEWAY=1
+                GW_HOST_KEY=""
+                FOLLOW_GATEWAY=1
                 return 0
             fi
             log ERROR "no readable Gateway file at ${GATEWAY_FOLLOW_FILE} after 60s and no POOL_GATEWAY_HOST fallback — is the provider's pool-tunnel running?"

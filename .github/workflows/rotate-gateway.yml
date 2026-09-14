@@ -221,7 +221,11 @@ jobs:
             exit 0
           fi
 
-          live="$(rotate_live_providers fatesaikou "$OLD_IP" "$OLD_HOST_KEY" "${specs[@]}")"
+          # Keep only well-formed "<name> <port>" lines. Anything else on
+          # stdout is not a provider, and silently treating it as one is how
+          # a stray log line became the probe target once already.
+          live="$(rotate_live_providers fatesaikou "$OLD_IP" "$OLD_HOST_KEY" "${specs[@]}" \
+                  | grep -E '^[A-Za-z0-9][A-Za-z0-9._-]* [0-9]+$' || true)"
           ports="$(awk '{print $2}' <<<"$live" | tr '\n' ' ' | sed 's/ $//')"
           node="$(awk 'NR==1{print $1}' <<<"$live")"
 

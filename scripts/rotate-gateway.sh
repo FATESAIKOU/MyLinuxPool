@@ -194,7 +194,11 @@ rotate_live_providers() {
         if [[ "$banner" == SSH-* ]]; then
             printf '%s %s\n' "$name" "$port"
         else
-            log INFO "provider ${name} (port ${port}) is not attached — excluded from this rotate"
+            # WARN, not INFO: log INFO writes to stdout (lib/log.sh), and
+            # this function's stdout IS its return value. An INFO line here
+            # ends up parsed as a provider and the caller probes a
+            # timestamp. Same trap rotate_create_preview_linode notes above.
+            log WARN "provider ${name} (port ${port}) is not attached — excluded from this rotate"
         fi
     done
 }
