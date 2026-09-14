@@ -11,6 +11,9 @@
 4. [Fh-proxy 的 Windows 側設定](#4-fh-proxy-的-windows-側設定)
 5. [故障排除](#5-故障排除)
 6. [已知環境限制](#6-已知環境限制)
+7. [事故紀錄與教訓](#7-事故紀錄與教訓2026-09-1314-首次實機驗收)
+8. [改了 provision-gateway.sh 之後](#8-改了-provision-gatewaysh-之後)
+9. [傳送機密到遠端機器的唯一正確做法](#9-傳送機密到遠端機器的唯一正確做法)
 
 ---
 
@@ -508,6 +511,27 @@ ssh -t <linode帳號>@lish-<region>.linode.com <linode標籤>
 repo 佈署的 `sshproxy/.ssh/id_rsa.crypted`，其公鑰**必須**出現在
 `authorized_keys.crypted` 裡。首次驗收時這兩者是不一致的，導致所有 provider
 都無法建立隧道。詳見 `POOL_RUNTIME_SPEC.md` §4 的不變式說明。
+
+### 7.5 檔案模式也是介面的一部分
+
+把 `ssh-tunnel` 拆成 `ssh-tunnel-client` / `ssh-tunnel-server` 時，兩個新的
+`install.sh` 以 **644** 進了版控。Gateway 裝的是 `-server`，於是重構後第一次
+rotate dry run 死在：
+
+```
+ERROR .../shared-configs/ssh-tunnel-server/install.sh missing or not executable
+```
+
+`-client` 是 provider 註冊時才裝的，而兩台 provider 都在拆分**之前**就註冊完了，
+所以本地怎麼測都不會踩到——這個缺陷只在「新機器」或「新註冊」的路徑上存在。
+
+語法檢查、JSON 檢查、單元測試都看不到檔案模式。`ops-scripts/preflight` 補上了
+這條規則：**沒有任何地方 `source` 它的腳本，就一定得能執行**。
+（`scripts/*.sh` 全部被 workflow `source`，644 是對的；
+`crypto.sh` 與 `provision-gateway.sh` 被當路徑執行，所以是 755。）
+
+修法：`git update-index --chmod=+x <path>`。改本機的 `chmod` 不夠，
+要進版控的是 git index 裡的模式。
 
 ---
 
