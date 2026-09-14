@@ -200,6 +200,15 @@ jobs:
       # (register.sh) — reuse it as the build context instead of shipping
       # any files there ourselves, pinned to the exact commit this run
       # was dispatched from.
+      # `GH_TOKEN=... git fetch` (the previous form here) does nothing on
+      # its own — plain git doesn't consult that env var at all, only `gh`
+      # does. register.sh now configures a global git credential helper
+      # that reads ~/.mylinuxpool/gh_token (2026-09-14 incident: fh-proxy,
+      # registered after that fix landed, had no fallback and failed
+      # outright; fh-l only kept working by accident, via a stale `gh auth
+      # login` state predating the switch away from it). This `-c` is a
+      # second line of defense: it makes this one invocation work even on
+      # a provider that hasn't been re-registered since that fix.
       - name: Build worker image on provider
         id: build
         uses: ./.github/actions/pool-ssh
@@ -207,11 +216,9 @@ jobs:
           node: ${{ inputs.provider }}
           timeout: "60"
           command: >-
-            GH_TOKEN="$(cat ~/.mylinuxpool/gh_token 2>/dev/null)"
-            git -C ~/.mylinuxpool/repo fetch origin ${{ github.sha }} &&
+            git -c credential.https://github.com.helper='!f() { echo username=x-access-token; echo "password=$(cat $HOME/.mylinuxpool/gh_token 2>/dev/null)"; }; f' -C ~/.mylinuxpool/repo fetch origin ${{ github.sha }} &&
             git -C ~/.mylinuxpool/repo checkout ${{ github.sha }} &&
-            docker build -f ~/.mylinuxpool/repo/workers/${{ inputs.image }}/Dockerfile
-            -t ${{ steps.identity.outputs.image_tag }} ~/.mylinuxpool/repo
+            docker build -f ~/.mylinuxpool/repo/workers/${{ inputs.image }}/Dockerfile -t ${{ steps.identity.outputs.image_tag }} ~/.mylinuxpool/repo
 
       # Everything that touches a secret value happens in this one step —
       # WORKER_KEY, the authorized_keys bundle, and every profile-declared

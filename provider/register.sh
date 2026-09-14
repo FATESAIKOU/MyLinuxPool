@@ -261,7 +261,7 @@ step1_preflight_no_sudo() {
 # all, so we drop the token in a file for pool-resolve to pick up later
 # and export it for the rest of this run.
 step2_store_token() {
-    log INFO "step 2/9: store gh token"
+    log INFO "step 2/9: store gh token + git credential helper"
 
     mkdir -p "$STATE_DIR"
 
@@ -279,6 +279,30 @@ step2_store_token() {
     chmod 600 "$GH_TOKEN_FILE"
 
     export GH_TOKEN="$GH_POOL_TOKEN"
+
+    # `gh` reading GH_TOKEN covers pool-resolve, but plain `git` (fetch/pull
+    # on ~/.mylinuxpool/repo) has its own, separate credential story — it
+    # doesn't consult GH_TOKEN at all. Without this, git falls back to an
+    # interactive username/password prompt, which fails immediately over
+    # ssh/non-interactively ("could not read Username ... No such device").
+    # 2026-09-14 incident: fh-l happened to keep working across this
+    # change only because a *stale* `gh auth login` state was still sitting
+    # in ~/.config/gh/hosts.yml from before we switched off it — fh-proxy,
+    # registered after the switch, had nothing and failed outright. A
+    # global credential helper that reads the token FILE at invocation
+    # time (not a static value baked into ~/.gitconfig) fixes both: it
+    # doesn't depend on any login state, and re-running this replaces
+    # whatever helper (or none) was there before, so a stale machine like
+    # fh-l converges to the same setup as a fresh one.
+    local cred_helper='!f() { echo username=x-access-token; echo "password=$(cat $HOME/.mylinuxpool/gh_token 2>/dev/null)"; }; f'
+    local current_helper
+    current_helper="$(git config --global --get credential.https://github.com.helper 2>/dev/null || true)"
+    if [[ "$current_helper" == "$cred_helper" ]]; then
+        log INFO "git credential helper for github.com already configured"
+    else
+        git config --global credential.https://github.com.helper "$cred_helper"
+        log INFO "configured git credential helper for github.com to read ${GH_TOKEN_FILE}"
+    fi
 }
 
 # ---- step 3: fetch runtime ---------------------------------------------------
