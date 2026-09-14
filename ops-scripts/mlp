@@ -87,8 +87,9 @@ usage: mlp [command]
   (no command)     interactive main menu
   ls               list providers/workers with live state
   ssh [name]       connect to a node or worker (menu if name omitted)
-  wake             wake fh-l (unicast WoL via fh-proxy)
-  down             shut down fh-l (asks for confirmation first)
+  wake             wake nodes that declare power.launch (fzf pick if more than one)
+  down             shut down nodes that declare power.shutdown (fzf pick if more than one)
+  state            compare master (GitHub) vs Gateway state.json vs local snapshot
   status           run pool-status
   rotate [--real]  rotate the Gateway (dry run unless --real)
   worker new       build and start a worker on a provider
@@ -502,29 +503,70 @@ cmd_ssh() {
 }
 
 # ---- wake / down ------------------------------------------------------------
+# The set of nodes that can be woken / shut down is whatever NODE_* declares
+# under .power — never a hardcoded name (REDESIGN §3.35: NODE_FH_L.power was
+# the master copy, and cmd_wake/cmd_down hardcoding fh-l was the second).
+power_targets() {
+    local action="$1" var node json
+    while IFS= read -r var; do
+        [[ -n "$var" ]] || continue
+        [[ "$var" == "NODE_GATEWAY" ]] && continue
+        node="$(printf '%s' "${var#NODE_}" | tr '[:upper:]' '[:lower:]' | tr '_' '-')"
+        json="$("$POOL_RESOLVE" "$node" 2>/dev/null)" || continue
+        if printf '%s' "$json" | jq -e --arg a "$action" '.power[$a] != null' >/dev/null 2>&1; then
+            printf '%s\n' "$node"
+        fi
+    done < <(gh api "repos/${REPO}/actions/variables?per_page=100" --jq '.variables[].name' 2>/dev/null | grep '^NODE_')
+}
+
+# pick_power_target <action> — returns exactly one node name.
+pick_power_target() {
+    local action="$1" nodes=() n
+    while IFS= read -r n; do
+        [[ -n "$n" ]] && nodes+=("$n")
+    done < <(power_targets "$action")
+
+    case "${#nodes[@]}" in
+        0)
+            die "no node declares .power.${action} — nothing to wake/down"
+            ;;
+        1)
+            printf '%s\n' "${nodes[0]}"
+            ;;
+        *)
+            printf '%s\n' "${nodes[@]}" \
+                | fzf --prompt="${action}> " --height='~40%' \
+                      --header="multiple nodes declare .power.${action} — pick one"
+            ;;
+    esac
+}
+
 cmd_wake() {
     resolve_gateway
-    local fhl_json rc method via mac target_ip port waited state
+    local node="$1" json rc method via mac target_ip port waited state
 
-    fhl_json="$("$POOL_RESOLVE" fh-l)"
+    node="$(pick_power_target launch)"
+    [[ -n "$node" ]] || { echo "aborted."; return 1; }
+
+    json="$("$POOL_RESOLVE" "$node")"
     rc=$?
-    [[ $rc -eq 0 ]] || die "pool-resolve fh-l failed (exit ${rc})"
+    [[ $rc -eq 0 ]] || die "pool-resolve ${node} failed (exit ${rc})"
 
-    method="$(printf '%s' "$fhl_json" | jq -r '.power.launch.method // empty')"
-    via="$(printf '%s' "$fhl_json" | jq -r '.power.launch.via // empty')"
-    mac="$(printf '%s' "$fhl_json" | jq -r '.power.launch.mac // empty')"
-    target_ip="$(printf '%s' "$fhl_json" | jq -r '.power.launch.target_ip // empty')"
-    port="$(printf '%s' "$fhl_json" | jq -r '.gateway_port // empty')"
+    method="$(printf '%s' "$json" | jq -r '.power.launch.method // empty')"
+    via="$(printf '%s' "$json" | jq -r '.power.launch.via // empty')"
+    mac="$(printf '%s' "$json" | jq -r '.power.launch.mac // empty')"
+    target_ip="$(printf '%s' "$json" | jq -r '.power.launch.target_ip // empty')"
+    port="$(printf '%s' "$json" | jq -r '.gateway_port // empty')"
 
-    [[ "$method" == "wol-unicast" ]] || die "NODE_FH_L.power.launch.method is '${method:-<empty>}', expected wol-unicast"
-    [[ -n "$via" && -n "$mac" && -n "$target_ip" && -n "$port" ]] || die "NODE_FH_L.power.launch is missing via/mac/target_ip, or gateway_port is missing"
+    [[ "$method" == "wol-unicast" ]] || die "NODE_${node}.power.launch.method is '${method:-<empty>}', expected wol-unicast"
+    [[ -n "$via" && -n "$mac" && -n "$target_ip" && -n "$port" ]] || die "NODE_${node}.power.launch is missing via/mac/target_ip, or gateway_port is missing"
 
-    echo "waking fh-l via ${via}: unicast WoL to ${mac} @ ${target_ip} ..."
+    echo "waking ${node} via ${via}: unicast WoL to ${mac} @ ${target_ip} ..."
     if ! run_on_node "$via" "~/.mylinuxpool/bin/pool-wol ${mac} ${target_ip}"; then
         die "failed to send WoL packet via ${via}"
     fi
 
-    echo "packet sent — waiting for fh-l's port (${port}) on the Gateway (up to 5 minutes)"
+    echo "packet sent — waiting for ${node}'s port (${port}) on the Gateway (up to 5 minutes)"
     if ! open_gateway_master; then
         die "Gateway unreachable while waiting"
     fi
@@ -534,7 +576,7 @@ cmd_wake() {
         state="$(gw_probe_port "$port")"
         if [[ "$state" == "up" ]]; then
             close_gateway_master
-            printf '\n%sfh-l is up%s (after %ss)\n' "$C_GREEN" "$C_RESET" "$waited"
+            printf '\n%s%s is up%s (after %ss)\n' "$C_GREEN" "$node" "$C_RESET" "$waited"
             return 0
         fi
         printf '.'
@@ -544,25 +586,28 @@ cmd_wake() {
 
     close_gateway_master
     echo ""
-    die "timed out after 5 minutes waiting for fh-l"
+    die "timed out after 5 minutes waiting for ${node}"
 }
 
 cmd_down() {
     resolve_gateway
-    local fhl_json rc method shutdown_cmd port confirm waited state
+    local node="$1" json rc method shutdown_cmd port confirm waited state
 
-    fhl_json="$("$POOL_RESOLVE" fh-l)"
+    node="$(pick_power_target shutdown)"
+    [[ -n "$node" ]] || { echo "aborted."; return 1; }
+
+    json="$("$POOL_RESOLVE" "$node")"
     rc=$?
-    [[ $rc -eq 0 ]] || die "pool-resolve fh-l failed (exit ${rc})"
+    [[ $rc -eq 0 ]] || die "pool-resolve ${node} failed (exit ${rc})"
 
-    method="$(printf '%s' "$fhl_json" | jq -r '.power.shutdown.method // empty')"
-    shutdown_cmd="$(printf '%s' "$fhl_json" | jq -r '.power.shutdown.command // empty')"
-    port="$(printf '%s' "$fhl_json" | jq -r '.gateway_port // empty')"
+    method="$(printf '%s' "$json" | jq -r '.power.shutdown.method // empty')"
+    shutdown_cmd="$(printf '%s' "$json" | jq -r '.power.shutdown.command // empty')"
+    port="$(printf '%s' "$json" | jq -r '.gateway_port // empty')"
 
-    [[ "$method" == "ssh" && -n "$shutdown_cmd" ]] || die "NODE_FH_L.power.shutdown is missing method/command"
-    [[ -n "$port" ]] || die "NODE_FH_L is missing gateway_port"
+    [[ "$method" == "ssh" && -n "$shutdown_cmd" ]] || die "NODE_${node}.power.shutdown is missing method/command"
+    [[ -n "$port" ]] || die "NODE_${node} is missing gateway_port"
 
-    printf '%sThis will shut down fh-l%s (running: %s)\n' "$C_YELLOW" "$C_RESET" "$shutdown_cmd"
+    printf '%sThis will shut down %s%s (running: %s)\n' "$C_YELLOW" "$node" "$C_RESET" "$shutdown_cmd"
     printf 'Type "yes" to confirm: '
     read -r confirm
     if [[ "$confirm" != "yes" ]]; then
@@ -570,12 +615,12 @@ cmd_down() {
         return 1
     fi
 
-    echo "sending shutdown command to fh-l..."
-    if ! run_on_node fh-l "$shutdown_cmd"; then
-        die "failed to run shutdown command on fh-l"
+    echo "sending shutdown command to ${node}..."
+    if ! run_on_node "$node" "$shutdown_cmd"; then
+        die "failed to run shutdown command on ${node}"
     fi
 
-    echo "waiting for fh-l's port (${port}) to disappear from the Gateway (up to 2 minutes)"
+    echo "waiting for ${node}'s port (${port}) to disappear from the Gateway (up to 2 minutes)"
     if ! open_gateway_master; then
         die "Gateway unreachable while waiting"
     fi
@@ -585,7 +630,7 @@ cmd_down() {
         state="$(gw_probe_port "$port")"
         if [[ "$state" == "down" ]]; then
             close_gateway_master
-            printf '\n%sfh-l is down%s (after %ss)\n' "$C_GREEN" "$C_RESET" "$waited"
+            printf '\n%s%s is down%s (after %ss)\n' "$C_GREEN" "$node" "$C_RESET" "$waited"
             return 0
         fi
         printf '.'
@@ -595,7 +640,107 @@ cmd_down() {
 
     close_gateway_master
     echo ""
-    die "fh-l's port is still up after 2 minutes — shutdown may not have worked"
+    die "${node}'s port is still up after 2 minutes — shutdown may not have worked"
+}
+
+# ---- mlp state --------------------------------------------------------------
+# Compares the three copies of cluster truth (REDESIGN N7):
+#   master   GitHub NODE_* + POOL_WORKERS
+#   gateway  /var/lib/mylinuxpool/state.json (the cache the Gateway serves)
+#   local    ~/.mylinuxpool/state.json (this Mac's snapshot, if any)
+# Exits non-zero when anything diverges — that is what made a pre-ledger
+# worker invisible to a rotate in 2026-09-14.
+cmd_state() {
+    resolve_gateway
+    if ! open_gateway_master; then
+        die "Gateway unreachable (${GW_USER}@${GW_IP})"
+    fi
+
+    local master_nodes master_ports master_serial
+    local gw_json gw_serial gw_nodes gw_ports gw_workers
+    local local_json local_serial local_nodes local_ports
+
+    # Normalize master node names to the same lowercase-hyphen spelling
+    # state.json uses for .nodes keys (NODE_FH_L -> fh-l), so the comm
+    # comparisons below compare like with like.
+    master_nodes="$({ gh api "repos/${REPO}/actions/variables?per_page=100" --jq '.variables[].name' 2>/dev/null | grep '^NODE_' | sed 's/^NODE_//' | tr '[:upper:]' '[:lower:]' | tr '_' '-' | sort; })"
+    master_ports="$(gw_run '~/.mylinuxpool/bin/pool-port-alloc --list' | jq -r '[.[].port] | sort | .[]' 2>/dev/null)"
+
+    gw_json="$(gw_run 'cat /var/lib/mylinuxpool/state.json')"
+    if [[ -z "$gw_json" ]]; then
+        echo "mlp: gateway state.json unreadable — is the Gateway provisioned with the state cache?" >&2
+        gw_serial=""; gw_nodes=""; gw_ports=""
+    else
+        gw_serial="$(printf '%s' "$gw_json" | jq -r '.serial // empty')"
+        gw_nodes="$(printf '%s' "$gw_json" | jq -r '.nodes | keys[]' 2>/dev/null | sort)"
+        gw_ports="$(printf '%s' "$gw_json" | jq -r '[.workers[].port] | sort | .[]' 2>/dev/null)"
+    fi
+
+    if [[ -f "${MLP_STATE_DIR}/state.json" ]]; then
+        local_json="$(cat "${MLP_STATE_DIR}/state.json" 2>/dev/null)"
+        local_serial="$(printf '%s' "$local_json" | jq -r '.serial // empty')"
+        local_nodes="$(printf '%s' "$local_json" | jq -r '.nodes | keys[]' 2>/dev/null | sort)"
+        local_ports="$(printf '%s' "$local_json" | jq -r '[.workers[].port] | sort | .[]' 2>/dev/null)"
+    else
+        local_serial=""; local_nodes=""; local_ports=""
+    fi
+
+    close_gateway_master
+
+    # master has no serial — only the two cache copies do
+    master_serial=""
+
+    local drift=0
+    local name
+
+    printf '%s%sSTATE%s\n' "$C_BOLD" "$C_BOLD" "$C_RESET"
+    printf '  %-10s %-10s %-10s %-10s\n' "copy" "serial" "nodes" "ports"
+    printf '  %-10s %-10s %-10s %-10s\n' "master" "${master_serial:--}" "$(printf '%s' "$master_nodes" | grep -c . || true)" "$(printf '%s' "$master_ports" | grep -c . || true)"
+    printf '  %-10s %-10s %-10s %-10s\n' "gateway" "${gw_serial:--}" "$(printf '%s' "$gw_nodes" | grep -c . || true)" "$(printf '%s' "$gw_ports" | grep -c . || true)"
+    printf '  %-10s %-10s %-10s %-10s\n' "local" "${local_serial:--}" "$(printf '%s' "$local_nodes" | grep -c . || true)" "$(printf '%s' "$local_ports" | grep -c . || true)"
+
+    # node sets
+    local only_gw only_local only_master common
+    only_master="$(comm -23 <(printf '%s\n' "$master_nodes") <(printf '%s\n' "$gw_nodes") 2>/dev/null)"
+    only_gw="$(comm -13 <(printf '%s\n' "$master_nodes") <(printf '%s\n' "$gw_nodes") 2>/dev/null)"
+    only_local="$(comm -13 <(printf '%s\n' "$master_nodes") <(printf '%s\n' "$local_nodes") 2>/dev/null)"
+    if [[ -n "$only_master" || -n "$only_gw" ]]; then
+        echo ""
+        echo "node set differs (master vs gateway):"
+        [[ -n "$only_master" ]] && printf '%s    only in master:   %s%s\n' "$C_RED" "$(printf '%s' "$only_master" | tr '\n' ' ')" "$C_RESET"
+        [[ -n "$only_gw" ]] && printf '%s    only in gateway:  %s%s\n' "$C_RED" "$(printf '%s' "$only_gw" | tr '\n' ' ')" "$C_RESET"
+        drift=1
+    fi
+    if [[ -n "$only_local" ]]; then
+        echo ""
+        printf '%s    local has nodes missing from master: %s%s\n' "$C_YELLOW" "$(printf '%s' "$only_local" | tr '\n' ' ')" "$C_RESET"
+    fi
+
+    # worker port sets
+    local only_ports_master only_ports_gw
+    only_ports_master="$(comm -23 <(printf '%s\n' "$master_ports") <(printf '%s\n' "$gw_ports") 2>/dev/null)"
+    only_ports_gw="$(comm -13 <(printf '%s\n' "$master_ports") <(printf '%s\n' "$gw_ports") 2>/dev/null)"
+    if [[ -n "$only_ports_master" || -n "$only_ports_gw" ]]; then
+        echo ""
+        echo "worker port set differs (master vs gateway):"
+        [[ -n "$only_ports_master" ]] && printf '%s    only in master:   %s%s\n' "$C_RED" "$(printf '%s' "$only_ports_master" | tr '\n' ' ')" "$C_RESET"
+        [[ -n "$only_ports_gw" ]] && printf '%s    only in gateway:  %s%s\n' "$C_RED" "$(printf '%s' "$only_ports_gw" | tr '\n' ' ')" "$C_RESET"
+        drift=1
+    fi
+
+    # serials
+    if [[ -n "$gw_serial" && -n "$local_serial" && "$gw_serial" != "$local_serial" ]]; then
+        echo ""
+        printf '%s    serial differs: gateway=%s local=%s%s\n' "$C_YELLOW" "$gw_serial" "$local_serial" "$C_RESET"
+        drift=1
+    fi
+
+    if [[ "$drift" -eq 0 ]]; then
+        echo ""
+        printf '%sconsistent — master, gateway and local agree%s\n' "$C_GREEN" "$C_RESET"
+        return 0
+    fi
+    return 1
 }
 
 cmd_status() {
@@ -921,6 +1066,7 @@ main_menu() {
                 "wake           wake fh-l" \
                 "down           shut down fh-l" \
                 "status         run pool-status" \
+                "state          compare master vs Gateway vs local snapshots" \
                 "rotate         Gateway dry run (builds and discards a preview machine)" \
                 "rotate-real    replace the live Gateway for real (asks you to type its IP)" \
                 "worker-new     build and start a worker on a provider" \
@@ -940,6 +1086,7 @@ main_menu() {
             wake) cmd_wake ;;
             down) cmd_down ;;
             status) cmd_status ;;
+            state) cmd_state ;;
             rotate) cmd_rotate ;;
             rotate-real) cmd_rotate --real ;;
             worker-new) worker_new ;;
@@ -976,6 +1123,7 @@ main() {
         wake) cmd_wake "$@" ;;
         down) cmd_down "$@" ;;
         status) cmd_status "$@" ;;
+        state) cmd_state "$@" ;;
         rotate) cmd_rotate "$@" ;;
         worker) cmd_worker "$@" ;;
         ssh-config) cmd_ssh_config "$@" ;;
@@ -988,4 +1136,9 @@ main() {
     esac
 }
 
-main "$@"
+# Only run as a standalone command when actually executed, not sourced —
+# sourcing is how tests load the functions above (same pattern as
+# scripts/lib/crypto.sh and pool-tunnel).
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+    main "$@"
+fi

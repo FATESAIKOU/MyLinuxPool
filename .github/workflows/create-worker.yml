@@ -19,12 +19,9 @@ on:
   workflow_dispatch:
     inputs:
       provider:
-        description: Provider to host the worker
+        description: Provider to host the worker (a registered NODE_* with role=provider)
         required: true
-        type: choice
-        options:
-          - fh-l
-          - fh-proxy
+        type: string
       image:
         description: profiles/worker/<image> directory to build
         required: false
@@ -62,16 +59,41 @@ jobs:
       # `env:` here, never inlined directly into this script's own body,
       # since inlining is exactly what this step exists to make safe for
       # every step after it.
+      #
+      # provider is free text now (the choice list was a second copy of the
+      # NODE_* ledger; adding a provider meant editing the workflow, and
+      # nothing reminded you to — docs/REDESIGN.md §3.35). It is validated
+      # against the NODE_* variables themselves: the input must name a node
+      # whose role == "provider", compared in the hyphenated spelling
+      # (STATE_CONTRACT.md §2 invariant 2, NODE_FH_PROXY -> fh-proxy). A
+      # typo still fails — loudly, listing the actual options.
       - name: Validate inputs
         shell: bash
         env:
           IMAGE_IN: ${{ inputs.image }}
           NAME_IN: ${{ inputs.name }}
+          PROVIDER_IN: ${{ inputs.provider }}
         run: |
           set -euo pipefail
           source scripts/create-worker.sh
           create_worker_validate_name "$IMAGE_IN" image || { echo "::error::invalid 'image' input"; exit 1; }
           create_worker_validate_name "$NAME_IN" name || { echo "::error::invalid 'name' input"; exit 1; }
+
+          provider="$(printf '%s' "$PROVIDER_IN" | tr '[:upper:]' '[:lower:]' | tr '_' '-')"
+          if [[ -z "$provider" ]]; then
+            echo "::error::provider is required"
+            exit 1
+          fi
+          providers="$(gh api "repos/${GH_REPO}/actions/variables" --paginate --jq \
+            '[.variables[]
+              | select(.name | startswith("NODE_"))
+              | (.value | fromjson)
+              | select(.role == "provider")
+              | .name] | unique | sort' 2>/dev/null || true)"
+          if ! jq -e --arg p "$provider" 'index($p) != null' <<<"${providers:-[]}" >/dev/null 2>&1; then
+            echo "::error::'$PROVIDER_IN' is not a registered provider. Available: $(printf '%s' "${providers:-[]}" | jq -r 'join(", ")')"
+            exit 1
+          fi
 
       - name: Validate image profile
         shell: bash

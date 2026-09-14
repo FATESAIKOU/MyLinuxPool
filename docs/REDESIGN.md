@@ -316,11 +316,27 @@ N7 要求「主本只有一個地方」。目前狀態盤查（2026-09-15）：
 前兩項是真正的違規：**它們讓「加一台 provider」變成要改兩個地方**，
 而其中一個地方（workflow 的下拉選單）不會有任何機制提醒你忘了改。
 
-修法：
-- `create-worker` 的 provider 改成自由文字輸入，並在 workflow 內用
-  `NODE_*` 驗證它確實是一台已註冊的 provider（錯字仍會被擋，但清單不再重複）
-- `mlp` 的 `wake`/`down` 改成掃描所有節點、挑出宣告了 `power.launch` /
-  `power.shutdown` 的那些；只有一台時直接用，多台時用 fzf 選
+**兩項都已修正（2026-09-15）：**
+
+- `create-worker` 的 provider 改成自由文字，workflow 內用 `NODE_*` 驗證
+  `role == "provider"`。錯字仍被擋，錯誤訊息會列出可用名稱，
+  但清單不再有第二份。加一台 provider 現在只要註冊。
+- `mlp` 的 `wake`/`down` 改成掃描節點、挑出宣告了 `power.launch` /
+  `power.shutdown` 的（`power_targets` / `pick_power_target`）。
+  一台直接用、多台 fzf 選、零台明確報錯。
+
+剩下 `gh_token` 一項，見 §2.8——消除它需要 rotate 在切換前主動推位址給
+provider，本次不做。
+
+## 3.36 `mlp state`：讓分歧看得見
+
+比對主本、Gateway 快取、本機快取三處的 serial／節點集合／埠集合，
+一致回 0、不一致列出差異並回非 0。
+
+第一次實跑就抓到東西：我的 Mac 上有一份 `serial 99`、含兩個不存在的 worker
+的 `state.json`——是某個 agent 手動造來驗自己程式碼時留下的。
+在此之前那份假資料躺在那裡不會有任何人發現，而 `pool-resolve` 的第一層
+讀取會優先採用它。
 
 ## 3.4 派工方式
 
