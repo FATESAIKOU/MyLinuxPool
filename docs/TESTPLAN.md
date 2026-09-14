@@ -76,8 +76,8 @@
 | V10 | **worker 跟隨檔遺失** | 刪掉 `gateway/gateway.json`，worker 仍能在下次 rotate 跟上 | ⚠️ 部分——檔案本身已驗會自癒（V9），但「遺失後仍跟得上 rotate」未單獨驗 |
 | V11 | **主本與實際分歧** | `mlp state` 能看出差異 | ✅ 已驗——第一次跑就抓到我 Mac 上一份 serial 99 的假快取 |
 | V12 | **rotate 與 provider 離線同時發生** | 兩台都有 worker；rotate 途中關掉 fh-l 再喚醒 | ✅ 已驗（見下） |
-| V13 | **provider 宣告漂移自癒** | 竄改 `bin/pool-status` 後 `pool-sync` 把它修回來；無漂移時不重啟 tunnel | ⬜ 本次部署驗收 |
-| V14 | **provider 不再留常駐 clone** | 部署後 `~/.mylinuxpool/` 無 `repo/`，且推導不出的資訊只剩 `config` + `gh_token` | ⬜ 本次部署驗收 |
+| V13 | **provider 宣告漂移自癒** | 竄改 `bin/pool-status` 後 `pool-sync` 把它修回來；無漂移時不重啟 tunnel | ✅ 已驗——兩台各 17/17 |
+| V14 | **provider 不再留常駐 clone** | 部署後 `~/.mylinuxpool/` 無 `repo/`，且推導不出的資訊只剩 `config` + `gh_token` | ✅ 已驗——8.2 MB → 只剩衍生物；推 master 後兩台各自收斂到新的 unit 檔 |
 
 ### V12 實測（2026-09-14，generation 9 → 10）
 
