@@ -187,6 +187,46 @@ jobs:
           # exact secret value in any log line regardless.
           rotate_run_provision fatesaikou "$PREVIEW_IP" "$trusted_ips" "$FILE_CRYPTO_KEY"
 
+      # The check that was missing. A rotate used to switch NODE_GATEWAY
+      # and only then discover whether providers could attach; when they
+      # couldn't, that was three minutes of no tunnels before the
+      # rollback. Ask one provider first, while the live Gateway is still
+      # in charge, and a bad machine costs nothing.
+      #
+      # Runs on dry runs too — proving a preview is reachable by a real
+      # provider is most of what a dry run is for.
+      - name: Probe a real provider tunnel into the new Gateway
+        id: probe
+        shell: bash
+        env:
+          PREVIEW_IP: ${{ steps.create_preview.outputs.preview_ip }}
+        run: |
+          set -euo pipefail
+          source scripts/rotate-gateway.sh
+          cmd="$(rotate_build_tunnel_probe_cmd "$PREVIEW_IP" sshproxy 2999)"
+          echo "cmd=${cmd}" >> "$GITHUB_OUTPUT"
+
+      - name: Run the probe on fh-l
+        id: probe_run
+        continue-on-error: true
+        uses: ./.github/actions/pool-ssh
+        with:
+          node: fh-l
+          command: ${{ steps.probe.outputs.cmd }}
+          timeout: 30
+
+      - name: Fail the rotate if the probe could not build a tunnel
+        shell: bash
+        env:
+          OUTCOME: ${{ steps.probe_run.outcome }}
+        run: |
+          set -euo pipefail
+          if [[ "$OUTCOME" != "success" ]]; then
+            echo "::error::a provider could not build a reverse tunnel into the new Gateway — see the probe step's log for ssh's own message. NODE_GATEWAY was NOT switched; the live Gateway is untouched."
+            exit 1
+          fi
+          echo "provider tunnel probe succeeded"
+
       # Before the switch, so a failure here still leaves the live Gateway
       # in charge. Runs on dry runs too — the copy targets the preview
       # machine that is about to be deleted, so it costs nothing and keeps

@@ -144,6 +144,31 @@ rotate_wait_for_cloud_init() {
     esac
 }
 
+# rotate_build_tunnel_probe_cmd <new_ip> <tunnel_user> <probe_port>
+#   Prints the command to run ON A PROVIDER that answers the only question
+#   that matters before a switch: can this machine actually build its
+#   reverse tunnel to the new Gateway?
+#
+#   Until now nothing asked. The rotate switched NODE_GATEWAY first and
+#   found out afterwards, by watching for providers that never arrived —
+#   which on 2026-09-14 meant three minutes with no tunnels before the
+#   rollback. Asking first turns that into a failure before the switch,
+#   with the live Gateway still serving.
+#
+#   Deliberately mirrors pool-tunnel's own ssh options, because a probe
+#   that connects differently from the real thing proves nothing. The one
+#   difference is the port: a scratch port, so the probe cannot collide
+#   with the forward the provider is currently holding open on the live
+#   Gateway.
+rotate_build_tunnel_probe_cmd() {
+    local new_ip="$1" tunnel_user="$2" probe_port="$3"
+    printf '%s\n' "ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new \
+-o ExitOnForwardFailure=yes -o AddressFamily=inet -o ConnectTimeout=10 \
+-i \$HOME/.ssh/id_pool -o IdentitiesOnly=yes \
+-R 127.0.0.1:${probe_port}:localhost:22 ${tunnel_user}@${new_ip} \
+'echo TUNNEL_PROBE_OK'"
+}
+
 # rotate_carry_worker_claims <user> <old_ip> <new_ip>
 #   Copy the worker port ledger (~/pool/workers.d) from the outgoing
 #   Gateway to the incoming one.
