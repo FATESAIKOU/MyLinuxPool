@@ -73,6 +73,24 @@ unit 的 `--check` 必須比對**內容**，不是檔案存在。
 2. 沒有任何一個地方能看到「叢集現在長怎樣」
 3. 埠帳本沒有主本（違反 N1）
 
+**N8 每台機器上的持久狀態趨近於零。**
+除了**身分**與**憑證**，任何機器上的 `~/.mylinuxpool/` 內容都必須是
+可重建的衍生物——整個刪掉之後系統要能自己長回來。
+
+盤點（節點 = 主本的副本，副本越多、越不一致的機會越大）：
+
+| 機器 | 內容 | 性質 |
+|---|---|---|
+| Mac | `known_hosts`、`cache/`、`ssh_config` | 全部可重建 |
+| provider | `config`（節點名） | **身分**——不可衍生 |
+| provider | `gh_token` | **憑證**——不可衍生 |
+| provider | `repo/`、`bin/`、`gateway/`、`gateway_known_hosts`、`cache/` | 全部可重建 |
+| Gateway | `repo/`、`bin/`、`workers.d/` | 全部可重建（帳本改為 `POOL_WORKERS` 的快取後） |
+| worker | 無（掛載 + 環境變數） | 已經是 0 |
+
+> 驗收判準：在 provider 上刪掉除 `config` 與 `gh_token` 以外的一切，
+> 系統必須自行恢復，不需人工介入。
+
 ---
 
 # 2. 基本設計
@@ -149,6 +167,11 @@ Gateway 當快取則沒有這個問題：推送失敗只是退回問 GitHub，�
 | 2 | GitHub var | Gateway 換人或掛掉 | 是 |
 | 3 | 本機 30 秒快取 | GitHub 也不可用 | 否 |
 
+**快取是無條件信任的**（2026-09-14 決議）。讀取端不去驗證它新不新——
+要驗證就得問 GitHub，那省 API 的目的就落空了，是循環論證。
+正確性改由**寫入端**保證：任何改變狀態的 workflow，**推完快取才算完成**，
+推送失敗就是 workflow 失敗。
+
 **Gateway 自己的位址是唯一例外**：它必須來自 GitHub 或本機快取，
 否則就是先有雞還是先有蛋。這也正是 N7 描述的 failback。
 
@@ -175,8 +198,8 @@ Gateway 依然零 GitHub 憑證：它只被寫入，不主動寫 GitHub。
 | Gateway 掛了 | 節點退回問 GitHub；`mlp` 亦同 |
 | GitHub 掛了 | 節點用 Gateway 快取；已連線者不受影響 |
 | 兩者都掛 | 節點用本機 30 秒快取重建隧道（現有行為，保留） |
-| state.json 比 var 舊 | `serial` 可偵測；讀取端記錄警告並改問 GitHub |
-| 推送 state.json 失敗 | 僅記錄警告，不使 workflow 失敗（快取而已） |
+| state.json 比 var 舊 | **不會發生**——見下方「無條件信任」 |
+| 推送 state.json 失敗 | **workflow 失敗**。既然讀取端無條件信任快取，一份沒推成功的快取就是錯誤狀態，不能當成小事 |
 
 ## 2.7 一併收尾的既有缺陷
 
@@ -185,6 +208,19 @@ Gateway 依然零 GitHub 憑證：它只被寫入，不主動寫 GitHub。
 | D1 | 埠帳本在 `~/pool/`，其餘在 `~/.mylinuxpool/` | 帳本任務 |
 | D2 | `pool-resolve` 快取鍵重複（`fh_proxy` / `fh-proxy` 兩份，`--refresh` 只刷一份） | 讀取路徑任務 |
 | D3 | Gateway 上有無人使用的 `id_rsa`（違反 N2） | 獨立小任務 |
+
+## 2.8 N8 帶來的設計含意
+
+**provider 的 `gh_token` 是唯一擋在「零狀態」前面的東西。**
+有一條路可以再往下砍：rotate 在**切換之前**，透過還活著的舊 Gateway
+把新位址推給每一台掛著的 provider。這樣計畫性的 rotate 完全不需要 GitHub，
+token 退化成「Gateway 非計畫性死亡」時的破窗工具。
+
+本次**不做**，但設計上不要擋死：`state.json` 的推送機制天生就能拿來做這件事。
+
+其餘衍生物的處理原則：**能重建就不要保護它**。
+`bin/`、`repo/`、`cache/`、`gateway_known_hosts` 都不需要備份、不需要遷移、
+不需要在 rotate 時搬運——刪掉就重建。
 
 ---
 
@@ -242,6 +278,7 @@ Gateway 依然零 GitHub 憑證：它只被寫入，不主動寫 GitHub。
 | V6 | 實體斷網 | 60 秒回收殭屍埠、恢復（維持現有表現） |
 | V7 | Worker 跟隨 rotate | 容器 ID 不變 |
 | V8 | `verify-profile` | 三台皆 `matches`，且比對內容 |
+| V9 | **零狀態（新）** | provider 上刪掉除 `config`、`gh_token` 外的一切，系統自行恢復 |
 
 V5 的模擬方式：在 provider 上把 `api.github.com` 指到黑洞，或撤掉 token
 （後者較貼近真實：token 過期是實際會發生的事）。
