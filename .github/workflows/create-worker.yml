@@ -263,6 +263,11 @@ jobs:
           gateway-ip: ${{ steps.gateway.outputs.ip }}
           host-key: ${{ steps.gateway.outputs.host_key }}
           source: create-worker#${{ github.run_id }}
+          # These workflows reach machines through the pool-ssh action,
+          # which loads keys per call — there is no agent for push-state to
+          # borrow, unlike repair-gateway. Hand it the key instead of
+          # depending on what the caller happens to have set up.
+          ssh-key: ${{ secrets.SSH_KEY_ACTIONS }}
 
       - name: Verify worker is actually reachable (not just alive)
         shell: bash

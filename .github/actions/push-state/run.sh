@@ -49,13 +49,32 @@ SSH_KEY="${PUSH_SSH_KEY:-}"
 # step) is used as before.
 SSH_AGENT_PID_OLD="${SSH_AGENT_PID:-}"
 SSH_AUTH_SOCK_OLD="${SSH_AUTH_SOCK:-}"
+STARTED_AGENT=0
 cleanup_agent() {
-    if [[ -n "$SSH_AGENT_PID_OLD" && -n "$SSH_AGENT_PID" && "$SSH_AGENT_PID" != "$SSH_AGENT_PID_OLD" ]]; then
+    # Kill only the agent WE started. A caller's agent (same socket path
+    # before and after) must survive this step.
+    if [[ "$STARTED_AGENT" -eq 1 ]]; then
         ssh-agent -k >/dev/null 2>&1 || true
     fi
 }
 if [[ -n "$SSH_KEY" ]]; then
+    # ssh-agent (macOS at least) puts its socket under ~/.ssh — make sure
+    # it exists before the agent tries to create it there.
+    if ! mkdir -p "${HOME}/.ssh"; then
+        log ERROR "could not create ${HOME}/.ssh for the temporary ssh-agent"
+        exit 1
+    fi
     eval "$(ssh-agent -s)" >/dev/null
+    # The eval only helps if the agent actually started. When it did not
+    # (e.g. socket creation failed), SSH_AUTH_SOCK still points at the
+    # caller's agent — loading the key there would silently fall back to
+    # the exact hidden dependency this input exists to remove, and a
+    # `publickey denied` later would look unrelated. Fail loudly instead.
+    if [[ -z "${SSH_AGENT_PID:-}" || -z "${SSH_AUTH_SOCK:-}" || "${SSH_AUTH_SOCK:-}" == "$SSH_AUTH_SOCK_OLD" ]]; then
+        log ERROR "could not start the temporary ssh-agent for the provided key"
+        exit 1
+    fi
+    STARTED_AGENT=1
     if ! printf '%s\n' "$SSH_KEY" | ssh-add - >/dev/null 2>&1; then
         log ERROR "could not load the provided ssh key into the temporary agent"
         cleanup_agent
