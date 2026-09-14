@@ -392,6 +392,47 @@ pool-port-alloc --list                       # 列出目前登記
   時以 env 或 mount 注入
 - entrypoint：起 sshd → 起 `pool-tunnel`（與 provider 共用同一支程式）
 
+### 10.2b Worker profile：宣告需要哪些機密
+
+每個 `workers/<image>/` 底下放一份 `profile.json`，宣告這個 worker 需要什麼。
+**只寫 secret 的名稱，不寫值** —— 與 node var 用 `key_secret` 指向 secret
+名稱是同一個模式。
+
+```json
+{
+  "name": "base",
+  "description": "標準 Linux 工作環境",
+  "secrets": {},
+  "env": {}
+}
+```
+
+```json
+{
+  "name": "ai-dev",
+  "description": "容器內跑 AI agent 做開發",
+  "secrets": {
+    "GH_TOKEN": "GH_DEV_TOKEN",
+    "ANTHROPIC_API_KEY": "ANTHROPIC_API_KEY"
+  },
+  "env": { "GIT_AUTHOR_NAME": "mylinuxpool-worker" }
+}
+```
+
+- `secrets` 是「容器內的環境變數名稱 → GitHub secret 名稱」的對應。
+  `create-worker` 依此逐一取出並以 `-e` 注入。
+- **profile 進版控，值永遠不進。** 換 token 只需改 profile 裡的名字，
+  不必動任何程式碼。
+- 若 profile 宣告的 secret 在 repo 中不存在，`create-worker` 必須以明確
+  錯誤中止（列出缺哪一個），不可靜默注入空值。
+- `base` 的 `secrets` 是空的 —— 它完全不帶任何 GitHub 憑證。
+
+> **為什麼隧道不走這條路。** 隧道所需的 Gateway 位址與埠由
+> `create-worker` 在 `docker run` 當下直接注入（見 §10.3），與 profile 無關。
+> 因此一個沒宣告任何 secret 的 worker 仍能連回 Gateway，容器內卻沒有任何
+> GitHub 憑證可被竊取。容器內的工作需要什麼權限，由 profile 明確宣告，
+> 而不是繼承一把萬用 token。
+
 ### 10.3 Worker 的隧道身分
 
 Worker 沿用 `pool-tunnel`，但它的「節點定義」不在 GitHub var 裡
@@ -399,8 +440,13 @@ Worker 沿用 `pool-tunnel`，但它的「節點定義」不在 GitHub var 裡
 
 - `pool-tunnel` 需支援從**環境變數**取得自身設定，作為 `pool-resolve <name>`
   的替代路徑：`POOL_GATEWAY_PORT`、`POOL_NODE_NAME`
-- Gateway 的位址仍走 `pool-resolve gateway`（worker 需要 `GH_WORKER_TOKEN`）
+- **Gateway 的位址也一併由環境變數注入**：`POOL_GATEWAY_HOST`、
+  `POOL_GATEWAY_USER`。三者皆設定時，`pool-tunnel` 完全不呼叫
+  `pool-resolve`，因此 worker **不需要任何 GitHub 憑證即可建立隧道**。
 - 若 `POOL_GATEWAY_PORT` 已設定，就不去讀 `NODE_<NAME>` var
+- 代價：worker 無法偵測 Gateway 換人，rotate 後連不回來。這正是預期行為
+  —— worker 是拋棄式的（`ARCHITECTURE.md` §1），rotate 後重跑
+  `create-worker` 即可。
 
 ### 10.4 workflows
 
