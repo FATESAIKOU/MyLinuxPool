@@ -62,6 +62,7 @@ CTL_DIR=""
 CTL=""
 GW_IP=""
 GW_USER=""
+GW_HOST_KEY=""
 
 # ---- colors: tput, off outside a real terminal --------------------------
 if [[ -t 1 ]] && command -v tput >/dev/null 2>&1; then
@@ -128,7 +129,20 @@ resolve_gateway() {
     [[ $rc -eq 0 ]] || die "pool-resolve gateway failed (exit ${rc})"
     GW_IP="$(printf '%s' "$json" | jq -r '.ip // empty')"
     GW_USER="$(printf '%s' "$json" | jq -r '.user // empty')"
+    GW_HOST_KEY="$(printf '%s' "$json" | jq -r '.host_key // empty')"
     [[ -n "$GW_IP" && -n "$GW_USER" ]] || die "NODE_GATEWAY is missing ip/user"
+
+    # NODE_GATEWAY carries the Gateway's host key, written by the rotate
+    # that built the machine and writable only by Actions. Pin to it, so a
+    # rotate needs no `trust-gateway` afterwards and a recycled Linode
+    # address cannot collide with a stale entry (RUNBOOK §7.8).
+    if [[ -n "$GW_HOST_KEY" ]]; then
+        mkdir -p "$MLP_STATE_DIR"
+        if ! grep -qxF "${GW_IP} ${GW_HOST_KEY}" "$GW_KNOWN_HOSTS" 2>/dev/null; then
+            ssh-keygen -R "$GW_IP" -f "$GW_KNOWN_HOSTS" >/dev/null 2>&1
+            printf '%s %s\n' "$GW_IP" "$GW_HOST_KEY" >> "$GW_KNOWN_HOSTS"
+        fi
+    fi
 }
 
 open_gateway_master() {
@@ -158,6 +172,16 @@ cmd_trust_gateway() {
     resolve_gateway
     mkdir -p "$MLP_STATE_DIR"
     touch "$GW_KNOWN_HOSTS"
+
+    # resolve_gateway already pinned the key NODE_GATEWAY carries, which
+    # is a real identity check rather than trusting whatever answers.
+    # Nothing left to do, and nothing to accept on faith.
+    if [[ -n "$GW_HOST_KEY" ]]; then
+        printf '%spinned %s from NODE_GATEWAY%s → %s\n' \
+            "$C_GREEN" "$GW_IP" "$C_RESET" "$GW_KNOWN_HOSTS"
+        echo "  (no trust-on-first-use needed; this runs automatically on every mlp command)"
+        return 0
+    fi
 
     # Unconditional and silent-if-nothing-to-do on purpose: macOS's default
     # /etc/ssh/ssh_config sets HashKnownHosts yes, so entries in here won't
