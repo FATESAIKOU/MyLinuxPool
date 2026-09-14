@@ -78,6 +78,7 @@
 | V12 | **rotate 與 provider 離線同時發生** | 兩台都有 worker；rotate 途中關掉 fh-l 再喚醒 | ✅ 已驗（見下） |
 | V13 | **provider 宣告漂移自癒** | 竄改 `bin/pool-status` 後 `pool-sync` 把它修回來；無漂移時不重啟 tunnel | ✅ 已驗——兩台各 17/17 |
 | V14 | **provider 不再留常駐 clone** | 部署後 `~/.mylinuxpool/` 無 `repo/`，且推導不出的資訊只剩 `config` + `gh_token` | ✅ 已驗——8.2 MB → 只剩衍生物；推 master 後兩台各自收斂到新的 unit 檔 |
+| V15 | **rotate 後 provider 狀態仍最小** | rotate 到 generation 11 之後，`~/.mylinuxpool/` 仍無 `repo/`，`pool-sync` 仍正常，worker 原地存活 | ✅ 已驗——fh-proxy 17/17；容器 `1bfa9e46f8ac` 未重建；`mlp state` consistent |
 
 ### V12 實測（2026-09-14，generation 9 → 10）
 
