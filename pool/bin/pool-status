@@ -1,0 +1,386 @@
+#!/usr/bin/env bash
+# pool-status — read-only cluster diagnostic.
+# spec: docs/POOL_RUNTIME_SPEC.md §1, docs/RUNBOOK.md §7.1
+#
+# One run should show where the cluster is broken. It never fixes anything,
+# never aborts on a single failed check, and gets every address value through
+# pool-resolve. gh is only used to enumerate NODE_* variable names so that we
+# can discover providers; values never come from gh here.
+
+set -uo pipefail
+
+REPO="${POOL_REPO:-FATESAIKOU/MyLinuxPool}"
+STATE_DIR="${HOME}/.mylinuxpool"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
+POOL_RESOLVE="${SCRIPT_DIR}/pool-resolve"
+
+SSH_OPTS=(-o BatchMode=yes -o ConnectTimeout=5 -o StrictHostKeyChecking=accept-new)
+
+BRIEF=0
+ok_count=0
+warn_count=0
+fail_count=0
+
+usage() {
+    echo "usage: pool-status [--brief]" >&2
+}
+
+parse_args() {
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --brief) BRIEF=1; shift ;;
+            -h|--help) usage; exit 0 ;;
+            *) usage; exit 2 ;;
+        esac
+    done
+}
+
+parse_args "$@"
+
+report() {
+    local st="$1" name="$2" desc="${3:-}"
+    case "$st" in
+        OK) ok_count=$((ok_count + 1)) ;;
+        WARN) warn_count=$((warn_count + 1)) ;;
+        FAIL) fail_count=$((fail_count + 1)) ;;
+    esac
+    [[ "$BRIEF" -eq 1 && "$st" == "OK" ]] && return 0
+    if [[ -n "$desc" ]]; then
+        printf '[%s] %s: %s\n' "$st" "$name" "$desc"
+    else
+        printf '[%s] %s\n' "$st" "$name"
+    fi
+}
+
+oneline() { printf '%s' "$1" | tr '\n' ' '; }
+
+# `timeout` is not in POSIX, but it is on every host we run on; degrade to a
+# direct call if it is missing so the tool still runs.
+HAS_TIMEOUT=0
+command -v timeout >/dev/null 2>&1 && HAS_TIMEOUT=1
+tmo() {
+    if [[ "$HAS_TIMEOUT" -eq 1 ]]; then
+        timeout "$@"
+    else
+        shift
+        "$@"
+    fi
+}
+
+load_gh_token() {
+    if [[ -z "${GH_TOKEN:-}" && -f "${STATE_DIR}/gh_token" ]]; then
+        GH_TOKEN="$(cat "${STATE_DIR}/gh_token")"
+        export GH_TOKEN
+    fi
+}
+
+# Classifies a TCP connection attempt: ok | timeout | refused | dns | error.
+# Refused is the fail2ban signature from RUNBOOK §7.1 (reject with
+# icmp port-unreachable), hence the distinct class.
+tcp_classify() {
+    local host="$1" port="$2" err rc err_lc
+    err="$(tmo 5 bash -c "exec 3<>/dev/tcp/${host}/${port}" 2>&1)"
+    rc=$?
+    if [[ $rc -eq 0 ]]; then
+        printf 'ok'
+        return 0
+    fi
+    if [[ $rc -eq 124 ]]; then
+        printf 'timeout'
+        return 0
+    fi
+    err_lc="$(printf '%s' "$err" | tr '[:upper:]' '[:lower:]')"
+    case "$err_lc" in
+        *refused*) printf 'refused' ;;
+        *"name or service"*|*nodename*|*"unknown host"*|*"temporary failure in name resolution"*|*"could not resolve"*)
+            printf 'dns' ;;
+        *) printf 'error' ;;
+    esac
+}
+
+range_ports() {
+    local lo="$1" hi="$2" p
+    while IFS= read -r p; do
+        case "$p" in ''|*[!0-9]*) continue ;; esac
+        (( p >= lo && p <= hi )) && printf '%s\n' "$p"
+    done
+}
+
+# ---------------------------------------------------------------------------
+# A. local prerequisites
+# ---------------------------------------------------------------------------
+missing_tools=""
+for tool in gh jq ssh; do
+    command -v "$tool" >/dev/null 2>&1 || missing_tools="${missing_tools} ${tool}"
+done
+if [[ -z "$missing_tools" ]]; then
+    report OK "本機工具" "gh / jq / ssh 皆存在"
+else
+    report FAIL "本機工具" "缺少:${missing_tools}"
+fi
+
+if [[ -f "${STATE_DIR}/gh_token" ]]; then
+    if [[ -s "${STATE_DIR}/gh_token" ]]; then
+        report OK "gh_token 檔案" "存在且非空"
+    else
+        report WARN "gh_token 檔案" "存在但為空（${STATE_DIR}/gh_token）"
+    fi
+else
+    report OK "gh_token 檔案" "不存在；將使用 gh 的既有認證狀態"
+fi
+
+GW_JSON=""
+GW_IP=""
+GW_USER=""
+GW_TUNNEL_USER=""
+GW_ERR=""
+if [[ ! -x "$POOL_RESOLVE" ]]; then
+    report FAIL "pool-resolve gateway" "${POOL_RESOLVE} 不存在或不可執行"
+else
+    of="$(mktemp "${TMPDIR:-/tmp}/pool-status.XXXXXX")"
+    ef="$(mktemp "${TMPDIR:-/tmp}/pool-status.XXXXXX")"
+    "$POOL_RESOLVE" gateway --refresh >"$of" 2>"$ef"
+    GW_RC=$?
+    GW_JSON="$(cat "$of")"
+    GW_ERR="$(oneline "$(cat "$ef")")"
+    rm -f "$of" "$ef"
+    if [[ $GW_RC -ne 0 ]]; then
+        report FAIL "pool-resolve gateway" "退出碼 ${GW_RC}: ${GW_ERR:0:200}"
+    else
+        if printf '%s' "$GW_ERR" | grep -q 'WARN'; then
+            report WARN "pool-resolve gateway" "使用過期快取: ${GW_ERR:0:200}"
+        else
+            report OK "pool-resolve gateway" "成功（GitHub 認證正常）"
+        fi
+        GW_IP="$(printf '%s' "$GW_JSON" | jq -r '.ip // empty' 2>/dev/null)"
+        GW_USER="$(printf '%s' "$GW_JSON" | jq -r '.user // empty' 2>/dev/null)"
+        GW_TUNNEL_USER="$(printf '%s' "$GW_JSON" | jq -r '.tunnel_user // empty' 2>/dev/null)"
+        if [[ -z "$GW_IP" ]]; then
+            report FAIL "gateway var" "缺少 .ip"
+        fi
+        if [[ -z "$GW_USER" ]]; then
+            report FAIL "gateway var" "缺少 .user（無法測 ssh 登入）"
+        fi
+    fi
+fi
+
+# ---------------------------------------------------------------------------
+# B. gateway
+# ---------------------------------------------------------------------------
+GW_LOGIN_USER=""
+GW_SSH_EXTRA=()
+GW_LOGIN_OK=0
+GW_PORTS_OK=0
+GW_PORTS=""
+GW_SS=""
+
+gw_ssh() {
+    tmo 25 ssh "${SSH_OPTS[@]}" ${GW_SSH_EXTRA[@]+"${GW_SSH_EXTRA[@]}"} \
+        "${GW_LOGIN_USER}@${GW_IP}" "$1" 2>&1
+}
+
+if [[ -n "$GW_IP" ]]; then
+    TCP_CLASS="$(tcp_classify "$GW_IP" 22)"
+    case "$TCP_CLASS" in
+        ok)
+            report OK "Gateway TCP 22" "${GW_IP}:22 可達"
+            ;;
+        timeout)
+            report FAIL "Gateway TCP 22" "逾時（${GW_IP}:22；可能是網路或防火牆 DROP）"
+            ;;
+        refused)
+            report FAIL "Gateway TCP 22" "立即被拒（${GW_IP}:22 Connection refused）"
+            printf '       hint: 若 ICMP 通但 TCP 立即被拒，優先懷疑 fail2ban，執行 `nft list ruleset | grep -A5 f2b-table` 檢查\n'
+            ;;
+        dns)
+            report FAIL "Gateway TCP 22" "DNS/解析錯誤（${GW_IP}）"
+            ;;
+        *)
+            report FAIL "Gateway TCP 22" "其他連線錯誤（${GW_IP}:22）"
+            ;;
+    esac
+
+    if [[ "$TCP_CLASS" == "ok" && -n "$GW_USER" ]]; then
+        # Management login first (that is the Actions path); fall back to the
+        # tunnel identity with the shared id_pool key when running on a
+        # provider that has no management access to the Gateway.
+        ssh_err="$(tmo 12 ssh "${SSH_OPTS[@]}" "${GW_USER}@${GW_IP}" true 2>&1)"
+        ssh_rc=$?
+        if [[ $ssh_rc -eq 0 ]]; then
+            GW_LOGIN_USER="$GW_USER"
+            GW_SSH_EXTRA=()
+            GW_LOGIN_OK=1
+        elif [[ -f "${HOME}/.ssh/id_pool" && -n "$GW_TUNNEL_USER" ]]; then
+            ssh_err="$(tmo 12 ssh "${SSH_OPTS[@]}" -i "${HOME}/.ssh/id_pool" -o IdentitiesOnly=yes \
+                "${GW_TUNNEL_USER}@${GW_IP}" true 2>&1)"
+            ssh_rc=$?
+            if [[ $ssh_rc -eq 0 ]]; then
+                GW_LOGIN_USER="$GW_TUNNEL_USER"
+                GW_SSH_EXTRA=(-i "${HOME}/.ssh/id_pool" -o IdentitiesOnly=yes)
+                GW_LOGIN_OK=1
+            fi
+        fi
+        if [[ "$GW_LOGIN_OK" -eq 1 ]]; then
+            report OK "Gateway SSH 登入" "以 ${GW_LOGIN_USER} 登入成功"
+        else
+            report FAIL "Gateway SSH 登入" "失敗: $(oneline "$ssh_err" | cut -c1-160)"
+        fi
+    elif [[ "$TCP_CLASS" == "ok" ]]; then
+        report WARN "Gateway SSH 登入" "略過（gateway var 缺 .user）"
+    else
+        report WARN "Gateway SSH 登入" "略過（TCP 不可達）"
+    fi
+fi
+
+if [[ "$GW_LOGIN_OK" -eq 1 ]]; then
+    GW_SS="$(gw_ssh 'ss -tln')"
+    ss_rc=$?
+    if [[ $ss_rc -ne 0 ]]; then
+        report WARN "Gateway listener 2000–2999" "ss 執行失敗 (rc=${ss_rc}): $(oneline "$GW_SS" | cut -c1-120)"
+    else
+        GW_PORTS="$(printf '%s\n' "$GW_SS" | grep -o '127\.0\.0\.1:[0-9]*' | cut -d: -f2 | sort -n -u)"
+        GW_PORTS_OK=1
+        LIST_2000="$(printf '%s\n' "$GW_PORTS" | range_ports 2000 2999)"
+        if [[ -n "$LIST_2000" ]]; then
+            pretty="$(printf '%s\n' "$LIST_2000" | tr '\n' ' ' | sed 's/ *$//' | tr ' ' ',')"
+            report OK "Gateway listener 2000–2999" "$pretty"
+        else
+            report WARN "Gateway listener 2000–2999" "無任何 listener"
+        fi
+    fi
+else
+    report WARN "Gateway listener 2000–2999" "略過（Gateway 無法登入）"
+fi
+
+# ---------------------------------------------------------------------------
+# C. providers (discover NODE_* vars, then ask pool-resolve for each value)
+# ---------------------------------------------------------------------------
+LOCAL_NODE=""
+if [[ -f "${STATE_DIR}/config" ]]; then
+    LOCAL_NODE="$(sed -n 's/^NODE_NAME=//p' "${STATE_DIR}/config" | head -n 1)"
+fi
+LOCAL_NODE_NORM="${LOCAL_NODE//-/_}"
+
+PROVIDER_LIST=""
+if command -v gh >/dev/null 2>&1; then
+    load_gh_token
+    ALL_VARS="$(gh api "repos/${REPO}/actions/variables?per_page=100" --jq '.variables[].name' 2>/dev/null)"
+    vars_rc=$?
+    if [[ $vars_rc -ne 0 ]]; then
+        report WARN "provider 清單" "無法列出 NODE_* var（gh api 失敗）"
+    else
+        NODE_VARS="$(printf '%s\n' "$ALL_VARS" | grep '^NODE_' || true)"
+        while IFS= read -r var; do
+            [[ -n "$var" ]] || continue
+            node="$(printf '%s' "${var#NODE_}" | tr '[:upper:]' '[:lower:]')"
+            pjson="$("$POOL_RESOLVE" "$node" 2>/dev/null)"
+            p_rc=$?
+            if [[ $p_rc -ne 0 ]]; then
+                report FAIL "節點 ${node}" "pool-resolve 失敗（退出碼 ${p_rc}）"
+                continue
+            fi
+            role="$(printf '%s' "$pjson" | jq -r '.role // empty' 2>/dev/null)"
+            [[ "$role" == "provider" ]] || continue
+            pname="$(printf '%s' "$pjson" | jq -r '.name // empty' 2>/dev/null)"
+            [[ -n "$pname" ]] || pname="$node"
+            pport="$(printf '%s' "$pjson" | jq -r '.gateway_port // empty' 2>/dev/null)"
+            if [[ -z "$pport" ]]; then
+                report FAIL "provider ${pname}" "缺少 gateway_port"
+                continue
+            fi
+            PROVIDER_LIST="${PROVIDER_LIST}${pname}|${pport}"$'\n'
+        done <<< "$NODE_VARS"
+    fi
+fi
+
+if [[ -z "$PROVIDER_LIST" ]]; then
+    report WARN "provider 清單" "找不到任何 role=provider 的節點"
+else
+    banner_ports="$(printf '%s' "$PROVIDER_LIST" | cut -d'|' -f2 | tr '\n' ' ')"
+    BANNER_OUT=""
+    if [[ "$GW_LOGIN_OK" -eq 1 ]]; then
+        # Banner, not just an open port — §3.2: `nc -z` cannot tell our
+        # tunnel from a rogue listener on the same port.
+        banner_cmd="for p in ${banner_ports}; do printf '%s ' \"\$p\"; timeout 2 nc 127.0.0.1 \"\$p\" </dev/null 2>/dev/null | head -c 4; echo; done"
+        BANNER_OUT="$(gw_ssh "$banner_cmd")"
+    fi
+
+    while IFS='|' read -r pname pport; do
+        [[ -n "$pname" ]] || continue
+        if [[ "$GW_PORTS_OK" -eq 1 ]]; then
+            if printf '%s\n' "$GW_PORTS" | grep -qx "$pport"; then
+                report OK "provider ${pname} listener" "Gateway 127.0.0.1:${pport} 有 listener"
+            else
+                report FAIL "provider ${pname} listener" "Gateway 127.0.0.1:${pport} 沒有 listener"
+            fi
+            if printf '%s\n' "$BANNER_OUT" | grep -q "^${pport} SSH-"; then
+                report OK "provider ${pname} banner" "127.0.0.1:${pport} 回得出 SSH banner"
+            else
+                report FAIL "provider ${pname} banner" "127.0.0.1:${pport} 未回 SSH banner（可能是冒牌 listener 或隧道半死）"
+            fi
+        else
+            report WARN "provider ${pname}" "略過埠檢查（Gateway listener 清單不可得）"
+        fi
+
+        pname_norm="${pname//-/_}"
+        if [[ -n "$LOCAL_NODE_NORM" && "$pname_norm" == "$LOCAL_NODE_NORM" ]]; then
+            if command -v systemctl >/dev/null 2>&1; then
+                svc="$(tmo 5 systemctl --user is-active pool-tunnel 2>/dev/null)"
+                if [[ "$svc" == "active" ]]; then
+                    report OK "provider ${pname} 本機服務" "pool-tunnel active"
+                else
+                    report FAIL "provider ${pname} 本機服務" "pool-tunnel 狀態為 ${svc:-unknown}"
+                fi
+            fi
+            if command -v loginctl >/dev/null 2>&1; then
+                linger="$(loginctl show-user "${USER:-$(id -un)}" 2>/dev/null | grep '^Linger=' | head -n 1)"
+                if [[ "$linger" == "Linger=yes" ]]; then
+                    report OK "provider ${pname} linger" "Linger=yes"
+                else
+                    report FAIL "provider ${pname} linger" "${linger:-Linger=unknown}（需 sudo loginctl enable-linger）"
+                fi
+            fi
+        fi
+    done <<< "$PROVIDER_LIST"
+fi
+
+# ---------------------------------------------------------------------------
+# D. worker ports (2300–2399) vs the workers.d placeholders on the Gateway
+# ---------------------------------------------------------------------------
+if [[ "$GW_LOGIN_OK" -ne 1 ]]; then
+    report WARN "worker 埠" "略過（Gateway 無法登入）"
+elif [[ "$GW_PORTS_OK" -ne 1 ]]; then
+    report WARN "worker 埠" "略過（Gateway listener 清單不可得）"
+else
+    W_LISTEN="$(printf '%s\n' "$GW_PORTS" | range_ports 2300 2399)"
+    W_LS="$(gw_ssh 'if [ -d "$HOME/pool/workers.d" ]; then ls -1 "$HOME/pool/workers.d"; else echo __POOL_WORKERS_D_MISSING__; fi')"
+    if printf '%s' "$W_LS" | grep -q '__POOL_WORKERS_D_MISSING__'; then
+        report WARN "worker 埠" "Gateway 上 ~/pool/workers.d/ 不存在"
+    else
+        W_FILES="$(printf '%s\n' "$W_LS" | sed -n 's/^\([0-9][0-9]*\)\.json$/\1/p' | sort -n -u)"
+        orphan_listeners=""
+        for p in $W_LISTEN; do
+            printf '%s\n' "$W_FILES" | grep -qx "$p" || orphan_listeners="${orphan_listeners} ${p}"
+        done
+        stale_files=""
+        for p in $W_FILES; do
+            printf '%s\n' "$W_LISTEN" | grep -qx "$p" || stale_files="${stale_files} ${p}"
+        done
+        if [[ -z "$orphan_listeners" && -z "$stale_files" ]]; then
+            report OK "worker 埠" "2300–2399 的 listener 與 workers.d 佔位檔一致"
+        else
+            [[ -n "$orphan_listeners" ]] && report WARN "worker 埠" "有 listener 但無佔位檔（孤兒）:${orphan_listeners}"
+            [[ -n "$stale_files" ]] && report WARN "worker 埠" "有佔位檔但無 listener（worker 可能已死）:${stale_files}"
+        fi
+    fi
+fi
+
+# ---------------------------------------------------------------------------
+# summary
+# ---------------------------------------------------------------------------
+printf '%s\n' "----"
+printf '總結: %s OK, %s WARN, %s FAIL\n' "$ok_count" "$warn_count" "$fail_count"
+if [[ $fail_count -gt 0 ]]; then
+    exit 1
+fi
+exit 0

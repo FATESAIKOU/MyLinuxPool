@@ -288,6 +288,12 @@ fh-l 長時間關機後租約到期，若拿到別的 IP，unicast 目標就錯�
 
 ## 5. 故障排除
 
+> **先跑 `pool/bin/pool-status`。** 它會一次檢查本機前置、Gateway 可達性、
+> 每個 provider 的隧道與 SSH banner、以及 worker 埠與佔位檔的一致性，
+> 並在 TCP 被立即拒絕時主動提示去查 fail2ban（§7.1 那次事故的正確診斷
+> 順序已內建其中）。有 FAIL 才往下看對應小節。
+
+
 ### 5.1 隧道沒起來
 
 **症狀**：從 Gateway `ssh -p <port> 127.0.0.1` 連不上；`Launch`/`Create Worker`
