@@ -770,7 +770,8 @@ main_menu() {
                 "wake           wake fh-l" \
                 "down           shut down fh-l" \
                 "status         run pool-status" \
-                "rotate         rotate the Gateway (dry run; --real from the CLI)" \
+                "rotate         Gateway dry run (builds and discards a preview machine)" \
+                "rotate-real    replace the live Gateway for real (asks you to type its IP)" \
                 "worker-new     build and start a worker on a provider" \
                 "worker-rm      stop a worker and release its port" \
                 "trust-gateway  re-accept the Gateway's host key after a rotate" \
@@ -788,6 +789,7 @@ main_menu() {
             down) cmd_down ;;
             status) cmd_status ;;
             rotate) cmd_rotate ;;
+            rotate-real) cmd_rotate --real ;;
             worker-new) worker_new ;;
             worker-rm) worker_rm ;;
             trust-gateway) cmd_trust_gateway ;;
