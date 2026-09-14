@@ -70,8 +70,29 @@
 | V7 | worker 跟隨 rotate | 容器 ID 不變 | ✅ 已驗 |
 | V8 | `verify-profile` 三台 matches | 比對內容而非存在 | ✅ 已驗 |
 | V9 | **零狀態自癒** | 刪光衍生物，50 秒內全部回來 | ✅ 已驗（兩台） |
-| V10 | **worker 跟隨檔遺失** | 刪掉 `gateway/gateway.json`，worker 仍能在下次 rotate 跟上 | ❌ 未測 |
-| V11 | **主本與實際分歧** | 手動讓 `POOL_WORKERS` 少一筆，rotate 後該 worker 不應被靜默丟棄 | ❌ 未測 |
+| V10 | **worker 跟隨檔遺失** | 刪掉 `gateway/gateway.json`，worker 仍能在下次 rotate 跟上 | ⚠️ 部分——檔案本身已驗會自癒（V9），但「遺失後仍跟得上 rotate」未單獨驗 |
+| V11 | **主本與實際分歧** | `mlp state` 能看出差異 | ✅ 已驗——第一次跑就抓到我 Mac 上一份 serial 99 的假快取 |
+| V12 | **rotate 與 provider 離線同時發生** | 兩台都有 worker；rotate 途中關掉 fh-l 再喚醒 | ✅ 已驗（見下） |
+
+### V12 實測（2026-09-14，generation 9 → 10）
+
+```
+15:45:53  rotate 開始
+15:47:58  fh-l 關機（rotate 在 step 6-7）
+15:51:09  rotate 判定 fh-l not attached，只 probe fh-proxy、只等 2226
+          restored 2 claim(s) ← 含離線 fh-l 的 2300，位子保留
+15:52:03  fh-proxy 的 worker 1 秒內切到 generation 10
+15:52:46  送 WoL
+15:54:47  fh-l 的 worker 開機後直接接上 generation 10
+15:55:00  fh-l 完全上線
+```
+
+容器 ID 前後不變（`abec2ea3eddd` / `1bfa9e46f8ac`）——**fh-l 整機斷電再開，
+同一個容器回來**。`mlp state` 事後回報三處一致。
+
+這一輪也暴露了兩個缺陷：`mlp wake`/`mlp down` 因為 `local node="$1"` 在
+`set -u` 下炸掉（盲寫測試只測純函式、沒測進入點），以及我把
+`systemctl reboot` 的失敗當成成功——fh-l 的 sudoers 只允許 `poweroff`。
 
 ### V5 怎麼做（建議）
 

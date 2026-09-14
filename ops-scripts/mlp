@@ -87,8 +87,8 @@ usage: mlp [command]
   (no command)     interactive main menu
   ls               list providers/workers with live state
   ssh [name]       connect to a node or worker (menu if name omitted)
-  wake             wake nodes that declare power.launch (fzf pick if more than one)
-  down             shut down nodes that declare power.shutdown (fzf pick if more than one)
+  wake [name]       wake a node declaring power.launch (fzf pick if none given / more than one)
+  down [name]       shut down a node declaring power.shutdown (fzf pick if none given / more than one)
   state            compare master (GitHub) vs Gateway state.json vs local snapshot
   status           run pool-status
   rotate [--real]  rotate the Gateway (dry run unless --real)
@@ -543,14 +543,22 @@ pick_power_target() {
 
 cmd_wake() {
     resolve_gateway
-    local node="$1" json rc method via mac target_ip port waited state
+    local node="${1:-}" json rc method via mac target_ip port waited state
 
-    node="$(pick_power_target launch)"
-    [[ -n "$node" ]] || { echo "aborted."; return 1; }
-
-    json="$("$POOL_RESOLVE" "$node")"
-    rc=$?
-    [[ $rc -eq 0 ]] || die "pool-resolve ${node} failed (exit ${rc})"
+    if [[ -n "$node" ]]; then
+        json="$("$POOL_RESOLVE" "$node")"
+        rc=$?
+        [[ $rc -eq 0 ]] || die "pool-resolve ${node} failed (exit ${rc})"
+        if ! printf '%s' "$json" | jq -e '.power.launch != null' >/dev/null 2>&1; then
+            die "${node} does not declare .power.launch — nothing to wake"
+        fi
+    else
+        node="$(pick_power_target launch)"
+        [[ -n "$node" ]] || { echo "aborted."; return 1; }
+        json="$("$POOL_RESOLVE" "$node")"
+        rc=$?
+        [[ $rc -eq 0 ]] || die "pool-resolve ${node} failed (exit ${rc})"
+    fi
 
     method="$(printf '%s' "$json" | jq -r '.power.launch.method // empty')"
     via="$(printf '%s' "$json" | jq -r '.power.launch.via // empty')"
@@ -591,14 +599,22 @@ cmd_wake() {
 
 cmd_down() {
     resolve_gateway
-    local node="$1" json rc method shutdown_cmd port confirm waited state
+    local node="${1:-}" json rc method shutdown_cmd port confirm waited state
 
-    node="$(pick_power_target shutdown)"
-    [[ -n "$node" ]] || { echo "aborted."; return 1; }
-
-    json="$("$POOL_RESOLVE" "$node")"
-    rc=$?
-    [[ $rc -eq 0 ]] || die "pool-resolve ${node} failed (exit ${rc})"
+    if [[ -n "$node" ]]; then
+        json="$("$POOL_RESOLVE" "$node")"
+        rc=$?
+        [[ $rc -eq 0 ]] || die "pool-resolve ${node} failed (exit ${rc})"
+        if ! printf '%s' "$json" | jq -e '.power.shutdown != null' >/dev/null 2>&1; then
+            die "${node} does not declare .power.shutdown — nothing to shut down"
+        fi
+    else
+        node="$(pick_power_target shutdown)"
+        [[ -n "$node" ]] || { echo "aborted."; return 1; }
+        json="$("$POOL_RESOLVE" "$node")"
+        rc=$?
+        [[ $rc -eq 0 ]] || die "pool-resolve ${node} failed (exit ${rc})"
+    fi
 
     method="$(printf '%s' "$json" | jq -r '.power.shutdown.method // empty')"
     shutdown_cmd="$(printf '%s' "$json" | jq -r '.power.shutdown.command // empty')"

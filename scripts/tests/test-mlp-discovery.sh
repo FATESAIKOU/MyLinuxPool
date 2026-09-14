@@ -121,7 +121,14 @@ if ! declare -F "$fn" >/dev/null 2>&1; then
     printf '<undefined function: %s>' "$fn"
     exit 127
 fi
-( "$fn" "${args[@]}" )
+# bash 3.2 + set -u: expanding an EMPTY "${args[@]}" errors as "unbound
+# variable", so branch on $# instead and keep -u alive for the call itself
+# (that is what makes an mlp-side unbound-variable bug still surface).
+if [[ "$#" -gt 0 ]]; then
+    ( "$fn" "${args[@]}" )
+else
+    ( "$fn" )
+fi
 rc=$?
 printf '%s' "$rc" > "$LOADER_DONE"
 exit "$rc"
@@ -234,6 +241,43 @@ run_main_case "power:null node does not crash discovery" power_targets "fh-l" la
 
 set_nodes "{}"
 run_main_case "no nodes at all -> explicit error, non-zero exit" pick_power_target "NONE" launch
+
+# ---- smoke: cmd_wake / cmd_down entry points (2026-09-15 regression) ------
+# `mlp wake` / `mlp down` with no argument used to die with
+# "unbound variable" because a leftover `="$1"` was still on the local
+# declaration while the very next line overwrote $node from
+# pick_power_target. The pure-function cases above cannot see that — these
+# call the real entry points. Verdict: exit non-zero is FINE (they are
+# supposed to stop in this fixture), but the output must not contain
+# "unbound variable" — that is the regression.
+J_GW='{"name":"gateway","role":"gateway","ip":"1.2.3.4","user":"gw","host_key":"ssh-ed25519 AAAAtest"}'
+
+echo "smoke: cmd_wake / cmd_down entry points with no args (regression):"
+run_smoke() {  # <label> <fn> [args...]
+    local label="$1" fn="$2"; shift 2
+    call_fn "$SANDBOX/mlp-lib.sh" "$fn" "$@"
+    if [[ "$MISSING" -eq 1 ]]; then
+        bad "$label (function not found — implementation not landed yet?)"
+    elif [[ "$RC" -eq 0 ]]; then
+        bad "$label (exited 0 — should have stopped in this fixture)"
+    elif printf '%s' "$ERR" | grep -q 'unbound variable'; then
+        bad "$label (UNBOUND VARIABLE: ${ERR})"
+    else
+        ok "$label (exit $RC, no unbound variable)"
+    fi
+}
+
+set_nodes "{\"gateway\":$J_GW,\"fh-proxy\":$J_FH_PXY_NOPWR}" fh-proxy
+run_smoke "mlp wake (no args): no power.launch node -> clean stop" cmd_wake
+
+set_nodes "{\"gateway\":$J_GW,\"fh-proxy\":$J_FH_PXY_NOPWR}" fh-proxy
+run_smoke "mlp down (no args): no power.shutdown node -> clean stop" cmd_down
+
+set_nodes "{\"gateway\":$J_GW,\"fh-proxy\":$J_FH_PXY_NOPWR}" fh-proxy
+run_smoke "mlp wake fh-proxy (named, no power.launch) -> clean stop" cmd_wake fh-proxy
+
+set_nodes "{\"gateway\":$J_GW,\"fh-l\":$J_FH_L,\"fh-proxy\":$J_FH_PXY_NOPWR}" fh-l fh-proxy
+run_smoke "mlp down fh-l (named, launch+shutdown but no gateway_port) -> clean stop at validation" cmd_down fh-l
 
 # ---- failure injection (REDESIGN.md §3.3, mandatory) ---------------------
 # The same cases, evaluated against a power_targets stub that always
