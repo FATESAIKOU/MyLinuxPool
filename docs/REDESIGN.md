@@ -90,6 +90,15 @@ unit 的 `--check` 必須比對**內容**，不是檔案存在。
 
 > 驗收判準：在 provider 上刪掉除 `config` 與 `gh_token` 以外的一切，
 > 系統必須自行恢復，不需人工介入。
+>
+> **例外：`bin/` 與 `repo/` 可重建但不會「自動」重建。**
+> 它們要跑一次 `install.sh`（或重跑 register）。照 N8 的字面去刪 `bin/`
+> 會讓節點停擺而不是自癒。這條界線寫在這裡，免得日後有人誤刪。
+>
+> 2026-09-14 實測（兩台 provider）：刪掉 `cache/`、`gateway/`、
+> `gateway_known_hosts`、`state.json`，**50 秒內全部自行恢復，隧道不中斷**。
+> 第一次跑這個測試時 `gateway/gateway.json` 沒有回來——而那是 worker 跟隨
+> rotate 的唯一來源——修正後才成立。
 
 ---
 
@@ -291,6 +300,27 @@ token 退化成「Gateway 非計畫性死亡」時的破窗工具。
 
 V5 的模擬方式：在 provider 上把 `api.github.com` 指到黑洞，或撤掉 token
 （後者較貼近真實：token 過期是實際會發生的事）。
+
+## 3.35 尚未達成：真相仍有第二份拷貝
+
+N7 要求「主本只有一個地方」。目前狀態盤查（2026-09-15）：
+
+| 資料 | 主本 | 第二份 | 是否合理 |
+|---|---|---|---|
+| 節點定址 | `NODE_*` var | Gateway `state.json`、節點本機快取 | ✅ 快取，會自動同步 |
+| 埠帳本 | `POOL_WORKERS` | Gateway `workers.d/`、`state.json` | ✅ 同上 |
+| **可用 provider 清單** | `NODE_*` var | **`create-worker.yml` 的 choice 選項寫死 `fh-l`/`fh-proxy`** | ❌ 新增 provider 要改 workflow |
+| **哪台可以 wake/down** | `NODE_FH_L.power` | **`mlp` 的 `cmd_wake`/`cmd_down` 寫死 fh-l** | ❌ var 裡已有 `power` 與 `capabilities` 可判斷 |
+| GitHub 憑證 | `GH_POOL_TOKEN` secret | 各 provider 的 `gh_token` | ⚠️ 目前必要（Gateway 換人時的退路），§2.8 有消除它的路 |
+
+前兩項是真正的違規：**它們讓「加一台 provider」變成要改兩個地方**，
+而其中一個地方（workflow 的下拉選單）不會有任何機制提醒你忘了改。
+
+修法：
+- `create-worker` 的 provider 改成自由文字輸入，並在 workflow 內用
+  `NODE_*` 驗證它確實是一台已註冊的 provider（錯字仍會被擋，但清單不再重複）
+- `mlp` 的 `wake`/`down` 改成掃描所有節點、挑出宣告了 `power.launch` /
+  `power.shutdown` 的那些；只有一台時直接用，多台時用 fzf 選
 
 ## 3.4 派工方式
 
