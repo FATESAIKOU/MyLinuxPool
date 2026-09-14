@@ -40,13 +40,16 @@ log() {
 }
 
 usage() {
-    echo "usage: install.sh [--key <FILE_CRYPTO_KEY>] [--home <dir>] [--user <name>] [--check]" >&2
+    echo "usage: install.sh [--key <FILE_CRYPTO_KEY>] [--home <dir>] [--user <name>] [--check] [--prune]" >&2
+    echo "  --prune: make authorized_keys EXACTLY the declared list, removing anything else." >&2
+    echo "           Revoking access is deliberate, so it never happens without this flag." >&2
 }
 
 KEY=""
 HOME_DIR="${HOME}"
 TARGET_USER="$(whoami)"
 CHECK_ONLY=0
+PRUNE=0
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -54,6 +57,7 @@ while [[ $# -gt 0 ]]; do
         --home) [[ $# -ge 2 ]] || { usage; exit 2; }; HOME_DIR="$2"; shift 2 ;;
         --user) [[ $# -ge 2 ]] || { usage; exit 2; }; TARGET_USER="$2"; shift 2 ;;
         --check) CHECK_ONLY=1; shift ;;
+        --prune) PRUNE=1; shift ;;
         -h|--help) usage; exit 0 ;;
         *) log ERROR "unknown argument: $1"; usage; exit 2 ;;
     esac
@@ -138,8 +142,21 @@ chmod 700 "$SSH_DIR"
 # seed the same key. Union, so growing the declared list converges and no
 # working identity is ever dropped by an install.
 merged="$(mktemp)"
-cat "$TARGET" 2>/dev/null > "$merged"
-printf '%s\n' "$authorized_keys_content" >> "$merged"
+if [[ "${PRUNE:-0}" -eq 1 ]]; then
+    printf '%s\n' "$authorized_keys_content" > "$merged"
+    if ! awk '$2 != ""' "$merged" | grep -q .; then
+        rm -f "$merged"
+        log ERROR "--prune refused: the declared authorized_keys is empty"
+        exit 1
+    fi
+    dropped="$(comm -23 \
+        <(awk '$2 != "" { print $2 }' "$TARGET" 2>/dev/null | sort -u) \
+        <(awk '$2 != "" { print $2 }' "$merged" | sort -u) | wc -l | tr -d ' ')"
+    log WARN "--prune: removing ${dropped} key(s) not in the declared list"
+else
+    cat "$TARGET" 2>/dev/null > "$merged"
+    printf '%s\n' "$authorized_keys_content" >> "$merged"
+fi
 awk '$2 != "" && !seen[$2]++' "$merged" > "$TARGET"
 rm -f "$merged"
 log INFO "authorized_keys now holds $(awk '$2 != ""' "$TARGET" | wc -l | tr -d ' ') key(s)" 

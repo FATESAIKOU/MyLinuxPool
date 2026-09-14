@@ -28,10 +28,13 @@ log() {
 }
 
 usage() {
-    echo "usage: install.sh [--key <FILE_CRYPTO_KEY>] [--home <dir>] [--user <name>] [--check]" >&2
+    echo "usage: install.sh [--key <FILE_CRYPTO_KEY>] [--home <dir>] [--user <name>] [--check] [--prune]" >&2
+    echo "  --prune: make authorized_keys EXACTLY the declared list, removing anything else." >&2
+    echo "           Revoking access is deliberate, so it never happens without this flag." >&2
 }
 
 KEY=""
+PRUNE=0
 HOME_DIR="${HOME}"
 TARGET_USER="$(whoami)"
 CHECK_ONLY=0
@@ -41,6 +44,7 @@ while [[ $# -gt 0 ]]; do
         --key) [[ $# -ge 2 ]] || { usage; exit 2; }; KEY="$2"; shift 2 ;;
         --home) [[ $# -ge 2 ]] || { usage; exit 2; }; HOME_DIR="$2"; shift 2 ;;
         --user) [[ $# -ge 2 ]] || { usage; exit 2; }; TARGET_USER="$2"; shift 2 ;;
+        --prune) PRUNE=1; shift ;;
         --check) CHECK_ONLY=1; shift ;;
         -h|--help) usage; exit 0 ;;
         *) log ERROR "unknown argument: $1"; usage; exit 2 ;;
@@ -158,13 +162,28 @@ if [[ $rc -ne 0 ]]; then
     exit 1
 fi
 
+if [[ "$PRUNE" -eq 1 ]]; then
+    # Refuse to write an empty file: that is a lockout, not a revocation.
+    if ! awk '$2 != ""' "$declared_ak" | grep -q .; then
+        rm -f "$declared_ak"
+        log ERROR "--prune refused: the declared authorized_keys is empty"
+        exit 1
+    fi
+    dropped="$(comm -23 \
+        <(awk '$2 != "" { print $2 }' "${SSH_DIR}/authorized_keys" 2>/dev/null | sort -u) \
+        <(awk '$2 != "" { print $2 }' "$declared_ak" | sort -u) | wc -l | tr -d ' ')"
+    awk '$2 != "" && !seen[$2]++' "$declared_ak" > "${SSH_DIR}/authorized_keys"
+    log WARN "--prune: removed ${dropped} key(s) not in the declared list"
+    merged_ak="$declared_ak"
+else
 merged_ak="$(mktemp)"
 # Existing lines first so their comments win; dedupe on the key blob.
 cat "${SSH_DIR}/authorized_keys" 2>/dev/null > "$merged_ak"
 cat "$declared_ak" >> "$merged_ak"
 awk '$2 != "" && !seen[$2]++' "$merged_ak" > "${SSH_DIR}/authorized_keys"
+fi
 log INFO "authorized_keys now holds $(awk '$2 != ""' "${SSH_DIR}/authorized_keys" | wc -l | tr -d ' ') key(s) (declared: $(awk '$2 != ""' "$declared_ak" | wc -l | tr -d ' '))"
-rm -f "$declared_ak" "$merged_ak"
+rm -f "$declared_ak" "$merged_ak" 2>/dev/null || true
 chmod 644 "${SSH_DIR}/authorized_keys"
 
 chown -R "${TARGET_USER}:${TARGET_USER}" "$SSH_DIR" 2>/dev/null || true
