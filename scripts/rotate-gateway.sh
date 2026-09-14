@@ -253,12 +253,38 @@ rotate_run_provision() {
 #   Prints the new NODE_GATEWAY value to stdout — the caller writes it.
 rotate_compute_new_gateway_json() {
     local old_json="$1" new_ip="$2" new_generation="$3" rotated_at="$4"
+    local host_key="${5:-}"
     jq -n \
         --argjson existing "$old_json" \
         --arg ip "$new_ip" \
         --argjson generation "$new_generation" \
         --arg rotated_at "$rotated_at" \
-        '$existing * {ip: $ip, generation: $generation, rotated_at: $rotated_at}'
+        --arg host_key "$host_key" \
+        '$existing * {ip: $ip, generation: $generation, rotated_at: $rotated_at}
+         | if $host_key == "" then . else . + {host_key: $host_key} end'
+}
+
+# rotate_read_host_key <user> <ip>
+#   Read the new Gateway's own host key over the session we just used to
+#   provision it, and print it as a bare "ssh-ed25519 AAAA..." line.
+#
+#   This is what NODE_GATEWAY carries so providers can verify the machine
+#   instead of trusting whatever answers on the address. Providers cannot
+#   use plain trust-on-first-use here: Linode recycles IPs, so a rotate
+#   regularly puts a different machine on an address a provider already
+#   has a key for, and StrictHostKeyChecking=accept-new accepts new hosts
+#   but refuses changed ones — every provider then refuses to attach.
+#   That is exactly how the 2026-09-14 rotate failed.
+rotate_read_host_key() {
+    local user="$1" ip="$2" key
+    key="$(ssh -o StrictHostKeyChecking=accept-new -o BatchMode=yes -o ConnectTimeout=10 \
+             "${user}@${ip}" 'cat /etc/ssh/ssh_host_ed25519_key.pub' 2>/dev/null \
+           | awk '{print $1, $2}')"
+    if [[ -z "$key" ]]; then
+        log WARN "could not read the new Gateway's host key — providers will fall back to trust-on-first-use"
+        return 0
+    fi
+    printf '%s\n' "$key"
 }
 
 # rotate_wait_for_providers <gw_user> <gw_ip> <deadline_secs> <port...>

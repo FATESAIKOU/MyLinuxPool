@@ -260,7 +260,10 @@ jobs:
           new_gen=$(( ${{ steps.read_old_gateway.outputs.old_generation }} + 1 ))
           now="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 
-          new_json="$(rotate_compute_new_gateway_json "$old_json" "$PREVIEW_IP" "$new_gen" "$now")"
+          # Carried in NODE_GATEWAY so providers verify the machine rather
+          # than trusting whatever answers on a recycled address.
+          host_key="$(rotate_read_host_key fatesaikou "$PREVIEW_IP")"
+          new_json="$(rotate_compute_new_gateway_json "$old_json" "$PREVIEW_IP" "$new_gen" "$now" "$host_key")"
           printf '%s' "$new_json" | gh variable set NODE_GATEWAY --repo "$GH_REPO"
           echo "switched=true" >> "$GITHUB_OUTPUT"
           echo "::notice::NODE_GATEWAY switched to ${PREVIEW_IP} (generation ${new_gen})"

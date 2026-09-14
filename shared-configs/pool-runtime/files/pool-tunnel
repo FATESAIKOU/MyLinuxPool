@@ -8,6 +8,9 @@
 set -uo pipefail
 
 STATE_DIR="${HOME}/.mylinuxpool"
+# Private to the tunnel: never the user's ~/.ssh/known_hosts, which other
+# tools also write and which outlives any single Gateway generation.
+KNOWN_HOSTS_FILE="${STATE_DIR}/gateway_known_hosts"
 RUN_DIR="${STATE_DIR}/run"
 CTL="${RUN_DIR}/ctl-gateway.sock"
 PRIVATE_KEY="${HOME}/.ssh/id_pool"
@@ -27,6 +30,7 @@ ONCE=0
 GW_IP=""
 GW_USER=""
 GW_GEN=""
+GW_HOST_KEY=""
 MY_PORT=""
 MASTER_PID=""
 # §10.3: set to 1 once resolve_connection_info sees all of
@@ -118,8 +122,8 @@ publish_gateway() {
     mkdir -p "$GATEWAY_PUBLISH_DIR" 2>/dev/null || return 0
     chmod 755 "$GATEWAY_PUBLISH_DIR" 2>/dev/null || true
     tmp="$(mktemp "${GATEWAY_PUBLISH_DIR}/.gw.XXXXXX" 2>/dev/null)" || return 0
-    printf '{"ip":"%s","tunnel_user":"%s","generation":"%s","published_at":"%s"}\n' \
-        "$GW_IP" "$GW_USER" "$GW_GEN" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$tmp" 2>/dev/null || {
+    printf '{"ip":"%s","tunnel_user":"%s","generation":"%s","host_key":"%s","published_at":"%s"}\n' \
+        "$GW_IP" "$GW_USER" "$GW_GEN" "$GW_HOST_KEY" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$tmp" 2>/dev/null || {
         rm -f "$tmp"; return 0
     }
     chmod 644 "$tmp" 2>/dev/null || true
@@ -132,13 +136,14 @@ publish_gateway() {
 # file is missing or unreadable, which the caller retries rather than
 # treats as fatal (the provider may not have written it yet).
 read_published_gateway() {
-    local ip user gen
+    local ip user gen hk
     [[ -r "$GATEWAY_FOLLOW_FILE" ]] || return 1
     ip="$(jq -r '.ip // empty' < "$GATEWAY_FOLLOW_FILE" 2>/dev/null)"
     user="$(jq -r '.tunnel_user // empty' < "$GATEWAY_FOLLOW_FILE" 2>/dev/null)"
     gen="$(jq -r '.generation // empty' < "$GATEWAY_FOLLOW_FILE" 2>/dev/null)"
+    hk="$(jq -r '.host_key // empty' < "$GATEWAY_FOLLOW_FILE" 2>/dev/null)"
     [[ -n "$ip" && -n "$user" ]] || return 1
-    printf '%s\t%s\t%s\n' "$ip" "$user" "$gen"
+    printf '%s\t%s\t%s\t%s\n' "$ip" "$user" "$gen" "$hk"
 }
 
 resolve_connection_info() {
@@ -170,7 +175,7 @@ resolve_connection_info() {
             log ERROR "no readable Gateway file at ${GATEWAY_FOLLOW_FILE} after 60s and no POOL_GATEWAY_HOST fallback — is the provider's pool-tunnel running?"
             return 1
         fi
-        IFS=$'\t' read -r GW_IP GW_USER GW_GEN <<< "$pub"
+        IFS=$'\t' read -r GW_IP GW_USER GW_GEN GW_HOST_KEY <<< "$pub"
         FOLLOW_GATEWAY=1
         log INFO "following ${GATEWAY_FOLLOW_FILE}: ${GW_USER}@${GW_IP} (generation ${GW_GEN:-unknown})"
         return 0
@@ -213,6 +218,7 @@ resolve_connection_info() {
     GW_IP="$(printf '%s' "$gw_json" | jq -r '.ip // empty')"
     GW_USER="$(printf '%s' "$gw_json" | jq -r '.tunnel_user // empty')"
     GW_GEN="$(printf '%s' "$gw_json" | jq -r '.generation // empty')"
+    GW_HOST_KEY="$(printf '%s' "$gw_json" | jq -r '.host_key // empty')"
 
     if [[ -z "$GW_IP" || -z "$GW_USER" ]]; then
         log ERROR "gateway node is missing ip/tunnel_user"
@@ -237,10 +243,11 @@ gateway_changed() {
             log WARN "gateway file ${GATEWAY_FOLLOW_FILE} unreadable, will retry next cycle"
             return 1
         fi
-        IFS=$'\t' read -r new_ip new_user new_gen <<< "$pub"
+        local new_hk
+        IFS=$'\t' read -r new_ip new_user new_gen new_hk <<< "$pub"
         if [[ "$new_ip" != "$GW_IP" || "$new_gen" != "$GW_GEN" ]]; then
             log INFO "gateway drift detected via ${GATEWAY_FOLLOW_FILE}: ip ${GW_IP}->${new_ip} generation ${GW_GEN}->${new_gen}"
-            GW_IP="$new_ip"; GW_USER="$new_user"; GW_GEN="$new_gen"
+            GW_IP="$new_ip"; GW_USER="$new_user"; GW_GEN="$new_gen"; GW_HOST_KEY="$new_hk"
             return 0
         fi
         return 1
@@ -259,6 +266,8 @@ gateway_changed() {
         log INFO "gateway drift detected: ip ${GW_IP}->${new_ip} generation ${GW_GEN}->${new_gen}"
         GW_IP="$new_ip"
         GW_GEN="$new_gen"
+        GW_HOST_KEY="$("$POOL_RESOLVE" gateway --field .host_key 2>/dev/null)"
+        [[ "$GW_HOST_KEY" == "null" ]] && GW_HOST_KEY=""
         return 0
     fi
 
@@ -280,13 +289,43 @@ control_alive() {
 start_master() {
     rm -f "$CTL"
 
+    # Host key handling, and why it is not accept-new against the user's
+    # own known_hosts:
+    #
+    # Linode recycles addresses, so a rotate regularly puts a different
+    # machine on an IP a provider already has a key for.
+    # StrictHostKeyChecking=accept-new accepts a NEW host but refuses a
+    # CHANGED one — so every provider refused to attach and the rotate had
+    # to roll back (RUNBOOK §7.8). Clearing known_hosts would only push
+    # the same failure to the next recycled address.
+    #
+    # NODE_GATEWAY carries the Gateway's host key instead: it is written
+    # by the rotate that built the machine, over the session that
+    # provisioned it, and only Actions can write that variable. Pin to it
+    # in a file of our own — a real identity check, and stricter than the
+    # trust-on-first-use it replaces.
+    local -a hostkey_opts
+    if [[ -n "$GW_HOST_KEY" ]]; then
+        printf '%s %s\n' "$GW_IP" "$GW_HOST_KEY" > "$KNOWN_HOSTS_FILE"
+        chmod 600 "$KNOWN_HOSTS_FILE" 2>/dev/null || true
+        hostkey_opts=(-o UserKnownHostsFile="$KNOWN_HOSTS_FILE"
+                      -o StrictHostKeyChecking=yes)
+    else
+        # No published key (a Gateway from before this was recorded).
+        # Use a private known_hosts anyway, so a recycled address cannot
+        # collide with an entry some other tool wrote.
+        hostkey_opts=(-o UserKnownHostsFile="$KNOWN_HOSTS_FILE"
+                      -o StrictHostKeyChecking=accept-new)
+        log WARN "NODE_GATEWAY carries no host_key — falling back to trust-on-first-use"
+    fi
+
     local -a cmd=(
         ssh -M -S "$CTL"
         -o ControlPersist=no
         -o ExitOnForwardFailure=yes
         -o ServerAliveInterval=15
         -o ServerAliveCountMax=2
-        -o StrictHostKeyChecking=accept-new
+        "${hostkey_opts[@]}"
         -o AddressFamily=inet
         -i "$PRIVATE_KEY" -o IdentitiesOnly=yes
         -N -R "127.0.0.1:${MY_PORT}:localhost:22"
