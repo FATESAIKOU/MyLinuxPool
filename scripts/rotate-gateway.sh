@@ -144,6 +144,52 @@ rotate_wait_for_cloud_init() {
     esac
 }
 
+# rotate_carry_worker_claims <user> <old_ip> <new_ip>
+#   Copy the worker port ledger (~/pool/workers.d) from the outgoing
+#   Gateway to the incoming one.
+#
+#   Without this, a rotate silently orphans every running worker: the
+#   ledger is Gateway-local, so the new machine starts empty, `mlp ls`
+#   shows nothing, and delete-worker cannot find the container that is
+#   still running on its provider. The worker itself now follows the
+#   Gateway (it reads the address its provider publishes), so carrying
+#   the ledger is what makes it visible and manageable again on the
+#   other side.
+#
+#   Never fatal. The old Gateway being unreachable is one of the reasons
+#   to rotate in the first place; losing the ledger is worth a warning,
+#   not an aborted rotate.
+rotate_carry_worker_claims() {
+    local user="$1" old_ip="$2" new_ip="$3"
+    local stage count
+
+    stage="$(mktemp -d)"
+    trap 'rm -rf "$stage"' RETURN
+
+    if ! ssh -o StrictHostKeyChecking=accept-new -o BatchMode=yes -o ConnectTimeout=10 \
+            "${user}@${old_ip}" 'cd ~/pool/workers.d 2>/dev/null && tar -cf - ./*.json 2>/dev/null' \
+            > "${stage}/claims.tar" 2>/dev/null; then
+        log WARN "could not read the worker ledger from the old Gateway (${old_ip}) — any running worker will need recreating"
+        return 0
+    fi
+
+    if [[ ! -s "${stage}/claims.tar" ]]; then
+        log INFO "no worker port claims to carry over"
+        return 0
+    fi
+
+    count="$(tar -tf "${stage}/claims.tar" 2>/dev/null | grep -c '\.json$' || true)"
+    if ! ssh -o StrictHostKeyChecking=accept-new -o BatchMode=yes -o ConnectTimeout=10 \
+            "${user}@${new_ip}" 'mkdir -p ~/pool/workers.d && tar -C ~/pool/workers.d -xf -' \
+            < "${stage}/claims.tar"; then
+        log WARN "could not write the worker ledger to the new Gateway (${new_ip}) — running workers will be invisible to mlp/delete-worker"
+        return 0
+    fi
+
+    log INFO "carried ${count} worker port claim(s) to the new Gateway"
+    return 0
+}
+
 # rotate_deploy_repo_bundle <user> <ip>
 #   Ships shared-configs/ + scripts/ (still encrypted, decryption happens
 #   per-unit on the Gateway inside provision-gateway.sh's own unit-install

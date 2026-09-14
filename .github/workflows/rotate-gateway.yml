@@ -187,6 +187,20 @@ jobs:
           # exact secret value in any log line regardless.
           rotate_run_provision fatesaikou "$PREVIEW_IP" "$trusted_ips" "$FILE_CRYPTO_KEY"
 
+      # Before the switch, so a failure here still leaves the live Gateway
+      # in charge. Runs on dry runs too — the copy targets the preview
+      # machine that is about to be deleted, so it costs nothing and keeps
+      # the step exercised instead of only ever running for real.
+      - name: Carry worker port claims to the new Gateway
+        shell: bash
+        env:
+          PREVIEW_IP: ${{ steps.create_preview.outputs.preview_ip }}
+          OLD_IP: ${{ steps.read_old_gateway.outputs.old_ip }}
+        run: |
+          set -euo pipefail
+          source scripts/rotate-gateway.sh
+          rotate_carry_worker_claims fatesaikou "$OLD_IP" "$PREVIEW_IP"
+
       - name: Switch NODE_GATEWAY to the new Gateway
         id: switch_point
         if: inputs.dry_run == false
