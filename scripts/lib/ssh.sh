@@ -84,9 +84,25 @@ ssh_jump_chain() {
     local ssh_args=(-o StrictHostKeyChecking=accept-new -o BatchMode=yes
                      -o ConnectTimeout="${SSH_CONNECT_TIMEOUT:-10}")
     if (( ${#jump_specs[@]} > 0 )); then
-        local jump_str
-        jump_str="$(IFS=,; echo "${jump_specs[*]}")"
-        ssh_args+=(-J "$jump_str")
+        # NOT -J. The implicit ProxyCommand -J builds inherits none of the
+        # options above, so each jump leg falls back to StrictHostKeyChecking
+        # =ask, which under BatchMode is an immediate "Host key verification
+        # failed". It normally goes unnoticed because a single-hop call to
+        # the Gateway earlier in the same job primes ~/.ssh/known_hosts for
+        # the jump leg — but a job that fails before that step reaches its
+        # cleanup handlers with nothing primed, so the failure path was the
+        # one path that could not clean up. Build the chain explicitly and
+        # attach the options to every leg.
+        local spec leg proxy="" ju jr jh jp
+        for spec in "${jump_specs[@]}"; do
+            ju="${spec%@*}"; jr="${spec#*@}"; jh="${jr%:*}"; jp="${jr##*:}"
+            leg="ssh -o StrictHostKeyChecking=accept-new -o BatchMode=yes"
+            leg+=" -o ConnectTimeout=${SSH_CONNECT_TIMEOUT:-10}"
+            [[ -n "$proxy" ]] && leg+=" -o ProxyCommand=\"${proxy}\""
+            leg+=" -p ${jp} -W %h:%p ${ju}@${jh}"
+            proxy="$leg"
+        done
+        ssh_args+=(-o ProxyCommand="$proxy")
     fi
 
     ssh "${ssh_args[@]}" -p "$final_port" "${final_user}@${final_host}" -- "$@"
