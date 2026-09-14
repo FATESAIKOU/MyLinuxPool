@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# bin/mlp — interactive admin CLI for MyLinuxPool, run from the operator's
+# ops-scripts/mlp — interactive admin CLI for MyLinuxPool, run from the operator's
 # own Mac (DDNS is gone; this replaces hand-building `ssh -J ...` chains).
 #
 # bash 3.2 COMPATIBLE ON PURPOSE — macOS ships 3.2, not bash 4+, and that
@@ -11,7 +11,7 @@
 # Plain indexed arrays, `[[ ... ]]`, process substitution and `printf %q`
 # are all fine — those have been in bash since well before 3.2.
 #
-# All node connection info comes from shared_config/pool-runtime's
+# All node connection info comes from shared-configs/pool-runtime's
 # pool-resolve. The one direct `gh api` call in this file (in
 # gather_targets) only enumerates NODE_* variable NAMES — pool-resolve has
 # no "list all nodes" capability and neither does anything else here, so
@@ -48,9 +48,12 @@ set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
-POOL_RESOLVE="${REPO_ROOT}/shared_config/pool-runtime/files/pool-resolve"
-POOL_STATUS="${REPO_ROOT}/shared_config/pool-runtime/files/pool-status"
+POOL_RESOLVE="${REPO_ROOT}/shared-configs/pool-runtime/files/pool-resolve"
+POOL_STATUS="${REPO_ROOT}/shared-configs/pool-runtime/files/pool-status"
 REPO="${POOL_REPO:-FATESAIKOU/MyLinuxPool}"
+
+# shellcheck source=../scripts/lib/ssh.sh
+source "${REPO_ROOT}/scripts/lib/ssh.sh"
 
 MLP_STATE_DIR="${HOME}/.mylinuxpool"
 GW_KNOWN_HOSTS="${MLP_STATE_DIR}/known_hosts"
@@ -246,9 +249,7 @@ run_on_node() {
     if [[ "$count" -eq 1 ]]; then
         # node has no hops of its own — it IS the Gateway. Direct
         # connection, verified against the dedicated Gateway known_hosts.
-        ssh -o UserKnownHostsFile="$GW_KNOWN_HOSTS" -o StrictHostKeyChecking=accept-new \
-            -o ConnectTimeout=10 -o BatchMode=yes \
-            -p "$port0" "${user0}@${host0}" "$cmd" < /dev/null
+        ssh_gateway_only "$GW_KNOWN_HOSTS" "$user0" "$host0" "$port0" "$cmd" < /dev/null
         return $?
     fi
 
@@ -264,12 +265,9 @@ run_on_node() {
 
     # hop0 is the Gateway (verified via its dedicated known_hosts); hop1
     # is 127.0.0.1:<port> on the far side of the reverse tunnel — not a
-    # stable identity (see top-of-file note), so no host-key checking at
-    # all for it, on purpose.
-    ssh -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no -o LogLevel=ERROR \
-        -o ConnectTimeout=10 -o BatchMode=yes \
-        -o ProxyCommand="ssh -o UserKnownHostsFile=${GW_KNOWN_HOSTS} -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 -W %h:%p ${user0}@${host0}" \
-        -p "$port1" "${user1}@${host1}" "$cmd" < /dev/null
+    # stable identity (see scripts/lib/ssh.sh's top-of-file note), so no
+    # host-key checking at all for it, on purpose.
+    ssh_via_gateway "$GW_KNOWN_HOSTS" "$user0" "$host0" "$port0" "$user1" "$host1" "$port1" "$cmd" < /dev/null
 }
 
 # ---- gather providers + workers ------------------------------------------
@@ -365,18 +363,20 @@ cmd_ls() {
 # ---- ssh ------------------------------------------------------------------
 do_connect() {
     local type="$1" port="$2" user="$3"
+    # This is an interactive login (a human is about to get a shell) —
+    # BatchMode must be off here, unlike every other caller of
+    # ssh_gateway_only/ssh_via_gateway in this file, or a key needing a
+    # passphrase would fail instead of prompting.
+    local SSH_BATCH_MODE=no
     case "$type" in
         gateway)
-            ssh -o UserKnownHostsFile="$GW_KNOWN_HOSTS" -o StrictHostKeyChecking=accept-new \
-                "${GW_USER}@${GW_IP}"
+            ssh_gateway_only "$GW_KNOWN_HOSTS" "$GW_USER" "$GW_IP" 22
             ;;
         provider|worker)
-            # See the top-of-file trust model note: the Gateway leg is
-            # verified (dedicated known_hosts, via ProxyCommand); the
+            # See scripts/lib/ssh.sh's trust-model note: the Gateway leg
+            # is verified (dedicated known_hosts, via ProxyCommand); the
             # 127.0.0.1:<port> leg is not checked at all, on purpose.
-            ssh -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no -o LogLevel=ERROR \
-                -o ProxyCommand="ssh -o UserKnownHostsFile=${GW_KNOWN_HOSTS} -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 -W %h:%p ${GW_USER}@${GW_IP}" \
-                -p "$port" "${user}@127.0.0.1"
+            ssh_via_gateway "$GW_KNOWN_HOSTS" "$GW_USER" "$GW_IP" 22 "$user" 127.0.0.1 "$port"
             ;;
         *)
             die "unknown target type: ${type}"

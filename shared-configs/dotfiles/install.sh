@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# shared_config/dotfiles/install.sh — docs/LAYOUT.md §1
+# shared-configs/dotfiles/install.sh — docs/LAYOUT.md §1
 # No key, no root: plain file copies into <home>.
 
 set -uo pipefail

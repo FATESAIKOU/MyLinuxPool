@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# shared_config/ssh-tunnel-server/install.sh — docs/LAYOUT.md §1
+# shared-configs/ssh-tunnel-server/install.sh — docs/LAYOUT.md §1
 #
 # Installs sshproxy's authorized_keys on the machine that gets DIALED INTO
 # by every provider's/worker's reverse tunnel — the Gateway. This is the
-# other half of the sshproxy identity from shared_config/ssh-tunnel-client
+# other half of the sshproxy identity from shared-configs/ssh-tunnel-client
 # (which installs the matching PRIVATE key on providers/workers): a
 # machine that receives the tunnel needs the public side authorized, never
 # the private key itself. (2026-09-15: these two used to be one
@@ -26,7 +26,7 @@ set -uo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
 FILES_DIR="${SCRIPT_DIR}/files"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
-DECRYPT="${REPO_ROOT}/scripts/decryptStdin.sh"
+DECRYPT="${REPO_ROOT}/scripts/lib/crypto.sh"
 
 log() {
     local level="$1"; shift
@@ -88,8 +88,8 @@ fi
 # Confirm we actually have the ability to decrypt before doing anything
 # that depends on it — an absent tool must fail as "can't check this",
 # never get misread as "checked, and it's wrong". 2026-09-15 incident:
-# shared_config/ was deployed without scripts/ alongside it, so this unit
-# hit "scripts/decryptStdin.sh: No such file or directory" and — before
+# shared-configs/ was deployed without scripts/ alongside it, so this unit
+# hit "scripts/lib/crypto.sh: No such file or directory" and — before
 # this check existed — reported that as "invariant violated:
 # id_rsa.pub.crypted's key is not present in authorized_keys.crypted".
 # Those are not the same failure: one means "the environment can't run
@@ -100,7 +100,7 @@ fi
 # the ability to check before reporting a verdict.
 if [[ ! -x "$DECRYPT" ]]; then
     log ERROR "${DECRYPT} not found or not executable"
-    log ERROR "this unit depends on scripts/decryptStdin.sh — deploy shared_config/ together with scripts/, not shared_config/ alone"
+    log ERROR "this unit depends on scripts/lib/crypto.sh — deploy shared-configs/ together with scripts/, not shared-configs/ alone"
     exit 1
 fi
 
@@ -110,13 +110,13 @@ fi
 # the invariant comparison runs: a decrypt failure (wrong --key, or a
 # corrupted .crypted file) must be reported as "couldn't verify", not
 # blended into the same failure path as "verified, and it's wrong".
-pubkey_content="$("$DECRYPT" "$KEY" < "${FILES_DIR}/id_rsa.pub.crypted")"
+pubkey_content="$("$DECRYPT" decrypt "$KEY" < "${FILES_DIR}/id_rsa.pub.crypted")"
 pubkey_rc=$?
-authorized_keys_content="$("$DECRYPT" "$KEY" < "${FILES_DIR}/authorized_keys.crypted")"
+authorized_keys_content="$("$DECRYPT" decrypt "$KEY" < "${FILES_DIR}/authorized_keys.crypted")"
 authorized_keys_rc=$?
 
 if [[ $pubkey_rc -ne 0 || $authorized_keys_rc -ne 0 ]]; then
-    log ERROR "cannot verify invariant: decryptStdin.sh failed (id_rsa.pub.crypted exit ${pubkey_rc}, authorized_keys.crypted exit ${authorized_keys_rc})"
+    log ERROR "cannot verify invariant: crypto.sh failed (id_rsa.pub.crypted exit ${pubkey_rc}, authorized_keys.crypted exit ${authorized_keys_rc})"
     log ERROR "this means the --key is wrong or a .crypted file is corrupted — NOT that the invariant is violated. Fix the decrypt failure first, then re-run to actually check the invariant."
     exit 1
 fi

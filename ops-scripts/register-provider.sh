@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# provider/register.sh — spec: docs/POOL_RUNTIME_SPEC.md §4
+# ops-scripts/register-provider.sh — spec: docs/POOL_RUNTIME_SPEC.md §4
 # RegisterProvider: run once, by hand, on a brand-new provider machine.
 # Idempotent — safe to re-run (e.g. after a GH_POOL_TOKEN rotation).
 
@@ -126,7 +126,7 @@ ensure_local_bin_in_path() {
     local line='export PATH="$HOME/.local/bin:$PATH"'
     local rcfile="${HOME}/.bashrc"
     if ! grep -qF "$line" "$rcfile" 2>/dev/null; then
-        printf '\n# added by MyLinuxPool provider/register.sh --no-sudo\n%s\n' "$line" >> "$rcfile"
+        printf '\n# added by MyLinuxPool ops-scripts/register-provider.sh --no-sudo\n%s\n' "$line" >> "$rcfile"
         log INFO "added ~/.local/bin to PATH in ${rcfile} (new shells only; current one is patched below)"
     fi
     case ":$PATH:" in
@@ -266,7 +266,7 @@ step1_preflight_no_sudo() {
 }
 
 # ---- step 2: store gh token --------------------------------------------------
-# This duplicates part of shared_config/gh/install.sh on purpose instead of
+# This duplicates part of shared-configs/gh/install.sh on purpose instead of
 # calling it: that unit lives inside REPO_DIR, and REPO_DIR doesn't exist
 # yet on a brand-new provider — `gh repo clone` in step 3 needs this very
 # token first. Chicken-and-egg, so this bootstrap step stays inline.
@@ -368,7 +368,7 @@ step3_fetch_runtime() {
     }
 
     for unit in $units; do
-        install="${REPO_DIR}/shared_config/${unit}/install.sh"
+        install="${REPO_DIR}/shared-configs/${unit}/install.sh"
         if [[ ! -x "$install" ]]; then
             log ERROR "${install} missing or not executable (declared in ${PROFILE_JSON})"
             exit 1
@@ -397,14 +397,14 @@ step4_key() {
     mkdir -p "$SSH_DIR"
     chmod 700 "$SSH_DIR"
 
-    local authorized_keys_crypted="${REPO_DIR}/shared_config/ssh-admin/files/authorized_keys.crypted"
+    local authorized_keys_crypted="${REPO_DIR}/shared-configs/ssh-admin/files/authorized_keys.crypted"
     if [[ ! -f "$authorized_keys_crypted" ]]; then
         log ERROR "encrypted authorized_keys bundle not found at ${authorized_keys_crypted}"
         exit 1
     fi
 
     local actions_line
-    actions_line="$("${REPO_DIR}/scripts/decryptStdin.sh" "$FILE_CRYPTO_KEY" \
+    actions_line="$("${REPO_DIR}/scripts/lib/crypto.sh" decrypt "$FILE_CRYPTO_KEY" \
         < "$authorized_keys_crypted" | grep -F 'mylinuxpool-actions' | head -n1 || true)"
 
     if [[ -z "$actions_line" ]]; then

@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# shared_config/ssh-admin/install.sh — docs/LAYOUT.md §1
+# shared-configs/ssh-admin/install.sh — docs/LAYOUT.md §1
 # fatesaikou's own ssh identity — used on the Gateway only (a provider
 # reaches Actions the other way around: SSH_KEY_ACTIONS' public half goes
 # into the PROVIDER's authorized_keys, which is a narrower operation
-# ops-script/register-provider.sh does itself, not this unit — this unit
+# ops-scripts/register-provider.sh does itself, not this unit — this unit
 # is fatesaikou's FULL identity, private key included, and that must never
 # land on a provider).
 #
@@ -14,7 +14,7 @@ set -uo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
 FILES_DIR="${SCRIPT_DIR}/files"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
-DECRYPT="${REPO_ROOT}/scripts/decryptStdin.sh"
+DECRYPT="${REPO_ROOT}/scripts/lib/crypto.sh"
 
 log() {
     local level="$1"; shift
@@ -79,7 +79,7 @@ fi
 # what was really a missing scripts/ directory).
 if [[ ! -x "$DECRYPT" ]]; then
     log ERROR "${DECRYPT} not found or not executable"
-    log ERROR "this unit depends on scripts/decryptStdin.sh — deploy shared_config/ together with scripts/, not shared_config/ alone"
+    log ERROR "this unit depends on scripts/lib/crypto.sh — deploy shared-configs/ together with scripts/, not shared-configs/ alone"
     exit 1
 fi
 
@@ -89,11 +89,11 @@ chmod 700 "$SSH_DIR"
 if [[ -f "${SSH_DIR}/id_rsa" ]]; then
     log INFO "${SSH_DIR}/id_rsa already present, skipping decrypt"
 else
-    "$DECRYPT" "$KEY" < "${FILES_DIR}/id_rsa.crypted" > "${SSH_DIR}/id_rsa"
+    "$DECRYPT" decrypt "$KEY" < "${FILES_DIR}/id_rsa.crypted" > "${SSH_DIR}/id_rsa"
     rc=$?
     if [[ $rc -ne 0 ]]; then
         rm -f "${SSH_DIR}/id_rsa"
-        log ERROR "decryptStdin.sh failed (exit ${rc}) while decrypting id_rsa.crypted — wrong --key, or the encrypted file is corrupted"
+        log ERROR "crypto.sh failed (exit ${rc}) while decrypting id_rsa.crypted — wrong --key, or the encrypted file is corrupted"
         exit 1
     fi
     log INFO "decrypted id_rsa to ${SSH_DIR}/id_rsa"
@@ -103,11 +103,11 @@ chmod 600 "${SSH_DIR}/id_rsa"
 if [[ -f "${SSH_DIR}/id_rsa.pub" ]]; then
     log INFO "${SSH_DIR}/id_rsa.pub already present, skipping decrypt"
 else
-    "$DECRYPT" "$KEY" < "${FILES_DIR}/id_rsa.pub.crypted" > "${SSH_DIR}/id_rsa.pub"
+    "$DECRYPT" decrypt "$KEY" < "${FILES_DIR}/id_rsa.pub.crypted" > "${SSH_DIR}/id_rsa.pub"
     rc=$?
     if [[ $rc -ne 0 ]]; then
         rm -f "${SSH_DIR}/id_rsa.pub"
-        log ERROR "decryptStdin.sh failed (exit ${rc}) while decrypting id_rsa.pub.crypted — wrong --key, or the encrypted file is corrupted"
+        log ERROR "crypto.sh failed (exit ${rc}) while decrypting id_rsa.pub.crypted — wrong --key, or the encrypted file is corrupted"
         exit 1
     fi
     log INFO "decrypted id_rsa.pub to ${SSH_DIR}/id_rsa.pub"
@@ -117,11 +117,11 @@ chmod 644 "${SSH_DIR}/id_rsa.pub"
 if [[ -f "${SSH_DIR}/authorized_keys" ]]; then
     log INFO "${SSH_DIR}/authorized_keys already present, skipping decrypt"
 else
-    "$DECRYPT" "$KEY" < "${FILES_DIR}/authorized_keys.crypted" > "${SSH_DIR}/authorized_keys"
+    "$DECRYPT" decrypt "$KEY" < "${FILES_DIR}/authorized_keys.crypted" > "${SSH_DIR}/authorized_keys"
     rc=$?
     if [[ $rc -ne 0 ]]; then
         rm -f "${SSH_DIR}/authorized_keys"
-        log ERROR "decryptStdin.sh failed (exit ${rc}) while decrypting authorized_keys.crypted — wrong --key, or the encrypted file is corrupted"
+        log ERROR "crypto.sh failed (exit ${rc}) while decrypting authorized_keys.crypted — wrong --key, or the encrypted file is corrupted"
         exit 1
     fi
     log INFO "decrypted authorized_keys to ${SSH_DIR}/authorized_keys"

@@ -19,7 +19,7 @@ PROFILE_JSON="${REPO_ROOT}/profiles/${PROFILE}/profile.json"
 [[ -f "$PROFILE_JSON" ]] || { echo "verify-profile: no such profile: ${PROFILE_JSON}" >&2; exit 2; }
 
 UNITS="$(python3 -c "import json;print(' '.join(json.load(open('${PROFILE_JSON}'))['shared_config']))")"
-RESOLVE="${REPO_ROOT}/shared_config/pool-runtime/files/pool-resolve"
+RESOLVE="${REPO_ROOT}/shared-configs/pool-runtime/files/pool-resolve"
 
 HOPS="$("$RESOLVE" "$NODE" --expand-hops)" || {
     echo "verify-profile: could not resolve ${NODE}" >&2; exit 3; }
@@ -46,10 +46,10 @@ cd "$HOME/.mlp-verify" || exit 1
 fail=0
 for u in $UNITS_LIST; do
     printf '  %-22s ' "$u"
-    if [[ ! -f "shared_config/$u/install.sh" ]]; then
+    if [[ ! -f "shared-configs/$u/install.sh" ]]; then
         echo "MISSING UNIT"; fail=1; continue
     fi
-    if bash "shared_config/$u/install.sh" --check --key "$POOL_KEY" >/tmp/vp.out 2>&1; then
+    if bash "shared-configs/$u/install.sh" --check --key "$POOL_KEY" >/tmp/vp.out 2>&1; then
         echo "ok"
     else
         echo "DRIFT: $(tail -1 /tmp/vp.out | sed 's/^\[[^]]*\] [A-Z]* //' | cut -c1-56)"
@@ -65,7 +65,7 @@ echo "  units: ${UNITS}"
 echo
 
 # COPYFILE_DISABLE: macOS tar 會塞 xattr，遠端 GNU tar 會對每個檔案抱怨一次
-COPYFILE_DISABLE=1 tar czf "${STAGE}/payload.tgz" -C "$REPO_ROOT" shared_config scripts 2>/dev/null
+COPYFILE_DISABLE=1 tar czf "${STAGE}/payload.tgz" -C "$REPO_ROOT" shared-configs scripts 2>/dev/null
 ssh "${SSH_OPTS[@]}" -p "$LPORT" "${LUSER}@${LHOST}" \
     'rm -rf ~/.mlp-verify && mkdir -p ~/.mlp-verify && tar xzf - -C ~/.mlp-verify' \
     < "${STAGE}/payload.tgz" || { echo "verify-profile: could not stage" >&2; exit 3; }

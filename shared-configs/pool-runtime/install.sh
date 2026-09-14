@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# shared_config/pool-runtime/install.sh — docs/LAYOUT.md §1
+# shared-configs/pool-runtime/install.sh — docs/LAYOUT.md §1
 #
 # Installs pool-resolve/pool-tunnel/pool-wol/pool-status/pool-port-alloc to
 # <home>/.mylinuxpool/bin/ (the canonical location — POOL_RUNTIME_SPEC.md
@@ -11,7 +11,7 @@
 # systemd service, and `loginctl enable-linger`, are role-specific
 # decisions (a provider runs pool-tunnel as a persistent service; the
 # Gateway never runs it at all — it only needs the tools for ad-hoc use)
-# and stay the caller's job (ops-script/register-provider.sh).
+# and stay the caller's job (ops-scripts/register-provider.sh).
 
 set -uo pipefail
 

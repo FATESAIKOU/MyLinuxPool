@@ -3,7 +3,7 @@
 #
 # Contract with the calling workflow:
 #   - this repo must already be checked out (pool-resolve is read from
-#     $GITHUB_WORKSPACE/shared_config/pool-runtime/files/, not assumed to
+#     $GITHUB_WORKSPACE/shared-configs/pool-runtime/files/, not assumed to
 #     be on PATH)
 #   - GH_TOKEN must be exported (secrets.GITHUB_TOKEN or GH_POOL_TOKEN) so
 #     pool-resolve can read NODE_* vars
@@ -26,16 +26,25 @@ log() {
 NODE="${POOL_SSH_NODE:?POOL_SSH_NODE not set}"
 COMMAND="${POOL_SSH_COMMAND:?POOL_SSH_COMMAND not set}"
 TIMEOUT="${POOL_SSH_TIMEOUT:-10}"
+export SSH_CONNECT_TIMEOUT="$TIMEOUT"
 
-POOL_RESOLVE="${GITHUB_WORKSPACE:-.}/shared_config/pool-runtime/files/pool-resolve"
+POOL_RESOLVE="${GITHUB_WORKSPACE:-.}/shared-configs/pool-runtime/files/pool-resolve"
 if [[ ! -x "$POOL_RESOLVE" ]]; then
     POOL_RESOLVE="$(command -v pool-resolve || true)"
 fi
 if [[ -z "$POOL_RESOLVE" || ! -x "$POOL_RESOLVE" ]]; then
-    log ERROR "pool-resolve not found under \$GITHUB_WORKSPACE/shared_config/pool-runtime/files or on PATH"
+    log ERROR "pool-resolve not found under \$GITHUB_WORKSPACE/shared-configs/pool-runtime/files or on PATH"
     log ERROR "did the workflow check out this repo (actions/checkout) before calling pool-ssh?"
     exit 1
 fi
+
+SSH_LIB="${GITHUB_WORKSPACE:-.}/scripts/lib/ssh.sh"
+if [[ ! -f "$SSH_LIB" ]]; then
+    log ERROR "${SSH_LIB} not found — did the workflow check out this repo before calling pool-ssh?"
+    exit 1
+fi
+# shellcheck source=../../../scripts/lib/ssh.sh
+source "$SSH_LIB"
 
 log INFO "resolving jump chain for node '${NODE}'"
 hops_json="$("$POOL_RESOLVE" "$NODE" --expand-hops)"
@@ -62,9 +71,12 @@ cleanup() {
 }
 trap cleanup EXIT
 
-jump_specs=()
-final_host="" final_port="22" final_user=""
-
+# Key loading is this script's own job (Actions-specific: each hop names
+# an env var by key_secret, injected from secrets.* by the calling
+# workflow) — scripts/lib/ssh.sh never loads keys itself, it only
+# assembles and runs the chain once every needed identity is already in
+# this agent.
+final_user="" final_host="" final_port="22"
 for (( i = 0; i < hop_count; i++ )); do
     hop="$(printf '%s' "$hops_json" | jq -c ".[$i]")"
     host="$(printf '%s' "$hop" | jq -r '.host')"
@@ -84,23 +96,10 @@ for (( i = 0; i < hop_count; i++ )); do
         exit 1
     fi
 
-    if (( i < hop_count - 1 )); then
-        jump_specs+=("${user}@${host}:${port}")
-    else
-        final_host="$host"
-        final_port="$port"
-        final_user="$user"
-    fi
+    (( i == hop_count - 1 )) && { final_user="$user"; final_host="$host"; final_port="$port"; }
 done
 
-ssh_args=(-o StrictHostKeyChecking=accept-new -o ConnectTimeout="$TIMEOUT" -o BatchMode=yes)
-
-if (( ${#jump_specs[@]} > 0 )); then
-    jump_str="$(IFS=,; echo "${jump_specs[*]}")"
-    ssh_args+=(-J "$jump_str")
-fi
-
-log INFO "running command on ${final_user}@${final_host}:${final_port} (${#jump_specs[@]} jump(s))"
+log INFO "running command on ${final_user}@${final_host}:${final_port} (${hop_count} hop(s), uniform trust)"
 
 # stderr flows straight to the step's log, untouched. stdout is teed so it
 # still shows up live in the log AND gets captured for callers that need
@@ -108,7 +107,7 @@ log INFO "running command on ${final_user}@${final_host}:${final_port} (${#jump_
 # pool-port-alloc) — PIPESTATUS keeps `tee`'s own exit code from masking
 # ssh's under `pipefail`.
 set +e
-ssh "${ssh_args[@]}" -p "$final_port" "${final_user}@${final_host}" -- "$COMMAND" | tee "$STDOUT_FILE"
+ssh_jump_chain "$hops_json" "$COMMAND" | tee "$STDOUT_FILE"
 rc="${PIPESTATUS[0]}"
 set -e
 

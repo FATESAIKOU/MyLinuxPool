@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# shared_config/gh/install.sh — docs/LAYOUT.md §1
+# shared-configs/gh/install.sh — docs/LAYOUT.md §1
 #
 # needs_key=false: this unit has no files/ at all, so --key is accepted
 # (interface parity) but unused. The token-file/credential-helper part of
@@ -13,7 +13,7 @@
 # needs_root=true: apt-installing `gh` needs root, but ONLY when `gh` isn't
 # already on PATH — the root check is gated on that (see below), not
 # unconditional, so a caller that already has `gh` some other way (e.g.
-# provider/register.sh's own --no-sudo tarball bootstrap, run before this
+# ops-scripts/register-provider.sh's own --no-sudo tarball bootstrap, run before this
 # unit ever gets called) can still call this unit as a normal user to get
 # the token file + git credential helper set up.
 

@@ -1,20 +1,14 @@
 #!/usr/bin/env bash
-# shared_config/standalonescripts/install.sh — docs/LAYOUT.md §1
-#
-# dlpw/uppw need rclone at RUNTIME (LAYOUT.md's own §"為什麼要這樣改" #3:
-# this dependency used to be implicit and undocumented). This unit only
-# places the two scripts — it does not install rclone itself; the profile
-# that lists this unit must also list the rclone unit. The soft check
-# below just warns if rclone isn't there yet, it doesn't block install.
-#
-# needs_key=true, needs_root=false.
+# shared-configs/rclone/install.sh — docs/LAYOUT.md §1
+# needs_root=true: this unit apt-installs the rclone binary, so the caller
+# must already be root (checked below, skipped for --check).
 
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
 FILES_DIR="${SCRIPT_DIR}/files"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
-DECRYPT="${REPO_ROOT}/scripts/decryptStdin.sh"
+DECRYPT="${REPO_ROOT}/scripts/lib/crypto.sh"
 
 log() {
     local level="$1"; shift
@@ -47,21 +41,24 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-TARGET_DIR="${HOME_DIR}/testSH"
+TARGET="${HOME_DIR}/.config/rclone/rclone.conf"
 
 check_installed() {
-    [[ -x "${TARGET_DIR}/dlpw" && -x "${TARGET_DIR}/uppw" ]]
+    command -v rclone >/dev/null 2>&1 || return 1
+    [[ -f "$TARGET" ]] || return 1
+    return 0
 }
 
 if [[ "$CHECK_ONLY" -eq 1 ]]; then
     if check_installed; then
-        log INFO "standalonescripts already installed"
+        log INFO "rclone already installed"
         exit 0
     fi
-    log INFO "standalonescripts not fully installed"
+    log INFO "rclone not fully installed"
     exit 1
 fi
 
+# needs_key=true: --key, or the key piped on stdin, is required from here on.
 if [[ -z "$KEY" ]]; then
     if [[ ! -t 0 ]]; then
         KEY="$(cat)"
@@ -79,30 +76,37 @@ fi
 # what was really a missing scripts/ directory).
 if [[ ! -x "$DECRYPT" ]]; then
     log ERROR "${DECRYPT} not found or not executable"
-    log ERROR "this unit depends on scripts/decryptStdin.sh — deploy shared_config/ together with scripts/, not shared_config/ alone"
+    log ERROR "this unit depends on scripts/lib/crypto.sh — deploy shared-configs/ together with scripts/, not shared-configs/ alone"
+    exit 1
+fi
+
+if [[ "$(id -u)" -ne 0 ]]; then
+    log ERROR "this unit needs_root=true — run as root"
     exit 1
 fi
 
 if ! command -v rclone >/dev/null 2>&1; then
-    log WARN "rclone is not on PATH yet — dlpw/uppw will be installed but won't work until the rclone unit is also installed"
+    log INFO "installing rclone via apt"
+    apt-get update -y
+    apt-get install -y rclone
+else
+    log INFO "rclone binary already present"
 fi
 
-mkdir -p "$TARGET_DIR"
-for f in dlpw uppw; do
-    if [[ -f "${TARGET_DIR}/${f}" ]]; then
-        log INFO "${TARGET_DIR}/${f} already present, skipping decrypt"
-    else
-        "$DECRYPT" "$KEY" < "${FILES_DIR}/${f}.crypted" > "${TARGET_DIR}/${f}"
-        rc=$?
-        if [[ $rc -ne 0 ]]; then
-            rm -f "${TARGET_DIR}/${f}"
-            log ERROR "decryptStdin.sh failed (exit ${rc}) while decrypting ${f}.crypted — wrong --key, or the encrypted file is corrupted"
-            exit 1
-        fi
-        log INFO "decrypted ${f} to ${TARGET_DIR}/${f}"
+mkdir -p "$(dirname "$TARGET")"
+if [[ -f "$TARGET" ]]; then
+    log INFO "${TARGET} already present, skipping decrypt"
+else
+    "$DECRYPT" decrypt "$KEY" < "${FILES_DIR}/rclone.conf.crypted" > "$TARGET"
+    rc=$?
+    if [[ $rc -ne 0 ]]; then
+        rm -f "$TARGET"
+        log ERROR "crypto.sh failed (exit ${rc}) while decrypting rclone.conf.crypted — wrong --key, or the encrypted file is corrupted"
+        exit 1
     fi
-    chmod +x "${TARGET_DIR}/${f}"
-done
-chown -R "${TARGET_USER}:${TARGET_USER}" "$TARGET_DIR" 2>/dev/null || true
+    log INFO "decrypted rclone.conf to ${TARGET}"
+fi
+chmod 600 "$TARGET"
+chown -R "${TARGET_USER}:${TARGET_USER}" "$(dirname "$TARGET")" 2>/dev/null || true
 
-log INFO "standalonescripts installed to ${TARGET_DIR}"
+log INFO "rclone installed and configured"

@@ -3,7 +3,8 @@ name: Delete Worker
 # spec: docs/POOL_RUNTIME_SPEC.md §10.4
 #
 # Every remote command goes through .github/actions/pool-ssh — this file
-# never constructs its own `ssh -J ...` chain.
+# never constructs its own `ssh -J ...` chain. Input validation and claim
+# matching live in scripts/delete-worker.sh (docs/LAYOUT.md §3).
 
 on:
   workflow_dispatch:
@@ -43,24 +44,14 @@ jobs:
           NAME_IN: ${{ inputs.name }}
         run: |
           set -euo pipefail
-          if [[ -z "$PORT_IN" && -z "$NAME_IN" ]]; then
-            echo "::error::give either 'port' or 'name'"
-            exit 1
-          fi
-          if [[ -n "$PORT_IN" ]] && ! [[ "$PORT_IN" =~ ^[0-9]+$ ]]; then
-            echo "::error::'port' must be numeric, got '${PORT_IN}'"
-            exit 1
-          fi
-          if [[ -n "$NAME_IN" ]] && ! [[ "$NAME_IN" =~ ^[A-Za-z0-9._-]+$ ]]; then
-            echo "::error::'name' must match ^[A-Za-z0-9._-]+\$, got '${NAME_IN}'"
-            exit 1
-          fi
+          source scripts/delete-worker.sh
+          delete_worker_validate_inputs "$PORT_IN" "$NAME_IN" || { echo "::error::invalid input — see log above"; exit 1; }
 
       # pool-port-alloc is installed at ~/.mylinuxpool/bin/ on the Gateway
-      # (shared_config/pool-runtime's install.sh, called from
-      # provision.sh) — call that directly. Piping the script's own text
-      # into `bash -c` was the earlier approach, but $BASH_SOURCE isn't a
-      # real path under `-c`, which broke pool-port-alloc's own
+      # (shared-configs/pool-runtime's install.sh, called from
+      # provision-gateway.sh) — call that directly. Piping the script's
+      # own text into `bash -c` was the earlier approach, but $BASH_SOURCE
+      # isn't a real path under `-c`, which broke pool-port-alloc's own
       # SCRIPT_DIR-relative lookup of pool-resolve (2026-09-14 incident) —
       # same fix as create-worker.yml.
       - name: List worker port claims on the Gateway
@@ -70,10 +61,6 @@ jobs:
           node: gateway
           command: ~/.mylinuxpool/bin/pool-port-alloc --list
 
-      # The real state of a port is `ss` on the Gateway, not this
-      # placeholder (spec §10.1) — but we need it here regardless, to
-      # learn WHICH provider and container to reach, since neither `port`
-      # nor `name` alone tells us that.
       - name: Find the matching claim
         id: find
         shell: bash
@@ -83,29 +70,13 @@ jobs:
           # matters here since these placeholders can carry a name
           # someone passed to create-worker.yml.
           CLAIMS_JSON: ${{ steps.list.outputs.stdout }}
+          PORT_IN: ${{ inputs.port }}
+          NAME_IN: ${{ inputs.name }}
         run: |
           set -euo pipefail
-          claims="$CLAIMS_JSON"
-          port_in="${{ inputs.port }}"
-          name_in="${{ inputs.name }}"
-
-          if [[ -n "$port_in" ]]; then
-            match="$(jq -c --argjson p "$port_in" '[.[] | select(.port == $p)] | first // empty' <<<"$claims")"
-          else
-            container="mlp-${name_in}"
-            match="$(jq -c --arg c "$container" '[.[] | select(.container == $c)] | first // empty' <<<"$claims")"
-          fi
-
-          if [[ -z "$match" ]]; then
-            echo "::error::no worker port claim found for '${port_in}${name_in}' — check pool-port-alloc --list on the Gateway"
-            exit 1
-          fi
-
-          {
-            echo "port=$(jq -r '.port' <<<"$match")"
-            echo "provider=$(jq -r '.provider' <<<"$match")"
-            echo "container=$(jq -r '.container // empty' <<<"$match")"
-          } >> "$GITHUB_OUTPUT"
+          source scripts/delete-worker.sh
+          delete_worker_find_claim "$CLAIMS_JSON" "$PORT_IN" "$NAME_IN" >> "$GITHUB_OUTPUT" \
+            || { echo "::error::no worker port claim found — see log above"; exit 1; }
 
       # Best-effort: a provider being briefly unreachable shouldn't block
       # freeing the port below — but the step still shows red so it's not

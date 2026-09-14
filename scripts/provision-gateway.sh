@@ -1,24 +1,24 @@
 #!/usr/bin/env bash
-# gateway/provision.sh — spec: docs/POOL_RUNTIME_SPEC.md §9.2, docs/LAYOUT.md
+# scripts/provision-gateway.sh — spec: docs/POOL_RUNTIME_SPEC.md §9.2, docs/LAYOUT.md
 #
 # Runs on a freshly cloud-init'd Gateway, as root, driven by Actions AFTER
-# shared_config/ has already been scp'd to
-# /home/fatesaikou/.mylinuxpool/repo/shared_config (see rotate-gateway.yml's
+# shared-configs/ has already been scp'd to
+# /home/fatesaikou/.mylinuxpool/repo/shared-configs (see rotate-gateway.yml's
 # bundle-deploy step — it no longer decrypts/flattens files itself; that
 # now happens per-unit, right here, so each unit's install.sh can find its
 # own co-located files/). Idempotent — safe to re-run.
 #
 # FILE_CRYPTO_KEY must be exported in this process's environment (the
 # workflow passes it the same way it already passes POOL_TRUSTED_IPS:
-# `sudo env FILE_CRYPTO_KEY=... POOL_TRUSTED_IPS=... bash -s < provision.sh`).
+# `sudo env FILE_CRYPTO_KEY=... POOL_TRUSTED_IPS=... bash -s < provision-gateway.sh`).
 # It is never written to disk or logged here — each unit gets it via
 # --key on its own argv, the one pre-existing, accepted exception to "no
-# secrets as CLI args" (spec §7) that scripts/decryptStdin.sh already set.
+# secrets as CLI args" (spec §7) that scripts/lib/crypto.sh already set.
 
 set -euo pipefail
 
 REPO_DIR="/home/fatesaikou/.mylinuxpool/repo"
-SHARED_CONFIG_DIR="${REPO_DIR}/shared_config"
+SHARED_CONFIG_DIR="${REPO_DIR}/shared-configs"
 WORKERS_DIR="/home/fatesaikou/pool/workers.d"
 SSHD_CONF="/etc/ssh/sshd_config.d/10-mylinuxpool.conf"
 FAIL2BAN_CONF="/etc/fail2ban/jail.d/mylinuxpool-ignore.conf"
@@ -35,7 +35,7 @@ log() {
 }
 
 if [[ "$(id -u)" -ne 0 ]]; then
-    log ERROR "provision.sh must run as root"
+    log ERROR "provision-gateway.sh must run as root"
     exit 1
 fi
 
@@ -93,12 +93,12 @@ step2_fail2ban_ignoreip() {
     if ! command -v fail2ban-client >/dev/null 2>&1; then
         log ERROR "fail2ban is not installed — writing an ignoreip rule for it would be meaningless"
         log ERROR "this is exactly the gap that caused the 2026-09-13 45-minute lockout: no fail2ban means no ignoreip means no rescue path if the home IP gets banned"
-        log ERROR "cloud-init must finish installing fail2ban before provision.sh runs — see rotate-gateway.yml's cloud-init wait step"
+        log ERROR "cloud-init must finish installing fail2ban before provision-gateway.sh runs — see rotate-gateway.yml's cloud-init wait step"
         exit 1
     fi
 
     # Don't assume the directory survived cloud-init's package install —
-    # provision.sh has been run against a still-provisioning box before.
+    # provision-gateway.sh has been run against a still-provisioning box before.
     mkdir -p "$(dirname "$FAIL2BAN_CONF")"
 
     local desired
@@ -135,7 +135,7 @@ step3_install_shared_config() {
     log INFO "step 3/6: install shared_config units"
 
     if [[ ! -d "$SHARED_CONFIG_DIR" ]]; then
-        log ERROR "${SHARED_CONFIG_DIR} not found — did the bundle deploy step scp shared_config/ here?"
+        log ERROR "${SHARED_CONFIG_DIR} not found — did the bundle deploy step scp shared-configs/ here?"
         exit 1
     fi
 

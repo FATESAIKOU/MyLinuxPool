@@ -31,16 +31,16 @@
 
 ## 日常操作
 
-在 Mac 上用 `bin/mlp`：
+在 Mac 上用 `ops-scripts/mlp`：
 
 ```bash
-bin/mlp                # 互動式選單
-bin/mlp ls             # 列出所有節點與即時狀態
-bin/mlp ssh            # 選一個節點登入
-bin/mlp wake           # 喚醒 fh-l
-bin/mlp down           # 關閉 fh-l
-bin/mlp status         # 完整健康檢查
-bin/mlp trust-gateway  # Gateway rotate 後第一次連線要跑這個
+ops-scripts/mlp                # 互動式選單
+ops-scripts/mlp ls             # 列出所有節點與即時狀態
+ops-scripts/mlp ssh            # 選一個節點登入
+ops-scripts/mlp wake           # 喚醒 fh-l
+ops-scripts/mlp down           # 關閉 fh-l
+ops-scripts/mlp status         # 完整健康檢查
+ops-scripts/mlp trust-gateway  # Gateway rotate 後第一次連線要跑這個
 ```
 
 需要 `fzf` / `jq` / `gh`（`brew install fzf jq gh`）。
@@ -57,12 +57,12 @@ bin/mlp trust-gateway  # Gateway rotate 後第一次連線要跑這個
 
 | 路徑 | 內容 |
 |---|---|
-| `bin/mlp` | 管理員 CLI（Mac） |
-| `shared_config/<unit>/` | 可分發安裝單位（`unit.json` + `install.sh` + `files/`），見 `docs/LAYOUT.md` |
-| `profiles/gateway/<name>/` | Gateway 角色的 cloud-config + 宣告要裝哪些 shared_config unit |
+| `profiles/gateway/<name>/` | Gateway 角色的 cloud-config + 宣告要裝哪些 unit |
+| `profiles/provider/<name>/` | Provider 角色宣告（`default`／`no-sudo`） |
 | `profiles/worker/<image>/` | Worker image 的 Dockerfile 與其 `profile.json` |
-| `provider/register.sh` | 新增一台 provider，一輩子跑一次 |
-| `gateway/provision.sh` | Gateway 開機後的 provision 腳本 |
+| `shared-configs/<unit>/` | 可分發安裝單位（`unit.json` + `install.sh` + `files/` + `tests/`），見 `docs/LAYOUT.md` |
+| `scripts/` | 業務邏輯（不依賴 GitHub Actions），含 `lib/{log,crypto,ssh,profile}.sh` |
+| `ops-scripts/` | 人手動跑的東西：`register-provider.sh`、`mlp`、`verify-profile` |
 | `docs/` | 見下 |
 
 ## 文件
@@ -87,6 +87,6 @@ bin/mlp trust-gateway  # Gateway rotate 後第一次連線要跑這個
 
 ## 出事時
 
-先跑 `bin/mlp status`。它會指出哪一層壞了，並在 TCP 被立即拒絕時提示去查
+先跑 `ops-scripts/mlp status`。它會指出哪一層壞了，並在 TCP 被立即拒絕時提示去查
 fail2ban —— 那正是 2026-09-13 導致整座叢集失聯 45 分鐘的原因
 （見 `RUNBOOK.md` §7）。

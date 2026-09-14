@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# shared_config/ssh-tunnel-client/install.sh — docs/LAYOUT.md §1
+# shared-configs/ssh-tunnel-client/install.sh — docs/LAYOUT.md §1
 #
 # Installs the shared sshproxy PRIVATE key that a provider's/worker's
 # pool-tunnel authenticates the reverse tunnel with, at the fixed path
@@ -9,7 +9,7 @@
 #
 # This is the "dials out" half of the sshproxy identity — the Gateway,
 # which gets DIALED, needs the matching authorized_keys instead, not this
-# private key. See shared_config/ssh-tunnel-server for that (2026-09-15:
+# private key. See shared-configs/ssh-tunnel-server for that (2026-09-15:
 # these two used to be one "ssh-tunnel" unit that quietly installed the
 # wrong half of the identity depending which end you asked — this split
 # undoes that).
@@ -21,7 +21,7 @@ set -uo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
 FILES_DIR="${SCRIPT_DIR}/files"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
-DECRYPT="${REPO_ROOT}/scripts/decryptStdin.sh"
+DECRYPT="${REPO_ROOT}/scripts/lib/crypto.sh"
 
 log() {
     local level="$1"; shift
@@ -87,7 +87,7 @@ fi
 # what was really a missing scripts/ directory).
 if [[ ! -x "$DECRYPT" ]]; then
     log ERROR "${DECRYPT} not found or not executable"
-    log ERROR "this unit depends on scripts/decryptStdin.sh — deploy shared_config/ together with scripts/, not shared_config/ alone"
+    log ERROR "this unit depends on scripts/lib/crypto.sh — deploy shared-configs/ together with scripts/, not shared-configs/ alone"
     exit 1
 fi
 
@@ -97,11 +97,11 @@ chmod 700 "$SSH_DIR"
 if [[ -f "$TARGET" ]]; then
     log INFO "${TARGET} already present, skipping decrypt"
 else
-    "$DECRYPT" "$KEY" < "${FILES_DIR}/id_rsa.crypted" > "$TARGET"
+    "$DECRYPT" decrypt "$KEY" < "${FILES_DIR}/id_rsa.crypted" > "$TARGET"
     rc=$?
     if [[ $rc -ne 0 ]]; then
         rm -f "$TARGET"
-        log ERROR "decryptStdin.sh failed (exit ${rc}) while decrypting id_rsa.crypted — wrong --key, or the encrypted file is corrupted"
+        log ERROR "crypto.sh failed (exit ${rc}) while decrypting id_rsa.crypted — wrong --key, or the encrypted file is corrupted"
         exit 1
     fi
     log INFO "decrypted shared sshproxy key to ${TARGET}"
