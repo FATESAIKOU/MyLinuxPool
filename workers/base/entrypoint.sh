@@ -45,12 +45,29 @@ fi
 
 chown -R worker:worker "${WORKER_HOME}/.ssh"
 
+# sshd's privilege-separation directory lives on tmpfs (/run) and does
+# NOT survive from image build to container start — creating it in the
+# Dockerfile is a no-op (2026-09-14 incident: container exited
+# immediately with "Missing privilege separation directory: /run/sshd").
+# /var/run is a compatibility symlink to /run on any Debian/Ubuntu-derived
+# image; mkdir -p is harmless either way (real dir or through the symlink).
+mkdir -p /run/sshd /var/run/sshd
+chmod 0755 /run/sshd /var/run/sshd
+
+# Host keys likewise aren't guaranteed to survive from build to a fresh
+# container — ssh-keygen -A only (re)generates whichever are missing.
 ssh-keygen -A
 
-/usr/sbin/sshd
+if ! /usr/sbin/sshd; then
+    echo "FATAL: sshd failed to start — see the message above for why" >&2
+    exit 1
+fi
 
 # Plain `su` (no `-`/login) updates HOME/USER for the target user but,
 # unlike `su -`, does not reset the rest of the environment — so
 # POOL_GATEWAY_PORT/HOST/USER, POOL_NODE_NAME, and anything profile.json
 # injected all still reach pool-tunnel (and whatever workload runs here).
+# `exec` replaces this script as PID 1, so if pool-tunnel itself ever
+# exits, that exit code becomes the container's own — visible in
+# `docker logs`/`docker inspect`, not swallowed.
 exec su worker -c 'exec /usr/local/bin/pool-tunnel'

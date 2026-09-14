@@ -308,6 +308,18 @@ jobs:
       # --- failure handling: never leave an orphaned port claim or a
       # broken, unverified container behind. ---
 
+      # Grab evidence BEFORE cleanup destroys it — the container removal
+      # step right after this one is exactly what erased the logs during
+      # the 2026-09-14 investigation, forcing a manual reproduction to
+      # find "Missing privilege separation directory: /run/sshd" at all.
+      - name: On failure, capture container logs before cleanup
+        if: failure() && steps.identity.outputs.container != ''
+        continue-on-error: true
+        uses: ./.github/actions/pool-ssh
+        with:
+          node: ${{ inputs.provider }}
+          command: echo "--- docker logs ${{ steps.identity.outputs.container }} (last 30 lines) ---"; docker logs --tail 30 ${{ steps.identity.outputs.container }} 2>&1 || echo "(no logs — container may never have been created)"
+
       - name: On failure, remove the (possibly broken) container
         if: failure() && steps.identity.outputs.container != ''
         uses: ./.github/actions/pool-ssh
