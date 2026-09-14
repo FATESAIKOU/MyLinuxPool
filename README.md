@@ -143,8 +143,17 @@ ops-scripts/mlp ssh [name]     # 登入節點或 worker，省略 name 就跳選�
 ops-scripts/mlp wake           # 喚醒 fh-l（經 fh-proxy 送 unicast WoL）
 ops-scripts/mlp down           # 關閉 fh-l（會先確認）
 ops-scripts/mlp status         # 完整健康檢查
+ops-scripts/mlp rotate         # Gateway dry run（不碰現役機器）
+ops-scripts/mlp rotate --real  # 真的換掉 Gateway，要打現役 IP 確認
+ops-scripts/mlp worker new     # 選 provider、選 image，開一個 worker
+ops-scripts/mlp worker rm      # 從清單挑一個刪掉、釋放埠
 ops-scripts/mlp trust-gateway  # rotate 之後第一次連線要先跑這個
 ```
+
+`rotate` / `worker` 這三個不是在本機執行，而是**觸發對應的 workflow 並把
+step 逐一串流回終端機**。分界線是：需要憑證或需要編排的走 workflow
+（機密全留在 GitHub，你的 Mac 一把都不用放）；互動、講求延遲的
+（`ssh` / `wake` / `down`）留在本機。
 
 需要 `fzf` `jq` `gh`：`brew install fzf jq gh`。
 
@@ -160,6 +169,7 @@ ops-scripts/mlp trust-gateway  # rotate 之後第一次連線要先跑這個
 | Workflow | 做什麼 | 重要參數 |
 |---|---|---|
 | `rotate-gateway` | 藍綠替換整台 Gateway | **`dry_run` 預設 `true`** |
+| `repair-gateway` | 對**現役**機器重跑 provision，不換 IP、不碰 `NODE_GATEWAY` | `confirm` 要打現役 IP |
 | `create-worker` | 在指定 provider 上開容器並接進 Gateway | `provider`、`image`、`name` |
 | `delete-worker` | 停容器、釋放埠 | `port` 或 `name` 擇一 |
 
@@ -173,6 +183,8 @@ Launch / Shutdown fh-l 不走 Actions，走 `mlp wake` / `mlp down`。
 3. 切換後在 Mac 上跑一次 `ops-scripts/mlp trust-gateway`（新機器的 host key）。
 4. provider 每 30 秒輪詢 `NODE_GATEWAY`，自己跟過去。實測**重連耗時 1 秒**，
    不需要登入任何一台 provider。
+5. **現役的 worker 會失聯，要重建。** 它們跑在 `STATIC_GATEWAY` 模式
+   （容器內不放任何 GitHub 憑證，代價是關掉漂移偵測），舊機器一刪隧道就永久斷。
 
 ### Create Worker
 
@@ -205,6 +217,19 @@ ops-scripts/mlp status
 `GH_POOL_TOKEN`、`LINODE_TOKEN` 可以重新產生。
 `FH_L_SUDO_PASSWORD` / `FH_PROXY_SUDO_PASSWORD` 零程式碼引用，隨時可改。
 
+GitHub secret 只有四個：`FILE_CRYPTO_KEY`、`SSH_KEY_ACTIONS`、
+`GH_POOL_TOKEN`、`LINODE_TOKEN`。隧道身分不在其中——同一把私鑰已經以
+`shared-configs/ssh-tunnel-client/files/id_rsa.crypted` 隨 repo 分發，
+再存一份 secret 只是製造兩份要手動同步的東西。
+
+本機 repo 根目錄現在只剩 `crypto_key` 一個明文機密（`pw`、`fhproxy_pw`、
+`gw_pw`、`gh_token` 已抹除，值都在 `SECRETS.md`）。
+
+> ⚠️ `SECRETS.md` 記的 Gateway root 密碼，在 2026-09-14 那次 rotate 之後
+> 已經對應到一台被刪掉的機器。rotate 現在會優先用 `GATEWAY_ROOT_PASSWORD`
+> secret，但那個 secret **還沒設**——在設定之前，每次 rotate 出來的新機器
+> 都沒有主控台救援退路，只有 `repair-gateway` 這條路。
+
 ## 加一台 provider
 
 ```bash
@@ -226,6 +251,19 @@ sudoers 規則（所以無法遠端 poweroff）。
    GitHub secret（**只寫名稱**）。
 3. 跑 `ops-scripts/preflight` 確認 `COPY` 來源都存在、宣告的 unit 都在。
 4. `create-worker` 時把 `image` 填成資料夾名。
+
+## 佈署改動到現役 Gateway
+
+`scripts/provision-gateway.sh` 或 `shared-configs/` 的改動**只對下一台
+rotate 出來的機器生效**。要套到現役機器：
+
+```bash
+gh workflow run repair-gateway.yml -f confirm=<現役 Gateway IP>
+```
+
+它也是**你進不去 Gateway 時的回家路**——Actions 手上有 `SSH_KEY_ACTIONS`，
+就算你的身分被漂移掉了它還進得去。2026-09-14 就是這樣救回來的
+（`RUNBOOK.md` §7.6）。
 
 ## 改了東西要跑的檢查
 
