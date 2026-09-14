@@ -293,17 +293,38 @@ start_master() {
         "${GW_USER}@${GW_IP}"
     )
 
-    "${cmd[@]}" </dev/null >/dev/null 2>&1 &
+    # Keep ssh's stderr. Throwing it away and then asserting a cause
+    # ("remote forward was refused") turned every possible failure —
+    # auth, host key, connection, forward — into the same sentence, and
+    # a real rotate failure on 2026-09-14 could not be diagnosed at all
+    # because the only evidence had been discarded. Report what ssh said.
+    local err
+    err="$(mktemp "${STATE_DIR}/.ssherr.XXXXXX" 2>/dev/null)" || err=""
+    if [[ -n "$err" ]]; then
+        "${cmd[@]}" </dev/null >/dev/null 2>"$err" &
+    else
+        "${cmd[@]}" </dev/null >/dev/null 2>&1 &
+    fi
     MASTER_PID=$!
 
     local waited=0
     while (( waited < 10 )); do
         if ! kill -0 "$MASTER_PID" 2>/dev/null; then
             wait "$MASTER_PID" 2>/dev/null
-            log ERROR "ssh ControlMaster exited during setup (rc=$?) — remote forward was refused"
+            local rc=$?
+            log ERROR "ssh ControlMaster exited during setup (rc=${rc})"
+            if [[ -n "$err" && -s "$err" ]]; then
+                while IFS= read -r line; do
+                    [[ -n "$line" ]] && log ERROR "  ssh: ${line}"
+                done < "$err"
+            else
+                log ERROR "  ssh printed nothing — no further detail available"
+            fi
+            rm -f "$err"
             return 1
         fi
         if ssh -S "$CTL" -O check placeholder >/dev/null 2>&1; then
+            [[ -n "$err" ]] && rm -f "$err"
             return 0
         fi
         sleep 1
@@ -311,6 +332,12 @@ start_master() {
     done
 
     log ERROR "timed out waiting for ControlMaster to become ready"
+    if [[ -n "$err" && -s "$err" ]]; then
+        while IFS= read -r line; do
+            [[ -n "$line" ]] && log ERROR "  ssh: ${line}"
+        done < "$err"
+    fi
+    [[ -n "$err" ]] && rm -f "$err"
     kill "$MASTER_PID" 2>/dev/null || true
     wait "$MASTER_PID" 2>/dev/null || true
     return 1
