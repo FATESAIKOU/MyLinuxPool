@@ -144,6 +144,61 @@ rotate_wait_for_cloud_init() {
     esac
 }
 
+# rotate_live_providers <user> <gateway_ip> <name:port> [<name:port>...]
+#   Prints the "name port" pairs whose forwarded port answers with a real
+#   SSH banner on the CURRENT Gateway, one per line.
+#
+#   Rotate has to know which providers are actually attached before it
+#   changes anything, for two reasons that both bite when fh-l is off —
+#   which is its normal state, since it is a desktop that gets woken on
+#   demand:
+#
+#     - the pre-switch probe has to run somewhere that is up. Aimed at a
+#       fixed node, it fails whenever that node happens to be asleep and
+#       blocks every rotate.
+#     - waiting for providers to come back must wait for the ones that
+#       were there, not for every provider that has ever been registered.
+#       Otherwise a rotate can only ever succeed with the whole fleet
+#       powered on.
+#
+#   A listener alone is not proof — a dead session holds its port open for
+#   about a minute (RUNBOOK §7.9) — so this reads the banner, the same
+#   check pool-tunnel's health probe uses.
+#   Takes the current Gateway's host key (or "-" for none) and pins it,
+#   rather than leaning on whatever the caller's known_hosts happens to
+#   hold. Linode reuses addresses, so an ambient entry for this IP may
+#   belong to a machine that no longer exists — that is what made every
+#   provider look offline the first time this ran from a laptop.
+rotate_live_providers() {
+    local user="$1" gw_ip="$2" host_key="$3"; shift 3
+    local spec name port banner kh
+    local -a hk_opts
+
+    if [[ -n "$host_key" && "$host_key" != "-" ]]; then
+        kh="$(mktemp)"
+        printf '%s %s\n' "$gw_ip" "$host_key" > "$kh"
+        hk_opts=(-o UserKnownHostsFile="$kh" -o StrictHostKeyChecking=yes)
+    else
+        kh="$(mktemp)"
+        hk_opts=(-o UserKnownHostsFile="$kh" -o StrictHostKeyChecking=accept-new)
+    fi
+    # shellcheck disable=SC2064
+    trap "rm -f '$kh'" RETURN
+
+    for spec in "$@"; do
+        name="${spec%%:*}"; port="${spec##*:}"
+        [[ -n "$name" && -n "$port" ]] || continue
+        banner="$(ssh "${hk_opts[@]}" -o BatchMode=yes \
+                    -o ConnectTimeout=10 "${user}@${gw_ip}" \
+                    "timeout 2 nc 127.0.0.1 ${port} </dev/null | head -c 4" 2>/dev/null)"
+        if [[ "$banner" == SSH-* ]]; then
+            printf '%s %s\n' "$name" "$port"
+        else
+            log INFO "provider ${name} (port ${port}) is not attached — excluded from this rotate"
+        fi
+    done
+}
+
 # rotate_build_tunnel_probe_cmd <new_ip> <tunnel_user> <probe_port>
 #   Prints the command to run ON A PROVIDER that answers the only question
 #   that matters before a switch: can this machine actually build its

@@ -103,6 +103,7 @@ jobs:
             echo "old_ip=$(jq -r '.ip' <<<"$old_json")"
             echo "old_generation=$(jq -r '.generation' <<<"$old_json")"
             echo "old_label=$(jq -r '.linode_label // "fws"' <<<"$old_json")"
+            echo "old_host_key=$(jq -r '.host_key // "-"' <<<"$old_json")"
           } >> "$GITHUB_OUTPUT"
 
       - name: Create preview Gateway
@@ -195,6 +196,42 @@ jobs:
       #
       # Runs on dry runs too — proving a preview is reachable by a real
       # provider is most of what a dry run is for.
+      # Which providers are actually attached right now, decided against the
+      # CURRENT Gateway before anything changes. fh-l is a desktop that is
+      # normally asleep, so "every registered provider" is the wrong set
+      # both for choosing where to probe from and for deciding who has to
+      # come back afterwards.
+      - name: Determine which providers are attached
+        id: live
+        shell: bash
+        env:
+          OLD_IP: ${{ steps.read_old_gateway.outputs.old_ip }}
+          OLD_HOST_KEY: ${{ steps.read_old_gateway.outputs.old_host_key }}
+        run: |
+          set -euo pipefail
+          source scripts/rotate-gateway.sh
+
+          mapfile -t specs < <(gh api "repos/${GH_REPO}/actions/variables" --paginate --jq \
+            '.variables[] | select(.name | startswith("NODE_")) | .value | fromjson
+             | select(.role == "provider") | "\(.name):\(.gateway_port)"')
+
+          if (( ${#specs[@]} == 0 )); then
+            echo "::warning::no role=provider nodes registered"
+            { echo "ports="; echo "probe_node="; } >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          live="$(rotate_live_providers fatesaikou "$OLD_IP" "$OLD_HOST_KEY" "${specs[@]}")"
+          ports="$(awk '{print $2}' <<<"$live" | tr '\n' ' ' | sed 's/ $//')"
+          node="$(awk 'NR==1{print $1}' <<<"$live")"
+
+          echo "attached: ${live:-<none>}"
+          { echo "ports=${ports}"; echo "probe_node=${node}"; } >> "$GITHUB_OUTPUT"
+
+          if [[ -z "$node" ]]; then
+            echo "::warning::no provider is currently attached — the tunnel probe will be skipped and nothing will be waited for"
+          fi
+
       - name: Read the new Gateway's host key
         id: hostkey
         shell: bash
@@ -224,8 +261,9 @@ jobs:
           cmd="$(rotate_build_tunnel_probe_cmd "$PREVIEW_IP" sshproxy 2999 "$HOST_KEY")"
           echo "cmd=${cmd}" >> "$GITHUB_OUTPUT"
 
-      - name: Run the probe on fh-l
+      - name: Run the probe on a provider that is attached
         id: probe_run
+        if: steps.live.outputs.probe_node != ''
         continue-on-error: true
         # pool-ssh resolves the hop chain and looks each hop's key_secret
         # up as an env var. The rest of this workflow reaches machines
@@ -235,7 +273,7 @@ jobs:
           SSH_KEY_ACTIONS: ${{ secrets.SSH_KEY_ACTIONS }}
         uses: ./.github/actions/pool-ssh
         with:
-          node: fh-l
+          node: ${{ steps.live.outputs.probe_node }}
           command: ${{ steps.probe.outputs.cmd }}
           timeout: 30
 
@@ -243,8 +281,13 @@ jobs:
         shell: bash
         env:
           OUTCOME: ${{ steps.probe_run.outcome }}
+          PROBE_NODE: ${{ steps.live.outputs.probe_node }}
         run: |
           set -euo pipefail
+          if [[ -z "$PROBE_NODE" ]]; then
+            echo "::warning::no provider was attached, so nothing could verify the new Gateway from a provider's side"
+            exit 0
+          fi
           if [[ "$OUTCOME" != "success" ]]; then
             echo "::error::a provider could not build a reverse tunnel into the new Gateway — see the probe step's log for ssh's own message. NODE_GATEWAY was NOT switched; the live Gateway is untouched."
             exit 1
@@ -289,17 +332,19 @@ jobs:
         shell: bash
         env:
           PREVIEW_IP: ${{ steps.create_preview.outputs.preview_ip }}
+          LIVE_PORTS: ${{ steps.live.outputs.ports }}
         run: |
           set -euo pipefail
           source scripts/rotate-gateway.sh
-          ports_json="$(gh api "repos/${GH_REPO}/actions/variables" --paginate --jq \
-            '[.variables[] | select(.name | startswith("NODE_")) | .value | fromjson | select(.role == "provider") | .gateway_port]')"
-
-          mapfile -t ports < <(jq -r '.[]' <<<"$ports_json")
+          # Only the providers that were attached before the switch. Waiting
+          # for every registered provider means a rotate can never succeed
+          # unless the whole fleet is powered on, and fh-l normally is not.
+          read -r -a ports <<< "${LIVE_PORTS}"
           if (( ${#ports[@]} == 0 )); then
-            echo "::warning::no role=provider nodes found in NODE_* vars — nothing to wait for"
+            echo "::warning::no provider was attached before the switch — nothing to wait for"
             exit 0
           fi
+          echo "waiting only for the providers that were attached: ${ports[*]}"
 
           if ! rotate_wait_for_providers fatesaikou "$PREVIEW_IP" 180 "${ports[@]}"; then
             echo "::error::providers never came back — see log above"
