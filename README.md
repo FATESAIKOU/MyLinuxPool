@@ -153,8 +153,26 @@ ops-scripts/mlp rotate         # Gateway dry run（不碰現役機器）
 ops-scripts/mlp rotate --real  # 真的換掉 Gateway，要打現役 IP 確認
 ops-scripts/mlp worker new     # 選 provider、選 image，開一個 worker
 ops-scripts/mlp worker rm      # 從清單挑一個刪掉、釋放埠
-ops-scripts/mlp trust-gateway  # rotate 之後第一次連線要先跑這個
+ops-scripts/mlp ssh-config     # 匯出 ssh_config，讓 ssh/scp/rsync 直接可用
+ops-scripts/mlp trust-gateway  # 通常不用跑了（每條指令都會自動釘選）
 ```
+
+### 用原生 ssh 而不透過 mlp
+
+```bash
+ops-scripts/mlp ssh-config --write     # 寫到 ~/.mylinuxpool/ssh_config
+# 依提示把 Include 加到 ~/.ssh/config 的第一行
+ssh fh-l
+ssh worker-2300                        # 或完整容器名
+rsync -av ./x fh-proxy:~/
+ssh -R 127.0.0.1:9000:localhost:9000 fh-l    # 反向隧道
+```
+
+Gateway 那一段用 `NODE_GATEWAY` 帶的 host key 釘選；`127.0.0.1:<port>` 那些
+段落刻意不驗證——每個節點都在同一個 loopback 位址上應答，worker 重建就換一把
+金鑰，釘了只會每次跳警告。驗證由 Gateway 那一段負責。
+
+**rotate 之後要重新產生**（位址與 host key 都變了）。
 
 `rotate` / `worker` 這三個不是在本機執行，而是**觸發對應的 workflow 並把
 step 逐一串流回終端機**。分界線是：需要憑證或需要編排的走 workflow

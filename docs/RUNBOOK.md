@@ -646,6 +646,53 @@ ops-scripts/mlp worker new   # 重新建
 
 ---
 
+### 7.9 物理斷網之後，殭屍 session 會占住轉發埠
+
+2026-09-14 拔網路線再接回來，結果只有 fh-proxy 自己回來，另外三條隧道
+（fh-l 與兩個 worker）等了五分鐘也沒動靜。
+
+Gateway 上四個埠**都還有 listener**，但只有 2226 探測得到 SSH banner：
+
+```
+2226  pid 13856  存活 5:47   ← fh-proxy 重連後的新 session，活的
+2222  pid  9598  存活 14:55  ← 殭屍
+2300  pid  9653  存活 14:54  ← 殭屍
+2301  pid  5487  存活 23:26  ← 殭屍
+```
+
+物理斷線不會送出 FIN/RST，而 Gateway 的 sshd 跑在
+**`ClientAliveInterval 0`**——它從不主動探測客戶端，所以對端消失的 session
+永遠不會被回收，一直占著它的轉發埠。`TCPKeepAlive yes` 有開，但預設要
+**約兩小時**才會開始探測。
+
+節點回來之後，它的 `-R 127.0.0.1:<port>` 被自己屍體占著的埠拒絕，
+`ExitOnForwardFailure` 讓連線退出，然後永遠重試一個不會被釋放的埠。
+fh-proxy 之所以例外，只是它的舊 session 剛好被乾淨關閉。
+
+**修法**：`provision-gateway.sh` 的 sshd 設定加上
+
+```
+ClientAliveInterval 15
+ClientAliveCountMax 3
+```
+
+45 秒內回收，遠小於 `pool-tunnel` 的重試 backoff，所以現在會自癒。
+
+**當下要手動清的話**（判準是「有 listener 但不回 SSH banner」——
+別直接殺全部，活的 session 也在裡面）：
+
+```bash
+for port in 2222 2226 2300 2301; do
+  banner="$(timeout 2 nc 127.0.0.1 "$port" </dev/null | head -c 4)"
+  pid="$(sudo ss -ltnp | grep -A1 "127.0.0.1:${port} " | grep -oE 'pid=[0-9]+' | head -1 | cut -d= -f2)"
+  [ "$banner" = "SSH-" ] || [ -z "$pid" ] || sudo kill "$pid"
+done
+```
+
+三條隧道在殺掉殭屍後 **40 秒內**全部自己回來。
+
+---
+
 ---
 
 ## 8. 改了 provision-gateway.sh 之後
