@@ -354,3 +354,64 @@ inputs:
 - 等待 provider 歸隊（step 6）時，逐一輪詢每個 `role=provider` 的節點的
   `gateway_port`，全部出現才算成功；上限 180 秒。
 - 孤兒清掃：刪除任何存在超過 2 小時、label 以 `-preview` 結尾的機器。
+
+## 10. Phase D：Worker 實作規格
+
+背景見 `ARCHITECTURE.md` §1（拋棄式身分）與 §5（Create Worker 七步驟）。
+
+### 10.1 埠配發：`pool/bin/pool-port-alloc`
+
+**在 Gateway 上執行**（由 workflow 經 `pool-ssh` 呼叫）。
+
+```
+pool-port-alloc --claim <provider> <image>   # 配發並佔位，印出埠號
+pool-port-alloc --release <port>             # 釋放
+pool-port-alloc --list                       # 列出目前登記
+```
+
+- 範圍取自 `NODE_GATEWAY.ports.worker`（目前 2300–2399）
+- **必須以 `flock` 序列化**，避免兩個 CreateWorker 同時搶到同一個埠
+- 判定「空」的依據是**兩者皆須成立**：`ss -tln` 顯示該埠沒有 listener，
+  且 `~/pool/workers.d/<port>.json` 不存在
+- 佔位檔內容：`{provider, image, port, created_at, container}`
+- 範圍用盡時退出碼 `6` 並明確說明
+
+> 埠的**真實狀態以 `ss` 為準**，佔位檔只用來記「這個埠是誰的」。
+> 兩者不一致時（例如 rotate 後佔位檔隨舊機蒸發），以 `ss` 為準。
+
+### 10.2 `workers/base/Dockerfile`
+
+標準 Linux 工作環境。要求：
+
+- 基底 `ubuntu:24.04`
+- 安裝：`openssh-server` `ca-certificates` `curl` `git` `jq`
+  `netcat-openbsd` `rclone` `gh`（依決策，每台 worker 必裝 rclone/git/gh）
+- 建立非 root 使用者 `worker`，可 sudo
+- sshd 設定為**純金鑰認證**
+- **image 內不得含任何機密**（規格 §7）。金鑰與 token 一律 `docker run`
+  時以 env 或 mount 注入
+- entrypoint：起 sshd → 起 `pool-tunnel`（與 provider 共用同一支程式）
+
+### 10.3 Worker 的隧道身分
+
+Worker 沿用 `pool-tunnel`，但它的「節點定義」不在 GitHub var 裡
+（worker 是拋棄式的，不該污染耐久登記表）。因此：
+
+- `pool-tunnel` 需支援從**環境變數**取得自身設定，作為 `pool-resolve <name>`
+  的替代路徑：`POOL_GATEWAY_PORT`、`POOL_NODE_NAME`
+- Gateway 的位址仍走 `pool-resolve gateway`（worker 需要 `GH_WORKER_TOKEN`）
+- 若 `POOL_GATEWAY_PORT` 已設定，就不去讀 `NODE_<NAME>` var
+
+### 10.4 workflows
+
+- `create-worker.yml`：輸入 `provider`、`image`（`workers/` 下的目錄名）、
+  `name`（選填）。流程見 `ARCHITECTURE.md` §5。成功時輸出連線指令。
+- `delete-worker.yml`：輸入 `port` 或 `name`。停止並移除 container、
+  釋放佔位檔。
+
+### 10.5 驗收條件
+
+1. 在 fh-l 與 fh-proxy 上各開一個 worker，皆能經 Gateway 的動態埠 ssh 進入
+2. 同時開兩個 worker，埠不衝突（驗證 `flock`）
+3. `delete-worker` 後埠確實釋放，可被下一個 worker 取得
+4. worker image 內不含任何機密（`docker history` 與 `docker run ... env` 檢查）
