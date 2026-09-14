@@ -1,0 +1,101 @@
+name: Repair Gateway
+
+# Re-runs scripts/provision-gateway.sh against the Gateway that is live
+# right now, instead of a preview machine. Two things need this:
+#
+#   1. A provision-gateway.sh or shared-configs change only reaches the
+#      next machine a rotate produces (RUNBOOK §8). This applies it to the
+#      current one without replacing hardware or changing its IP.
+#   2. Recovery: if the Gateway's declared state has drifted far enough
+#      that you can't log in any more, Actions still can — it holds
+#      SSH_KEY_ACTIONS. This is the way back in that doesn't need LISH.
+#
+# Safe to re-run: provision is idempotent, and NODE_GATEWAY is never
+# touched, so nothing here can move the cluster's addressing.
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirm:
+        description: Type the Gateway's current IP to confirm you mean this machine
+        required: true
+
+permissions:
+  contents: read
+
+env:
+  GH_TOKEN: ${{ secrets.GH_POOL_TOKEN }}
+  GH_REPO: ${{ github.repository }}
+
+concurrency:
+  group: rotate-gateway   # shares rotate's lock: never provision mid-rotate
+  cancel-in-progress: false
+
+jobs:
+  repair:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Start ssh-agent, load the Actions key
+        shell: bash
+        env:
+          SSH_KEY_ACTIONS: ${{ secrets.SSH_KEY_ACTIONS }}
+        run: |
+          set -euo pipefail
+          eval "$(ssh-agent -s)" >/dev/null
+          echo "SSH_AUTH_SOCK=${SSH_AUTH_SOCK}" >> "$GITHUB_ENV"
+          echo "SSH_AGENT_PID=${SSH_AGENT_PID}" >> "$GITHUB_ENV"
+          ssh-add - <<< "$SSH_KEY_ACTIONS"
+
+      - name: Resolve the live Gateway and check the confirmation
+        id: gw
+        shell: bash
+        env:
+          CONFIRM: ${{ inputs.confirm }}
+        run: |
+          set -euo pipefail
+          ip="$(shared-configs/pool-runtime/files/pool-resolve gateway --refresh --field .ip)"
+          gen="$(shared-configs/pool-runtime/files/pool-resolve gateway --field .generation)"
+          echo "live Gateway: ${ip} (generation ${gen})"
+          if [[ "$CONFIRM" != "$ip" ]]; then
+            echo "::error::confirmation '${CONFIRM}' does not match the live Gateway ${ip}"
+            exit 1
+          fi
+          echo "ip=${ip}" >> "$GITHUB_OUTPUT"
+          echo "generation=${gen}" >> "$GITHUB_OUTPUT"
+
+      - name: Deploy shared-configs + scripts to the Gateway
+        shell: bash
+        env:
+          GW_IP: ${{ steps.gw.outputs.ip }}
+        run: |
+          set -euo pipefail
+          source scripts/rotate-gateway.sh
+          rotate_deploy_repo_bundle fatesaikou "$GW_IP"
+
+      - name: Run provision-gateway.sh
+        shell: bash
+        env:
+          FILE_CRYPTO_KEY: ${{ secrets.FILE_CRYPTO_KEY }}
+          GW_IP: ${{ steps.gw.outputs.ip }}
+        run: |
+          set -euo pipefail
+          source scripts/rotate-gateway.sh
+          trusted_ips="$(gh variable get POOL_TRUSTED_IPS --repo "$GH_REPO")"
+          rotate_run_provision fatesaikou "$GW_IP" "$trusted_ips" "$FILE_CRYPTO_KEY"
+
+      - name: Report
+        if: always()
+        shell: bash
+        env:
+          GW_IP: ${{ steps.gw.outputs.ip }}
+          GEN: ${{ steps.gw.outputs.generation }}
+        run: |
+          echo "Re-provisioned Gateway ${GW_IP} (generation ${GEN}). NODE_GATEWAY unchanged."
+
+      - name: Stop ssh-agent
+        if: always()
+        shell: bash
+        run: ssh-agent -k >/dev/null 2>&1 || true

@@ -221,11 +221,16 @@ profile.json  Dockerfile  entrypoint.sh
 ```
 scripts/
 ├── lib/{log.sh,crypto.sh,ssh.sh,profile.sh}
+├── tests/                     純函式測試，不碰網路
 ├── provision-gateway.sh
 ├── rotate-gateway.sh
 ├── create-worker.sh
 └── delete-worker.sh
 ```
+
+`tests/` 沿用「測試跟著被測物走」那條原則（§2）：`scripts/` 的檔案是
+function library，可以 `source` 進來直接測，不需要真機。
+需要真機的驗證屬於 `ops-scripts/verify-profile`，不在這裡。
 
 `lib/ssh.sh` 內含跳板鏈的組裝與執行，**可在 Mac 上直接使用** ——
 `ops-scripts/mlp` 與 workflow 都用它，不再各寫一份。

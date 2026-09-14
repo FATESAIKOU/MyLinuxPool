@@ -44,8 +44,14 @@ delete_worker_find_claim() {
     if [[ -n "$port_in" ]]; then
         match="$(jq -c --argjson p "$port_in" '[.[] | select(.port == $p)] | first // empty' <<<"$claims_json")"
     else
-        local container="mlp-${name_in}"
-        match="$(jq -c --arg c "$container" '[.[] | select(.container == $c)] | first // empty' <<<"$claims_json")"
+        # Two names are in circulation for the same worker: create-worker
+        # reports the bare name (fh-l-default-123) while `mlp ls` and docker
+        # show the container (mlp-fh-l-default-123). Copying the one you can
+        # see must work, so accept either spelling rather than making the
+        # caller know which is which.
+        local bare="${name_in#mlp-}"
+        match="$(jq -c --arg c "mlp-${bare}" --arg n "$bare" \
+            '[.[] | select(.container == $c or .container == $n)] | first // empty' <<<"$claims_json")"
     fi
 
     if [[ -z "$match" ]]; then

@@ -132,12 +132,17 @@ log INFO "invariant OK: sshproxy's public key is present in authorized_keys"
 mkdir -p "$SSH_DIR"
 chmod 700 "$SSH_DIR"
 
-if [[ -f "$TARGET" ]]; then
-    log INFO "${TARGET} already present, skipping write"
-else
-    printf '%s\n' "$authorized_keys_content" > "$TARGET"
-    log INFO "installed authorized_keys to ${TARGET}"
-fi
+# Same trap as ssh-admin had: cloud-init creates sshproxy with an
+# authorized_keys of its own, so "skip if present" meant the declared list
+# was never applied — invisible today only because cloud-init happens to
+# seed the same key. Union, so growing the declared list converges and no
+# working identity is ever dropped by an install.
+merged="$(mktemp)"
+cat "$TARGET" 2>/dev/null > "$merged"
+printf '%s\n' "$authorized_keys_content" >> "$merged"
+awk '$2 != "" && !seen[$2]++' "$merged" > "$TARGET"
+rm -f "$merged"
+log INFO "authorized_keys now holds $(awk '$2 != ""' "$TARGET" | wc -l | tr -d ' ') key(s)" 
 chmod 644 "$TARGET"
 chown "${TARGET_USER}:${TARGET_USER}" "$TARGET" 2>/dev/null || true
 

@@ -49,8 +49,34 @@ done
 
 SSH_DIR="${HOME_DIR}/.ssh"
 
+# Key material only — "ssh-rsa AAAAB3... comment" keys on the AAAAB3 part,
+# so a re-typed comment isn't mistaken for a different key.
+key_blobs() { awk '{ if ($2 != "") print $2 }' "$1" 2>/dev/null | sort -u; }
+
+# File existence proved nothing: cloud-init writes an authorized_keys of its
+# own, so "the file is there" was true on a machine that had exactly one of
+# the declared keys. Compare the contents.
 check_installed() {
-    [[ -f "${SSH_DIR}/id_rsa" && -f "${SSH_DIR}/id_rsa.pub" && -f "${SSH_DIR}/authorized_keys" ]]
+    [[ -f "${SSH_DIR}/id_rsa" && -f "${SSH_DIR}/id_rsa.pub" && -f "${SSH_DIR}/authorized_keys" ]] || return 1
+
+    local declared missing extra
+    declared="$(mktemp)"
+    if ! "$DECRYPT" decrypt "$KEY" < "${FILES_DIR}/authorized_keys.crypted" > "$declared" 2>/dev/null; then
+        rm -f "$declared"
+        log ERROR "cannot verify: authorized_keys.crypted would not decrypt (wrong --key?)"
+        return 1
+    fi
+
+    missing="$(comm -23 <(key_blobs "$declared") <(key_blobs "${SSH_DIR}/authorized_keys") | wc -l | tr -d ' ')"
+    extra="$(comm -13 <(key_blobs "$declared") <(key_blobs "${SSH_DIR}/authorized_keys") | wc -l | tr -d ' ')"
+    rm -f "$declared"
+
+    [[ "$extra" -gt 0 ]] && log WARN "authorized_keys has ${extra} key(s) not declared by this unit"
+    if [[ "$missing" -gt 0 ]]; then
+        log ERROR "authorized_keys is missing ${missing} declared key(s)"
+        return 1
+    fi
+    return 0
 }
 
 if [[ "$CHECK_ONLY" -eq 1 ]]; then
@@ -114,18 +140,31 @@ else
 fi
 chmod 644 "${SSH_DIR}/id_rsa.pub"
 
-if [[ -f "${SSH_DIR}/authorized_keys" ]]; then
-    log INFO "${SSH_DIR}/authorized_keys already present, skipping decrypt"
-else
-    "$DECRYPT" decrypt "$KEY" < "${FILES_DIR}/authorized_keys.crypted" > "${SSH_DIR}/authorized_keys"
-    rc=$?
-    if [[ $rc -ne 0 ]]; then
-        rm -f "${SSH_DIR}/authorized_keys"
-        log ERROR "crypto.sh failed (exit ${rc}) while decrypting authorized_keys.crypted — wrong --key, or the encrypted file is corrupted"
-        exit 1
-    fi
-    log INFO "decrypted authorized_keys to ${SSH_DIR}/authorized_keys"
+# "Skip if the file exists" looked idempotent and was actually a silent
+# no-op: cloud-init creates the account with its own authorized_keys, so
+# every fresh Gateway kept exactly cloud-init's key and none of the
+# declared ones. provision still reported success.
+#
+# Union rather than replace: an install must never be able to lock out an
+# identity that is currently working, including one this unit doesn't know
+# about. Revoking a key is a separate, deliberate act — `--check` reports
+# undeclared keys so they stay visible.
+declared_ak="$(mktemp)"
+"$DECRYPT" decrypt "$KEY" < "${FILES_DIR}/authorized_keys.crypted" > "$declared_ak"
+rc=$?
+if [[ $rc -ne 0 ]]; then
+    rm -f "$declared_ak"
+    log ERROR "crypto.sh failed (exit ${rc}) while decrypting authorized_keys.crypted — wrong --key, or the encrypted file is corrupted"
+    exit 1
 fi
+
+merged_ak="$(mktemp)"
+# Existing lines first so their comments win; dedupe on the key blob.
+cat "${SSH_DIR}/authorized_keys" 2>/dev/null > "$merged_ak"
+cat "$declared_ak" >> "$merged_ak"
+awk '$2 != "" && !seen[$2]++' "$merged_ak" > "${SSH_DIR}/authorized_keys"
+log INFO "authorized_keys now holds $(awk '$2 != ""' "${SSH_DIR}/authorized_keys" | wc -l | tr -d ' ') key(s) (declared: $(awk '$2 != ""' "$declared_ak" | wc -l | tr -d ' '))"
+rm -f "$declared_ak" "$merged_ak"
 chmod 644 "${SSH_DIR}/authorized_keys"
 
 chown -R "${TARGET_USER}:${TARGET_USER}" "$SSH_DIR" 2>/dev/null || true
