@@ -14,7 +14,16 @@ STATE_DIR="${HOME}/.mylinuxpool"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
 POOL_RESOLVE="${SCRIPT_DIR}/pool-resolve"
 
-SSH_OPTS=(-o BatchMode=yes -o ConnectTimeout=5 -o StrictHostKeyChecking=accept-new)
+# Share pool-tunnel's pinned known_hosts rather than the user's own.
+# accept-new against ~/.ssh/known_hosts breaks the moment Linode reissues
+# an address a previous Gateway used — it accepts a new host but refuses
+# a changed one (RUNBOOK §7.8). pool-tunnel maintains this file from the
+# host key NODE_GATEWAY carries, so pointing at it means a status check
+# verifies the same identity the tunnel does.
+GW_KNOWN_HOSTS="${HOME}/.mylinuxpool/gateway_known_hosts"
+SSH_OPTS=(-o BatchMode=yes -o ConnectTimeout=5
+          -o UserKnownHostsFile="$GW_KNOWN_HOSTS"
+          -o StrictHostKeyChecking=accept-new)
 
 BRIEF=0
 ok_count=0
