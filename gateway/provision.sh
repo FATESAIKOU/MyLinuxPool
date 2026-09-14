@@ -1,12 +1,14 @@
 #!/usr/bin/env bash
 # gateway/provision.sh — spec: docs/POOL_RUNTIME_SPEC.md §9.2
 # Runs on a freshly cloud-init'd Gateway, as root, driven by Actions after
-# the bundle (static_normal_files + decrypted static_secret_files) has
-# already been scp'd into place. Idempotent — safe to re-run.
+# the bundle (static_normal_files + decrypted static_secret_files +
+# pool/bin/*) has already been scp'd into place. Idempotent — safe to
+# re-run.
 
 set -euo pipefail
 
 WORKERS_DIR="/home/fatesaikou/pool/workers.d"
+POOL_BIN_DIR="/home/fatesaikou/pool/bin"
 SSHD_CONF="/etc/ssh/sshd_config.d/10-mylinuxpool.conf"
 FAIL2BAN_CONF="/etc/fail2ban/jail.d/mylinuxpool-ignore.conf"
 BUNDLE_USERS=(fatesaikou sshproxy)
@@ -32,7 +34,7 @@ fi
 # that's an existing weakness this rewrite is meant to close, not carry
 # forward.
 step1_sshd_harden() {
-    log INFO "step 1/6: sshd hardening (key-only auth)"
+    log INFO "step 1/7: sshd hardening (key-only auth)"
 
     local desired
     desired="$(cat <<'EOF'
@@ -70,7 +72,7 @@ EOF
 # ignoreip rule only existed on the machine that got rotated away.
 # Without this step every rotate reintroduces the same lockout.
 step2_fail2ban_ignoreip() {
-    log INFO "step 2/6: fail2ban ignoreip (critical — see RUNBOOK.md §7.1, do not skip)"
+    log INFO "step 2/7: fail2ban ignoreip (critical — see RUNBOOK.md §7.1, do not skip)"
 
     if [[ -z "${POOL_TRUSTED_IPS:-}" ]]; then
         log ERROR "POOL_TRUSTED_IPS is not set in the environment"
@@ -135,16 +137,36 @@ fix_user_perms() {
 }
 
 step3_fix_permissions() {
-    log INFO "step 3/6: fix bundle file ownership/permissions"
+    log INFO "step 3/7: fix bundle file ownership/permissions"
     local user
     for user in "${BUNDLE_USERS[@]}"; do
         fix_user_perms "$user"
     done
 }
 
-# ---- step 4: install runtime --------------------------------------------------
-step4_install_runtime() {
-    log INFO "step 4/6: install runtime (docker.io, rclone, gh)"
+# ---- step 4: install pool/bin/* -----------------------------------------------
+# ARCHITECTURE.md §5 step 4 ("安裝 Gateway runtime") always meant pool/bin/*
+# too, not just docker/rclone/gh — this was a real gap: pool-port-alloc
+# had nowhere to live on the Gateway, so create-worker/delete-worker had
+# no way to run it (spec §10.1/§10.4). The files themselves are staged
+# under /home/fatesaikou by the workflow's bundle deploy step and already
+# get their ownership fixed by step 3 above (same chown -R as everything
+# else there) — this step only needs to set the execute bit.
+step4_install_pool_bin() {
+    log INFO "step 4/7: install pool/bin/*"
+
+    if [[ ! -d "$POOL_BIN_DIR" ]] || [[ -z "$(ls -A "$POOL_BIN_DIR" 2>/dev/null)" ]]; then
+        log ERROR "${POOL_BIN_DIR} is missing or empty — did the bundle deploy step scp pool/bin/* here?"
+        exit 1
+    fi
+
+    chmod +x "${POOL_BIN_DIR}"/*
+    log INFO "chmod +x on $(ls -1 "$POOL_BIN_DIR" | wc -l) file(s) under ${POOL_BIN_DIR}"
+}
+
+# ---- step 5: install runtime --------------------------------------------------
+step5_install_runtime() {
+    log INFO "step 5/7: install runtime (docker.io, rclone, gh)"
 
     local pkgs=()
     command -v docker >/dev/null 2>&1 || pkgs+=(docker.io)
@@ -162,17 +184,17 @@ step4_install_runtime() {
     fi
 }
 
-# ---- step 5: worker port ledger directory ------------------------------------
-step5_workers_dir() {
-    log INFO "step 5/6: create ${WORKERS_DIR}"
+# ---- step 6: worker port ledger directory ------------------------------------
+step6_workers_dir() {
+    log INFO "step 6/7: create ${WORKERS_DIR}"
     mkdir -p "$WORKERS_DIR"
     chown -R fatesaikou:fatesaikou "$(dirname "$WORKERS_DIR")"
     log INFO "ensured ${WORKERS_DIR}"
 }
 
-# ---- step 6: verify -----------------------------------------------------------
-step6_verify() {
-    log INFO "step 6/6: verify"
+# ---- step 7: verify -----------------------------------------------------------
+step7_verify() {
+    log INFO "step 7/7: verify"
 
     if ! sshd -t; then
         log ERROR "sshd -t failed"
@@ -193,16 +215,22 @@ step6_verify() {
         exit 1
     fi
 
-    log INFO "all checks passed: sshd config valid, fail2ban active, nc/flock/ss/jq present"
+    if [[ ! -x "${POOL_BIN_DIR}/pool-port-alloc" ]]; then
+        log ERROR "${POOL_BIN_DIR}/pool-port-alloc missing or not executable"
+        exit 1
+    fi
+
+    log INFO "all checks passed: sshd config valid, fail2ban active, nc/flock/ss/jq present, pool/bin/* executable"
 }
 
 main() {
     step1_sshd_harden
     step2_fail2ban_ignoreip
     step3_fix_permissions
-    step4_install_runtime
-    step5_workers_dir
-    step6_verify
+    step4_install_pool_bin
+    step5_install_runtime
+    step6_workers_dir
+    step7_verify
     log INFO "provisioning complete"
 }
 

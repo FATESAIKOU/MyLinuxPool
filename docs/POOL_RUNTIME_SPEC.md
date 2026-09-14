@@ -315,11 +315,21 @@ cloud-init 只負責「開機後能被 ssh 進來」這件事，其餘交給 `pr
    `authorized_keys` 與 `*.pub` 為 `644`。
    > 現行機的 `/home/sshproxy/.ssh/id_rsa` 原本是 644（全系統可讀的私鑰），
    > 是實機發現的既有弱點，新機不可重蹈。
-4. **安裝 runtime**：`docker.io`、`rclone`、`gh`
+4. **安裝 `pool/bin/*`**：`chmod +x /home/fatesaikou/pool/bin/*`。
+   檔案本身由 workflow 的佈署 bundle 那步 scp 過來（併進與
+   `static_normal_files`/`static_secret_files` 同一份 `home/` staging
+   樹，走同一趟 `scp` + `sudo cp -a`），擁有者已由上一步的
+   `chown -R` 一併修正，這裡只需要補執行位。
+   > **2026-09-14 補上的缺口**：`ARCHITECTURE.md` §5 step 4「安裝 Gateway
+   > runtime」原本就包含 `pool/bin/*`，但實作只裝了
+   > `docker`/`rclone`/`gh`。少了它，`pool-port-alloc` 在 Gateway 上無處
+   > 可跑，`create-worker`/`delete-worker` 第一次連線就失敗
+   > （`pool-resolve not found`）。
+5. **安裝 runtime**：`docker.io`、`rclone`、`gh`
    （`gh` 用 apt 即可，Gateway 不跑 `pool-resolve` 所以版本不拘）。
-5. **建立 `~/pool/workers.d/`**（worker 埠登記表的位置，見 `ARCHITECTURE.md` §5）。
-6. **驗收**：`sshd -t` 通過、`fail2ban-client status` 正常、
-   `nc`/`flock`/`ss`/`jq` 皆存在。
+6. **建立 `~/pool/workers.d/`**（worker 埠登記表的位置，見 `ARCHITECTURE.md` §5）。
+7. **驗收**：`sshd -t` 通過、`fail2ban-client status` 正常、
+   `nc`/`flock`/`ss`/`jq` 皆存在，且 `~/pool/bin/pool-port-alloc` 存在並可執行。
 
 ### 9.3 `.github/actions/pool-ssh`（composite action）
 
@@ -361,7 +371,10 @@ inputs:
 
 ### 10.1 埠配發：`pool/bin/pool-port-alloc`
 
-**在 Gateway 上執行**（由 workflow 經 `pool-ssh` 呼叫）。
+**在 Gateway 上執行**（由 workflow 經 `pool-ssh` 呼叫已安裝在
+`~/pool/bin/pool-port-alloc` 的那份，見 §9.2 step 4——不要用送原始碼字串
+給 `bash -c` 的方式執行；那樣 `BASH_SOURCE` 不是真實檔案路徑，
+`pool-port-alloc` 內用來找 `pool-resolve` 的 `SCRIPT_DIR` 會解析錯誤）。
 
 ```
 pool-port-alloc --claim <provider> <image>   # 配發並佔位，印出埠號
@@ -369,7 +382,14 @@ pool-port-alloc --release <port>             # 釋放
 pool-port-alloc --list                       # 列出目前登記
 ```
 
-- 範圍取自 `NODE_GATEWAY.ports.worker`（目前 2300–2399）
+- 範圍取自 `NODE_GATEWAY.ports.worker`（目前 2300–2399），**但** Gateway
+  依 §10.2b 的設計刻意不持有任何 GitHub 憑證，`pool-resolve` 在那裡本來
+  就跑不起來。因此 `--claim` 讀取範圍時**優先看環境變數
+  `POOL_WORKER_PORT_RANGE`**（格式 `"<lo> <hi>"`），有設就直接用、
+  完全不呼叫 `pool-resolve`；只有兩者都沒有時才 fallback 呼叫
+  `pool-resolve gateway --field .ports.worker`（供未來 Gateway 若真的
+  裝了憑證時的獨立手動使用）。workflow 呼叫時一律先在 Actions runner
+  （有 `GH_TOKEN` 的那一端）resolve 好範圍，再以此環境變數傳入。
 - **必須以 `flock` 序列化**，避免兩個 CreateWorker 同時搶到同一個埠
 - 判定「空」的依據是**兩者皆須成立**：`ss -tln` 顯示該埠沒有 listener，
   且 `~/pool/workers.d/<port>.json` 不存在

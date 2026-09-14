@@ -56,24 +56,18 @@ jobs:
             exit 1
           fi
 
-      # pool-port-alloc runs on the Gateway with no persistent copy of
-      # itself and no GH token to fetch NODE_GATEWAY with — same reasoning
-      # as create-worker.yml: embed the script's own content and run it
-      # over stdin via pool-ssh's single `command` string.
-      - name: Build list-placeholders command
-        id: list_cmd
-        shell: bash
-        run: |
-          set -euo pipefail
-          script_q="$(printf '%q' "$(cat pool/bin/pool-port-alloc)")"
-          echo "cmd=bash -c ${script_q} _ --list" >> "$GITHUB_OUTPUT"
-
+      # pool-port-alloc is installed at ~/pool/bin/ on the Gateway
+      # (provision.sh, spec §9.2 step 4) — call that directly. Piping the
+      # script's own text into `bash -c` was the earlier approach, but
+      # $BASH_SOURCE isn't a real path under `-c`, which broke
+      # pool-port-alloc's own SCRIPT_DIR-relative lookup of pool-resolve
+      # (2026-09-14 incident) — same fix as create-worker.yml.
       - name: List worker port claims on the Gateway
         id: list
         uses: ./.github/actions/pool-ssh
         with:
           node: gateway
-          command: ${{ steps.list_cmd.outputs.cmd }}
+          command: ~/pool/bin/pool-port-alloc --list
 
       # The real state of a port is `ss` on the Gateway, not this
       # placeholder (spec §10.1) — but we need it here regardless, to
@@ -123,19 +117,11 @@ jobs:
           node: ${{ steps.find.outputs.provider }}
           command: docker rm -f ${{ steps.find.outputs.container }}
 
-      - name: Build release-port command
-        id: release_cmd
-        shell: bash
-        run: |
-          set -euo pipefail
-          script_q="$(printf '%q' "$(cat pool/bin/pool-port-alloc)")"
-          echo "cmd=bash -c ${script_q} _ --release ${{ steps.find.outputs.port }}" >> "$GITHUB_OUTPUT"
-
       - name: Release the port on the Gateway
         uses: ./.github/actions/pool-ssh
         with:
           node: gateway
-          command: ${{ steps.release_cmd.outputs.cmd }}
+          command: ~/pool/bin/pool-port-alloc --release ${{ steps.find.outputs.port }}
 
       - name: Summary
         shell: bash

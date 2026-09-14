@@ -158,23 +158,24 @@ jobs:
             echo "port_hi=$(jq -r '.ports.worker[1]' <<<"$gw_json")"
           } >> "$GITHUB_OUTPUT"
 
-      # pool-port-alloc runs ON the Gateway, but the Gateway has no
-      # persistent copy of it (or a GH token to fetch NODE_GATEWAY itself
-      # with) — so the script's own content is embedded and run over
-      # stdin via pool-ssh's single `command` string, and the (non-secret)
-      # port range is handed in directly instead of making pool-port-alloc
-      # call pool-resolve/gh remotely. `%q` avoids all quoting/heredoc
-      # fragility for both the range and the script body.
+      # pool-port-alloc is installed at ~/pool/bin/ on the Gateway
+      # (provision.sh, spec §9.2 step 4) — call that directly rather than
+      # shipping the script's own text over as a `bash -c` string: under
+      # `-c`, $BASH_SOURCE isn't a real path, which broke pool-port-alloc's
+      # own SCRIPT_DIR-relative lookup of pool-resolve (2026-09-14
+      # incident). The Gateway holds no GitHub credential of its own
+      # (spec §10.2b), so the (non-secret) port range is handed in via
+      # POOL_WORKER_PORT_RANGE instead of letting pool-port-alloc call
+      # pool-resolve/gh remotely — it can't, there either.
       - name: Build claim-port command
         id: claim_cmd
         shell: bash
         run: |
           set -euo pipefail
-          script_q="$(printf '%q' "$(cat pool/bin/pool-port-alloc)")"
           range_q="$(printf '%q' "${{ steps.gateway.outputs.port_lo }} ${{ steps.gateway.outputs.port_hi }}")"
           provider_q="$(printf '%q' "${{ inputs.provider }}")"
           image_q="$(printf '%q' "${{ inputs.image }}")"
-          echo "cmd=POOL_WORKER_PORT_RANGE=${range_q} bash -c ${script_q} _ --claim ${provider_q} ${image_q}" >> "$GITHUB_OUTPUT"
+          echo "cmd=POOL_WORKER_PORT_RANGE=${range_q} ~/pool/bin/pool-port-alloc --claim ${provider_q} ${image_q}" >> "$GITHUB_OUTPUT"
 
       - name: Claim a worker port on the Gateway
         id: claim
@@ -314,18 +315,9 @@ jobs:
           node: ${{ inputs.provider }}
           command: docker rm -f ${{ steps.identity.outputs.container }} >/dev/null 2>&1 || true
 
-      - name: On failure, build release-port command
-        id: release_cmd
-        if: failure() && steps.port.outputs.port != ''
-        shell: bash
-        run: |
-          set -euo pipefail
-          script_q="$(printf '%q' "$(cat pool/bin/pool-port-alloc)")"
-          echo "cmd=bash -c ${script_q} _ --release ${{ steps.port.outputs.port }}" >> "$GITHUB_OUTPUT"
-
       - name: Release claimed port on the Gateway
         if: failure() && steps.port.outputs.port != ''
         uses: ./.github/actions/pool-ssh
         with:
           node: gateway
-          command: ${{ steps.release_cmd.outputs.cmd }}
+          command: ~/pool/bin/pool-port-alloc --release ${{ steps.port.outputs.port }}

@@ -35,6 +35,23 @@ usage() {
 }
 
 worker_port_range() {
+    if [[ -n "${POOL_WORKER_PORT_RANGE:-}" ]]; then
+        # Lets a caller that already resolved NODE_GATEWAY itself (e.g.
+        # create-worker.yml, running where GH_TOKEN is actually scoped)
+        # hand the range straight in. The Gateway deliberately holds no
+        # GitHub credential of its own (spec §10.2b) — pool-resolve can't
+        # authenticate here regardless of whether it's installed, so this
+        # must be checked (and satisfied) before ever touching it below.
+        local lo hi
+        read -r lo hi <<< "$POOL_WORKER_PORT_RANGE"
+        if [[ -z "$lo" || -z "$hi" ]]; then
+            log ERROR "pool-port-alloc: POOL_WORKER_PORT_RANGE must be '<lo> <hi>', got '${POOL_WORKER_PORT_RANGE}'"
+            return 1
+        fi
+        printf '%s %s\n' "$lo" "$hi"
+        return 0
+    fi
+
     if [[ ! -x "$POOL_RESOLVE" ]]; then
         log ERROR "pool-port-alloc: pool-resolve not found at ${POOL_RESOLVE}"
         return 1

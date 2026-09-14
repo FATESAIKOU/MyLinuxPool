@@ -189,7 +189,7 @@ jobs:
               ;;
           esac
 
-      - name: Deploy bundle (static_normal_files + decrypted static_secret_files)
+      - name: Deploy bundle (static_normal_files + decrypted static_secret_files + pool/bin)
         shell: bash
         env:
           FILE_CRYPTO_KEY: ${{ secrets.FILE_CRYPTO_KEY }}
@@ -216,6 +216,16 @@ jobs:
               scripts/decryptStdin.sh "$FILE_CRYPTO_KEY" < "$crypted" > "$dest"
             done < <(find static_secret_files/home -type f -name '*.crypted' -print0)
           fi
+
+          # pool/bin/* onto the Gateway too (ARCHITECTURE.md §5 step 4) —
+          # pool-port-alloc/pool-resolve need to actually exist there for
+          # create-worker/delete-worker to run them (spec §10.1/§10.4).
+          # Staged under the same home/ tree so the existing scp + `sudo
+          # cp -a` below carries it over for free; provision.sh's own
+          # step then just chmod +x's it (ownership already gets fixed by
+          # provision.sh's per-user chown -R, same as everything else here).
+          mkdir -p "${stage}/fatesaikou/pool/bin"
+          cp -a pool/bin/. "${stage}/fatesaikou/pool/bin/"
 
           scp -o StrictHostKeyChecking=accept-new -r "$stage" "fatesaikou@${PREVIEW_IP}:/tmp/mlp-bundle-home"
           ssh -o StrictHostKeyChecking=accept-new "fatesaikou@${PREVIEW_IP}" \
