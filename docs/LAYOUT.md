@@ -2,20 +2,38 @@
 
 ```
 Root
-├── shared_config/<unit>/      服務／工具的分發單位
-├── profiles/<role>/<name>/    角色設定，明確列出要載入哪些 unit
-├── scripts/                   業務邏輯，不依賴 GitHub Actions
-├── ops-script/                人手動跑的東西（註冊、mlp）
-├── .github/workflows/         只做 GitHub 專屬的事，其餘呼叫 scripts/
-├── docs/  tests/
+├── profiles/<role>/<name>/     角色設定，明確列出要載入哪些 unit
+├── shared-configs/<unit>/      服務／工具的分發單位（自帶 install.sh 與 tests/）
+├── scripts/                    業務邏輯，不依賴 GitHub Actions
+├── ops-scripts/                人手動跑的東西（register-provider、mlp、verify-profile）
+│
+├── .github/workflows/          薄殼：只做 GitHub 專屬的事，其餘呼叫 scripts/
+├── docs/                       文件
+└── README.md  .gitignore
 ```
 
-## 1. `shared_config/<unit>/` —— 分發單位
+**根目錄只有四個程式目錄。** `.github/`、`docs/`、`README.md` 是基礎設施與
+文件，不是程式，屬於另一個層次。
+
+不存在 `gateway/`、`provider/`、`bin/`、`tests/` —— 它們的職責分別落在：
+
+| 原本 | 現在 | 為什麼 |
+|---|---|---|
+| `gateway/provision.sh` | `scripts/provision-gateway.sh` | 是業務邏輯，被 rotate 呼叫 |
+| `provider/register.sh` | `ops-scripts/register-provider.sh` | 人手動跑的 |
+| `bin/mlp` | `ops-scripts/mlp` | 人手動跑的 |
+| `tests/` | `shared-configs/<unit>/tests/` | **測試跟著被測物走**——測 `pool-resolve` 的測試屬於 `pool-runtime` 這個 unit |
+
+最後一條值得說明：unit 自帶 `tests/` 之後，一個 unit 就完整了——
+`unit.json` 宣告它是什麼、`install.sh` 裝它、`--check` 驗部署狀態、
+`tests/` 驗程式行為。不需要去別的地方找它的任何一部分。
+
+## 1. `shared-configs/<unit>/` —— 分發單位
 
 一個 unit 是「在一台機器上把某個服務／工具裝到可用狀態」所需的全部東西。
 
 ```
-shared_config/<unit>/
+shared-configs/<unit>/
 ├── unit.json      宣告
 ├── install.sh     安裝
 └── files/         要佈署的檔案（*.crypted 由 install.sh 解密）
@@ -55,18 +73,18 @@ install.sh [--key <FILE_CRYPTO_KEY>] [--home <dir>] [--user <name>] [--check]
 
 `needs_key: true` 的 unit 都靠 `../../scripts/decryptStdin.sh`（相對於自己
 的 `SCRIPT_DIR`）解密 `files/*.crypted`——這是**刻意的**跨目錄依賴，用意是
-避免每個 unit 各自複製一份解密邏輯。代價是：**單獨佈署 `shared_config/`
+避免每個 unit 各自複製一份解密邏輯。代價是：**單獨佈署 `shared-configs/`
 而不帶 `scripts/` 會讓每個 needs_key unit 的 install.sh 找不到解密工具**。
 
-2026-09-15 實機踩到：只打包 `shared_config/` 送上 Gateway，
+2026-09-15 實機踩到：只打包 `shared-configs/` 送上 Gateway，
 `ssh-tunnel-server` 因為 `scripts/decryptStdin.sh` 不存在而無法解密，
 但當時的程式碼把「沒有能力檢查」誤報成「檢查不通過」（印出「不變式被違
 反」），讓人差點去改根本沒問題的資料。現在每個 unit 的 install.sh 在使用
 `decryptStdin.sh` 之前都會先確認它存在且可執行，不存在就以明確訊息中止
-（說明這個 unit 依賴 `scripts/decryptStdin.sh`，需要跟 `shared_config/`
+（說明這個 unit 依賴 `scripts/decryptStdin.sh`，需要跟 `shared-configs/`
 一起佈署），而不是讓解密指令默默失敗後繼續用空/錯的內容跑下去。
 
-**佈署 `shared_config/` 到任何機器時，務必連同 `scripts/` 一起帶上。**
+**佈署 `shared-configs/` 到任何機器時，務必連同 `scripts/` 一起帶上。**
 
 ### 目前的 unit
 
@@ -130,7 +148,7 @@ profile.json      宣告
 }
 ```
 
-- `systemd_user_services`：安裝完 `shared_config` 之後要 `enable --now` 的
+- `systemd_user_services`：安裝完 `shared-configs` 之後要 `enable --now` 的
   `systemctl --user` 服務名稱（檔案本身由宣告的 unit 負責放好，例如
   `pool-runtime` 放 `pool-tunnel.service`；這裡只負責啟用）
 - `linger`：是否需要 `loginctl enable-linger`（讓 `--user` 服務在登出後繼續活著）
@@ -138,7 +156,7 @@ profile.json      宣告
   由呼叫端組出 `<user> <rule>`）；空陣列代表這個 profile 刻意不要任何 sudoers 規則
 
 `systemd_user_services` / `linger` / `sudoers_rules` 是**非 unit** 的宣告——
-沒有對應的 `shared_config/<unit>/`，因為它們描述的是「這台機器除了裝檔案
+沒有對應的 `shared-configs/<unit>/`，因為它們描述的是「這台機器除了裝檔案
 之外還需要什麼系統層級的設定」，不是「裝什麼檔案」。任何角色的 profile
 都可以用這三個欄位，不是 provider 專屬。
 
@@ -152,9 +170,9 @@ profiles/provider/default/profile.json    # 有 sudo：fh-l
 profiles/provider/no-sudo/profile.json    # 沒有 sudo：fh-proxy，sudoers_rules 是空陣列
 ```
 
-兩者的 `shared_config` 完全一樣——差異只在 `sudoers_rules`。`register.sh`
-依 `--no-sudo` 旗標選對應的 profile；`ops-script/verify-profile` 只驗
-`shared_config` 裡的 unit（見 §6 的範圍說明），從不檢查 `sudoers_rules`
+兩者的 `shared-configs` 完全一樣——差異只在 `sudoers_rules`。`register.sh`
+依 `--no-sudo` 旗標選對應的 profile；`ops-scripts/verify-profile` 只驗
+`shared-configs` 裡的 unit（見 §6 的範圍說明），從不檢查 `sudoers_rules`
 有沒有落地，所以 `--no-sudo` 機器缺 sudoers 規則不會被誤判成落差——它本來
 就沒被宣告要有。
 
@@ -196,7 +214,7 @@ scripts/
 ```
 
 `lib/ssh.sh` 內含跳板鏈的組裝與執行，**可在 Mac 上直接使用** ——
-`ops-script/mlp` 與 workflow 都用它，不再各寫一份。
+`ops-scripts/mlp` 與 workflow 都用它，不再各寫一份。
 
 ## 4. `.github/workflows/`
 
@@ -209,7 +227,7 @@ scripts/
 
 **流程判斷、重試、回滾的邏輯都在 `scripts/` 裡**，workflow 不重複實作。
 
-## 5. `ops-script/`
+## 5. `ops-scripts/`
 
 人手動執行的東西。
 
@@ -239,7 +257,7 @@ scripts/
 
 > **目前不做的事：反過來抓孤兒**。`--check` 不會掃機器上的檔案、反查有
 > 沒有任何 profile 宣告過它——也就是說，它回答不了「這台機器上有沒有不
-> 該存在的東西」。2026-09-15 把 `shared_config/` 送上現行 Gateway 逐一跑
+> 該存在的東西」。2026-09-15 把 `shared-configs/` 送上現行 Gateway 逐一跑
 > `--check` 時，翻出了 `~/testSH/grc.sh`（repo 裡已刪除的舊檔，2026-09-14
 > 就發現過一次）與 `~/testSH/pws`（來源不明）——這兩個都是人工比對「機器
 > 上有什麼」與「profile 宣告了什麼」才找到的，`--check` 本身認不出它們。
