@@ -10,8 +10,12 @@
 # Gateway's own case — it deliberately holds no GitHub credential, spec
 # §10.2b), this unit just installs the `gh` binary and stops there.
 #
-# needs_root=true: apt-installing `gh` needs root (checked below, skipped
-# for --check).
+# needs_root=true: apt-installing `gh` needs root, but ONLY when `gh` isn't
+# already on PATH — the root check is gated on that (see below), not
+# unconditional, so a caller that already has `gh` some other way (e.g.
+# provider/register.sh's own --no-sudo tarball bootstrap, run before this
+# unit ever gets called) can still call this unit as a normal user to get
+# the token file + git credential helper set up.
 
 set -uo pipefail
 
@@ -61,12 +65,11 @@ if [[ "$CHECK_ONLY" -eq 1 ]]; then
     exit 1
 fi
 
-if [[ "$(id -u)" -ne 0 ]]; then
-    log ERROR "this unit needs_root=true — run as root"
-    exit 1
-fi
-
 if ! command -v gh >/dev/null 2>&1; then
+    if [[ "$(id -u)" -ne 0 ]]; then
+        log ERROR "gh is not installed and apt-installing it needs root — run as root, or install gh some other way first (e.g. the caller's own no-root bootstrap) and re-run this unit"
+        exit 1
+    fi
     log INFO "installing gh via apt"
     apt-get update -y
     apt-get install -y gh

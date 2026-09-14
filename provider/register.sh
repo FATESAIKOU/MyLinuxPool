@@ -80,6 +80,18 @@ fi
 
 VAR_NAME="NODE_$(printf '%s' "$NAME" | tr '[:lower:]' '[:upper:]' | tr '-' '_')"
 
+# --no-sudo selects the matching provider profile — it's the one axis
+# these two variants actually differ on today (see profiles/provider/*/
+# profile.json: same shared_config units either way, no-sudo just
+# declares an empty sudoers_rules). Which units to install, and which
+# non-unit things (systemd --user services, linger, sudoers) this role
+# needs, are read from that profile from here on — not hardcoded per step
+# (2026-09-15: profiles/provider/ didn't exist at all before this; every
+# provider's actual requirements only lived as inline logic in this file).
+PROFILE_NAME="default"
+[[ "$NO_SUDO" -eq 1 ]] && PROFILE_NAME="no-sudo"
+PROFILE_JSON="${REPO_DIR}/profiles/provider/${PROFILE_NAME}/profile.json"
+
 arch_suffix() {
     case "$(uname -m)" in
         x86_64) echo amd64 ;;
@@ -311,9 +323,21 @@ step2_store_token() {
 }
 
 # ---- step 3: fetch runtime ---------------------------------------------------
+# The repo has to be cloned unconditionally (the profile we're about to
+# read lives in it) — but WHICH shared_config units get installed after
+# that comes entirely from profiles/provider/<name>/profile.json's
+# "shared_config" array, not a list hardcoded here. This is also why "gh"
+# is safe to call generically now even though step 2 above handles gh's
+# token/credential-helper as an unavoidable inline bootstrap (repo doesn't
+# exist yet at step 2) — by this point the repo exists, gh is already on
+# PATH (step 1), and re-running the gh unit here is just an idempotent
+# no-op confirming the profile's declaration actually holds.
 step3_fetch_runtime() {
-    log INFO "step 3/9: fetch runtime (clone/pull repo, install pool-runtime unit)"
+    log INFO "step 3/9: fetch runtime (clone/pull repo, install profile-declared units)"
 
+    # BIN_DIR is what pool-runtime's own install.sh derives as
+    # <home>/.mylinuxpool/bin — kept as our own constant too since step9
+    # invokes pool-resolve directly.
     mkdir -p "$STATE_DIR"
 
     if [[ -d "${REPO_DIR}/.git" ]]; then
@@ -331,18 +355,37 @@ step3_fetch_runtime() {
         gh repo clone "$REPO" "$REPO_DIR" -- --branch "$BRANCH"
     fi
 
-    # BIN_DIR is what pool-runtime's own install.sh derives as
-    # <home>/.mylinuxpool/bin — kept as our own constant too since step9
-    # invokes pool-resolve directly.
-    "${REPO_DIR}/shared_config/pool-runtime/install.sh" --home "$HOME" --user "$(whoami)"
+    if [[ ! -f "$PROFILE_JSON" ]]; then
+        log ERROR "no such profile: ${PROFILE_JSON}"
+        log ERROR "profiles/provider/{default,no-sudo} should exist on branch '${BRANCH}' — wrong --branch for a dev branch that hasn't merged this yet?"
+        exit 1
+    fi
+
+    local units unit install
+    units="$(jq -r '.shared_config[]' "$PROFILE_JSON")" || {
+        log ERROR "could not read .shared_config from ${PROFILE_JSON}"
+        exit 1
+    }
+
+    for unit in $units; do
+        install="${REPO_DIR}/shared_config/${unit}/install.sh"
+        if [[ ! -x "$install" ]]; then
+            log ERROR "${install} missing or not executable (declared in ${PROFILE_JSON})"
+            exit 1
+        fi
+        log INFO "installing unit '${unit}' (profiles/provider/${PROFILE_NAME})"
+        "$install" --key "$FILE_CRYPTO_KEY" --home "$HOME" --user "$(whoami)"
+    done
 }
 
-# ---- step 4: shared sshproxy key + Actions authorized_keys ------------------
+# ---- step 4: Actions authorized_keys -----------------------------------------
+# The sshproxy private key itself is now installed generically in step 3
+# (whichever unit the profile declares for it — ssh-tunnel-client today).
+# This step is the one piece of step 4's old job that has no unit of its
+# own: a narrow "pull just the mylinuxpool-actions line out of ssh-admin's
+# authorized_keys bundle" extraction, not a wholesale unit install.
 step4_key() {
-    log INFO "step 4/9: sshproxy private key + Actions authorized_keys"
-
-    "${REPO_DIR}/shared_config/ssh-tunnel-client/install.sh" \
-        --key "$FILE_CRYPTO_KEY" --home "$HOME" --user "$(whoami)"
+    log INFO "step 4/9: Actions authorized_keys"
 
     # Actions reaches this machine directly, as the last hop of its own
     # NODE_<NAME> var, using SSH_KEY_ACTIONS (see docs/ARCHITECTURE.md §3)
@@ -447,40 +490,51 @@ step6_register_var() {
     log INFO "wrote ${VAR_NAME}"
 }
 
-# ---- step 7: narrow sudoers rule ---------------------------------------------
+# ---- step 7: sudoers rules (profile-declared) --------------------------------
+# Which rules (if any) this host gets comes from profiles/provider/<name>/
+# profile.json's "sudoers_rules" array, not a NO_SUDO-gated hardcoded
+# rule. default declares the poweroff/ethtool rule; no-sudo declares an
+# empty list — a host that can't apply sudo rules remotely (no password,
+# no TTY to prompt on) simply has a profile that asks for none, so this
+# step is a correct, declared no-op there rather than a special case.
 step7_sudoers() {
-    log INFO "step 7/9: sudoers rule for poweroff/ethtool (needs your sudo password)"
+    log INFO "step 7/9: sudoers rules (declared in ${PROFILE_JSON})"
 
-    if [[ "$NO_SUDO" -eq 1 ]]; then
-        log INFO "--no-sudo: skipping sudoers rule — this host cannot do 'sudo systemctl poweroff' remotely"
-        log INFO "Shutdown-Fh-l-style power control doesn't apply here; an always-on provider like fh-proxy doesn't need it anyway"
+    local rules
+    rules="$(jq -r '.sudoers_rules[]?' "$PROFILE_JSON")"
+    if [[ -z "$rules" ]]; then
+        log INFO "profile '${PROFILE_NAME}' declares no sudoers_rules — skipping (needs your sudo password otherwise)"
         return 0
     fi
 
     if ! ensure_sudo; then
         log ERROR "sudo needs a password but this environment can't provide one (no TTY / no askpass)"
-        log ERROR "re-run this from a session with a real TTY, or pass --no-sudo if this host doesn't need remote poweroff"
+        log ERROR "re-run this from a session with a real TTY, or use a profile ('--no-sudo') that declares no sudoers_rules"
         exit 1
     fi
 
     local target="/etc/sudoers.d/mylinuxpool"
-    local rule="$(whoami) ALL=(root) NOPASSWD: /usr/bin/systemctl poweroff, /usr/sbin/ethtool"
-
-    if [[ -f "$target" ]] && sudo -n grep -qF "$rule" "$target" 2>/dev/null; then
-        log INFO "sudoers rule already present, skipping"
-        return 0
-    fi
-
+    local who
+    who="$(whoami)"
     local tmp
     tmp="$(mktemp)"
-    printf '%s\n' "$rule" > "$tmp"
+    while IFS= read -r rule; do
+        [[ -z "$rule" ]] && continue
+        printf '%s %s\n' "$who" "$rule" >> "$tmp"
+    done <<< "$rules"
+
+    if [[ -f "$target" ]] && sudo -n diff -q "$tmp" "$target" >/dev/null 2>&1; then
+        log INFO "sudoers rules already up to date, skipping"
+        rm -f "$tmp"
+        return 0
+    fi
 
     # Now that ensure_sudo confirmed sudo actually works, -n makes every
     # call below fail fast on its own merits — no more auth prompts to
     # get misattributed to whatever command happened to trigger them.
     local visudo_out
     if ! visudo_out="$(sudo -n visudo -c -f "$tmp" 2>&1)"; then
-        log ERROR "generated sudoers rule failed 'visudo -c' validation, aborting without touching ${target}"
+        log ERROR "generated sudoers rule(s) failed 'visudo -c' validation, aborting without touching ${target}"
         log ERROR "visudo output: ${visudo_out}"
         rm -f "$tmp"
         exit 1
@@ -547,27 +601,44 @@ enable_linger() {
 }
 
 step8_systemd() {
-    log INFO "step 8/9: enable pool-tunnel.service and enable linger"
+    log INFO "step 8/9: enable profile-declared systemd --user services + linger"
 
-    # pool-runtime's own install.sh (called from step3) already placed the
-    # unit file at ~/.config/systemd/user/pool-tunnel.service — nothing to
-    # copy here anymore, just enable/start it (a role-specific decision
-    # that unit deliberately leaves to its caller).
-    local unit_dst="${HOME}/.config/systemd/user/pool-tunnel.service"
+    # Whichever unit was installed in step 3 already placed each service's
+    # unit file under ~/.config/systemd/user/ — nothing to copy here,
+    # just enable/start whatever profiles/provider/<name>/profile.json's
+    # "systemd_user_services" lists (a role-specific decision units
+    # deliberately leave to their caller, not something a unit does
+    # itself).
+    local services
+    services="$(jq -r '.systemd_user_services[]?' "$PROFILE_JSON")"
 
-    if [[ ! -f "$unit_dst" ]]; then
-        log ERROR "${unit_dst} not found — step 3 (pool-runtime install) should have placed it"
-        exit 1
+    if [[ -z "$services" ]]; then
+        log INFO "profile '${PROFILE_NAME}' declares no systemd_user_services — skipping"
+    else
+        local svc unit_dst
+        while IFS= read -r svc; do
+            [[ -z "$svc" ]] && continue
+            unit_dst="${HOME}/.config/systemd/user/${svc}"
+            if [[ ! -f "$unit_dst" ]]; then
+                log ERROR "${unit_dst} not found — one of step 3's units should have placed it (check which shared_config unit provides ${svc})"
+                exit 1
+            fi
+            if [[ "$NO_SUDO" -eq 1 ]]; then
+                patch_unit_path_for_no_sudo "$unit_dst"
+            fi
+            systemctl --user daemon-reload
+            systemctl --user enable --now "$svc"
+            log INFO "enabled systemd --user service ${svc}"
+        done <<< "$services"
     fi
 
-    if [[ "$NO_SUDO" -eq 1 ]]; then
-        patch_unit_path_for_no_sudo "$unit_dst"
+    local want_linger
+    want_linger="$(jq -r '.linger // false' "$PROFILE_JSON")"
+    if [[ "$want_linger" == "true" ]]; then
+        enable_linger
+    else
+        log INFO "profile '${PROFILE_NAME}' does not declare linger — skipping"
     fi
-
-    systemctl --user daemon-reload
-    systemctl --user enable --now pool-tunnel.service
-
-    enable_linger
 }
 
 # ---- step 9: verify from the Gateway side ------------------------------------

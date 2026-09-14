@@ -51,6 +51,23 @@ install.sh [--key <FILE_CRYPTO_KEY>] [--home <dir>] [--user <name>] [--check]
 - 金鑰只經 `--key` 或 stdin 傳入，**不得**寫進任何檔案或日誌
 - 日誌沿用 `[YYYY-MM-DDTHH:MM:SSZ] LEVEL ` 格式
 
+### 跨目錄依賴：`scripts/decryptStdin.sh`
+
+`needs_key: true` 的 unit 都靠 `../../scripts/decryptStdin.sh`（相對於自己
+的 `SCRIPT_DIR`）解密 `files/*.crypted`——這是**刻意的**跨目錄依賴，用意是
+避免每個 unit 各自複製一份解密邏輯。代價是：**單獨佈署 `shared_config/`
+而不帶 `scripts/` 會讓每個 needs_key unit 的 install.sh 找不到解密工具**。
+
+2026-09-15 實機踩到：只打包 `shared_config/` 送上 Gateway，
+`ssh-tunnel-server` 因為 `scripts/decryptStdin.sh` 不存在而無法解密，
+但當時的程式碼把「沒有能力檢查」誤報成「檢查不通過」（印出「不變式被違
+反」），讓人差點去改根本沒問題的資料。現在每個 unit 的 install.sh 在使用
+`decryptStdin.sh` 之前都會先確認它存在且可執行，不存在就以明確訊息中止
+（說明這個 unit 依賴 `scripts/decryptStdin.sh`，需要跟 `shared_config/`
+一起佈署），而不是讓解密指令默默失敗後繼續用空/錯的內容跑下去。
+
+**佈署 `shared_config/` 到任何機器時，務必連同 `scripts/` 一起帶上。**
+
 ### 目前的 unit
 
 | unit | 內容 | needs_root |
@@ -93,6 +110,53 @@ cloud-config.yaml cloud-init
   "fail2ban": { "ignoreip_from_var": "POOL_TRUSTED_IPS" }
 }
 ```
+
+### `profiles/provider/<name>/`
+
+```
+profile.json      宣告
+```
+
+```json
+{
+  "name": "default",
+  "role": "provider",
+  "shared_config": ["pool-runtime", "ssh-tunnel-client", "gh"],
+  "systemd_user_services": ["pool-tunnel.service"],
+  "linger": true,
+  "sudoers_rules": [
+    "ALL=(root) NOPASSWD: /usr/bin/systemctl poweroff, /usr/sbin/ethtool"
+  ]
+}
+```
+
+- `systemd_user_services`：安裝完 `shared_config` 之後要 `enable --now` 的
+  `systemctl --user` 服務名稱（檔案本身由宣告的 unit 負責放好，例如
+  `pool-runtime` 放 `pool-tunnel.service`；這裡只負責啟用）
+- `linger`：是否需要 `loginctl enable-linger`（讓 `--user` 服務在登出後繼續活著）
+- `sudoers_rules`：要寫進 `/etc/sudoers.d/mylinuxpool` 的規則（不含使用者名稱，
+  由呼叫端組出 `<user> <rule>`）；空陣列代表這個 profile 刻意不要任何 sudoers 規則
+
+`systemd_user_services` / `linger` / `sudoers_rules` 是**非 unit** 的宣告——
+沒有對應的 `shared_config/<unit>/`，因為它們描述的是「這台機器除了裝檔案
+之外還需要什麼系統層級的設定」，不是「裝什麼檔案」。任何角色的 profile
+都可以用這三個欄位，不是 provider 專屬。
+
+**同一個角色、兩種最終狀態**：`provider/register.sh` 支援 `--no-sudo`
+（沒有 sudo 密碼的機器，例如 fh-proxy），這台機器就是裝不了 sudoers
+規則——這不是缺陷，是這台機器**真實的最終狀態**。用兩個 profile 表達，
+而不是一個 profile 加執行期旗標：
+
+```
+profiles/provider/default/profile.json    # 有 sudo：fh-l
+profiles/provider/no-sudo/profile.json    # 沒有 sudo：fh-proxy，sudoers_rules 是空陣列
+```
+
+兩者的 `shared_config` 完全一樣——差異只在 `sudoers_rules`。`register.sh`
+依 `--no-sudo` 旗標選對應的 profile；`ops-script/verify-profile` 只驗
+`shared_config` 裡的 unit（見 §6 的範圍說明），從不檢查 `sudoers_rules`
+有沒有落地，所以 `--no-sudo` 機器缺 sudoers 規則不會被誤判成落差——它本來
+就沒被宣告要有。
 
 ### `profiles/worker/<name>/`
 

@@ -1,0 +1,8 @@
+{
+  "name": "no-sudo",
+  "role": "provider",
+  "shared_config": ["pool-runtime", "ssh-tunnel-client", "gh"],
+  "systemd_user_services": ["pool-tunnel.service"],
+  "linger": true,
+  "sudoers_rules": []
+}
