@@ -88,6 +88,23 @@ arch_suffix() {
     esac
 }
 
+# Confirms sudo actually works BEFORE any real sudo call, so a later
+# failure is never misattributed to whatever that call happened to be
+# (2026-09-14 incident: `sudo visudo` failed for lack of a usable
+# credential, but the error pointed at visudo itself). `-n` never
+# prompts, so a cached ticket is detected instantly with no risk of
+# hanging; only when that's absent, and only if stdin is a real TTY
+# sudo could actually prompt on, do we let it try once interactively.
+ensure_sudo() {
+    if sudo -n true 2>/dev/null; then
+        return 0
+    fi
+    if [[ -t 0 ]] && sudo -v; then
+        return 0
+    fi
+    return 1
+}
+
 # Idempotently make sure ~/.local/bin is on PATH for future interactive
 # shells. This is purely for human convenience (running gh/jq by hand) —
 # pool-tunnel.service gets its own PATH via step8_systemd, since systemd
@@ -180,13 +197,21 @@ step1_preflight_sudo() {
     command -v docker >/dev/null 2>&1 || pkgs+=(docker.io)
     dpkg -s openssh-server >/dev/null 2>&1 || pkgs+=(openssh-server)
 
-    if (( ${#pkgs[@]} > 0 )); then
-        log INFO "installing missing packages: ${pkgs[*]}"
-        sudo apt-get update -y
-        sudo apt-get install -y "${pkgs[@]}"
-    else
+    if (( ${#pkgs[@]} == 0 )); then
         log INFO "all required packages already present"
+        return 0
     fi
+
+    log INFO "installing missing packages: ${pkgs[*]}"
+
+    if ! ensure_sudo; then
+        log ERROR "sudo needs a password but this environment can't provide one (no TTY / no askpass)"
+        log ERROR "re-run this from a session with a real TTY, or install manually: sudo apt-get install ${pkgs[*]}"
+        exit 1
+    fi
+
+    sudo -n apt-get update -y
+    sudo -n apt-get install -y "${pkgs[@]}"
 }
 
 # --no-sudo: only jq/gh have a viable no-root install path (a static
@@ -380,10 +405,16 @@ step7_sudoers() {
         return 0
     fi
 
+    if ! ensure_sudo; then
+        log ERROR "sudo needs a password but this environment can't provide one (no TTY / no askpass)"
+        log ERROR "re-run this from a session with a real TTY, or pass --no-sudo if this host doesn't need remote poweroff"
+        exit 1
+    fi
+
     local target="/etc/sudoers.d/mylinuxpool"
     local rule="$(whoami) ALL=(root) NOPASSWD: /usr/bin/systemctl poweroff, /usr/sbin/ethtool"
 
-    if [[ -f "$target" ]] && sudo grep -qF "$rule" "$target" 2>/dev/null; then
+    if [[ -f "$target" ]] && sudo -n grep -qF "$rule" "$target" 2>/dev/null; then
         log INFO "sudoers rule already present, skipping"
         return 0
     fi
@@ -392,13 +423,18 @@ step7_sudoers() {
     tmp="$(mktemp)"
     printf '%s\n' "$rule" > "$tmp"
 
-    if ! sudo visudo -c -f "$tmp" >/dev/null 2>&1; then
+    # Now that ensure_sudo confirmed sudo actually works, -n makes every
+    # call below fail fast on its own merits — no more auth prompts to
+    # get misattributed to whatever command happened to trigger them.
+    local visudo_out
+    if ! visudo_out="$(sudo -n visudo -c -f "$tmp" 2>&1)"; then
         log ERROR "generated sudoers rule failed 'visudo -c' validation, aborting without touching ${target}"
+        log ERROR "visudo output: ${visudo_out}"
         rm -f "$tmp"
         exit 1
     fi
 
-    sudo install -o root -g root -m 440 "$tmp" "$target"
+    sudo -n install -o root -g root -m 440 "$tmp" "$target"
     rm -f "$tmp"
     log INFO "installed ${target}"
 }
@@ -448,7 +484,13 @@ enable_linger() {
         exit 1
     fi
 
-    sudo loginctl enable-linger "$who"
+    if ! ensure_sudo; then
+        log ERROR "sudo needs a password but this environment can't provide one (no TTY / no askpass)"
+        log ERROR "re-run this from a session with a real TTY, or enable linger yourself: sudo loginctl enable-linger ${who}"
+        exit 1
+    fi
+
+    sudo -n loginctl enable-linger "$who"
     log INFO "enabled linger for ${who}"
 }
 
