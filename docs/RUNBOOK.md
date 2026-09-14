@@ -707,6 +707,57 @@ done
 
 ---
 
+### 7.10 fh-l 關機時 rotate（它平常就是關機的）
+
+`fh-l` 是桌機，平常關機、要用才 `mlp wake` 叫醒——所以「rotate 時它是關的」
+不是例外狀況，是常態。2026-09-14 實測這個場景，抓出三個缺陷，
+**前兩個是同一天為了修別的問題而引入的**：
+
+| # | 缺陷 | 後果 |
+|---|---|---|
+| 1 | 切換前的 probe 寫死打 `fh-l` | fh-l 一睡著就擋掉所有 rotate |
+| 2 | 等 provider 重連要求**所有**已註冊 provider 回來 | 少一台就永遠等不到，必定回滾 |
+| 3 | `rotate_live_providers` 用 `log INFO` → 寫到 stdout，汙染自己的回傳值 | probe 去打一個叫 `[2026-09-14T11:00:58Z]` 的節點 |
+
+第 3 個特別值得記：`lib/log.sh` 的 `INFO` 依約定寫 **stdout**，
+而那個函式的 stdout 就是它的回傳值。同一個檔案裡的
+`rotate_create_preview_linode` 早就註明過這個陷阱，我還是踩了。
+修法是改用 `WARN`（走 stderr），並在呼叫端只保留符合
+`^<name> <port>$` 的行——讓未來任何 stdout 雜訊都不可能默默變成 probe 目標。
+
+#### 現在的行為
+
+`rotate_live_providers` 在**動任何東西之前**，對現役 Gateway 逐一讀每個
+provider 轉發埠的 SSH banner（不是看 listener——死掉的 session 會占著埠約一分鐘，
+見 §7.9）。得到的清單同時決定兩件事：probe 從哪一台跑、之後要等哪些埠回來。
+一台都沒有時，probe 跳過並警告，rotate 仍可進行。
+
+#### 實測（generation 7 → 8，fh-l 全程關機）
+
+三次失敗**全部停在切換點之前**——`NODE_GATEWAY` 一次都沒被動過，
+現役 Gateway 全程正常服務，preview 每次都被清掉。修好後：
+
+```
+probe 對象     fh-proxy（唯一掛著的）
+等待的埠       只有 2226
+結果           成功，generation 8
+```
+
+接著 `mlp wake` 叫醒 fh-l：
+
+```
+11:10:42  WoL 封包送出
+11:11:26  ssh: connect to host 172.105.219.60 port 22: Network is unreachable
+          ← 先試睡前記得的那台（pool-resolve 快取），拿到誠實的錯誤
+11:11:31  tunnel established: sshproxy@172.104.114.31 <- :2222 (generation 8)
+11:11:32  它的 worker 也接上 generation 8
+```
+
+**喚醒到全數上線 50 秒。** worker 沒有走冤枉路——它讀的是 provider 剛更新過的
+發布檔，一次就是 gen 8。
+
+---
+
 ---
 
 ## 8. 改了 provision-gateway.sh 之後
