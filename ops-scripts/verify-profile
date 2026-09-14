@@ -30,13 +30,37 @@ j=','.join('%s@%s:%s' % (x['user'],x['host'],x['port']) for x in h[:-1]) or '-'
 l=h[-1]
 print(j, l['user'], l['host'], l['port'])")"
 
+KNOWN_HOSTS="${HOME}/.mylinuxpool/known_hosts"
+
 SSH_OPTS=(-o BatchMode=yes -o ConnectTimeout=10
-          -o UserKnownHostsFile="${HOME}/.mylinuxpool/known_hosts"
-          -o StrictHostKeyChecking=accept-new
           # 不轉送 Mac 的 en_US.UTF-8——provider 上沒有那個 locale，
           # 遠端每開一次 bash 就警告一行，把真正的輸出淹掉。
           -o SetEnv=LC_ALL=C)
-[[ "$JUMPS" != "-" ]] && SSH_OPTS+=(-J "$JUMPS")
+
+if [[ "$JUMPS" == "-" ]]; then
+    # 終端就是跳板本身（gateway）：用專屬 known_hosts 驗它。
+    SSH_OPTS+=(-o UserKnownHostsFile="$KNOWN_HOSTS" -o StrictHostKeyChecking=accept-new)
+else
+    # -J 產生的隱式 ProxyCommand **不繼承** UserKnownHostsFile 或
+    # StrictHostKeyChecking，跳板那一段會退回預設的 ~/.ssh/known_hosts
+    # 並在 BatchMode 下直接失敗。rotate 之前會過，只是因為舊 Gateway IP
+    # 剛好躺在預設檔裡——矇對的，不是設計。
+    # 明確組 ProxyCommand，把選項帶進去（跟 scripts/lib/ssh.sh 同一套做法）。
+    proxy=""
+    IFS=',' read -r -a hops <<< "$JUMPS"
+    for h in "${hops[@]}"; do
+        hu="${h%@*}"; hr="${h#*@}"; hh="${hr%:*}"; hp="${hr##*:}"
+        leg="ssh -o UserKnownHostsFile=${KNOWN_HOSTS} -o StrictHostKeyChecking=accept-new"
+        leg+=" -o BatchMode=yes -o ConnectTimeout=10"
+        [[ -n "$proxy" ]] && leg+=" -o ProxyCommand=\"${proxy}\""
+        leg+=" -p ${hp} -W %h:%p ${hu}@${hh}"
+        proxy="$leg"
+    done
+    # 最終目的地是 Gateway loopback 上的轉發埠，那裡的 host key 隨著
+    # 每次 rotate/worker 重建而變，釘住它只會製造假警報。
+    SSH_OPTS+=(-o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no -o LogLevel=ERROR
+               -o ProxyCommand="$proxy")
+fi
 
 STAGE="$(mktemp -d)"; trap 'rm -rf "$STAGE"' EXIT
 

@@ -60,8 +60,39 @@ key_blobs() { awk '{ if ($2 != "") print $2 }' "$1" 2>/dev/null | sort -u; }
 # File existence proved nothing: cloud-init writes an authorized_keys of its
 # own, so "the file is there" was true on a machine that had exactly one of
 # the declared keys. Compare the contents.
+# Content, not existence. "The file is there" was true on a machine whose
+# authorized_keys had one of ten declared keys (RUNBOOK §7.6); the same
+# blindness applies to every decrypted file this unit installs.
+#   same_as_declared <declared.crypted> <installed-path>
+#     0 = matches, 1 = differs, 2 = cannot tell (decrypt failed)
+same_as_declared() {
+    local crypted="$1" installed="$2" tmp rc
+    [[ -f "$installed" ]] || return 1
+    tmp="$(mktemp)"
+    "$DECRYPT" decrypt "$KEY" < "$crypted" > "$tmp" 2>/dev/null
+    rc=$?
+    if [[ $rc -ne 0 ]]; then
+        rm -f "$tmp"
+        log ERROR "cannot verify $(basename "$installed"): ${crypted##*/} would not decrypt (wrong --key?)"
+        return 2
+    fi
+    if cmp -s "$tmp" "$installed"; then rm -f "$tmp"; return 0; fi
+    rm -f "$tmp"
+    return 1
+}
+
 check_installed() {
     [[ -f "${SSH_DIR}/id_rsa" && -f "${SSH_DIR}/id_rsa.pub" && -f "${SSH_DIR}/authorized_keys" ]] || return 1
+
+    local f
+    for f in id_rsa id_rsa.pub; do
+        same_as_declared "${FILES_DIR}/${f}.crypted" "${SSH_DIR}/${f}"
+        case $? in
+            0) ;;
+            2) return 1 ;;
+            *) log ERROR "${SSH_DIR}/${f} differs from the declared version"; return 1 ;;
+        esac
+    done
 
     local declared missing extra
     declared="$(mktemp)"

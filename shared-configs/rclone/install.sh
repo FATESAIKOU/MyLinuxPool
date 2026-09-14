@@ -43,10 +43,35 @@ done
 
 TARGET="${HOME_DIR}/.config/rclone/rclone.conf"
 
+# Content, not existence. "The file is there" was true on a machine whose
+# authorized_keys had one of ten declared keys (RUNBOOK §7.6); the same
+# blindness applies to every decrypted file this unit installs.
+#   same_as_declared <declared.crypted> <installed-path>
+#     0 = matches, 1 = differs, 2 = cannot tell (decrypt failed)
+same_as_declared() {
+    local crypted="$1" installed="$2" tmp rc
+    [[ -f "$installed" ]] || return 1
+    tmp="$(mktemp)"
+    "$DECRYPT" decrypt "$KEY" < "$crypted" > "$tmp" 2>/dev/null
+    rc=$?
+    if [[ $rc -ne 0 ]]; then
+        rm -f "$tmp"
+        log ERROR "cannot verify $(basename "$installed"): ${crypted##*/} would not decrypt (wrong --key?)"
+        return 2
+    fi
+    if cmp -s "$tmp" "$installed"; then rm -f "$tmp"; return 0; fi
+    rm -f "$tmp"
+    return 1
+}
+
 check_installed() {
-    command -v rclone >/dev/null 2>&1 || return 1
-    [[ -f "$TARGET" ]] || return 1
-    return 0
+    command -v rclone >/dev/null 2>&1 || { log ERROR "rclone binary not installed"; return 1; }
+    same_as_declared "${FILES_DIR}/rclone.conf.crypted" "$TARGET"
+    case $? in
+        0) return 0 ;;
+        2) return 1 ;;
+        *) log ERROR "${TARGET} differs from the declared rclone.conf"; return 1 ;;
+    esac
 }
 
 if [[ "$CHECK_ONLY" -eq 1 ]]; then

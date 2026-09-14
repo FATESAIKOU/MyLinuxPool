@@ -49,8 +49,41 @@ done
 
 TARGET_DIR="${HOME_DIR}/testSH"
 
+# Content, not existence. "The file is there" was true on a machine whose
+# authorized_keys had one of ten declared keys (RUNBOOK §7.6); the same
+# blindness applies to every decrypted file this unit installs.
+#   same_as_declared <declared.crypted> <installed-path>
+#     0 = matches, 1 = differs, 2 = cannot tell (decrypt failed)
+same_as_declared() {
+    local crypted="$1" installed="$2" tmp rc
+    [[ -f "$installed" ]] || return 1
+    tmp="$(mktemp)"
+    "$DECRYPT" decrypt "$KEY" < "$crypted" > "$tmp" 2>/dev/null
+    rc=$?
+    if [[ $rc -ne 0 ]]; then
+        rm -f "$tmp"
+        log ERROR "cannot verify $(basename "$installed"): ${crypted##*/} would not decrypt (wrong --key?)"
+        return 2
+    fi
+    if cmp -s "$tmp" "$installed"; then rm -f "$tmp"; return 0; fi
+    rm -f "$tmp"
+    return 1
+}
+
 check_installed() {
-    [[ -x "${TARGET_DIR}/dlpw" && -x "${TARGET_DIR}/uppw" ]]
+    local f rc=0
+    for f in dlpw uppw; do
+        if [[ ! -x "${TARGET_DIR}/${f}" ]]; then
+            log ERROR "${TARGET_DIR}/${f} missing or not executable"; rc=1; continue
+        fi
+        same_as_declared "${FILES_DIR}/${f}.crypted" "${TARGET_DIR}/${f}"
+        case $? in
+            0) ;;
+            2) rc=1 ;;
+            *) log ERROR "${TARGET_DIR}/${f} differs from the declared version"; rc=1 ;;
+        esac
+    done
+    return "$rc"
 }
 
 if [[ "$CHECK_ONLY" -eq 1 ]]; then
