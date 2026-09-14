@@ -207,6 +207,13 @@ resolve_connection_info() {
         fi
     fi
 
+    # Deliberately NOT --refresh, unlike the drift check below and unlike
+    # ops-scripts/mlp. This runs on the rebuild path, which is exactly when
+    # the network may be unhealthy: served from pool-resolve's 30s cache, a
+    # node can rebuild its tunnel using the last known address even while
+    # GitHub is unreachable. Forcing a refresh here would turn a GitHub
+    # outage into a tunnel outage. If the cached address is stale, the 30s
+    # drift check corrects it — and that one does use --refresh.
     local gw_json
     gw_json="$("$POOL_RESOLVE" gateway)"
     rc=$?
