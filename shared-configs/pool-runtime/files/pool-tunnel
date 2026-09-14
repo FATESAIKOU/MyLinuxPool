@@ -34,6 +34,23 @@ MASTER_PID=""
 # check, which would otherwise fail forever with no GH credentials to use.
 STATIC_GATEWAY=0
 
+# Where a node that CAN resolve the Gateway publishes what it found, and
+# where a node that cannot goes to read it. A provider writes this on
+# every successful resolve; a worker container gets the directory
+# bind-mounted read-only and follows it.
+#
+# This is the third mode, between "call pool-resolve" (needs a GitHub
+# token) and "take the address from the environment" (needs nothing, but
+# freezes at docker-run time and so cannot survive a rotate). A worker
+# reading its provider's published file needs no credential and still
+# follows the Gateway, because the provider it runs on is already
+# tracking NODE_GATEWAY on its own 30s cycle.
+GATEWAY_PUBLISH_DIR="${POOL_GATEWAY_PUBLISH_DIR:-${HOME}/.mylinuxpool/gateway}"
+GATEWAY_PUBLISH_FILE="${GATEWAY_PUBLISH_DIR}/gateway.json"
+# Set in the container (create-worker points it at the bind mount).
+GATEWAY_FOLLOW_FILE="${POOL_GATEWAY_FILE:-}"
+FOLLOW_GATEWAY=0
+
 log() {
     local level="$1"; shift
     local ts
@@ -91,8 +108,73 @@ next_backoff() {
 # drift check below rather than let it spam errors with no way to
 # succeed. This is expected — workers are disposable; re-run
 # create-worker after a rotate.
+# publish_gateway — record what we resolved so co-located containers can
+# follow it. Written via a temp file in the same directory and renamed, so
+# a reader never sees a half-written file. Never fatal: publishing is a
+# convenience for others, and failing to do it must not take down a
+# working tunnel.
+publish_gateway() {
+    local tmp
+    mkdir -p "$GATEWAY_PUBLISH_DIR" 2>/dev/null || return 0
+    chmod 755 "$GATEWAY_PUBLISH_DIR" 2>/dev/null || true
+    tmp="$(mktemp "${GATEWAY_PUBLISH_DIR}/.gw.XXXXXX" 2>/dev/null)" || return 0
+    printf '{"ip":"%s","tunnel_user":"%s","generation":"%s","published_at":"%s"}\n' \
+        "$GW_IP" "$GW_USER" "$GW_GEN" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$tmp" 2>/dev/null || {
+        rm -f "$tmp"; return 0
+    }
+    chmod 644 "$tmp" 2>/dev/null || true
+    mv -f "$tmp" "$GATEWAY_PUBLISH_FILE" 2>/dev/null || rm -f "$tmp"
+    return 0
+}
+
+# read_published_gateway — pull ip/user/generation out of the file a
+# provider published. Prints "ip<TAB>user<TAB>generation"; non-zero if the
+# file is missing or unreadable, which the caller retries rather than
+# treats as fatal (the provider may not have written it yet).
+read_published_gateway() {
+    local ip user gen
+    [[ -r "$GATEWAY_FOLLOW_FILE" ]] || return 1
+    ip="$(jq -r '.ip // empty' < "$GATEWAY_FOLLOW_FILE" 2>/dev/null)"
+    user="$(jq -r '.tunnel_user // empty' < "$GATEWAY_FOLLOW_FILE" 2>/dev/null)"
+    gen="$(jq -r '.generation // empty' < "$GATEWAY_FOLLOW_FILE" 2>/dev/null)"
+    [[ -n "$ip" && -n "$user" ]] || return 1
+    printf '%s\t%s\t%s\n' "$ip" "$user" "$gen"
+}
+
 resolve_connection_info() {
     local self_json rc
+
+    # Follow mode: the port is still ours to know (create-worker assigned
+    # it), but the Gateway address comes from the provider's published
+    # file and is re-read on every drift cycle.
+    if [[ -n "$GATEWAY_FOLLOW_FILE" && -n "${POOL_GATEWAY_PORT:-}" ]]; then
+        local pub i
+        MY_PORT="$POOL_GATEWAY_PORT"
+        for i in $(seq 1 30); do
+            pub="$(read_published_gateway)" && break
+            [[ "$i" -eq 1 ]] && log INFO "waiting for ${GATEWAY_FOLLOW_FILE} to appear"
+            sleep 2
+        done
+        if [[ -z "${pub:-}" ]]; then
+            # Fall back to the frozen address rather than refusing to run:
+            # a tunnel that cannot survive a rotate still beats no tunnel,
+            # and this is what a provider on an older pool-runtime gives us.
+            if [[ -n "${POOL_GATEWAY_HOST:-}" && -n "${POOL_GATEWAY_USER:-}" ]]; then
+                log WARN "no readable Gateway file at ${GATEWAY_FOLLOW_FILE} after 60s — falling back to POOL_GATEWAY_HOST; this tunnel will NOT survive a Gateway rotate"
+                GW_IP="$POOL_GATEWAY_HOST"
+                GW_USER="$POOL_GATEWAY_USER"
+                GW_GEN=""
+                STATIC_GATEWAY=1
+                return 0
+            fi
+            log ERROR "no readable Gateway file at ${GATEWAY_FOLLOW_FILE} after 60s and no POOL_GATEWAY_HOST fallback — is the provider's pool-tunnel running?"
+            return 1
+        fi
+        IFS=$'\t' read -r GW_IP GW_USER GW_GEN <<< "$pub"
+        FOLLOW_GATEWAY=1
+        log INFO "following ${GATEWAY_FOLLOW_FILE}: ${GW_USER}@${GW_IP} (generation ${GW_GEN:-unknown})"
+        return 0
+    fi
 
     if [[ -n "${POOL_GATEWAY_PORT:-}" && -n "${POOL_GATEWAY_HOST:-}" && -n "${POOL_GATEWAY_USER:-}" ]]; then
         MY_PORT="$POOL_GATEWAY_PORT"
@@ -145,6 +227,24 @@ resolve_connection_info() {
 # read; the routine 2s loop above just reads pool-resolve's own cache.
 gateway_changed() {
     local new_ip new_gen rc
+
+    # Follow mode re-reads the provider's file instead of asking GitHub.
+    # A file that has gone missing is not "no drift" — say so and retry,
+    # rather than reporting health we cannot actually observe.
+    if [[ "$FOLLOW_GATEWAY" -eq 1 ]]; then
+        local pub new_user
+        if ! pub="$(read_published_gateway)"; then
+            log WARN "gateway file ${GATEWAY_FOLLOW_FILE} unreadable, will retry next cycle"
+            return 1
+        fi
+        IFS=$'\t' read -r new_ip new_user new_gen <<< "$pub"
+        if [[ "$new_ip" != "$GW_IP" || "$new_gen" != "$GW_GEN" ]]; then
+            log INFO "gateway drift detected via ${GATEWAY_FOLLOW_FILE}: ip ${GW_IP}->${new_ip} generation ${GW_GEN}->${new_gen}"
+            GW_IP="$new_ip"; GW_USER="$new_user"; GW_GEN="$new_gen"
+            return 0
+        fi
+        return 1
+    fi
 
     new_ip="$("$POOL_RESOLVE" gateway --refresh --field .ip)"
     rc=$?
@@ -310,6 +410,10 @@ main() {
                 continue
             fi
 
+            # Only a node that resolved this itself has anything worth
+            # publishing; a follower would just echo back what it read.
+            [[ "$FOLLOW_GATEWAY" -eq 1 || "$STATIC_GATEWAY" -eq 1 ]] || publish_gateway
+
             if start_master; then
                 log INFO "tunnel established: ${GW_USER}@${GW_IP} <- :${MY_PORT} (gateway generation ${GW_GEN})"
                 backoff=2
@@ -345,10 +449,12 @@ main() {
         fi
 
         local now=$(date +%s)
-        if [[ "$STATIC_GATEWAY" -ne 1 ]] && (( now - last_gw_check >= GATEWAY_CHECK_INTERVAL )); then
+        if [[ "$STATIC_GATEWAY" -ne 1 || "$FOLLOW_GATEWAY" -eq 1 ]] \
+           && (( now - last_gw_check >= GATEWAY_CHECK_INTERVAL )); then
             last_gw_check=$now
             if gateway_changed; then
                 log WARN "rebuilding tunnel immediately due to gateway drift"
+                [[ "$FOLLOW_GATEWAY" -eq 1 || "$STATIC_GATEWAY" -eq 1 ]] || publish_gateway
                 teardown_master
             fi
         fi

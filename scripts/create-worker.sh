@@ -129,7 +129,26 @@ create_worker_build_run_cmd() {
     authorized_keys_q="$(printf '%q' "$authorized_keys_content")"
 
     local cmd
-    cmd="docker rm -f ${container_q} >/dev/null 2>&1; docker run -d --restart unless-stopped --name ${container_q}"
+    # Create the mount source first. Docker creates a missing bind-mount
+    # source itself, as root — and then the provider's pool-tunnel, which
+    # runs as the user, cannot write the file the worker is waiting for.
+    cmd="mkdir -p \$HOME/.mylinuxpool/gateway; "
+    cmd+="docker rm -f ${container_q} >/dev/null 2>&1; docker run -d --restart unless-stopped --name ${container_q}"
+    # The provider's own pool-tunnel publishes the Gateway it is currently
+    # attached to into ~/.mylinuxpool/gateway/. Mount that directory
+    # read-only and point the container at it, so the worker follows a
+    # rotate instead of freezing at the address it was started with — and
+    # still carries no GitHub credential of its own.
+    #
+    # The DIRECTORY is mounted, not the file: publish_gateway writes a temp
+    # file and renames it, which replaces the inode. A file bind-mount
+    # would keep pointing at the old one and the worker would never see an
+    # update.
+    #
+    # HOST/USER are still passed as a fallback for the first moments before
+    # the file exists, and for a provider running an older pool-runtime.
+    cmd+=" -v \$HOME/.mylinuxpool/gateway:/run/mlp-gateway:ro"
+    cmd+=" -e POOL_GATEWAY_FILE=/run/mlp-gateway/gateway.json"
     cmd+=" -e POOL_GATEWAY_PORT=${port_q} -e POOL_GATEWAY_HOST=${host_q} -e POOL_GATEWAY_USER=${tunnel_user_q}"
     cmd+=" -e POOL_NODE_NAME=${node_name_q}"
     cmd+=" -e WORKER_KEY=${worker_key_q} -e WORKER_AUTHORIZED_KEYS=${authorized_keys_q}"
