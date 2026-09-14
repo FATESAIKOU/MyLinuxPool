@@ -131,8 +131,10 @@ ensure_sudo() {
 
 # Idempotently make sure ~/.local/bin is on PATH for future interactive
 # shells. This is purely for human convenience (running gh/jq by hand) —
-# pool-tunnel.service gets its own PATH via step8_systemd, since systemd
-# --user services don't source ~/.bashrc.
+# the systemd --user services carry their own PATH in their DECLARED unit
+# files (files/pool-tunnel.service, files/pool-sync.service), because they
+# don't source ~/.bashrc and because anything this script patched into an
+# installed unit afterwards would be reverted by pool-sync (RUNBOOK §7.11).
 ensure_local_bin_in_path() {
     mkdir -p "$LOCAL_BIN"
     local line='export PATH="$HOME/.local/bin:$PATH"'
@@ -564,24 +566,14 @@ step7_sudoers() {
 
 # ---- step 8: systemd user service + linger -----------------------------------
 
-# systemd --user services get a minimal default PATH that does not include
-# ~/.local/bin — under --no-sudo, pool-resolve/pool-tunnel would silently
-# fail to find jq/gh there. Patch the *installed* unit only, idempotently;
-# the copy in the repo is left untouched.
-patch_unit_path_for_no_sudo() {
-    local unit_dst="$1"
-    local path_line="Environment=PATH=${LOCAL_BIN}:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
-
-    if grep -qF "$path_line" "$unit_dst"; then
-        return 0
-    fi
-
-    awk -v line="$path_line" '
-        {print}
-        /^\[Service\]/ && !added {print line; added=1}
-    ' "$unit_dst" > "${unit_dst}.tmp" && mv "${unit_dst}.tmp" "$unit_dst"
-    log INFO "added ~/.local/bin to pool-tunnel.service's PATH (--no-sudo)"
-}
+# NOTE (2026-09-15): there is deliberately NO post-install patching of
+# installed unit files here anymore. pool-sync enforces that installed
+# units match the repo's declared files exactly, so any "install, then
+# modify what got installed" approach is silently reverted on the next
+# sync — this happened for the ~/.local/bin PATH line under --no-sudo.
+# The PATH fix belongs in the declaration itself
+# (shared-configs/pool-runtime/files/pool-tunnel.service), never in a
+# post-install rewrite of ~/.config/systemd/user/.
 
 # `loginctl enable-linger` normally needs root. Under --no-sudo we try it
 # bare first (some newer systemd/polkit setups let a user linger themselves)
@@ -626,6 +618,11 @@ step8_systemd() {
     # "systemd_user_services" lists (a role-specific decision units
     # deliberately leave to their caller, not something a unit does
     # itself).
+    #
+    # pool-sync.timer is deliberately NOT enabled here: enabling it with
+    # --now fires it immediately, and the first sync can restart
+    # pool-tunnel mid-run. Verify the freshly built tunnel FIRST (step 9),
+    # then enable the thing that may restart it (step 9.5).
     local services
     services="$(jq -r '.systemd_user_services[]?' "$PROFILE_JSON")"
 
@@ -635,13 +632,11 @@ step8_systemd() {
         local svc unit_dst
         while IFS= read -r svc; do
             [[ -z "$svc" ]] && continue
+            [[ "$svc" == "pool-sync.timer" ]] && continue
             unit_dst="${HOME}/.config/systemd/user/${svc}"
             if [[ ! -f "$unit_dst" ]]; then
                 log ERROR "${unit_dst} not found — one of step 3's units should have placed it (check which shared_config unit provides ${svc})"
                 exit 1
-            fi
-            if [[ "$NO_SUDO" -eq 1 ]]; then
-                patch_unit_path_for_no_sudo "$unit_dst"
             fi
             systemctl --user daemon-reload
             systemctl --user enable --now "$svc"
@@ -693,6 +688,31 @@ step9_verify() {
     log INFO "verified: gateway sees an SSH banner on 127.0.0.1:${GATEWAY_PORT}"
 }
 
+# ---- step 9.5: enable pool-sync.timer -----------------------------------------
+# Deliberately AFTER step9_verify: enabling with --now fires the sync
+# immediately, and a first sync that detects drift would restart
+# pool-tunnel while step 9 is still verifying it. With the post-install
+# patching gone (see step 8's note) the first sync has nothing to drift on,
+# but ordering verify → enable keeps the race impossible regardless.
+step95_enable_pool_sync() {
+    local services
+    services="$(jq -r '.systemd_user_services[]?' "$PROFILE_JSON")"
+
+    if ! printf '%s\n' "$services" | grep -qF 'pool-sync.timer'; then
+        log INFO "profile '${PROFILE_NAME}' does not declare pool-sync.timer — nothing to enable"
+        return 0
+    fi
+
+    local unit_dst="${HOME}/.config/systemd/user/pool-sync.timer"
+    if [[ ! -f "$unit_dst" ]]; then
+        log ERROR "${unit_dst} not found — one of step 3's units should have placed it (check which shared_config unit provides pool-sync.timer)"
+        exit 1
+    fi
+    systemctl --user daemon-reload
+    systemctl --user enable --now pool-sync.timer
+    log INFO "enabled systemd --user timer pool-sync.timer (after tunnel verification)"
+}
+
 main() {
     step1_preflight
     step2_store_token
@@ -703,6 +723,7 @@ main() {
     step7_sudoers
     step8_systemd
     step9_verify
+    step95_enable_pool_sync
     log INFO "registration complete for node '${NAME}' (gateway_port=${GATEWAY_PORT})"
 }
 

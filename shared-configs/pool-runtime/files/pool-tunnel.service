@@ -7,6 +7,12 @@ Type=simple
 ExecStart=%h/.mylinuxpool/bin/pool-tunnel
 Restart=always
 RestartSec=5
+# 這一行必須留在宣告檔裡，不可以改成由 register-provider.sh 事後補：
+# pool-sync 用 install.sh --check 做內容比對，任何事後補上的行都會被
+# 它還原掉（宣告與實際打架，而且贏的是錯的那邊）。--no-sudo 註冊時
+# gh 裝在 ~/.local/bin，systemd user service 的預設 PATH 不含它，所以
+# PATH 直接在宣告裡寫死。%h 在 systemd 單元裡會展開成家目錄。
+Environment=PATH=%h/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 # 不要設 StandardOutput=file，日誌一律走 journald
 
 [Install]

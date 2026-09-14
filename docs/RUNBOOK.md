@@ -803,6 +803,41 @@ probe 對象     fh-proxy（唯一掛著的）
 
 ---
 
+### 7.11 把 `--check` 改成比內容之後，任何「安裝後再修改」都變成漂移
+
+2026-09-15 部署 `pool-sync` 當天，第一次在 fh-proxy 跑新版註冊就撞到。
+
+`register-provider.sh --no-sudo` 有一步是：裝完 `pool-tunnel.service` 之後，
+再去**改寫已安裝的那個檔**，補一行讓 PATH 含 `~/.local/bin`（`--no-sudo` 時
+`gh` 裝在那裡）。在 `--check` 只驗「檔案存不存在」的年代，這完全無害。
+
+`pool-sync` 上線後，`--check` 改成逐檔 `cmp`。於是：
+
+```
+02:41:28  register step8  啟用 pool-sync.timer
+02:41:29  pool-sync.timer 立刻觸發（OnBootSec 已過期）
+02:41:31  pool-sync       偵測到 pool-tunnel.service 漂移 → 重裝 → 把那行 PATH 還原掉
+02:41:31  pool-sync       重啟 pool-tunnel
+02:41:29– register step9  正在驗證那條隧道 …30 次都讀不到 banner
+02:42:34  register        ERROR: could not read an SSH banner
+```
+
+三件事同時暴露：
+
+1. **宣告與實際打架，而贏的是錯的那邊。** register 刻意加上去的 PATH 被
+   靜默移除，沒有任何錯誤——只有下次 `gh` 不在 `/usr/bin` 的機器會炸。
+2. **`pool-sync` 換了 unit 檔卻沒有 `daemon-reload`。** systemd 自己印了
+   `unit file changed on disk` 的警告，那次 restart 用的是舊定義。
+3. **register 先啟用 timer、再驗證隧道。** 啟用一個「會重啟隧道的東西」
+   之後才去驗證隧道，是自找的競態。
+
+三個都修了：PATH 移進宣告檔 `files/pool-tunnel.service`、`pool-sync` 在
+restart 前先 `daemon-reload`、register 把 timer 的啟用移到驗證之後。
+
+> **通則：`install.sh --check` 一旦比內容，「安裝後再修改已安裝檔案」這種
+> 做法就全部作廢。** 要改就改宣告檔。這條適用於未來每一個 unit——
+> 任何 post-install 的微調都會被下一次 `pool-sync` 還原，而且不會有人發現。
+
 ## 8. 改了 provision-gateway.sh 之後
 
 `scripts/provision-gateway.sh` 的改動**只對下一台 rotate 出來的機器生效**。現行

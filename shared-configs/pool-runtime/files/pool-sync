@@ -178,9 +178,16 @@ main() {
     # pool-tunnel holds every worker's reverse tunnel; an unnecessary
     # restart drops all of them for nothing (spec §3.5: restarts are
     # costly, so the sync must be able to run with no change at all).
+    # The order is load-bearing: daemon-reload MUST come before restart.
+    # The install above may have replaced the pool-tunnel.service unit
+    # file itself; restarting first would run against the STALE in-memory
+    # definition (systemd only re-reads unit files on daemon-reload, and
+    # it prints "unit file changed on disk" otherwise) — reload first,
+    # then restart, so the new definition is the one that takes effect.
     if [[ "$changed" -eq 1 ]]; then
+        systemctl --user daemon-reload
         systemctl --user restart pool-tunnel
-        log INFO "pool-tunnel restarted (files changed)"
+        log INFO "pool-tunnel restarted (files changed; daemon-reload first)"
     else
         log INFO "no changes — pool-tunnel NOT restarted"
     fi
