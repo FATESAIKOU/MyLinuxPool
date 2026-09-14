@@ -124,7 +124,15 @@ check_deps() {
 
 resolve_gateway() {
     local json rc
-    json="$("$POOL_RESOLVE" gateway)"
+    # --refresh, not the 30s cache. Every command here means "through the
+    # Gateway that is current right now"; served from cache, `ls` spends up
+    # to 30 seconds after a rotate probing the previous machine, which is
+    # still running until it is promoted away — so the table mixes nodes
+    # that moved with nodes that had not yet, and reads as a fault when
+    # nothing is wrong. One API call per command is the right price for an
+    # interactive tool, and it also means the host key pinned below is the
+    # current one.
+    json="$("$POOL_RESOLVE" gateway --refresh)"
     rc=$?
     [[ $rc -eq 0 ]] || die "pool-resolve gateway failed (exit ${rc})"
     GW_IP="$(printf '%s' "$json" | jq -r '.ip // empty')"
