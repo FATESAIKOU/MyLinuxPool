@@ -677,9 +677,9 @@ cmd_rotate() {
     resolve_gateway
     gw_ip="$GW_IP"
     printf '%sThis replaces the live Gateway (%s).%s\n' "$C_YELLOW" "$gw_ip" "$C_RESET"
-    echo "  Providers reconnect on their own (~1s). Any running worker is"
-    echo "  stranded and has to be recreated — workers pin the Gateway"
-    echo "  address at docker-run time and cannot follow a rotate."
+    echo "  Providers reconnect on their own (~1s). Running workers follow"
+    echo "  too — they read the address their provider publishes, and the"
+    echo "  port ledger is carried over — but expect a brief interruption."
     echo "  Run 'mlp rotate' (dry run) first if you haven't."
     printf 'Type the current Gateway IP to confirm: '
     read -r confirm

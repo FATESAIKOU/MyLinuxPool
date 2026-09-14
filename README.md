@@ -119,6 +119,12 @@ shared-configs/rclone/
 Worker 的 profile 多一個 `secrets` 欄位，映射「容器環境變數名 → GitHub secret 名」
 ——只有名稱，永遠不寫值。image 裡不含任何憑證，機密只在 `docker run` 時注入。
 
+**Worker 怎麼知道 Gateway 在哪？** 不是問 GitHub（容器裡沒有憑證），而是讀
+它所在 provider 發布的檔案。provider 的 `pool-tunnel` 本來就每 30 秒在追
+`NODE_GATEWAY`，所以它就是同機容器的權威來源：它把結果寫成
+`~/.mylinuxpool/gateway/gateway.json`，`create-worker` 把那個**目錄**唯讀掛進容器。
+掛目錄而不是掛檔案，是因為發布用的是「寫暫存檔再改名」，掛檔案會鎖在舊 inode 上。
+
 ## 目錄
 
 | 路徑 | 內容 |
@@ -183,8 +189,10 @@ Launch / Shutdown fh-l 不走 Actions，走 `mlp wake` / `mlp down`。
 3. 切換後在 Mac 上跑一次 `ops-scripts/mlp trust-gateway`（新機器的 host key）。
 4. provider 每 30 秒輪詢 `NODE_GATEWAY`，自己跟過去。實測**重連耗時 1 秒**，
    不需要登入任何一台 provider。
-5. **現役的 worker 會失聯，要重建。** 它們跑在 `STATIC_GATEWAY` 模式
-   （容器內不放任何 GitHub 憑證，代價是關掉漂移偵測），舊機器一刪隧道就永久斷。
+5. **現役的 worker 會自己跟過去，不需要重建。** 它們讀 provider 發布的
+   `~/.mylinuxpool/gateway/gateway.json`（唯讀 bind mount），30 秒內偵測到
+   位址變更並重建隧道；rotate 同時把埠帳本搬到新機器，所以 `mlp ls` 與
+   `delete-worker` 也還找得到它們。
 
 ### Create Worker
 

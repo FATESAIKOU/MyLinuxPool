@@ -614,11 +614,14 @@ Actions 手上有 `SSH_KEY_ACTIONS`，就算你的身分被漂移掉了它還進
 可以把宣告狀態壓回機器上。2026-09-14 的 §7.6 事故就是這樣救回來的——
 比 LISH 快，也不需要 root 密碼。
 
-> **rotate 會讓現役 worker 失聯。** worker 跑在 `STATIC_GATEWAY` 模式
-> （`POOL_GATEWAY_HOST` 給死值，容器內才不需要任何 GitHub 憑證），
-> 而那個模式刻意關掉了 30 秒漂移偵測（`pool-tunnel:348`）。
-> 舊機器一刪，它們的隧道就永久斷了，容器要重建。
-> provider 不受影響——它們會自己跟過去，實測 1 秒。
+> **rotate 之後 worker 會自己跟過去**（2026-09-14 起）。它們讀所在 provider
+> 發布的 `~/.mylinuxpool/gateway/gateway.json`，30 秒內偵測到位址變更並重建；
+> rotate 也會把 `~/pool/workers.d` 帳本搬到新機器，所以 `mlp ls` 與
+> `delete-worker` 仍找得到它們。provider 本身重連實測 1 秒。
+>
+> 在此之前的行為是：帳本隨舊機器消失、容器還在 provider 上跑、隧道永久斷線
+> ——工具完全看不到的孤兒，只能登入 provider 手動 `docker rm`。
+> 如果你在 2026-09-14 之前 rotate 過，去兩台 provider 上檢查一次 `docker ps`。
 
 ### 已知的手動補齊紀錄
 

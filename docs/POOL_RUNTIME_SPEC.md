@@ -466,13 +466,31 @@ Worker 沿用 `pool-tunnel`，但它的「節點定義」不在 GitHub var 裡
 
 - `pool-tunnel` 需支援從**環境變數**取得自身設定，作為 `pool-resolve <name>`
   的替代路徑：`POOL_GATEWAY_PORT`、`POOL_NODE_NAME`
-- **Gateway 的位址也一併由環境變數注入**：`POOL_GATEWAY_HOST`、
-  `POOL_GATEWAY_USER`。三者皆設定時，`pool-tunnel` 完全不呼叫
-  `pool-resolve`，因此 worker **不需要任何 GitHub 憑證即可建立隧道**。
 - 若 `POOL_GATEWAY_PORT` 已設定，就不去讀 `NODE_<NAME>` var
-- 代價：worker 無法偵測 Gateway 換人，rotate 後連不回來。這正是預期行為
-  —— worker 是拋棄式的（`ARCHITECTURE.md` §1），rotate 後重跑
-  `create-worker` 即可。
+- **Gateway 的位址由 provider 發布的檔案取得**（`POOL_GATEWAY_FILE`）。
+  容器裡沒有 GitHub 憑證，但它也不需要——它所在的 provider 本來就每 30 秒
+  在追 `NODE_GATEWAY`，所以 provider 就是同機容器的權威來源。
+
+#### 三種取得 Gateway 位址的模式
+
+| 模式 | 觸發條件 | 能否跟隨 rotate | 用於 |
+|---|---|---|---|
+| resolve | 什麼都沒設 | ✅ | provider（有 GitHub token） |
+| **follow** | `POOL_GATEWAY_FILE` + `POOL_GATEWAY_PORT` | ✅ | **worker（預設）** |
+| static | `POOL_GATEWAY_HOST`/`USER`/`PORT` | ❌ | 退路：檔案讀不到時 |
+
+- **follow**：`pool-tunnel` 每 30 秒重讀該檔案，`ip` 或 `generation` 變了就
+  立刻重建隧道。發布端（provider）在每次成功解析與每次偵測到漂移時寫入。
+- 發布用「寫暫存檔 → `mv -f`」，讀取端永遠看不到寫到一半的檔案。
+  因此 `create-worker` 必須掛**目錄**而非檔案——改名會換 inode，
+  掛檔案會鎖在舊的那個上。
+- `create-worker` 必須先 `mkdir -p` 掛載來源，否則 Docker 會以 root 建立它，
+  而以一般使用者身分執行的 provider `pool-tunnel` 就再也寫不進去。
+- 檔案 60 秒內出不來且有 `POOL_GATEWAY_HOST` 時，退回 static 並**明說**
+  這條隧道撐不過 rotate；沒有退路則失敗。
+- 光是 worker 跟上還不夠：埠帳本 `~/pool/workers.d` 在 Gateway 上，
+  rotate 必須把它搬到新機器（`rotate_carry_worker_claims`），
+  否則 worker 連得上卻對 `mlp ls` 與 `delete-worker` 隱形。
 
 ### 10.4 workflows
 
