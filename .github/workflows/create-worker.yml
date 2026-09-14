@@ -136,6 +136,7 @@ jobs:
             echo "tunnel_user=$(jq -r '.tunnel_user' <<<"$gw_json")"
             echo "port_lo=$(jq -r '.ports.worker[0]' <<<"$gw_json")"
             echo "port_hi=$(jq -r '.ports.worker[1]' <<<"$gw_json")"
+            echo "host_key=$(jq -r '.host_key // ""' <<<"$gw_json")"
           } >> "$GITHUB_OUTPUT"
 
       - name: Build claim-port command
@@ -226,14 +227,42 @@ jobs:
       # before docker build/run even happen) — record it into the
       # placeholder now so delete-worker.yml can find this claim by name,
       # not just by port.
+      # Path follows pool-port-alloc, which now writes to
+      # ~/.mylinuxpool/workers.d (everything else already lived there).
       - name: Record container name in the port placeholder
         uses: ./.github/actions/pool-ssh
         with:
           node: gateway
           command: >-
-            f=~/pool/workers.d/${{ steps.port.outputs.port }}.json &&
+            f=~/.mylinuxpool/workers.d/${{ steps.port.outputs.port }}.json &&
             jq --arg c '${{ steps.identity.outputs.container }}' '.container = $c' "$f" > "$f.tmp" &&
             mv "$f.tmp" "$f"
+
+      # The Gateway placeholder is a cache; POOL_WORKERS is the master
+      # (docs/STATE_CONTRACT.md §1). Writing it here is what lets a rotate
+      # restore the ledger from the repo instead of copying it off a
+      # machine that may be unreachable.
+      - name: Record the worker in POOL_WORKERS
+        shell: bash
+        run: |
+          set -euo pipefail
+          source scripts/lib/ledger.sh
+          cur="$(gh api "repos/${GH_REPO}/actions/variables/POOL_WORKERS" --jq .value 2>/dev/null || true)"
+          new="$(ledger_add "$cur" \
+                   "${{ steps.port.outputs.port }}" \
+                   "${{ inputs.provider }}" \
+                   "${{ inputs.image }}" \
+                   "${{ steps.identity.outputs.container }}" \
+                   "$(date -u +%Y-%m-%dT%H:%M:%SZ)")"
+          printf '%s' "$new" | gh variable set POOL_WORKERS --repo "$GH_REPO"
+          echo "POOL_WORKERS now holds $(printf '%s' "$new" | jq 'length') worker(s)"
+
+      - name: Push the state cache
+        uses: ./.github/actions/push-state
+        with:
+          gateway-ip: ${{ steps.gateway.outputs.ip }}
+          host-key: ${{ steps.gateway.outputs.host_key }}
+          source: create-worker#${{ github.run_id }}
 
       - name: Verify worker is actually reachable (not just alive)
         shell: bash

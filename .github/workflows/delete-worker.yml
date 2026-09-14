@@ -95,6 +95,36 @@ jobs:
           node: gateway
           command: ~/.mylinuxpool/bin/pool-port-alloc --release ${{ steps.find.outputs.port }}
 
+      # POOL_WORKERS is the master ledger; the Gateway placeholder released
+      # in the previous step is only its cache (docs/STATE_CONTRACT.md §1).
+      - name: Remove the worker from POOL_WORKERS
+        shell: bash
+        run: |
+          set -euo pipefail
+          source scripts/lib/ledger.sh
+          cur="$(gh api "repos/${GH_REPO}/actions/variables/POOL_WORKERS" --jq .value 2>/dev/null || true)"
+          new="$(ledger_remove "$cur" "${{ steps.find.outputs.port }}")"
+          printf '%s' "$new" | gh variable set POOL_WORKERS --repo "$GH_REPO"
+          echo "POOL_WORKERS now holds $(printf '%s' "$new" | jq 'length') worker(s)"
+
+      - name: Resolve Gateway for the push
+        id: gw
+        shell: bash
+        run: |
+          set -euo pipefail
+          gw_json="$(shared-configs/pool-runtime/files/pool-resolve gateway --refresh)"
+          {
+            echo "ip=$(jq -r '.ip' <<<"$gw_json")"
+            echo "host_key=$(jq -r '.host_key // ""' <<<"$gw_json")"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Push the state cache
+        uses: ./.github/actions/push-state
+        with:
+          gateway-ip: ${{ steps.gw.outputs.ip }}
+          host-key: ${{ steps.gw.outputs.host_key }}
+          source: delete-worker#${{ github.run_id }}
+
       - name: Summary
         shell: bash
         run: |
