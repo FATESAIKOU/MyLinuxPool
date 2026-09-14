@@ -78,6 +78,17 @@ step2_fail2ban_ignoreip() {
         exit 2
     fi
 
+    if ! command -v fail2ban-client >/dev/null 2>&1; then
+        log ERROR "fail2ban is not installed — writing an ignoreip rule for it would be meaningless"
+        log ERROR "this is exactly the gap that caused the 2026-09-13 45-minute lockout: no fail2ban means no ignoreip means no rescue path if the home IP gets banned"
+        log ERROR "cloud-init must finish installing fail2ban before provision.sh runs — see rotate-gateway.yml's cloud-init wait step"
+        exit 1
+    fi
+
+    # Don't assume the directory survived cloud-init's package install —
+    # provision.sh has been run against a still-provisioning box before.
+    mkdir -p "$(dirname "$FAIL2BAN_CONF")"
+
     local desired
     desired="$(printf '[DEFAULT]\nignoreip = %s\n' "$POOL_TRUSTED_IPS")"
 

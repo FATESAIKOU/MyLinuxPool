@@ -135,16 +135,55 @@ jobs:
           PREVIEW_IP: ${{ steps.create_preview.outputs.preview_ip }}
         run: |
           set -euo pipefail
+
+          ssh_up=0
           for i in $(seq 1 60); do
             if ssh -o StrictHostKeyChecking=accept-new -o ConnectTimeout=5 -o BatchMode=yes \
                 "fatesaikou@${PREVIEW_IP}" true 2>/dev/null; then
-              echo "preview reachable after ${i} attempt(s)"
-              exit 0
+              echo "ssh reachable after ${i} attempt(s)"
+              ssh_up=1
+              break
             fi
             sleep 5
           done
-          echo "::error::preview machine never became reachable over ssh"
-          exit 1
+          if [[ "$ssh_up" -ne 1 ]]; then
+            echo "::error::preview machine never became reachable over ssh"
+            exit 1
+          fi
+
+          # ssh coming up only means sshd is alive — cloud-init can still be
+          # installing packages (fail2ban included) in the background at
+          # that point. provision.sh has failed against a still-provisioning
+          # box for exactly this reason; wait for cloud-init itself to reach
+          # a final state before handing off to it.
+          echo "waiting for cloud-init to finish (up to 10 minutes)..."
+          set +e
+          cloud_init_out="$(ssh -o StrictHostKeyChecking=accept-new "fatesaikou@${PREVIEW_IP}" \
+            'sudo timeout 600 cloud-init status --wait --long' 2>&1)"
+          cloud_init_rc=$?
+          set -e
+
+          echo "$cloud_init_out"
+
+          case "$cloud_init_rc" in
+            0)
+              echo "cloud-init finished cleanly"
+              ;;
+            2)
+              # "done" but with recoverable errors (degraded) — not the
+              # same as a hard failure, don't abort the rotate over it.
+              echo "::warning::cloud-init finished in a degraded state (recoverable errors) — see output above"
+              ;;
+            124)
+              echo "::error::cloud-init did not finish within 10 minutes"
+              ssh -o StrictHostKeyChecking=accept-new "fatesaikou@${PREVIEW_IP}" 'sudo cloud-init status --long' || true
+              exit 1
+              ;;
+            *)
+              echo "::error::cloud-init failed (exit ${cloud_init_rc}) — see output above"
+              exit 1
+              ;;
+          esac
 
       - name: Deploy bundle (static_normal_files + decrypted static_secret_files)
         shell: bash
