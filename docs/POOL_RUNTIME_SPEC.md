@@ -145,7 +145,7 @@ pool-resolve gateway --field .generation
 | 3 | Gateway 端埠被殘留連線佔住 | 明寫 `-R 127.0.0.1:` 使建立乾淨失敗 → 進退避重試，**不可回報健康**。健康檢測亦須讀 SSH banner，確認對面是自己的隧道而非冒牌 listener |
 | 4 | ControlMaster socket 殘留 | 啟動時若 socket 存在但 `-O check` 失敗，刪除後重建 |
 
-## 4. `provider/register.sh`
+## 4. `ops-scripts/register-provider.sh`
 
 ```
 register.sh --name <node-name> --gateway-port <port> [--role provider]
@@ -288,7 +288,7 @@ cloud-init 只負責「開機後能被 ssh 進來」這件事，其餘交給 `pr
 - **不裝**：nodejs、python3-pip、ipython、grc、vim、tmux、gcc、make
   （Gateway 是純 Gateway，不是工作站）
 
-### 9.2 `gateway/provision.sh`
+### 9.2 `scripts/provision-gateway.sh`
 
 在新機開機後、由 Actions 以 root 執行。必須冪等。
 

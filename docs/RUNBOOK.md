@@ -93,8 +93,8 @@ bash ops-scripts/register-provider.sh --name fh-l --gateway-port 2222 --branch f
 |---|---|---|
 | 1 | 前置檢查 | bash、`systemctl --user`、網路；缺 `rclone`/`git`/`gh`/`docker`/`openssh-server` 就以 apt 安裝（`--no-sudo` 下改成使用者層級安裝 `jq`/`gh`，見上） |
 | 2 | 存 gh token | 把 `GH_POOL_TOKEN` 寫進 `~/.mylinuxpool/gh_token`（600），並 `export GH_TOKEN`；**不呼叫** `gh auth login`（見上方 `read:org` 說明） |
-| 3 | 取得 runtime | clone repo（`--branch` 指定分支，預設 `master`）到 `~/.mylinuxpool/repo`，`pool/bin/*` 複製到 `~/.mylinuxpool/bin/` 並 `chmod +x` |
-| 4 | 金鑰 | 從 `static_secret_files/home/sshproxy/.ssh/id_rsa.crypted` 解密出 `~/.ssh/id_pool`（600）。所有 provider 共用同一把，公鑰已在 Gateway 的 `authorized_keys` |
+| 3 | 取得 runtime | clone repo（`--branch` 指定分支，預設 `master`）到 `~/.mylinuxpool/repo`；讀 `profiles/provider/{default,no-sudo}/profile.json`（依 `--no-sudo` 選一份）的 `shared_config` 陣列，逐一呼叫 `shared-configs/<unit>/install.sh` 裝好（今天是 `pool-runtime`、`ssh-tunnel-client`、`gh`）——裝哪些 unit 由 profile 宣告決定，不是寫死在腳本裡 |
+| 4 | Actions 的 authorized_keys | 從 `shared-configs/ssh-admin/files/authorized_keys.crypted` 解密，只抽出標記 `mylinuxpool-actions` 的那一行，附加進 `~/.ssh/authorized_keys`（讓 Actions 能直接連進這台機器）。sshproxy 的隧道私鑰（`~/.ssh/id_pool`）已在上一步由 `ssh-tunnel-client` unit 裝好，所有 provider 共用同一把，公鑰已在 Gateway 的 `authorized_keys` |
 | 5 | 身分 | 寫 `~/.mylinuxpool/config`：`NODE_NAME=<name>` |
 | 6 | 登記 | `gh variable set NODE_<NAME>`，內容依 `ARCHITECTURE.md` §3 schema；已存在則合併 |
 | 7 | sudoers | 寫 `/etc/sudoers.d/mylinuxpool`（440）：只放行 `systemctl poweroff` 與 `ethtool`。**這步會互動要 sudo 密碼**；`--no-sudo` 下整步跳過 |
@@ -179,6 +179,16 @@ gh secret set GH_POOL_TOKEN --repo FATESAIKOU/MyLinuxPool
 （貼上新 token；`GH_WORKER_TOKEN` 若也有 rotate 一併更新。）
 
 ### 3.3 重新加密 repo 內的佈署檔
+
+> **2026-09-15 標記：這一節可能已經過時，尚未重寫。** 現行
+> `ops-scripts/register-provider.sh`／`shared-configs/gh/install.sh` 讀的
+> `GH_POOL_TOKEN` 完全來自呼叫時的環境變數，repo 裡（`shared-configs/`
+> 或任何地方）找不到對應的 `gh_pool_token.crypted`——下面這段「解密舊檔→
+> 換內容→重新加密→commit」的流程假設的是一個 repo 內加密儲存 token 的
+> 機制，這機制目前看起來不存在了。在確認現行正確的輪替方式之前，不要
+> 照抄這裡的指令。`static_secret_files/`、`scripts/decryptStdin.sh`／
+> `encryptStdin.sh` 這幾個路徑本身也早就不存在（前者已拆進
+> `shared-configs/<unit>/files/`，後者合併成 `scripts/lib/crypto.sh`）。
 
 在持有 `FILE_CRYPTO_KEY` 的信任機器上：
 
@@ -306,7 +316,7 @@ fh-l 長時間關機後租約到期，若拿到別的 IP，unicast 目標就錯�
 
 ## 5. 故障排除
 
-> **先跑 `pool/bin/pool-status`。** 它會一次檢查本機前置、Gateway 可達性、
+> **先跑 `ops-scripts/mlp status`。** 它會一次檢查本機前置、Gateway 可達性、
 > 每個 provider 的隧道與 SSH banner、以及 worker 埠與佔位檔的一致性，
 > 並在 TCP 被立即拒絕時主動提示去查 fail2ban（§7.1 那次事故的正確診斷
 > 順序已內建其中）。有 FAIL 才往下看對應小節。
@@ -574,68 +584,3 @@ ssh、bash、cmd.exe、PowerShell 每多一層轉義就多一次機會出錯。�
 5. 清除明文暫存
 6. `gh secret set FILE_CRYPTO_KEY`
 7. provider 上不存此金鑰（只在註冊當下用一次），無需同步
-
----
-
-## 10. 在外網（咖啡廳）使用
-
-`ops-scripts/mlp` **完全走公網路徑**，不依賴家用內網。已實測驗證：
-
-```
-經 mlp 連進 fh-l   SSH_CONNECTION = 127.0.0.1 → 127.0.0.1   （走 Gateway 的反向隧道）
-直接走 LAN         SSH_CONNECTION = 192.168.0.104 → 192.168.0.136
-```
-
-`mlp wake` 也安全：它讀 `NODE_FH_L.power.launch.target_ip`（`192.168.0.136`），
-但那個值是**傳給 fh-proxy 去用的**，你的機器從頭到尾不碰內網位址。
-
-### ⚠️ 唯一的風險：fail2ban
-
-`POOL_TRUSTED_IPS` 只有家裡的對外 IP。在外面，你的 IP **不在白名單**——
-連線失敗幾次（打錯、金鑰沒載入、網路抖動重試）就可能被封。
-
-症狀跟 §7.1 那次一樣：**所有 TCP 埠瞬間 refused，看起來像伺服器死了**。
-差別是在家還有 fh-l 的 LAN 直連當退路，在外面沒有。
-
-### 被封鎖時的救援程序（LISH 主控台）
-
-這條路需要兩樣東西，**出門前確認它們都在**：
-
-1. Mac 上的 `~/.ssh/id_rsa`（已註冊為 Linode profile 的 LISH 金鑰）
-2. Gateway 的 root 密碼（原本存在 repo 根目錄的 `gw_pw`）
-
-```bash
-# 1. 連進 LISH 主控台（不經 SSH 埠，因此不受 fail2ban 影響）
-ssh -t fatesaikou@lish-ap-northeast.linode.com fws
-
-# 2. 以 root 登入（密碼即 gw_pw 的內容）
-
-# 3. 查目前封了誰
-nft list ruleset | grep -A6 f2b-table
-
-# 4. 解封你現在的 IP
-fail2ban-client set sshd unbanip <你的IP>
-```
-
-> **LISH 金鑰要設在對的地方。** `linode-cli sshkeys create` 加的是「SSH Keys」
-> 清單（給建立新 Linode 時佈署用），**LISH 不看那個**。LISH 讀的是 profile 上
-> 另一個欄位：
->
-> ```bash
-> linode-cli profile update --authorized_keys "$(cat ~/.ssh/id_rsa.pub)"
-> ```
->
-> 這點在 2026-09-13 事故中卡了一段時間才發現。
-
-### 如果你想降低風險
-
-到新地點時把當地 IP 加進白名單：
-
-```bash
-gh variable set POOL_TRUSTED_IPS --repo FATESAIKOU/MyLinuxPool \
-  --body "127.0.0.1/8 ::1 138.64.68.94 $(curl -s https://api.ipify.org)"
-```
-
-但這只寫進 var——要真正生效還得在 Gateway 上重新渲染 fail2ban 設定
-（`scripts/provision-gateway.sh` 的 step 2 會做，或手動改
-`/etc/fail2ban/jail.d/mylinuxpool-ignore.conf` 後 restart）。

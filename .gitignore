@@ -14,3 +14,5 @@ image copy.png
 *.screenshot.png
 fhproxy_pw
 .claude/
+SECRETS.md
+secrets.env
