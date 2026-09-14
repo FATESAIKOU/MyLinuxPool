@@ -43,6 +43,7 @@ log() {
 
 usage() {
     echo "usage: pool-tunnel [--name <node-name>] [--once]" >&2
+    echo "       (or set POOL_GATEWAY_PORT / POOL_NODE_NAME — see spec §10.3, used by disposable workers)" >&2
 }
 
 load_name_from_config() {
@@ -71,20 +72,29 @@ next_backoff() {
 
 # §3.1 steps 1-2: ask pool-resolve (never gh) for our own gateway_port and
 # the Gateway's current ip/tunnel_user/generation.
+#
+# §10.3: a worker is disposable and gets no NODE_<NAME> var of its own —
+# if POOL_GATEWAY_PORT is set, take the port straight from the
+# environment and skip the pool-resolve "$NAME" lookup entirely. Providers
+# never set this env var, so their path below is unchanged.
 resolve_connection_info() {
     local self_json rc
 
-    self_json="$("$POOL_RESOLVE" "$NAME")"
-    rc=$?
-    if [[ $rc -ne 0 ]]; then
-        log ERROR "pool-resolve ${NAME} failed (exit ${rc})"
-        return 1
-    fi
+    if [[ -n "${POOL_GATEWAY_PORT:-}" ]]; then
+        MY_PORT="$POOL_GATEWAY_PORT"
+    else
+        self_json="$("$POOL_RESOLVE" "$NAME")"
+        rc=$?
+        if [[ $rc -ne 0 ]]; then
+            log ERROR "pool-resolve ${NAME} failed (exit ${rc})"
+            return 1
+        fi
 
-    MY_PORT="$(printf '%s' "$self_json" | jq -r '.gateway_port // empty')"
-    if [[ -z "$MY_PORT" ]]; then
-        log ERROR "node ${NAME} has no gateway_port defined"
-        return 1
+        MY_PORT="$(printf '%s' "$self_json" | jq -r '.gateway_port // empty')"
+        if [[ -z "$MY_PORT" ]]; then
+            log ERROR "node ${NAME} has no gateway_port defined"
+            return 1
+        fi
     fi
 
     local gw_json
@@ -237,8 +247,17 @@ main() {
     parse_args "$@"
 
     if [[ -z "$NAME" ]]; then
-        if ! load_name_from_config; then
-            log ERROR "no --name given and NODE_NAME not found in ${STATE_DIR}/config"
+        if [[ -n "${POOL_NODE_NAME:-}" ]]; then
+            # §10.3: worker identity, no NODE_<NAME> var / config file involved.
+            NAME="$POOL_NODE_NAME"
+        elif load_name_from_config; then
+            :
+        elif [[ -n "${POOL_GATEWAY_PORT:-}" ]]; then
+            # POOL_GATEWAY_PORT alone is enough to run (see
+            # resolve_connection_info) — NAME here is cosmetic only.
+            NAME="worker"
+        else
+            log ERROR "no --name given, NODE_NAME not found in ${STATE_DIR}/config, and neither POOL_NODE_NAME nor POOL_GATEWAY_PORT is set"
             exit 2
         fi
     fi

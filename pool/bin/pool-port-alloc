@@ -1,0 +1,192 @@
+#!/usr/bin/env bash
+# pool/bin/pool-port-alloc — spec: docs/POOL_RUNTIME_SPEC.md §10.1
+# Runs ON the Gateway (invoked remotely by a workflow via pool-ssh).
+# Allocates/releases worker ports out of NODE_GATEWAY.ports.worker.
+#
+# Truth is `ss` — the ~/pool/workers.d/<port>.json placeholder only
+# records whose port it is. A placeholder can outlive its listener (e.g.
+# it survives a Gateway rotate while the container behind it doesn't); ss
+# always wins that disagreement. Never calls `gh` directly — port range
+# comes from pool-resolve, same rule as every other component.
+
+set -uo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
+POOL_RESOLVE="${SCRIPT_DIR}/pool-resolve"
+
+WORKERS_DIR="${HOME}/pool/workers.d"
+LOCK_FILE="${WORKERS_DIR}/.lock"
+
+log() {
+    local level="$1"; shift
+    local ts
+    ts="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    if [[ "$level" == "INFO" ]]; then
+        printf '[%s] %s %s\n' "$ts" "$level" "$*"
+    else
+        printf '[%s] %s %s\n' "$ts" "$level" "$*" >&2
+    fi
+}
+
+usage() {
+    echo "usage: pool-port-alloc --claim <provider> <image>" >&2
+    echo "       pool-port-alloc --release <port>" >&2
+    echo "       pool-port-alloc --list" >&2
+}
+
+worker_port_range() {
+    if [[ ! -x "$POOL_RESOLVE" ]]; then
+        log ERROR "pool-port-alloc: pool-resolve not found at ${POOL_RESOLVE}"
+        return 1
+    fi
+
+    local range_json rc
+    range_json="$("$POOL_RESOLVE" gateway --field .ports.worker)"
+    rc=$?
+    if [[ $rc -ne 0 ]]; then
+        log ERROR "pool-port-alloc: pool-resolve gateway --field .ports.worker failed (exit ${rc})"
+        return "$rc"
+    fi
+
+    local lo hi
+    lo="$(printf '%s' "$range_json" | jq -r '.[0] // empty')"
+    hi="$(printf '%s' "$range_json" | jq -r '.[1] // empty')"
+    if [[ -z "$lo" || -z "$hi" ]]; then
+        log ERROR "pool-port-alloc: NODE_GATEWAY.ports.worker is missing/malformed: ${range_json}"
+        return 1
+    fi
+
+    printf '%s %s\n' "$lo" "$hi"
+    return 0
+}
+
+# A port is free only if BOTH hold: nothing is listening on it (per `ss`,
+# the real state) AND no placeholder file claims it.
+port_is_free() {
+    local port="$1"
+    if ss -Htln "sport = :${port}" 2>/dev/null | grep -q .; then
+        return 1
+    fi
+    [[ -f "${WORKERS_DIR}/${port}.json" ]] && return 1
+    return 0
+}
+
+cmd_claim() {
+    local provider="$1" image="$2"
+
+    mkdir -p "$WORKERS_DIR"
+
+    local lo hi
+    read -r lo hi < <(worker_port_range) || return 1
+
+    exec 200>"$LOCK_FILE"
+    flock -x 200
+
+    local port
+    for (( port = lo; port <= hi; port++ )); do
+        if port_is_free "$port"; then
+            local now
+            now="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            jq -n \
+                --arg provider "$provider" \
+                --arg image "$image" \
+                --argjson port "$port" \
+                --arg created_at "$now" \
+                '{provider: $provider, image: $image, port: $port, created_at: $created_at, container: null}' \
+                > "${WORKERS_DIR}/${port}.json"
+            printf '%s\n' "$port"
+            flock -u 200
+            return 0
+        fi
+    done
+
+    flock -u 200
+    log ERROR "pool-port-alloc: worker port range ${lo}-${hi} is exhausted"
+    return 6
+}
+
+cmd_release() {
+    local port="$1"
+
+    mkdir -p "$WORKERS_DIR"
+
+    exec 200>"$LOCK_FILE"
+    flock -x 200
+
+    if [[ -f "${WORKERS_DIR}/${port}.json" ]]; then
+        rm -f "${WORKERS_DIR}/${port}.json"
+        log INFO "pool-port-alloc: released port ${port}"
+    else
+        log WARN "pool-port-alloc: no placeholder for port ${port} (already released?)"
+    fi
+
+    flock -u 200
+    return 0
+}
+
+cmd_list() {
+    mkdir -p "$WORKERS_DIR"
+
+    exec 200>"$LOCK_FILE"
+    flock -s 200
+
+    local files=("${WORKERS_DIR}"/*.json)
+    if [[ ! -e "${files[0]}" ]]; then
+        printf '[]\n'
+        flock -u 200
+        return 0
+    fi
+
+    jq -s '.' "${files[@]}"
+    flock -u 200
+    return 0
+}
+
+main() {
+    if [[ $# -lt 1 ]]; then
+        usage
+        exit 2
+    fi
+
+    case "$1" in
+        --claim)
+            if [[ $# -ne 3 ]]; then
+                usage
+                exit 2
+            fi
+            cmd_claim "$2" "$3"
+            exit $?
+            ;;
+        --release)
+            if [[ $# -ne 2 ]]; then
+                usage
+                exit 2
+            fi
+            if ! [[ "$2" =~ ^[0-9]+$ ]]; then
+                log ERROR "pool-port-alloc: port must be numeric, got '$2'"
+                exit 2
+            fi
+            cmd_release "$2"
+            exit $?
+            ;;
+        --list)
+            if [[ $# -ne 1 ]]; then
+                usage
+                exit 2
+            fi
+            cmd_list
+            exit $?
+            ;;
+        -h|--help)
+            usage
+            exit 0
+            ;;
+        *)
+            log ERROR "pool-port-alloc: unknown argument: $1"
+            usage
+            exit 2
+            ;;
+    esac
+}
+
+main "$@"
