@@ -237,14 +237,15 @@ ops-scripts/mlp status
 
 看 `SECRETS.md`（gitignore，不進版控）。裡面每一項都標了理由與用法。
 
-**兩個失去就救不回來的**：
+**只有一項失去就救不回來**：
 
 - `FILE_CRYPTO_KEY` — 解開 9 個 `.crypted` 檔的對稱金鑰。GitHub secret 是
   唯寫的，讀不回來。失去它系統還活著，但你再也無法註冊新機器或檢視機密。
-- `GATEWAY_ROOT_PASSWORD` — 只存在你手上。SSH 完全進不去時經 LISH 救援的唯一辦法。
 
-`GH_POOL_TOKEN`、`LINODE_TOKEN` 可以重新產生。
-`FH_L_SUDO_PASSWORD` / `FH_PROXY_SUDO_PASSWORD` 零程式碼引用，隨時可改。
+`GH_POOL_TOKEN`、`LINODE_TOKEN` 都能重新產生，所以 `SECRETS.md` 只記重發
+程序、不記值——現值仍活在 GitHub secret 與機器上的本機副本裡。多記一份值
+只是在那個檔案外洩時擴大損害面。機器的 sudo 密碼是你自己的密碼，屬於你的
+密碼管理器，不在這裡留第二份。
 
 GitHub secret 只有四個：`FILE_CRYPTO_KEY`、`SSH_KEY_ACTIONS`、
 `GH_POOL_TOKEN`、`LINODE_TOKEN`。隧道身分不在其中——同一把私鑰已經以
@@ -252,12 +253,13 @@ GitHub secret 只有四個：`FILE_CRYPTO_KEY`、`SSH_KEY_ACTIONS`、
 再存一份 secret 只是製造兩份要手動同步的東西。
 
 本機 repo 根目錄現在只剩 `crypto_key` 一個明文機密（`pw`、`fhproxy_pw`、
-`gw_pw`、`gh_token` 已抹除，值都在 `SECRETS.md`）。
+`gw_pw`、`gh_token` 都已抹除）。
 
-> ⚠️ `SECRETS.md` 記的 Gateway root 密碼，在 2026-09-14 那次 rotate 之後
-> 已經對應到一台被刪掉的機器。rotate 現在會優先用 `GATEWAY_ROOT_PASSWORD`
-> secret，但那個 secret **還沒設**——在設定之前，每次 rotate 出來的新機器
-> 都沒有主控台救援退路，只有 `repair-gateway` 這條路。
+> ⚠️ Gateway 的 root 密碼由 rotate 隨機產生後就丟棄，沒有留在任何地方，
+> 所以**每一台 rotate 出來的機器都沒有 LISH 主控台救援退路**，只剩
+> `repair-gateway`（憑 `SSH_KEY_ACTIONS` 進去）這一條。要把退路補回來，
+> 就設 `GATEWAY_ROOT_PASSWORD` secret——rotate 會優先取它
+> （`scripts/rotate-gateway.sh:48`）。這個 secret 目前**還沒設**。
 
 ## 加一台 provider
 
@@ -354,7 +356,9 @@ scp installer.sh host:/tmp/ && cat crypto_key | ssh host 'bash /tmp/installer.sh
    ```
    需要 `~/.ssh/id_rsa` 的公鑰在 **Linode profile 的 authorized_keys**
    （用 `linode-cli profile update --authorized_keys`，不是 SSH Keys 清單——
-   LISH 不看那個），以及 `SECRETS.md` 裡的 root 密碼。
+   LISH 不看那個），以及該台機器的 root 密碼。注意：除非你設了
+   `GATEWAY_ROOT_PASSWORD` secret，rotate 產生的密碼是隨機且立刻丟棄的，
+   這條路在現役機器上走不通——改用 `repair-gateway`。
 4. provider 隧道斷 → `systemctl --user status pool-tunnel`，
    看 `journalctl --user -u pool-tunnel`。
 5. 全部都不行 → Gateway 可以整台 rotate 掉重建，不會遺失狀態。

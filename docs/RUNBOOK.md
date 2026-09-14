@@ -29,7 +29,7 @@
 | 變數 | 是什麼 | 從哪來 |
 |---|---|---|
 | `FILE_CRYPTO_KEY` | 對稱解密金鑰（信任根） | 你保管的密碼，與 GitHub secret 同名 |
-| `GH_POOL_TOKEN` | fine-grained PAT，能讀 repo vars、clone 私有 repo | GitHub → Settings → Developer settings → Fine-grained tokens |
+| `GH_POOL_TOKEN` | classic PAT（scope `repo`），能讀 repo vars、clone 私有 repo | GitHub → Settings → Developer settings → Tokens (classic) |
 
 這是整套系統中**唯一的人工輸入機密**。不要在指令歷史、log 或聊天中留下它們。
 
@@ -163,15 +163,21 @@ rotate 後第一次連線會因為金鑰不符被擋下，`ops-scripts/mlp` 會�
 
 ## 3. 更換 GH_POOL_TOKEN
 
-`GH_POOL_TOKEN` 是 fine-grained PAT，**會過期**。過期當天，provider 會開始
-拿不到 `NODE_GATEWAY`、隧道重建失敗，journal 會出現 `HTTP 401`。
-程序固定是四步：改 secret → 重新加密檔案 → commit → 各 provider 重跑註冊。
+現役的 `GH_POOL_TOKEN` 是 classic PAT，scope 只有 `repo`，且**沒有到期日**
+（2026-09-15 直接對 API 驗過：回應沒有
+`github-authentication-token-expiration` 標頭）。所以「某天突然過期」不是
+目前這顆 token 的失效模式；會觸發下列症狀的是你自己撤銷或換掉它。
+一旦它失效，provider 會拿不到 `NODE_GATEWAY`、隧道重建失敗，journal 出現
+`HTTP 401`。程序固定是四步：改 secret → 重新加密檔案 → commit →
+各 provider 重跑註冊。
 
 ### 3.1 產生新 token
 
-GitHub → Settings → Developer settings → Fine-grained tokens → 新建。
-權限：**只給這個 repo 的 Variables: Read、Contents: Read**（Worker 用的
-`GH_WORKER_TOKEN` 更窄：只有 Variables: Read，另見 `ARCHITECTURE.md` §3）。
+GitHub → Settings → Developer settings → Tokens (classic) → 新建，
+scope 勾 `repo`。若改用 fine-grained，權限給**只給這個 repo 的
+Variables: Read、Contents: Read**，但記得它有到期日，到期就會出現上述症狀
+（Worker 用的 `GH_WORKER_TOKEN` 更窄：只有 Variables: Read，
+另見 `ARCHITECTURE.md` §3）。
 
 ### 3.2 更新 GitHub secret
 
@@ -575,14 +581,16 @@ cloud-init 建帳號時就會寫一份 `authorized_keys`（只含 Actions 那把
 ### 7.7 rotate 會消滅自己的救援退路
 
 `scripts/rotate-gateway.sh` 用 `openssl rand -base64 24` 產生新機器的 root
-密碼，用完就丟。也就是說 `SECRETS.md` 裡記的那個 LISH 救援密碼，
-**在每次 rotate 完成的瞬間就對應到一台已經被刪掉的機器**——
+密碼，用完就丟。任何寫下來的 LISH 救援密碼，
+**在下一次 rotate 完成的瞬間就對應到一台已經被刪掉的機器**——
 最需要退路的時候，退路剛好不存在。
 
 已改成優先取 `GATEWAY_ROOT_PASS`（workflow 由選用的 `GATEWAY_ROOT_PASSWORD`
 secret 餵入），沒設定才回退隨機並在 log 明說「這台無法用主控台救援」。
 
-Generation 4 這台是在修好之前建的，它的 root 密碼無人知曉。
+**該 secret 目前仍未設定**，所以現役 Gateway（generation 10）與此前每一代
+的 root 密碼都無人知曉。基於這一點，2026-09-15 已把過期的密碼記錄整段從
+`SECRETS.md` 移除——留著一個必定失效的值，比沒有更危險。
 現階段的替代退路是 `repair-gateway` workflow（見 §8）。
 
 ### 7.8 Linode 會回收 IP，而 `accept-new` 不接受「換過的」金鑰
