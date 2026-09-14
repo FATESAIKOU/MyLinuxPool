@@ -59,7 +59,7 @@ jobs:
         with:
           token: ${{ secrets.LINODE_TOKEN }}
 
-      - name: Start ssh-agent, load Actions + sshproxy keys
+      - name: Start ssh-agent, load Actions key + decrypted tunnel key
         id: agent
         shell: bash
         env:
