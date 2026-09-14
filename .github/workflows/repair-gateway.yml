@@ -65,6 +65,7 @@ jobs:
           fi
           echo "ip=${ip}" >> "$GITHUB_OUTPUT"
           echo "generation=${gen}" >> "$GITHUB_OUTPUT"
+          echo "host_key=$(shared-configs/pool-runtime/files/pool-resolve gateway --field .host_key 2>/dev/null)" >> "$GITHUB_OUTPUT"
 
       - name: Deploy shared-configs + scripts to the Gateway
         shell: bash
@@ -85,6 +86,16 @@ jobs:
           source scripts/rotate-gateway.sh
           trusted_ips="$(gh variable get POOL_TRUSTED_IPS --repo "$GH_REPO")"
           rotate_run_provision fatesaikou "$GW_IP" "$trusted_ips" "$FILE_CRYPTO_KEY"
+
+      # The state cache is part of provisioning, not an afterthought: a
+      # Gateway without it serves nothing to the nodes that now prefer it.
+      # A failed push fails the repair, per docs/STATE_CONTRACT.md §4.
+      - name: Push the state cache
+        uses: ./.github/actions/push-state
+        with:
+          gateway-ip: ${{ steps.gw.outputs.ip }}
+          host-key: ${{ steps.gw.outputs.host_key }}
+          source: repair-gateway#${{ github.run_id }}
 
       - name: Report
         if: always()
