@@ -140,7 +140,6 @@ fi
 # Other setting
 export GOPATH=$HOME/golib
 export PATH="/opt/aarch64/bin:$PATH:$HOME/testSH:$HOME/.local/bin:$HOME/x-tools/moxie-none-moxiebox/bin:$GOPATH/bin"
-export TWITTER='/home/fatesaikou/testSC/MercenaryTwitterCrawler/twitter_files'
 
 #. /home/fatesaikou/torch/install/bin/torch-activate
 

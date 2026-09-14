@@ -1,0 +1,541 @@
+#!/usr/bin/env bash
+# bin/mlp — interactive admin CLI for MyLinuxPool, run from the operator's
+# own Mac (DDNS is gone; this replaces hand-building `ssh -J ...` chains).
+#
+# bash 3.2 COMPATIBLE ON PURPOSE — macOS ships 3.2, not bash 4+, and that
+# is very easy to forget on a Mac that also has a newer bash on $PATH via
+# Homebrew. Concretely, this file must never use:
+#   - associative arrays (`declare -A`)
+#   - ${var,,} / ${var^^} case conversion (use `tr` instead)
+#   - `mapfile`/`readarray`
+# Plain indexed arrays, `[[ ... ]]`, process substitution and `printf %q`
+# are all fine — those have been in bash since well before 3.2.
+#
+# All node connection info comes from pool/bin/pool-resolve. The one
+# direct `gh api` call in this file (in gather_targets) only enumerates
+# NODE_* variable NAMES — pool-resolve has no "list all nodes" capability
+# and neither does anything else here, so this is the same narrow,
+# already-established exception pool/bin/pool-status uses for the same
+# reason. No connection info (ip/port/user/...) is ever read from `gh`
+# directly — that always goes through pool-resolve.
+
+set -uo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+POOL_RESOLVE="${REPO_ROOT}/pool/bin/pool-resolve"
+POOL_STATUS="${REPO_ROOT}/pool/bin/pool-status"
+REPO="${POOL_REPO:-FATESAIKOU/MyLinuxPool}"
+
+CTL_DIR=""
+CTL=""
+GW_IP=""
+GW_USER=""
+
+# ---- colors: tput, off outside a real terminal --------------------------
+if [[ -t 1 ]] && command -v tput >/dev/null 2>&1; then
+    C_RESET="$(tput sgr0 2>/dev/null)"
+    C_BOLD="$(tput bold 2>/dev/null)"
+    C_GREEN="$(tput setaf 2 2>/dev/null)"
+    C_RED="$(tput setaf 1 2>/dev/null)"
+    C_YELLOW="$(tput setaf 3 2>/dev/null)"
+else
+    C_RESET=""; C_BOLD=""; C_GREEN=""; C_RED=""; C_YELLOW=""
+fi
+
+die() {
+    echo "mlp: $*" >&2
+    exit 1
+}
+
+usage() {
+    cat <<'EOF'
+usage: mlp [command]
+
+  (no command)     interactive main menu
+  ls               list providers/workers with live state
+  ssh [name]       connect to a node or worker (menu if name omitted)
+  wake             wake fh-l (unicast WoL via fh-proxy)
+  down             shut down fh-l (asks for confirmation first)
+  status           run pool-status
+  -h, --help       show this help
+
+requires: fzf, jq, gh — install missing ones with `brew install <name>`
+EOF
+}
+
+check_deps() {
+    local missing=""
+    command -v fzf >/dev/null 2>&1 || missing="${missing} fzf"
+    command -v jq >/dev/null 2>&1 || missing="${missing} jq"
+    command -v gh >/dev/null 2>&1 || missing="${missing} gh"
+    if [[ -n "$missing" ]]; then
+        echo "mlp: missing required tool(s):${missing}" >&2
+        echo "install with: brew install${missing}" >&2
+        exit 1
+    fi
+    if [[ ! -x "$POOL_RESOLVE" ]]; then
+        die "pool-resolve not found at ${POOL_RESOLVE} — run mlp from inside a MyLinuxPool checkout"
+    fi
+}
+
+# ---- gateway + shared ControlMaster --------------------------------------
+# One ssh session to the Gateway, reused for every port probe below —
+# never open a new connection per node. Same idea as pool-tunnel's own
+# health check riding its ControlMaster instead of a fresh handshake.
+
+resolve_gateway() {
+    local json rc
+    json="$("$POOL_RESOLVE" gateway)"
+    rc=$?
+    [[ $rc -eq 0 ]] || die "pool-resolve gateway failed (exit ${rc})"
+    GW_IP="$(printf '%s' "$json" | jq -r '.ip // empty')"
+    GW_USER="$(printf '%s' "$json" | jq -r '.user // empty')"
+    [[ -n "$GW_IP" && -n "$GW_USER" ]] || die "NODE_GATEWAY is missing ip/user"
+}
+
+open_gateway_master() {
+    CTL_DIR="$(mktemp -d "${TMPDIR:-/tmp}/mlp.XXXXXX")" || return 1
+    CTL="${CTL_DIR}/ctl-gateway"
+    ssh -M -S "$CTL" -o ControlPersist=60 -o ConnectTimeout=8 \
+        -o StrictHostKeyChecking=accept-new -o BatchMode=yes \
+        -N -f "${GW_USER}@${GW_IP}" 2>/dev/null
+}
+
+close_gateway_master() {
+    if [[ -n "$CTL" && -S "$CTL" ]]; then
+        ssh -S "$CTL" -O exit "${GW_USER}@${GW_IP}" >/dev/null 2>&1 || true
+    fi
+    [[ -n "$CTL_DIR" ]] && rm -rf "$CTL_DIR" 2>/dev/null || true
+    CTL=""
+    CTL_DIR=""
+}
+
+# Rides the shared ControlMaster; the remote-side `timeout` (present on
+# the Gateway) bounds the actual check, so no local `timeout` binary is
+# needed here — macOS doesn't ship one by default. Echoes up|down.
+gw_probe_port() {
+    local port="$1" banner
+    banner="$(ssh -S "$CTL" -o ConnectTimeout=5 "${GW_USER}@${GW_IP}" \
+        "timeout 2 nc 127.0.0.1 ${port} </dev/null | head -c 4" 2>/dev/null)"
+    if [[ "$banner" == SSH-* ]]; then
+        printf 'up'
+    else
+        printf 'down'
+    fi
+}
+
+gw_run() {
+    # Runs one command on the Gateway over the shared ControlMaster.
+    ssh -S "$CTL" -o ConnectTimeout=8 "${GW_USER}@${GW_IP}" "$1" 2>/dev/null
+}
+
+# ---- generic "run a command on any registered node" ----------------------
+# Builds the -J chain from pool-resolve <node> --expand-hops and runs $2
+# there. Same hop-walking shape as .github/actions/pool-ssh/run.sh (plain
+# indexed array + a counting loop — no associative arrays, bash 3.2 safe),
+# just using the operator's own ambient ssh credentials instead of an
+# ssh-agent loaded from GitHub secrets.
+run_on_node() {
+    local node="$1" cmd="$2"
+    local hops_json count i hop host port user
+    local jump_specs final_host final_port final_user jump_str
+
+    hops_json="$("$POOL_RESOLVE" "$node" --expand-hops 2>/dev/null)"
+    if [[ $? -ne 0 || -z "$hops_json" ]]; then
+        echo "mlp: could not resolve hop chain for '${node}'" >&2
+        return 1
+    fi
+
+    count="$(printf '%s' "$hops_json" | jq 'length' 2>/dev/null)"
+    case "$count" in
+        ''|*[!0-9]*) echo "mlp: malformed hop chain for '${node}'" >&2; return 1 ;;
+    esac
+    if [[ "$count" -lt 1 ]]; then
+        echo "mlp: empty hop chain for '${node}'" >&2
+        return 1
+    fi
+
+    jump_specs=()
+    final_host=""; final_port="22"; final_user=""
+
+    i=0
+    while [[ "$i" -lt "$count" ]]; do
+        hop="$(printf '%s' "$hops_json" | jq -c ".[$i]")"
+        host="$(printf '%s' "$hop" | jq -r '.host')"
+        port="$(printf '%s' "$hop" | jq -r '.port // 22')"
+        user="$(printf '%s' "$hop" | jq -r '.user')"
+        if [[ "$i" -lt "$((count - 1))" ]]; then
+            jump_specs+=("${user}@${host}:${port}")
+        else
+            final_host="$host"; final_port="$port"; final_user="$user"
+        fi
+        i=$((i + 1))
+    done
+
+    jump_str=""
+    if [[ "${#jump_specs[@]}" -gt 0 ]]; then
+        jump_str="$(IFS=,; echo "${jump_specs[*]}")"
+    fi
+
+    if [[ -n "$jump_str" ]]; then
+        ssh -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 -o BatchMode=yes \
+            -J "$jump_str" -p "$final_port" "${final_user}@${final_host}" "$cmd"
+    else
+        ssh -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 -o BatchMode=yes \
+            -p "$final_port" "${final_user}@${final_host}" "$cmd"
+    fi
+}
+
+# ---- gather providers + workers ------------------------------------------
+# Prints TSV: name<TAB>type<TAB>provider<TAB>port<TAB>user
+# type is one of: provider | worker (gateway is handled separately by
+# callers, since it never needs a Gateway hop to reach).
+gather_targets() {
+    local var node json role name port user
+
+    while IFS= read -r var; do
+        [[ -n "$var" ]] || continue
+        [[ "$var" == "NODE_GATEWAY" ]] && continue
+        node="$(printf '%s' "${var#NODE_}" | tr '[:upper:]' '[:lower:]')"
+        json="$("$POOL_RESOLVE" "$node" 2>/dev/null)" || continue
+        role="$(printf '%s' "$json" | jq -r '.role // empty' 2>/dev/null)"
+        [[ "$role" == "provider" ]] || continue
+        name="$(printf '%s' "$json" | jq -r '.name // empty' 2>/dev/null)"
+        port="$(printf '%s' "$json" | jq -r '.gateway_port // empty' 2>/dev/null)"
+        user="$(printf '%s' "$json" | jq -r '.user // empty' 2>/dev/null)"
+        [[ -n "$name" && -n "$port" && -n "$user" ]] || continue
+        printf '%s\tprovider\t-\t%s\t%s\n' "$name" "$port" "$user"
+    done < <(gh api "repos/${REPO}/actions/variables?per_page=100" --jq '.variables[].name' 2>/dev/null | grep '^NODE_')
+
+    local workers_json count i entry wprovider wport wcontainer wname
+    workers_json="$(gw_run '~/pool/bin/pool-port-alloc --list')"
+    [[ -n "$workers_json" ]] || workers_json='[]'
+
+    count="$(printf '%s' "$workers_json" | jq 'length' 2>/dev/null)"
+    case "$count" in ''|*[!0-9]*) count=0 ;; esac
+
+    i=0
+    while [[ "$i" -lt "$count" ]]; do
+        entry="$(printf '%s' "$workers_json" | jq -c ".[$i]")"
+        wprovider="$(printf '%s' "$entry" | jq -r '.provider // empty')"
+        wport="$(printf '%s' "$entry" | jq -r '.port // empty')"
+        wcontainer="$(printf '%s' "$entry" | jq -r '.container // empty')"
+        wname="$wcontainer"
+        [[ -n "$wname" && "$wname" != "null" ]] || wname="worker-${wport}"
+        [[ -n "$wport" ]] && printf '%s\tworker\t%s\t%s\tworker\n' "$wname" "$wprovider" "$wport"
+        i=$((i + 1))
+    done
+}
+
+# ---- ls -------------------------------------------------------------------
+print_state() {
+    if [[ "$1" == "up" ]]; then
+        printf '%s%-4s%s\n' "$C_GREEN" "up" "$C_RESET"
+    else
+        printf '%s%-4s%s\n' "$C_RED" "down" "$C_RESET"
+    fi
+}
+
+cmd_ls() {
+    resolve_gateway
+    if ! open_gateway_master; then
+        echo "mlp: Gateway unreachable (${GW_USER}@${GW_IP}) — nothing can be probed" >&2
+        return 1
+    fi
+
+    # Two passes: gather all rows first, then size the NAME column to the
+    # longest one actually seen (worker container names can run long,
+    # e.g. mlp-fh-proxy-base-34797874425) — a fixed width just breaks
+    # alignment on those instead of ever being "wide enough".
+    local name type provider port user state
+    local rows=()
+    rows[0]="$(printf 'gateway\tgateway\t-\t22\tup')"
+
+    while IFS=$'\t' read -r name type provider port user; do
+        [[ -n "$name" ]] || continue
+        state="$(gw_probe_port "$port")"
+        rows+=("$(printf '%s\t%s\t%s\t%s\t%s' "$name" "$type" "$provider" "$port" "$state")")
+    done < <(gather_targets)
+
+    close_gateway_master
+
+    local namewidth=4 r rname rlen
+    for r in "${rows[@]}"; do
+        rname="${r%%$'\t'*}"
+        rlen="${#rname}"
+        [[ "$rlen" -gt "$namewidth" ]] && namewidth="$rlen"
+    done
+
+    local fmt="%-${namewidth}s  %-9s %-12s %-6s "
+    printf "${C_BOLD}${fmt}%s${C_RESET}\n" "NAME" "TYPE" "PROVIDER" "PORT" "STATE"
+
+    for r in "${rows[@]}"; do
+        IFS=$'\t' read -r name type provider port state <<< "$r"
+        printf "$fmt" "$name" "$type" "$provider" "$port"
+        print_state "$state"
+    done
+}
+
+# ---- ssh ------------------------------------------------------------------
+do_connect() {
+    local type="$1" port="$2" user="$3"
+    case "$type" in
+        gateway)
+            ssh "${GW_USER}@${GW_IP}"
+            ;;
+        provider|worker)
+            ssh -J "${GW_USER}@${GW_IP}" -p "$port" "${user}@127.0.0.1"
+            ;;
+        *)
+            die "unknown target type: ${type}"
+            ;;
+    esac
+}
+
+connect_by_name() {
+    local name="$1" json rc role port user workers_json match_port
+
+    json="$("$POOL_RESOLVE" "$name" 2>/dev/null)"
+    rc=$?
+    if [[ $rc -eq 0 ]]; then
+        role="$(printf '%s' "$json" | jq -r '.role // empty')"
+        if [[ "$role" == "gateway" ]]; then
+            do_connect gateway 22 ""
+            return $?
+        fi
+        if [[ "$role" == "provider" ]]; then
+            port="$(printf '%s' "$json" | jq -r '.gateway_port // empty')"
+            user="$(printf '%s' "$json" | jq -r '.user // empty')"
+            if [[ -n "$port" && -n "$user" ]]; then
+                do_connect provider "$port" "$user"
+                return $?
+            fi
+        fi
+    fi
+
+    # Not a registered node — workers deliberately aren't (spec §10.3), so
+    # try matching by container name or bare port against the Gateway's
+    # own placeholder ledger.
+    if ! open_gateway_master; then
+        die "Gateway unreachable (${GW_USER}@${GW_IP})"
+    fi
+    workers_json="$(gw_run '~/pool/bin/pool-port-alloc --list')"
+    close_gateway_master
+    [[ -n "$workers_json" ]] || workers_json='[]'
+
+    if [[ "$name" =~ ^[0-9]+$ ]]; then
+        match_port="$name"
+    else
+        match_port="$(printf '%s' "$workers_json" | jq -r --arg n "$name" \
+            '[.[] | select(.container == $n)] | first | .port // empty' 2>/dev/null)"
+    fi
+
+    if [[ -n "$match_port" && "$match_port" != "null" ]]; then
+        do_connect worker "$match_port" worker
+        return $?
+    fi
+
+    die "no such node or worker: ${name}"
+}
+
+cmd_ssh() {
+    resolve_gateway
+    local target="${1:-}"
+
+    if [[ -n "$target" ]]; then
+        connect_by_name "$target"
+        return $?
+    fi
+
+    if ! open_gateway_master; then
+        die "Gateway unreachable (${GW_USER}@${GW_IP})"
+    fi
+
+    local name type provider port user state selected
+    selected="$(
+        {
+            printf 'gateway\tgateway\t-\t22\t%s\tup\n' "$GW_USER"
+            while IFS=$'\t' read -r name type provider port user; do
+                [[ -n "$name" ]] || continue
+                state="$(gw_probe_port "$port")"
+                printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$name" "$type" "$provider" "$port" "$user" "$state"
+            done < <(gather_targets)
+        } | fzf --delimiter=$'\t' --with-nth=1,2,3,4,6 \
+                --header='NAME  TYPE  PROVIDER  PORT  STATE' \
+                --prompt='ssh> ' --height='~60%'
+    )"
+
+    close_gateway_master
+
+    [[ -n "$selected" ]] || return 0
+
+    IFS=$'\t' read -r name type provider port user state <<< "$selected"
+    do_connect "$type" "$port" "$user"
+}
+
+# ---- wake / down ------------------------------------------------------------
+cmd_wake() {
+    resolve_gateway
+    local fhl_json rc method via mac target_ip port waited state
+
+    fhl_json="$("$POOL_RESOLVE" fh-l)"
+    rc=$?
+    [[ $rc -eq 0 ]] || die "pool-resolve fh-l failed (exit ${rc})"
+
+    method="$(printf '%s' "$fhl_json" | jq -r '.power.launch.method // empty')"
+    via="$(printf '%s' "$fhl_json" | jq -r '.power.launch.via // empty')"
+    mac="$(printf '%s' "$fhl_json" | jq -r '.power.launch.mac // empty')"
+    target_ip="$(printf '%s' "$fhl_json" | jq -r '.power.launch.target_ip // empty')"
+    port="$(printf '%s' "$fhl_json" | jq -r '.gateway_port // empty')"
+
+    [[ "$method" == "wol-unicast" ]] || die "NODE_FH_L.power.launch.method is '${method:-<empty>}', expected wol-unicast"
+    [[ -n "$via" && -n "$mac" && -n "$target_ip" && -n "$port" ]] || die "NODE_FH_L.power.launch is missing via/mac/target_ip, or gateway_port is missing"
+
+    echo "waking fh-l via ${via}: unicast WoL to ${mac} @ ${target_ip} ..."
+    if ! run_on_node "$via" "~/.mylinuxpool/bin/pool-wol ${mac} ${target_ip}"; then
+        die "failed to send WoL packet via ${via}"
+    fi
+
+    echo "packet sent — waiting for fh-l's port (${port}) on the Gateway (up to 5 minutes)"
+    if ! open_gateway_master; then
+        die "Gateway unreachable while waiting"
+    fi
+
+    waited=0
+    while [[ "$waited" -lt 300 ]]; do
+        state="$(gw_probe_port "$port")"
+        if [[ "$state" == "up" ]]; then
+            close_gateway_master
+            printf '\n%sfh-l is up%s (after %ss)\n' "$C_GREEN" "$C_RESET" "$waited"
+            return 0
+        fi
+        printf '.'
+        sleep 5
+        waited=$((waited + 5))
+    done
+
+    close_gateway_master
+    echo ""
+    die "timed out after 5 minutes waiting for fh-l"
+}
+
+cmd_down() {
+    resolve_gateway
+    local fhl_json rc method shutdown_cmd port confirm waited state
+
+    fhl_json="$("$POOL_RESOLVE" fh-l)"
+    rc=$?
+    [[ $rc -eq 0 ]] || die "pool-resolve fh-l failed (exit ${rc})"
+
+    method="$(printf '%s' "$fhl_json" | jq -r '.power.shutdown.method // empty')"
+    shutdown_cmd="$(printf '%s' "$fhl_json" | jq -r '.power.shutdown.command // empty')"
+    port="$(printf '%s' "$fhl_json" | jq -r '.gateway_port // empty')"
+
+    [[ "$method" == "ssh" && -n "$shutdown_cmd" ]] || die "NODE_FH_L.power.shutdown is missing method/command"
+    [[ -n "$port" ]] || die "NODE_FH_L is missing gateway_port"
+
+    printf '%sThis will shut down fh-l%s (running: %s)\n' "$C_YELLOW" "$C_RESET" "$shutdown_cmd"
+    printf 'Type "yes" to confirm: '
+    read -r confirm
+    if [[ "$confirm" != "yes" ]]; then
+        echo "aborted."
+        return 1
+    fi
+
+    echo "sending shutdown command to fh-l..."
+    if ! run_on_node fh-l "$shutdown_cmd"; then
+        die "failed to run shutdown command on fh-l"
+    fi
+
+    echo "waiting for fh-l's port (${port}) to disappear from the Gateway (up to 2 minutes)"
+    if ! open_gateway_master; then
+        die "Gateway unreachable while waiting"
+    fi
+
+    waited=0
+    while [[ "$waited" -lt 120 ]]; do
+        state="$(gw_probe_port "$port")"
+        if [[ "$state" == "down" ]]; then
+            close_gateway_master
+            printf '\n%sfh-l is down%s (after %ss)\n' "$C_GREEN" "$C_RESET" "$waited"
+            return 0
+        fi
+        printf '.'
+        sleep 5
+        waited=$((waited + 5))
+    done
+
+    close_gateway_master
+    echo ""
+    die "fh-l's port is still up after 2 minutes — shutdown may not have worked"
+}
+
+cmd_status() {
+    [[ -x "$POOL_STATUS" ]] || die "pool-status not found at ${POOL_STATUS}"
+    "$POOL_STATUS" "$@"
+}
+
+# ---- main menu --------------------------------------------------------------
+main_menu() {
+    local choice action
+    while true; do
+        choice="$(
+            printf '%s\n' \
+                "ls      list providers/workers and their live state" \
+                "ssh     pick a node/worker and connect" \
+                "wake    wake fh-l" \
+                "down    shut down fh-l" \
+                "status  run pool-status" \
+                "quit    exit" \
+            | fzf --prompt='mlp> ' --height='~50%' --header='select an action (Esc to quit)'
+        )"
+
+        [[ -n "$choice" ]] || break
+        action="$(printf '%s' "$choice" | awk '{print $1}')"
+
+        case "$action" in
+            ls) cmd_ls ;;
+            ssh) cmd_ssh ;;
+            wake) cmd_wake ;;
+            down) cmd_down ;;
+            status) cmd_status ;;
+            quit) break ;;
+        esac
+
+        echo ""
+        printf 'press Enter to return to the menu...'
+        read -r _
+    done
+}
+
+main() {
+    local cmd="${1:-}"
+
+    if [[ "$cmd" == "-h" || "$cmd" == "--help" ]]; then
+        usage
+        exit 0
+    fi
+
+    check_deps
+
+    if [[ -n "$cmd" ]]; then
+        shift
+    fi
+
+    case "$cmd" in
+        "") main_menu ;;
+        ls) cmd_ls "$@" ;;
+        ssh) cmd_ssh "$@" ;;
+        wake) cmd_wake "$@" ;;
+        down) cmd_down "$@" ;;
+        status) cmd_status "$@" ;;
+        *)
+            echo "mlp: unknown command '${cmd}'" >&2
+            usage
+            exit 2
+            ;;
+    esac
+}
+
+main "$@"
