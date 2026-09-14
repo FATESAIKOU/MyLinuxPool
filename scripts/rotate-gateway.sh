@@ -38,7 +38,20 @@ rotate_create_preview_linode() {
     local region="$1" type="$2" image="$3" rendered="$4"
     local root_pass create_json preview_id preview_ip
 
-    root_pass="$(openssl rand -base64 24 | tr -d '\n')"
+    # A random password thrown away at the end of this function meant the
+    # documented LISH break-glass path stopped working the moment a rotate
+    # finished — the recorded password belonged to a machine that no longer
+    # existed, and nobody knew the new one. Take it from the environment so
+    # the same password survives every rotate and stays worth recording;
+    # fall back to random only when the caller hasn't provided one, which
+    # keeps the console path unusable but is no worse than before.
+    if [[ -n "${GATEWAY_ROOT_PASS:-}" ]]; then
+        root_pass="$GATEWAY_ROOT_PASS"
+        log INFO "using the caller-supplied root password (LISH rescue stays valid)"
+    else
+        root_pass="$(openssl rand -base64 24 | tr -d '\n')"
+        log WARN "GATEWAY_ROOT_PASS not set — generating a throwaway root password; LISH console rescue will NOT be possible on this machine"
+    fi
     create_json="$(linode-cli linodes create \
         --no-defaults \
         --label fws-preview \
