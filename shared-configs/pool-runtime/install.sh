@@ -1,17 +1,25 @@
 #!/usr/bin/env bash
 # shared-configs/pool-runtime/install.sh — docs/LAYOUT.md §1
 #
-# Installs pool-resolve/pool-tunnel/pool-wol/pool-status/pool-port-alloc to
-# <home>/.mylinuxpool/bin/ (the canonical location — POOL_RUNTIME_SPEC.md
-# §0's state-dir layout, and what pool-tunnel.service's ExecStart=%h/...
-# already hardcodes) and the systemd user unit to
-# <home>/.config/systemd/user/. No root needed anywhere in this unit.
+# Installs pool-resolve/pool-tunnel/pool-wol/pool-status/pool-port-alloc
+# and pool-sync to <home>/.mylinuxpool/bin/ (the canonical location —
+# POOL_RUNTIME_SPEC.md §0's state-dir layout, and what
+# pool-tunnel.service's ExecStart=%h/... already hardcodes) and the
+# systemd user units (pool-tunnel.service, pool-sync.service,
+# pool-sync.timer) to <home>/.config/systemd/user/. No root needed
+# anywhere in this unit.
 #
 # This install.sh only gets the FILES in place. Enabling/starting the
-# systemd service, and `loginctl enable-linger`, are role-specific
-# decisions (a provider runs pool-tunnel as a persistent service; the
-# Gateway never runs it at all — it only needs the tools for ad-hoc use)
-# and stay the caller's job (ops-scripts/register-provider.sh).
+# systemd services, and `loginctl enable-linger`, are role-specific
+# decisions (a provider runs pool-tunnel + pool-sync.timer as persistent
+# services; the Gateway never runs them at all — it only needs the tools
+# for ad-hoc use) and stay the caller's job
+# (ops-scripts/register-provider.sh / the provider profile's
+# systemd_user_services).
+#
+# --check compares CONTENT, not just existence: an old, stale or tampered
+# bin/ must be reported as drift so pool-sync can converge it (task D —
+# the whole point of the sync is repairing exactly that).
 
 set -uo pipefail
 
@@ -53,14 +61,26 @@ done
 
 BIN_DIR="${HOME_DIR}/.mylinuxpool/bin"
 UNIT_DIR="${HOME_DIR}/.config/systemd/user"
-BINARIES="pool-resolve pool-tunnel pool-wol pool-status pool-port-alloc"
+BINARIES="pool-resolve pool-tunnel pool-wol pool-status pool-port-alloc pool-sync"
+UNITS="pool-tunnel.service pool-sync.service pool-sync.timer"
+
+# file_matches <installed-path> <repo-source>
+#   0 = byte-identical, 1 = missing or differs, 2 = repo source missing
+file_matches() {
+    local installed="$1" source="$2"
+    [[ -f "$source" ]] || return 2
+    [[ -f "$installed" ]] || return 1
+    cmp -s "$installed" "$source"
+}
 
 check_installed() {
     local f
     for f in $BINARIES; do
-        [[ -x "${BIN_DIR}/${f}" ]] || return 1
+        file_matches "${BIN_DIR}/${f}" "${FILES_DIR}/${f}" || return 1
     done
-    [[ -f "${UNIT_DIR}/pool-tunnel.service" ]] || return 1
+    for f in $UNITS; do
+        file_matches "${UNIT_DIR}/${f}" "${FILES_DIR}/${f}" || return 1
+    done
     return 0
 }
 
@@ -75,12 +95,15 @@ fi
 
 mkdir -p "$BIN_DIR"
 cp -f "${FILES_DIR}"/pool-resolve "${FILES_DIR}"/pool-tunnel "${FILES_DIR}"/pool-wol \
-      "${FILES_DIR}"/pool-status "${FILES_DIR}"/pool-port-alloc "${BIN_DIR}/"
+      "${FILES_DIR}"/pool-status "${FILES_DIR}"/pool-port-alloc "${FILES_DIR}"/pool-sync \
+      "${BIN_DIR}/"
 chmod +x "${BIN_DIR}"/pool-resolve "${BIN_DIR}"/pool-tunnel "${BIN_DIR}"/pool-wol \
-         "${BIN_DIR}"/pool-status "${BIN_DIR}"/pool-port-alloc
+         "${BIN_DIR}"/pool-status "${BIN_DIR}"/pool-port-alloc "${BIN_DIR}"/pool-sync
 
 mkdir -p "$UNIT_DIR"
 cp -f "${FILES_DIR}/pool-tunnel.service" "${UNIT_DIR}/pool-tunnel.service"
+cp -f "${FILES_DIR}/pool-sync.service" "${UNIT_DIR}/pool-sync.service"
+cp -f "${FILES_DIR}/pool-sync.timer" "${UNIT_DIR}/pool-sync.timer"
 
 chown -R "${TARGET_USER}:${TARGET_USER}" "${HOME_DIR}/.mylinuxpool" 2>/dev/null || true
 chown -R "${TARGET_USER}:${TARGET_USER}" "$UNIT_DIR" 2>/dev/null || true

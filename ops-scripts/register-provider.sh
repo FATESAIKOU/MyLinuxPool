@@ -7,7 +7,19 @@ set -euo pipefail
 
 REPO="FATESAIKOU/MyLinuxPool"
 STATE_DIR="${HOME}/.mylinuxpool"
-REPO_DIR="${STATE_DIR}/repo"
+# The repo is cloned into a TEMPORARY directory and deleted on every exit
+# path (see the trap below): declarations live on GitHub alone, and a
+# provider keeps only derived artifacts (REDESIGN N7 / task E). Do not
+# point this back at a persistent path — the old persistent clone was the
+# second copy of truth that silently drifted out of date.
+REPO_DIR="$(mktemp -d "${TMPDIR:-/tmp}/mlp-register.XXXXXX" 2>/dev/null)" || {
+    echo "register-provider: could not create temporary working directory" >&2
+    exit 1
+}
+# Every exit path — success, failure, interrupt — removes the temp clone.
+# The credential helper's token FILE is untouched (that is the provider's
+# credential, not a declaration).
+trap 'rm -rf "$REPO_DIR"' EXIT INT TERM
 BIN_DIR="${STATE_DIR}/bin"
 SSH_DIR="${HOME}/.ssh"
 PRIVATE_KEY="${SSH_DIR}/id_pool"
@@ -267,9 +279,10 @@ step1_preflight_no_sudo() {
 
 # ---- step 2: store gh token --------------------------------------------------
 # This duplicates part of shared-configs/gh/install.sh on purpose instead of
-# calling it: that unit lives inside REPO_DIR, and REPO_DIR doesn't exist
-# yet on a brand-new provider — `gh repo clone` in step 3 needs this very
-# token first. Chicken-and-egg, so this bootstrap step stays inline.
+# calling it: that unit lives inside REPO_DIR, and REPO_DIR is a temp
+# clone that doesn't exist yet on a brand-new provider — `gh repo clone`
+# in step 3 needs this very token first. Chicken-and-egg, so this
+# bootstrap step stays inline.
 #
 # `gh auth login --with-token` insists on a `read:org` scope our PAT
 # doesn't have and none of our operations (gh api read, gh variable set,
@@ -297,11 +310,12 @@ step2_store_token() {
 
     export GH_TOKEN="$GH_POOL_TOKEN"
 
-    # `gh` reading GH_TOKEN covers pool-resolve, but plain `git` (fetch/pull
-    # on ~/.mylinuxpool/repo) has its own, separate credential story — it
-    # doesn't consult GH_TOKEN at all. Without this, git falls back to an
-    # interactive username/password prompt, which fails immediately over
-    # ssh/non-interactively ("could not read Username ... No such device").
+    # `gh` reading GH_TOKEN covers pool-resolve, but plain `git` (the
+    # shallow clone in step 3) has its own, separate credential story —
+    # it doesn't consult GH_TOKEN at all. Without this, git falls back to
+    # an interactive username/password prompt, which fails immediately
+    # over ssh/non-interactively ("could not read Username ... No such
+    # device").
     # 2026-09-14 incident: fh-l happened to keep working across this
     # change only because a *stale* `gh auth login` state was still sitting
     # in ~/.config/gh/hosts.yml from before we switched off it — fh-proxy,
@@ -332,27 +346,30 @@ step2_store_token() {
 # exist yet at step 2) — by this point the repo exists, gh is already on
 # PATH (step 1), and re-running the gh unit here is just an idempotent
 # no-op confirming the profile's declaration actually holds.
+#
+# Task E: the clone is always fresh and always shallow, into the temp
+# REPO_DIR — never a persistent ~/.mylinuxpool/repo. The old "already
+# present, pull" branch is gone because there is nothing to pull: the
+# clone dies with the trap at the end of this run.
 step3_fetch_runtime() {
-    log INFO "step 3/9: fetch runtime (clone/pull repo, install profile-declared units)"
+    log INFO "step 3/9: fetch runtime (shallow clone into temp ${REPO_DIR}, install profile-declared units)"
 
     # BIN_DIR is what pool-runtime's own install.sh derives as
     # <home>/.mylinuxpool/bin — kept as our own constant too since step9
     # invokes pool-resolve directly.
     mkdir -p "$STATE_DIR"
 
-    if [[ -d "${REPO_DIR}/.git" ]]; then
-        local current_branch
-        current_branch="$(git -C "$REPO_DIR" rev-parse --abbrev-ref HEAD)"
-        if [[ "$current_branch" != "$BRANCH" ]]; then
-            log INFO "repo at ${REPO_DIR} is on '${current_branch}', switching to '${BRANCH}'"
-            git -C "$REPO_DIR" fetch origin "$BRANCH"
-            git -C "$REPO_DIR" checkout "$BRANCH"
-        fi
-        log INFO "repo already present at ${REPO_DIR}, pulling latest ${BRANCH}"
-        git -C "$REPO_DIR" pull --ff-only
-    else
-        log INFO "cloning repo into ${REPO_DIR} (branch ${BRANCH})"
-        gh repo clone "$REPO" "$REPO_DIR" -- --branch "$BRANCH"
+    log INFO "cloning ${REPO} into temp ${REPO_DIR} (branch ${BRANCH}, depth 1)"
+    gh repo clone "$REPO" "$REPO_DIR" -- --depth 1 --branch "$BRANCH" \
+        || { log ERROR "gh repo clone failed — check network and GH_POOL_TOKEN"; exit 1; }
+
+    # Migration: an old run left a persistent clone at ~/.mylinuxpool/repo
+    # that this script used to keep pulling forever. It is a second,
+    # frozen copy of the declarations — remove it, since truth lives on
+    # GitHub alone now.
+    if [[ -d "${STATE_DIR}/repo" ]]; then
+        rm -rf "${STATE_DIR}/repo"
+        log INFO "removed the old persistent clone at ${STATE_DIR}/repo — declarations now live on GitHub alone"
     fi
 
     if [[ ! -f "$PROFILE_JSON" ]]; then
@@ -373,7 +390,7 @@ step3_fetch_runtime() {
             log ERROR "${install} missing or not executable (declared in ${PROFILE_JSON})"
             exit 1
         fi
-        log INFO "installing unit '${unit}' (profiles/provider/${PROFILE_NAME})"
+        log INFO "installing unit '${unit}' from temp clone ${REPO_DIR} (profiles/provider/${PROFILE_NAME})"
         "$install" --key "$FILE_CRYPTO_KEY" --home "$HOME" --user "$(whoami)"
     done
 }

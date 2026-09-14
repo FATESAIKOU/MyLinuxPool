@@ -1,0 +1,13 @@
+[Unit]
+Description=MyLinuxPool sync pool-runtime from the repo
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=%h/.mylinuxpool/bin/pool-sync
+# systemd user service 的預設 PATH 不含 ~/.local/bin——register-provider.sh
+# 在系統沒有 gh 時會把 gh 裝到 ~/.local/bin（--no-sudo 的 tarball 安裝），
+# 沒有這行 pool-sync 的 `gh api` 會靜默失敗、每 30 分鐘退回 default profile
+# 並印一次 WARN。%h 在 systemd 單元裡會展開成家目錄。
+Environment=PATH=%h/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+# journald 是唯一日誌去向——不要設 StandardOutput=file

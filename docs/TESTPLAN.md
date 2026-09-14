@@ -8,7 +8,7 @@
 
 ---
 
-## 1. 純函式測試（已實作，230 個斷言）
+## 1. 純函式測試（已實作，約 300 個斷言）
 
 | 檔案 | 斷言 | 保護什麼 |
 |---|---|---|
@@ -20,6 +20,9 @@
 | `test-ssh-admin-install.sh` | 15 | 不再佈署私鑰、既有私鑰不被刪、drift 回報 |
 | `test-delete-worker.sh` | 9 | 兩種 worker 名稱寫法 |
 | `test-pool-resolve.sh` | 13 | 跳板鏈展開 |
+| `test-pool-sync.sh` | 47 | 收斂邏輯：GitHub 掛掉必須 exit 0、無變更不得重啟 tunnel、`needs_key` 的 unit 跳過、暫存目錄三種離開路徑都清、token 不入 argv 與 log、**跑完不新增任何檔案** |
+| `test-install-check.sh` | 18 + 3 injection | `pool-runtime` 的 `--check` 做的是**內容比對**而非存在性檢查（整個 pool-sync 設計的地基） |
+| `test-register-provider-tempclone.sh` | 9 | 註冊後不留 `~/.mylinuxpool/repo`、舊的會被刪、`gh_token` 保留、暫存目錄失敗時也清 |
 
 執行：`FILE_CRYPTO_KEY=$(cat crypto_key) scripts/tests/<file>`
 
@@ -73,6 +76,8 @@
 | V10 | **worker 跟隨檔遺失** | 刪掉 `gateway/gateway.json`，worker 仍能在下次 rotate 跟上 | ⚠️ 部分——檔案本身已驗會自癒（V9），但「遺失後仍跟得上 rotate」未單獨驗 |
 | V11 | **主本與實際分歧** | `mlp state` 能看出差異 | ✅ 已驗——第一次跑就抓到我 Mac 上一份 serial 99 的假快取 |
 | V12 | **rotate 與 provider 離線同時發生** | 兩台都有 worker；rotate 途中關掉 fh-l 再喚醒 | ✅ 已驗（見下） |
+| V13 | **provider 宣告漂移自癒** | 竄改 `bin/pool-status` 後 `pool-sync` 把它修回來；無漂移時不重啟 tunnel | ⬜ 本次部署驗收 |
+| V14 | **provider 不再留常駐 clone** | 部署後 `~/.mylinuxpool/` 無 `repo/`，且推導不出的資訊只剩 `config` + `gh_token` | ⬜ 本次部署驗收 |
 
 ### V12 實測（2026-09-14，generation 9 → 10）
 

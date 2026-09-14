@@ -253,6 +253,41 @@ journalctl --user -u pool-tunnel -n 20 --no-pager
 
 ---
 
+## 3.5 provider 的宣告漂移：`pool-sync`
+
+provider 上的 `~/.mylinuxpool/bin/` 是註冊那一刻裝上去的。rotate 不碰它，
+`pool-tunnel` 的 30 秒自癒也不碰它——**在 `pool-sync` 之前，改了 repo 裡的
+`pool-tunnel`，兩台 provider 會永遠跑舊版而且不會有任何提示**。
+
+`pool-sync.timer` 每 30 分鐘跑一次，clone 一份到暫存目錄，對 profile 宣告的
+每個 unit 跑 `install.sh --check`（內容比對），有落差才裝，**只有真的裝了才
+重啟 `pool-tunnel`**。它同時會刪掉舊版留下的 `~/.mylinuxpool/repo`。
+
+### 日常檢查
+
+```bash
+systemctl --user list-timers pool-sync.timer      # 下次何時跑
+systemctl --user status pool-sync                 # 上次結果
+journalctl --user -u pool-sync -n 50 --no-pager   # 它做了什麼
+~/.mylinuxpool/bin/pool-sync                      # 立刻手動跑一次
+```
+
+### 它「不會」做的事
+
+| 情況 | 行為 | 為什麼 |
+|---|---|---|
+| GitHub 取不到 | log WARN、**exit 0** | N6：GitHub 掛掉不可以變成 provider 故障 |
+| unit 的 `needs_key: true` | 跳過 | provider 邊緣刻意沒有 `FILE_CRYPTO_KEY`（N2） |
+| unit 的 `needs_root: true` | 跳過 | 它由 systemd **user** timer 啟動，沒有 root |
+| 沒有任何落差 | 不重啟 tunnel | 重啟會斷掉該機所有 worker 的隧道 |
+
+實際上今天能被它收斂的只有 `pool-runtime` 一個 unit——`ssh-tunnel-client`
+要金鑰、`gh` 要 root，兩個都只在註冊時處理。這是邊界，不是缺口：會漂移的
+本來就是 `bin/`。
+
+> 換句話說：**改了 `shared-configs/ssh-tunnel-client/` 或 `gh/` 的東西，
+> 還是要人手重跑 `register-provider.sh`。** 只有 `pool-runtime` 會自己跟上。
+
 ## 4. Fh-proxy 的 Windows 側設定
 
 Fh-proxy 是 WSL2。**Windows 的開機不會自動啟動 WSL，WSL 沒起來 systemd

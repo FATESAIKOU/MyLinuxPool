@@ -101,7 +101,9 @@ shared-configs/rclone/
 ```
 
 `install.sh --check` 會回報「宣告的」與「實際在機器上的」之間的落差，
-不做任何修改。
+不做任何修改。比對的是**內容**（逐檔 `cmp`），不是「檔案在不在」——
+`pool-sync` 的自癒完全建立在這一點上，所以它有自己的測試
+（`shared-configs/pool-runtime/tests/test-install-check.sh`）。
 
 ## 角色設定：`profiles/<role>/<name>/profile.json`
 
@@ -109,7 +111,7 @@ shared-configs/rclone/
 {
   "name": "default", "role": "provider",
   "shared_config": ["pool-runtime", "ssh-tunnel-client", "gh"],
-  "systemd_user_services": ["pool-tunnel.service"],
+  "systemd_user_services": ["pool-tunnel.service", "pool-sync.timer"],
   "linger": true,
   "sudoers_rules": ["ALL=(root) NOPASSWD: /usr/bin/systemctl poweroff, /usr/sbin/ethtool"]
 }
@@ -126,6 +128,35 @@ Worker 的 profile 多一個 `secrets` 欄位，映射「容器環境變數名 �
 `NODE_GATEWAY`，所以它就是同機容器的權威來源：它把結果寫成
 `~/.mylinuxpool/gateway/gateway.json`，`create-worker` 把那個**目錄**唯讀掛進容器。
 掛目錄而不是掛檔案，是因為發布用的是「寫暫存檔再改名」，掛檔案會鎖在舊 inode 上。
+
+## provider 上不留 repo：`pool-sync`
+
+provider 只放**衍生物**。宣告在 GitHub 有一份，機器上不留第二份——
+`register-provider.sh` 把 repo clone 到暫存目錄，裝完就刪。
+
+問題是衍生物會過期。rotate 只重建 Gateway；`pool-tunnel` 的 30 秒迴圈只重寫
+三個跟 Gateway 位址有關的檔案。`~/.mylinuxpool/bin/` 那五支腳本一旦裝上去，
+在此之前**沒有任何機制會更新它們**——實測時兩台 provider 都停在三個 commit
+之前，而且不會有人發現。
+
+`pool-sync.timer` 每 30 分鐘補上這一段：
+
+1. `git clone --depth 1` 一份到暫存目錄（GitHub 取不到就 `exit 0` —— 
+   GitHub 掛掉不可以變成 provider 故障）
+2. 對 profile 宣告的每個 unit 跑 `install.sh --check`
+3. 有落差才真的裝；**只有真的裝了才重啟 `pool-tunnel`**
+   （重啟會斷掉該機所有 worker 的隧道，無變更就重啟等於白付代價）
+4. 順手移除舊版留下的 `~/.mylinuxpool/repo`
+5. 清掉暫存目錄
+
+它**不記版本戳記**。判斷漂移靠的是 unit 自己的內容比對，不是 commit SHA，
+所以連被手動改過的 `bin/` 也會被修回來——而且 provider 上一個新檔案都不會多。
+
+需要 `FILE_CRYPTO_KEY` 的 unit（`ssh-tunnel-client`）一律跳過：provider 邊緣
+刻意不放解密金鑰，那些只在註冊時處理。
+
+盤查下來，provider 上**推導不出來的資訊只剩 59 bytes**——
+`config` 裡的 `NODE_NAME` 和 `gh_token`。
 
 ## 目錄
 

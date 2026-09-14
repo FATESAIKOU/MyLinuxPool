@@ -1,0 +1,189 @@
+#!/usr/bin/env bash
+# shared-configs/pool-runtime/files/pool-sync — spec: task D
+#
+# Converges a provider's installed pool-* scripts to what the repo
+# declares. register-provider.sh installs ~/.mylinuxpool/bin once, and
+# nothing ever updates it (rotate touches only the Gateway; pool-tunnel's
+# 30s self-heal loop only rebuilds the three derived files). Running every
+# 30 minutes via pool-sync.timer, this script re-checks every
+# profile-declared, non-secret unit with `install.sh --check` — a CONTENT
+# comparison, not an existence check — and reinstalls whatever drifted.
+#
+# WHY main() wraps the whole script (this is load-bearing): this file is
+# installed to ~/.mylinuxpool/bin/pool-sync, and pool-runtime's install.sh
+# replaces it in place. Bash reads a script incrementally by byte offset,
+# so a script swapped mid-read can decode garbage after the overwrite
+# point; a function body is parsed completely before execution starts, so
+# the running instance is immune to the file under it being rewritten.
+#
+# No state is kept under ~/.mylinuxpool and no new file is ever created:
+# convergence is judged purely by the units' own --check, so even a
+# manually tampered bin/ is repaired. Logs go to stdout/stderr (journald),
+# never to a file.
+#
+# Also responsible for one migration: register-provider.sh used to leave a
+# resident ~/.mylinuxpool/repo on the machine; once a fresh copy is
+# fetched here, that stale persistent clone is deleted so the repo's
+# declarations live only on GitHub (one source of truth, N7).
+
+set -uo pipefail
+
+REPO="${POOL_REPO:-FATESAIKOU/MyLinuxPool}"
+BRANCH="${POOL_BRANCH:-master}"
+STATE_DIR="${HOME}/.mylinuxpool"
+CONFIG_FILE="${STATE_DIR}/config"
+GH_TOKEN_FILE="${STATE_DIR}/gh_token"
+
+# Global on purpose: the EXIT trap below runs after main() returns, when
+# its locals are already gone — referencing a local under `set -u` would
+# itself abort the cleanup.
+TMP_DIR=""
+
+log() {
+    local level="$1"; shift
+    local ts
+    ts="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    if [[ "$level" == "INFO" ]]; then
+        printf '[%s] %s %s\n' "$ts" "$level" "$*"
+    else
+        printf '[%s] %s %s\n' "$ts" "$level" "$*" >&2
+    fi
+}
+
+main() {
+    # --- local facts: node identity + GitHub credential -------------
+    local node_name
+    node_name="$(grep '^NODE_NAME=' "$CONFIG_FILE" 2>/dev/null | head -1 | cut -d= -f2-)"
+    if [[ -z "$node_name" ]]; then
+        log ERROR "no NODE_NAME in ${CONFIG_FILE} — is this machine registered?"
+        exit 1
+    fi
+    if [[ ! -f "$GH_TOKEN_FILE" ]]; then
+        log ERROR "no token at ${GH_TOKEN_FILE} — cannot fetch the repo or read GitHub"
+        exit 1
+    fi
+
+    # --- fetch a fresh copy of the repo ------------------------------
+    # The credential helper reads the token from the file at invocation
+    # time (register-provider.sh's exact pattern) — the token never
+    # appears on a command line or in any log. POOL_REPO may be a full
+    # URL (local file:// repo in tests); otherwise it is owner/branch
+    # on github.com.
+    TMP_DIR="$(mktemp -d)"
+    trap 'rm -rf "$TMP_DIR"' EXIT
+
+    if [[ "$REPO" == *"://"* || "$REPO" == git@* ]]; then
+        clone_url="$REPO"
+    else
+        clone_url="https://github.com/${REPO}.git"
+    fi
+    if ! git clone --depth 1 --branch "$BRANCH" \
+            -c credential.https://github.com.helper="!f() { echo username=x-access-token; echo \"password=\$(cat $HOME/.mylinuxpool/gh_token 2>/dev/null)\"; }; f" \
+            "$clone_url" "$TMP_DIR/repo" >/dev/null 2>&1; then
+        # N6: GitHub being down must never become a provider fault.
+        log WARN "cannot fetch ${REPO}@${BRANCH} from GitHub — will retry on the next timer tick"
+        exit 0
+    fi
+
+    # --- migration: drop the old persistent clone ---------------------
+    # register-provider.sh used to leave a resident ~/.mylinuxpool/repo
+    # (the second copy of the repo's declarations on the machine). New
+    # registration removes it, but machines registered before that fix
+    # keep it forever unless re-registered. Once we have successfully
+    # fetched a fresh copy, that stale copy has no remaining purpose, so
+    # remove it here: any old machine converges on its own after the first
+    # timer tick — no re-registration needed.
+    if [[ -d "${STATE_DIR}/repo" ]]; then
+        rm -rf "${STATE_DIR}/repo"
+        log INFO "removed the old persistent repo clone at ${STATE_DIR}/repo — declarations now live only on GitHub"
+    fi
+
+    # --- which profile does this node belong to ----------------------
+    # .registered_with on the node's GitHub var records whether
+    # register-provider.sh ran with --no-sudo; the matching provider
+    # profile is the one source for what this machine should carry.
+    local var_name profile var_json registered_with
+    var_name="NODE_$(printf '%s' "$node_name" | tr '[:lower:]' '[:upper:]' | tr '-' '_')"
+    profile="default"
+    var_json="$(GH_TOKEN="$(cat "$GH_TOKEN_FILE")" \
+        gh api "repos/${REPO}/actions/variables/${var_name}" --jq .value 2>/dev/null || true)"
+    if [[ -z "$var_json" ]] || ! printf '%s' "$var_json" | jq empty >/dev/null 2>&1; then
+        log WARN "cannot read ${var_name} from GitHub — assuming profile 'default'"
+    else
+        registered_with="$(printf '%s' "$var_json" | jq -r '.registered_with // empty')"
+        if [[ "$registered_with" == "--no-sudo" ]]; then
+            profile="no-sudo"
+        fi
+    fi
+    log INFO "node ${node_name}: profile '${profile}' (${var_name})"
+
+    # --- converge every profile-declared unit -------------------------
+    # Only units that need NEITHER a decryption key NOR root can ever be
+    # converged here: pool-sync runs as the ordinary user from a systemd
+    # user timer (no sudo), and providers deliberately carry no
+    # FILE_CRYPTO_KEY (N2). Today that is exactly one unit — pool-runtime.
+    local profile_json units unit unit_json install
+    profile_json="${TMP_DIR}/repo/profiles/provider/${profile}/profile.json"
+    if [[ ! -f "$profile_json" ]]; then
+        log ERROR "profile '${profile}' not found in the fetched repo — sync aborted"
+        exit 1
+    fi
+    units="$(jq -r '.shared_config[]?' "$profile_json" 2>/dev/null || true)"
+    if [[ -z "$units" ]]; then
+        log WARN "profile '${profile}' declares no shared_config units — nothing to sync"
+    fi
+
+    local changed=0
+    for unit in $units; do
+        unit_json="${TMP_DIR}/repo/shared-configs/${unit}/unit.json"
+        if [[ ! -f "$unit_json" ]]; then
+            log WARN "no unit.json for declared unit '${unit}' — skipping"
+            continue
+        fi
+        if [[ "$(jq -r '.needs_key // false' "$unit_json" 2>/dev/null || true)" == "true" ]]; then
+            # N2: providers deliberately carry no decryption key; units
+            # that need one are only handled at registration time.
+            log INFO "skipped: ${unit} needs FILE_CRYPTO_KEY, only handled at registration"
+            continue
+        fi
+        if [[ "$(jq -r '.needs_root // false' "$unit_json" 2>/dev/null || true)" == "true" ]]; then
+            # pool-sync runs as the ordinary user from a systemd user
+            # timer — it has no root. Installing a needs_root unit would
+            # fail (and then retry every 30 minutes); a missing `gh`
+            # binary is exactly such a case, so these units are left to
+            # registration/repair, which run with the credentials this
+            # timer does not have.
+            log INFO "skipped: ${unit} needs root, only handled at registration or by an admin"
+            continue
+        fi
+        install="${TMP_DIR}/repo/shared-configs/${unit}/install.sh"
+        if [[ ! -x "$install" ]]; then
+            log WARN "install.sh of unit '${unit}' missing or not executable — skipping"
+            continue
+        fi
+        if "$install" --check --home "$HOME" --user "$(whoami)" >/dev/null 2>&1; then
+            log INFO "ok: ${unit} is up to date"
+        else
+            log INFO "installing: ${unit} (drift detected)"
+            if "$install" --home "$HOME" --user "$(whoami)" >/dev/null 2>&1; then
+                changed=1
+            else
+                log ERROR "install of unit '${unit}' failed — exit 1 for systemd to record"
+                exit 1
+            fi
+        fi
+    done
+
+    # --- restart the tunnel only when something actually changed -------
+    # pool-tunnel holds every worker's reverse tunnel; an unnecessary
+    # restart drops all of them for nothing (spec §3.5: restarts are
+    # costly, so the sync must be able to run with no change at all).
+    if [[ "$changed" -eq 1 ]]; then
+        systemctl --user restart pool-tunnel
+        log INFO "pool-tunnel restarted (files changed)"
+    else
+        log INFO "no changes — pool-tunnel NOT restarted"
+    fi
+}
+
+main "$@"

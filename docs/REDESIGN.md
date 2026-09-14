@@ -346,6 +346,52 @@ ssh-admin/files/id_rsa.pub.crypted          = ssh-keygen -y (同 unit 的私鑰)
 剩下 `gh_token` 一項，見 §2.8——消除它需要 rotate 在切換前主動推位址給
 provider，本次不做。
 
+### provider 上的常駐 clone（2026-09-15 移除）
+
+盤查漏掉的最大一份：`register-provider.sh` 會把整個 repo clone 到
+`~/.mylinuxpool/repo` 並**永久留著**（8.1 MB、84 個追蹤檔）。它同時違反兩條：
+
+- **N7**：宣告在 GitHub 有一份、在每台 provider 各有一份。
+- **N8**：那 8 MB 全是衍生物，卻是機器上最大的一塊狀態。
+
+更糟的是它**不會收斂**。rotate 只重建 Gateway，`pool-tunnel` 的 30 秒自癒
+迴圈只重寫三個衍生檔（`gateway/gateway.json`、`gateway_known_hosts`、
+`state.json` 快取），兩者都不碰 `bin/` 或 `repo/`。實測當天兩台 provider 都
+detached 在三個 commit 之前，而且沒有任何機制會告訴你。當時沒有實害純屬運氣
+——那三個 commit 剛好只動到 Gateway 專用的 unit。
+
+兩件事一起做：
+
+1. `register-provider.sh` 改成 clone 到 `mktemp -d`，`trap` 在所有離開路徑
+   （成功／失敗／中斷）清掉，並順手移除既有的 `~/.mylinuxpool/repo`。
+2. 新增 `pool-sync`（`pool-sync.timer`，每 30 分鐘）：clone 一份到暫存，
+   對 profile 宣告的每個 unit 跑 `install.sh --check`，有漂移才真的裝，
+   **只有真的裝了才重啟 `pool-tunnel`**（重啟會斷掉所有 worker 隧道，
+   無變更就重啟等於白白付代價）。它同樣會移除舊的常駐 clone，所以既有機器
+   跑過一次 timer 就自己收斂，不必重跑註冊。
+
+三個設計決定值得記下來：
+
+- **不記版本戳記。** 判斷「是否漂移」完全靠 unit 自己的 `--check` 做**內容
+  比對**，不比 commit SHA。代價是每次都要 clone 一份（`--depth 1`，幾百 KB），
+  換到的是：provider 上零新增檔案，而且連被**手動竄改**過的 `bin/` 也會被修
+  回來——這才是 N3 要的自癒，只追版本做不到。
+  為此 `pool-runtime/install.sh` 的 `--check` 從「檔案存不存在」改成 `cmp`
+  逐檔比對（舊版連整支腳本被換掉都回報 OK）。
+- **`needs_key == true` 的 unit 一律跳過。** provider 邊緣刻意沒有
+  `FILE_CRYPTO_KEY`（N2），能自癒的自然只有不需要解密的部分。這是邊界，
+  不是缺口——今天會漂移的實際上只有 `pool-runtime`。
+- **GitHub 取不到就 `exit 0`。** N6：GitHub 掛掉不可以變成 provider 故障。
+  這條有對應的注入測試（改成 `exit 1` 時測試會紅）。
+
+`pool-sync` 整支包在 `main() { ... }` 裡，最後一行才 `main "$@"`。原因是
+`install.sh` 會覆寫正在執行的 `bin/pool-sync`——bash 按位元組偏移量增量讀取
+腳本，被換掉之後往下讀會讀到垃圾；包成函式可讓 bash 在執行前就 parse 完整份。
+（同一個坑先前在「編輯正在跑的 monitor 腳本」上踩過一次。）
+
+盤查後 provider 上**推導不出來的資訊只剩 59 bytes**：`config` 裡的
+`NODE_NAME`（19 B）與 `gh_token`（40 B）。
+
 ## 3.36 `mlp state`：讓分歧看得見
 
 比對主本、Gateway 快取、本機快取三處的 serial／節點集合／埠集合，
