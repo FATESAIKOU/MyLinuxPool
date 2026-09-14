@@ -1,11 +1,18 @@
 #!/usr/bin/env bash
-# shared_config/ssh-tunnel/install.sh — docs/LAYOUT.md §1
+# shared_config/ssh-tunnel-client/install.sh — docs/LAYOUT.md §1
 #
-# Installs the shared sshproxy private key that a provider's pool-tunnel
-# authenticates the reverse tunnel with, at the fixed path pool-tunnel
-# itself expects: <home>/.ssh/id_pool (matches PRIVATE_KEY in
+# Installs the shared sshproxy PRIVATE key that a provider's/worker's
+# pool-tunnel authenticates the reverse tunnel with, at the fixed path
+# pool-tunnel itself expects: <home>/.ssh/id_pool (matches PRIVATE_KEY in
 # pool-tunnel/pool-resolve — this path is not configurable independently).
-# All providers share this one key on purpose (spec §4).
+# All providers/workers share this one key on purpose (spec §4).
+#
+# This is the "dials out" half of the sshproxy identity — the Gateway,
+# which gets DIALED, needs the matching authorized_keys instead, not this
+# private key. See shared_config/ssh-tunnel-server for that (2026-09-15:
+# these two used to be one "ssh-tunnel" unit that quietly installed the
+# wrong half of the identity depending which end you asked — this split
+# undoes that).
 #
 # needs_key=true, needs_root=false.
 
@@ -56,10 +63,10 @@ check_installed() {
 
 if [[ "$CHECK_ONLY" -eq 1 ]]; then
     if check_installed; then
-        log INFO "ssh-tunnel already installed at ${TARGET}"
+        log INFO "ssh-tunnel-client already installed at ${TARGET}"
         exit 0
     fi
-    log INFO "ssh-tunnel not installed"
+    log INFO "ssh-tunnel-client not installed"
     exit 1
 fi
 
@@ -85,4 +92,4 @@ fi
 chmod 600 "$TARGET"
 chown "${TARGET_USER}:${TARGET_USER}" "$TARGET" 2>/dev/null || true
 
-log INFO "ssh-tunnel installed to ${TARGET}"
+log INFO "ssh-tunnel-client installed to ${TARGET}"

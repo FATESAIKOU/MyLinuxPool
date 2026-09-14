@@ -124,7 +124,14 @@ loginctl show-user "$USER" | grep Linger   # 必須是 Linger=yes
 
 ## 2. Gateway rotate 之後要做什麼
 
-**什麼都不用做。**
+**叢集本身什麼都不用做。** 但有兩件屬於你個人的收尾：
+
+1. **第一次連線會需要 `mlp trust-gateway`** —— 新機器的主機金鑰不同，
+   這是預期的（見 §5 與 `bin/mlp` 的說明）。
+2. **`pws` 要重新下載** —— `dlpw`／`uppw` 操作的密碼檔是資料不是設定，
+   不隨 rotate 帶過去。在新機上跑一次 `~/testSH/dlpw` 即可。
+
+以下說明為什麼叢集本身不需要任何動作。
 
 原因：provider 需要從外界知道的資訊只有一項 —— `NODE_GATEWAY`。它每 30 秒
 自己去 GitHub 讀這個 var（經 `pool-resolve`），發現 `ip` 或 `generation` 變了就

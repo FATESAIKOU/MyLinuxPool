@@ -315,21 +315,27 @@ cloud-init 只負責「開機後能被 ssh 進來」這件事，其餘交給 `pr
    `authorized_keys` 與 `*.pub` 為 `644`。
    > 現行機的 `/home/sshproxy/.ssh/id_rsa` 原本是 644（全系統可讀的私鑰），
    > 是實機發現的既有弱點，新機不可重蹈。
-4. **安裝 `pool/bin/*`**：`chmod +x /home/fatesaikou/pool/bin/*`。
-   檔案本身由 workflow 的佈署 bundle 那步 scp 過來（併進與
-   `static_normal_files`/`static_secret_files` 同一份 `home/` staging
-   樹，走同一趟 `scp` + `sudo cp -a`），擁有者已由上一步的
-   `chown -R` 一併修正，這裡只需要補執行位。
+4. **安裝 pool-runtime**：呼叫 `shared_config/pool-runtime/install.sh`，
+   把 `pool-resolve`/`pool-tunnel`/`pool-wol`/`pool-status`/
+   `pool-port-alloc` 與 `pool-tunnel.service` 裝到 **`/home/fatesaikou/.mylinuxpool/bin/`**
+   （見 `docs/LAYOUT.md`；這個 unit 自己管檔案的擁有者與權限，不再
+   依賴上一步的 `chown -R`）。
    > **2026-09-14 補上的缺口**：`ARCHITECTURE.md` §5 step 4「安裝 Gateway
-   > runtime」原本就包含 `pool/bin/*`，但實作只裝了
+   > runtime」原本就包含這一份 runtime，但實作只裝了
    > `docker`/`rclone`/`gh`。少了它，`pool-port-alloc` 在 Gateway 上無處
    > 可跑，`create-worker`/`delete-worker` 第一次連線就失敗
    > （`pool-resolve not found`）。
+   > **2026-09-15 修正**：本節原本寫的目的地是 `~/pool/bin/`，與
+   > provider/worker 用的 `~/.mylinuxpool/bin/`（本文 §0 與
+   > `pool-tunnel.service` 的 `ExecStart=%h/.mylinuxpool/bin/...` 早就這樣
+   > 定）不一致——這是本規格自己寫錯，不是兩種故意不同的慣例。
+   > `create-worker.yml`/`delete-worker.yml` 曾經照著錯的那份呼叫
+   > `~/pool/bin/pool-port-alloc`，現已統一改回 `~/.mylinuxpool/bin/`。
 5. **安裝 runtime**：`docker.io`、`rclone`、`gh`
    （`gh` 用 apt 即可，Gateway 不跑 `pool-resolve` 所以版本不拘）。
 6. **建立 `~/pool/workers.d/`**（worker 埠登記表的位置，見 `ARCHITECTURE.md` §5）。
 7. **驗收**：`sshd -t` 通過、`fail2ban-client status` 正常、
-   `nc`/`flock`/`ss`/`jq` 皆存在，且 `~/pool/bin/pool-port-alloc` 存在並可執行。
+   `nc`/`flock`/`ss`/`jq` 皆存在，且 `~/.mylinuxpool/bin/pool-port-alloc` 存在並可執行。
 
 ### 9.3 `.github/actions/pool-ssh`（composite action）
 
@@ -372,7 +378,7 @@ inputs:
 ### 10.1 埠配發：`pool/bin/pool-port-alloc`
 
 **在 Gateway 上執行**（由 workflow 經 `pool-ssh` 呼叫已安裝在
-`~/pool/bin/pool-port-alloc` 的那份，見 §9.2 step 4——不要用送原始碼字串
+`~/.mylinuxpool/bin/pool-port-alloc` 的那份，見 §9.2 step 4——不要用送原始碼字串
 給 `bash -c` 的方式執行；那樣 `BASH_SOURCE` 不是真實檔案路徑，
 `pool-port-alloc` 內用來找 `pool-resolve` 的 `SCRIPT_DIR` 會解析錯誤）。
 

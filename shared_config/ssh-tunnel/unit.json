@@ -1,7 +1,0 @@
-{
-  "name": "ssh-tunnel",
-  "description": "sshproxy 的隧道身分（provider／worker）",
-  "needs_key": true,
-  "needs_root": false,
-  "provides": []
-}

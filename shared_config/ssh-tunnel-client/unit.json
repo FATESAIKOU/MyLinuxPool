@@ -1,0 +1,7 @@
+{
+  "name": "ssh-tunnel-client",
+  "description": "sshproxy 的隧道私鑰（主動撥出隧道的一方：provider／worker）",
+  "needs_key": true,
+  "needs_root": false,
+  "provides": []
+}

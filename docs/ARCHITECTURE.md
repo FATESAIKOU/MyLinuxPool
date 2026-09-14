@@ -204,7 +204,7 @@ gh variable get NODE_GATEWAY --repo FATESAIKOU/MyLinuxPool --jq .ip
 1. 建 `fws-preview`（Linode API）
 2. cloud-init：建 `fatesaikou`／`sshproxy`、純金鑰 sshd、基礎套件
 3. 佈署 bundle：`static_normal_files` ＋ 解密後的 `static_secret_files`（**無 S3**）
-4. 安裝 Gateway runtime：docker、rclone、git、gh、`pool/bin/*`
+4. 安裝 Gateway runtime：docker、rclone、git、gh、pool-runtime（裝到 `~/.mylinuxpool/bin/`）
 5. **切換點** — `gh variable set NODE_GATEWAY` 寫入新 IP、`generation+1`
 6. 等待 provider 歸隊：輪詢新機 `127.0.0.1` 上每個 provider 的 `gateway_port`（上限 180 秒）
 7. 成功 → 刪舊 `fws` → `fws-preview` 改名 `fws` → 回寫 var 的 `linode_label`

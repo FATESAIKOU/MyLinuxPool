@@ -1,7 +1,7 @@
 {
   "name": "default",
   "role": "gateway",
-  "shared_config": ["pool-runtime", "ssh-admin", "ssh-tunnel", "rclone",
+  "shared_config": ["pool-runtime", "ssh-admin", "ssh-tunnel-server", "rclone",
                     "standalonescripts", "dotfiles", "gh"],
   "packages": ["curl", "ca-certificates", "git", "jq", "netcat-openbsd",
                "util-linux", "iproute2", "fail2ban", "docker.io"],
