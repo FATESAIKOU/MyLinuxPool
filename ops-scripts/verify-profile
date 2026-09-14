@@ -32,7 +32,10 @@ print(j, l['user'], l['host'], l['port'])")"
 
 SSH_OPTS=(-o BatchMode=yes -o ConnectTimeout=10
           -o UserKnownHostsFile="${HOME}/.mylinuxpool/known_hosts"
-          -o StrictHostKeyChecking=accept-new)
+          -o StrictHostKeyChecking=accept-new
+          # 不轉送 Mac 的 en_US.UTF-8——provider 上沒有那個 locale，
+          # 遠端每開一次 bash 就警告一行，把真正的輸出淹掉。
+          -o SetEnv=LC_ALL=C)
 [[ "$JUMPS" != "-" ]] && SSH_OPTS+=(-J "$JUMPS")
 
 STAGE="$(mktemp -d)"; trap 'rm -rf "$STAGE"' EXIT
@@ -64,8 +67,14 @@ echo "verify-profile: ${NODE} against ${PROFILE}"
 echo "  units: ${UNITS}"
 echo
 
-# COPYFILE_DISABLE: macOS tar 會塞 xattr，遠端 GNU tar 會對每個檔案抱怨一次
-COPYFILE_DISABLE=1 tar czf "${STAGE}/payload.tgz" -C "$REPO_ROOT" shared-configs scripts 2>/dev/null
+# macOS 的 bsdtar 會替每個檔案塞 LIBARCHIVE.xattr 標頭，遠端 GNU tar 就對每個
+# 檔案抱怨一行。COPYFILE_DISABLE 只擋 ._ 檔，擋不掉 xattr——要 --no-xattrs。
+# GNU tar 也認這個旗標，但仍舊探一下，別假設本機是哪一種 tar。
+TAR_FLAGS=()
+tar --no-xattrs --version >/dev/null 2>&1 && TAR_FLAGS+=(--no-xattrs)
+tar --no-mac-metadata --version >/dev/null 2>&1 && TAR_FLAGS+=(--no-mac-metadata)
+COPYFILE_DISABLE=1 tar "${TAR_FLAGS[@]}" -czf "${STAGE}/payload.tgz" \
+    -C "$REPO_ROOT" shared-configs scripts 2>/dev/null
 ssh "${SSH_OPTS[@]}" -p "$LPORT" "${LUSER}@${LHOST}" \
     'rm -rf ~/.mlp-verify && mkdir -p ~/.mlp-verify && tar xzf - -C ~/.mlp-verify' \
     < "${STAGE}/payload.tgz" || { echo "verify-profile: could not stage" >&2; exit 3; }
