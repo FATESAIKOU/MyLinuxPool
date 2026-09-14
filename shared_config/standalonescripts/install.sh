@@ -72,6 +72,17 @@ if [[ -z "$KEY" ]]; then
     fi
 fi
 
+# Confirm we actually have the ability to decrypt before doing anything
+# that depends on it — an absent tool must fail as "can't check this",
+# never get misread as "checked, and it's wrong" (2026-09-15: exactly that
+# mixup, on ssh-tunnel-server, reported a data-integrity violation for
+# what was really a missing scripts/ directory).
+if [[ ! -x "$DECRYPT" ]]; then
+    log ERROR "${DECRYPT} not found or not executable"
+    log ERROR "this unit depends on scripts/decryptStdin.sh — deploy shared_config/ together with scripts/, not shared_config/ alone"
+    exit 1
+fi
+
 if ! command -v rclone >/dev/null 2>&1; then
     log WARN "rclone is not on PATH yet — dlpw/uppw will be installed but won't work until the rclone unit is also installed"
 fi
@@ -82,6 +93,12 @@ for f in dlpw uppw; do
         log INFO "${TARGET_DIR}/${f} already present, skipping decrypt"
     else
         "$DECRYPT" "$KEY" < "${FILES_DIR}/${f}.crypted" > "${TARGET_DIR}/${f}"
+        rc=$?
+        if [[ $rc -ne 0 ]]; then
+            rm -f "${TARGET_DIR}/${f}"
+            log ERROR "decryptStdin.sh failed (exit ${rc}) while decrypting ${f}.crypted — wrong --key, or the encrypted file is corrupted"
+            exit 1
+        fi
         log INFO "decrypted ${f} to ${TARGET_DIR}/${f}"
     fi
     chmod +x "${TARGET_DIR}/${f}"

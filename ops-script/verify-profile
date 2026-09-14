@@ -1,0 +1,83 @@
+#!/usr/bin/env bash
+# verify-profile —— 把某台機器的實際狀態與它的 profile 宣告對照。
+#
+#   verify-profile <node> <role/profile>   # 金鑰由 stdin 讀入
+#
+# 只讀不寫：對 profile 宣告的每個 unit 跑 install.sh --check。
+#
+# 機密處理見 RUNBOOK §9：遠端腳本先落地成檔案，金鑰才單獨走 stdin。
+# 絕不把兩者灌進同一個 stdin——那個錯誤在 2026-09-13/14 造成兩次金鑰洩漏。
+set -uo pipefail
+
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")/.." && pwd)"
+NODE="${1:-}"; PROFILE="${2:-}"
+
+[[ -n "$NODE" && -n "$PROFILE" ]] || {
+    echo "usage: verify-profile <node> <role/profile>   (key on stdin)" >&2; exit 2; }
+
+PROFILE_JSON="${REPO_ROOT}/profiles/${PROFILE}/profile.json"
+[[ -f "$PROFILE_JSON" ]] || { echo "verify-profile: no such profile: ${PROFILE_JSON}" >&2; exit 2; }
+
+UNITS="$(python3 -c "import json;print(' '.join(json.load(open('${PROFILE_JSON}'))['shared_config']))")"
+RESOLVE="${REPO_ROOT}/shared_config/pool-runtime/files/pool-resolve"
+
+HOPS="$("$RESOLVE" "$NODE" --expand-hops)" || {
+    echo "verify-profile: could not resolve ${NODE}" >&2; exit 3; }
+read -r JUMPS LUSER LHOST LPORT <<< "$(printf '%s' "$HOPS" | python3 -c "
+import json,sys
+h=json.load(sys.stdin)
+j=','.join('%s@%s:%s' % (x['user'],x['host'],x['port']) for x in h[:-1]) or '-'
+l=h[-1]
+print(j, l['user'], l['host'], l['port'])")"
+
+SSH_OPTS=(-o BatchMode=yes -o ConnectTimeout=10
+          -o UserKnownHostsFile="${HOME}/.mylinuxpool/known_hosts"
+          -o StrictHostKeyChecking=accept-new)
+[[ "$JUMPS" != "-" ]] && SSH_OPTS+=(-J "$JUMPS")
+
+STAGE="$(mktemp -d)"; trap 'rm -rf "$STAGE"' EXIT
+
+cat > "${STAGE}/run.sh" <<'REMOTE'
+#!/usr/bin/env bash
+# 金鑰是這支腳本唯一的 stdin 輸入。
+IFS= read -r POOL_KEY
+[[ -n "$POOL_KEY" ]] || { echo "no key on stdin" >&2; exit 2; }
+cd "$HOME/.mlp-verify" || exit 1
+fail=0
+for u in $UNITS_LIST; do
+    printf '  %-22s ' "$u"
+    if [[ ! -f "shared_config/$u/install.sh" ]]; then
+        echo "MISSING UNIT"; fail=1; continue
+    fi
+    if bash "shared_config/$u/install.sh" --check --key "$POOL_KEY" >/tmp/vp.out 2>&1; then
+        echo "ok"
+    else
+        echo "DRIFT: $(tail -1 /tmp/vp.out | sed 's/^\[[^]]*\] [A-Z]* //' | cut -c1-56)"
+        fail=1
+    fi
+done
+rm -f /tmp/vp.out
+exit "$fail"
+REMOTE
+
+echo "verify-profile: ${NODE} against ${PROFILE}"
+echo "  units: ${UNITS}"
+echo
+
+tar czf "${STAGE}/payload.tgz" -C "$REPO_ROOT" shared_config scripts 2>/dev/null
+ssh "${SSH_OPTS[@]}" -p "$LPORT" "${LUSER}@${LHOST}" \
+    'rm -rf ~/.mlp-verify && mkdir -p ~/.mlp-verify && tar xzf - -C ~/.mlp-verify' \
+    < "${STAGE}/payload.tgz" || { echo "verify-profile: could not stage" >&2; exit 3; }
+
+ssh "${SSH_OPTS[@]}" -p "$LPORT" "${LUSER}@${LHOST}" 'cat > ~/.mlp-verify/run.sh' < "${STAGE}/run.sh"
+
+ssh "${SSH_OPTS[@]}" -p "$LPORT" "${LUSER}@${LHOST}" \
+    "UNITS_LIST='${UNITS}' bash ~/.mlp-verify/run.sh"
+rc=$?
+
+ssh "${SSH_OPTS[@]}" -p "$LPORT" "${LUSER}@${LHOST}" 'rm -rf ~/.mlp-verify' </dev/null 2>/dev/null
+
+echo
+[[ "$rc" -eq 0 ]] && echo "verify-profile: ${NODE} matches ${PROFILE}" \
+                  || echo "verify-profile: ${NODE} has drift from ${PROFILE}"
+exit "$rc"

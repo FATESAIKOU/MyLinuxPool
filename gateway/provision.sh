@@ -121,12 +121,16 @@ step2_fail2ban_ignoreip() {
 # "installed elsewhere, disconnected from the files" problem LAYOUT.md's
 # rationale describes.
 #
-# sshproxy only gets `ssh-tunnel` (a spare copy of the shared key in its
-# own home — harmless, since sshproxy never runs pool-tunnel on the
-# Gateway itself). Its authorized_keys stays cloud-init's job
-# (SSHPROXY_PUBKEY, rendered fresh every rotate) — ssh-tunnel must never
-# touch it, or a provider's own copy of this same unit would end up
-# authorizing sshproxy to log into providers, which is not the point.
+# sshproxy gets `ssh-tunnel-server` — the "gets dialed into" half of the
+# sshproxy identity (authorized_keys), never `ssh-tunnel-client`'s private
+# key (that's for the machines that DIAL OUT: providers/workers). Its
+# install.sh is idempotent and skips writing if the file already exists —
+# cloud-init already rendered sshproxy's authorized_keys fresh this rotate
+# (SSHPROXY_PUBKEY, from the live secret), so in practice this call mostly
+# just re-runs the spec §4 invariant check (this bundle's id_rsa.pub vs.
+# its own authorized_keys) rather than overwriting anything cloud-init
+# already got right; it's still the thing that would actually install the
+# file on a path that doesn't go through cloud-init (spec §4).
 step3_install_shared_config() {
     log INFO "step 3/6: install shared_config units"
 
@@ -156,12 +160,12 @@ step3_install_shared_config() {
 
     home="/home/sshproxy"
     target_user="sshproxy"
-    install="${SHARED_CONFIG_DIR}/ssh-tunnel/install.sh"
+    install="${SHARED_CONFIG_DIR}/ssh-tunnel-server/install.sh"
     if [[ ! -x "$install" ]]; then
         log ERROR "${install} missing or not executable"
         exit 1
     fi
-    log INFO "installing unit 'ssh-tunnel' for ${target_user}"
+    log INFO "installing unit 'ssh-tunnel-server' for ${target_user}"
     "$install" --key "$FILE_CRYPTO_KEY" --home "$home" --user "$target_user"
 }
 

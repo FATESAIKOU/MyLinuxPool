@@ -341,7 +341,7 @@ step3_fetch_runtime() {
 step4_key() {
     log INFO "step 4/9: sshproxy private key + Actions authorized_keys"
 
-    "${REPO_DIR}/shared_config/ssh-tunnel/install.sh" \
+    "${REPO_DIR}/shared_config/ssh-tunnel-client/install.sh" \
         --key "$FILE_CRYPTO_KEY" --home "$HOME" --user "$(whoami)"
 
     # Actions reaches this machine directly, as the last hop of its own

@@ -85,11 +85,41 @@ if [[ -z "$KEY" ]]; then
     fi
 fi
 
+# Confirm we actually have the ability to decrypt before doing anything
+# that depends on it — an absent tool must fail as "can't check this",
+# never get misread as "checked, and it's wrong". 2026-09-15 incident:
+# shared_config/ was deployed without scripts/ alongside it, so this unit
+# hit "scripts/decryptStdin.sh: No such file or directory" and — before
+# this check existed — reported that as "invariant violated:
+# id_rsa.pub.crypted's key is not present in authorized_keys.crypted".
+# Those are not the same failure: one means "the environment can't run
+# this check", the other means "the data is actually broken" — and
+# whoever reads the second message goes and edits files that were never
+# wrong. Same lesson as the sudo-probe-misattributed-to-visudo and the
+# fake-listener-passing-as-a-healthy-tunnel incidents: confirm you have
+# the ability to check before reporting a verdict.
+if [[ ! -x "$DECRYPT" ]]; then
+    log ERROR "${DECRYPT} not found or not executable"
+    log ERROR "this unit depends on scripts/decryptStdin.sh — deploy shared_config/ together with scripts/, not shared_config/ alone"
+    exit 1
+fi
+
 # Both decrypted to memory (never written to disk) purely to check the
 # invariant below — authorized_keys is the only one of the two that's an
-# actual install target.
+# actual install target. Each decrypt's own exit code is checked BEFORE
+# the invariant comparison runs: a decrypt failure (wrong --key, or a
+# corrupted .crypted file) must be reported as "couldn't verify", not
+# blended into the same failure path as "verified, and it's wrong".
 pubkey_content="$("$DECRYPT" "$KEY" < "${FILES_DIR}/id_rsa.pub.crypted")"
+pubkey_rc=$?
 authorized_keys_content="$("$DECRYPT" "$KEY" < "${FILES_DIR}/authorized_keys.crypted")"
+authorized_keys_rc=$?
+
+if [[ $pubkey_rc -ne 0 || $authorized_keys_rc -ne 0 ]]; then
+    log ERROR "cannot verify invariant: decryptStdin.sh failed (id_rsa.pub.crypted exit ${pubkey_rc}, authorized_keys.crypted exit ${authorized_keys_rc})"
+    log ERROR "this means the --key is wrong or a .crypted file is corrupted — NOT that the invariant is violated. Fix the decrypt failure first, then re-run to actually check the invariant."
+    exit 1
+fi
 
 pubkey_fields="$(printf '%s' "$pubkey_content" | awk '{print $1, $2}')"
 if ! printf '%s\n' "$authorized_keys_content" | awk '{print $1, $2}' | grep -qxF "$pubkey_fields"; then

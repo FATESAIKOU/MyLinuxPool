@@ -80,6 +80,17 @@ if [[ -z "$KEY" ]]; then
     fi
 fi
 
+# Confirm we actually have the ability to decrypt before doing anything
+# that depends on it — an absent tool must fail as "can't check this",
+# never get misread as "checked, and it's wrong" (2026-09-15: exactly that
+# mixup, on ssh-tunnel-server, reported a data-integrity violation for
+# what was really a missing scripts/ directory).
+if [[ ! -x "$DECRYPT" ]]; then
+    log ERROR "${DECRYPT} not found or not executable"
+    log ERROR "this unit depends on scripts/decryptStdin.sh — deploy shared_config/ together with scripts/, not shared_config/ alone"
+    exit 1
+fi
+
 mkdir -p "$SSH_DIR"
 chmod 700 "$SSH_DIR"
 
@@ -87,6 +98,12 @@ if [[ -f "$TARGET" ]]; then
     log INFO "${TARGET} already present, skipping decrypt"
 else
     "$DECRYPT" "$KEY" < "${FILES_DIR}/id_rsa.crypted" > "$TARGET"
+    rc=$?
+    if [[ $rc -ne 0 ]]; then
+        rm -f "$TARGET"
+        log ERROR "decryptStdin.sh failed (exit ${rc}) while decrypting id_rsa.crypted — wrong --key, or the encrypted file is corrupted"
+        exit 1
+    fi
     log INFO "decrypted shared sshproxy key to ${TARGET}"
 fi
 chmod 600 "$TARGET"

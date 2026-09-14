@@ -72,6 +72,17 @@ if [[ -z "$KEY" ]]; then
     fi
 fi
 
+# Confirm we actually have the ability to decrypt before doing anything
+# that depends on it — an absent tool must fail as "can't check this",
+# never get misread as "checked, and it's wrong" (2026-09-15: exactly that
+# mixup, on ssh-tunnel-server, reported a data-integrity violation for
+# what was really a missing scripts/ directory).
+if [[ ! -x "$DECRYPT" ]]; then
+    log ERROR "${DECRYPT} not found or not executable"
+    log ERROR "this unit depends on scripts/decryptStdin.sh — deploy shared_config/ together with scripts/, not shared_config/ alone"
+    exit 1
+fi
+
 mkdir -p "$SSH_DIR"
 chmod 700 "$SSH_DIR"
 
@@ -79,6 +90,12 @@ if [[ -f "${SSH_DIR}/id_rsa" ]]; then
     log INFO "${SSH_DIR}/id_rsa already present, skipping decrypt"
 else
     "$DECRYPT" "$KEY" < "${FILES_DIR}/id_rsa.crypted" > "${SSH_DIR}/id_rsa"
+    rc=$?
+    if [[ $rc -ne 0 ]]; then
+        rm -f "${SSH_DIR}/id_rsa"
+        log ERROR "decryptStdin.sh failed (exit ${rc}) while decrypting id_rsa.crypted — wrong --key, or the encrypted file is corrupted"
+        exit 1
+    fi
     log INFO "decrypted id_rsa to ${SSH_DIR}/id_rsa"
 fi
 chmod 600 "${SSH_DIR}/id_rsa"
@@ -87,6 +104,12 @@ if [[ -f "${SSH_DIR}/id_rsa.pub" ]]; then
     log INFO "${SSH_DIR}/id_rsa.pub already present, skipping decrypt"
 else
     "$DECRYPT" "$KEY" < "${FILES_DIR}/id_rsa.pub.crypted" > "${SSH_DIR}/id_rsa.pub"
+    rc=$?
+    if [[ $rc -ne 0 ]]; then
+        rm -f "${SSH_DIR}/id_rsa.pub"
+        log ERROR "decryptStdin.sh failed (exit ${rc}) while decrypting id_rsa.pub.crypted — wrong --key, or the encrypted file is corrupted"
+        exit 1
+    fi
     log INFO "decrypted id_rsa.pub to ${SSH_DIR}/id_rsa.pub"
 fi
 chmod 644 "${SSH_DIR}/id_rsa.pub"
@@ -95,6 +118,12 @@ if [[ -f "${SSH_DIR}/authorized_keys" ]]; then
     log INFO "${SSH_DIR}/authorized_keys already present, skipping decrypt"
 else
     "$DECRYPT" "$KEY" < "${FILES_DIR}/authorized_keys.crypted" > "${SSH_DIR}/authorized_keys"
+    rc=$?
+    if [[ $rc -ne 0 ]]; then
+        rm -f "${SSH_DIR}/authorized_keys"
+        log ERROR "decryptStdin.sh failed (exit ${rc}) while decrypting authorized_keys.crypted — wrong --key, or the encrypted file is corrupted"
+        exit 1
+    fi
     log INFO "decrypted authorized_keys to ${SSH_DIR}/authorized_keys"
 fi
 chmod 644 "${SSH_DIR}/authorized_keys"

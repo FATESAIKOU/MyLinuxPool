@@ -60,8 +60,15 @@ install.sh [--key <FILE_CRYPTO_KEY>] [--home <dir>] [--user <name>] [--check]
 | `gh` | gh 本體 + token 檔 + git credential helper | true |
 | `dotfiles` | `.bashrc` `.vimrc` `.tmux.conf` | false |
 | `ssh-admin` | `fatesaikou` 的 ssh 身分（Gateway） | false |
-| `ssh-tunnel` | `sshproxy` 的隧道身分（provider／worker） | false |
+| `ssh-tunnel-client` | `sshproxy` 隧道私鑰（撥出的一方：provider／worker） | false |
+| `ssh-tunnel-server` | `sshproxy` 帳號的 authorized_keys（被撥入的一方：Gateway） | false |
 | `standalonescripts` | `dlpw` `uppw`（依賴 rclone） | false |
+
+> **2026-09-15 修正**：`ssh-tunnel-client`／`ssh-tunnel-server` 原本是同一個
+> `ssh-tunnel` unit，裝的是 sshproxy 的私鑰——這在 provider/worker（撥出的
+> 一方）上是對的，但同一份 profile 套到 Gateway（被撥入的一方）上語意就錯
+> 了：Gateway 需要的是 authorized_keys，不是私鑰。同一個名字底下裝著兩種
+> 不同的東西，只是恰好都叫「sshproxy 的隧道身分」，所以拆成兩個 unit。
 
 ## 2. `profiles/<role>/<name>/`
 
@@ -78,7 +85,7 @@ cloud-config.yaml cloud-init
 {
   "name": "default",
   "role": "gateway",
-  "shared_config": ["pool-runtime", "ssh-admin", "ssh-tunnel", "rclone",
+  "shared_config": ["pool-runtime", "ssh-admin", "ssh-tunnel-server", "rclone",
                     "standalonescripts", "dotfiles", "gh"],
   "packages": ["curl", "ca-certificates", "git", "jq", "netcat-openbsd",
                "util-linux", "iproute2", "fail2ban", "docker.io"],
@@ -158,15 +165,20 @@ scripts/
 改成以服務為分發單位後，每個 unit 自帶安裝邏輯與宣告，profile 明確列出
 要什麼。「這台機器上有什麼」變成讀一個 JSON 就知道的事。
 
-## 6. `--check` 的用途：找出宣告與實際的落差
+## 6. `--check` 的用途與現在的範圍
 
-每個 unit 的 `install.sh --check` 除了驗證「該裝的有沒有裝好」，還讓上層能
-回答一個目前完全無法回答的問題：**這台機器上有沒有不該存在的東西？**
+每個 unit 的 `install.sh --check` 驗證的是**單一方向**：「profile 宣告的
+這個 unit，在這台機器上有沒有裝好」。profile 明確列出 unit 之後，
+`pool-status` 可以逐一跑每個宣告 unit 的 `--check` 並比對，把「宣告了但
+沒裝好」的落差報出來——這是舊的檔案系統覆蓋層做不到的，因為舊結構下沒有
+任何地方寫著「這台機器應該有什麼」。
 
-2026-09-14 的實例：Gateway 上有 `~/testSH/grc.sh`，但 repo 裡已經刪掉它了
-——那台機器是在刪除之前 rotate 出來的。它是一個「repo 裡不存在、機器上卻
-有」的孤兒。在舊結構下沒有任何機制看得見這件事，因為沒有地方寫著
-「這台機器應該有什麼」。
-
-profile 明確列出 unit 之後，`pool-status` 可以逐一跑 `--check` 並比對，
-把落差報出來。這是舊的檔案系統覆蓋層做不到的。
+> **目前不做的事：反過來抓孤兒**。`--check` 不會掃機器上的檔案、反查有
+> 沒有任何 profile 宣告過它——也就是說，它回答不了「這台機器上有沒有不
+> 該存在的東西」。2026-09-15 把 `shared_config/` 送上現行 Gateway 逐一跑
+> `--check` 時，翻出了 `~/testSH/grc.sh`（repo 裡已刪除的舊檔，2026-09-14
+> 就發現過一次）與 `~/testSH/pws`（來源不明）——這兩個都是人工比對「機器
+> 上有什麼」與「profile 宣告了什麼」才找到的，`--check` 本身認不出它們。
+> 孤兒偵測（列出機器上的檔案、與所有已裝 unit 的 `files/` 清單反向比對、
+> 報出多餘項目）是明確未做的能力，需要另外設計——不要以為現在的
+> `--check` 已經涵蓋這件事。
