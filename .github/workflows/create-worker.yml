@@ -316,3 +316,21 @@ jobs:
         with:
           node: gateway
           command: ~/.mylinuxpool/bin/pool-port-alloc --release ${{ steps.port.outputs.port }}
+
+      # The port claim above was already rolled back on failure; the ledger
+      # entry needs the same treatment, or POOL_WORKERS keeps advertising a
+      # worker that was torn down. Seen for real on run 34853882457, which
+      # failed at the push after the entry was written.
+      - name: On failure, remove the entry from POOL_WORKERS
+        if: failure() && steps.port.outputs.port != ''
+        shell: bash
+        run: |
+          set -uo pipefail
+          source scripts/lib/ledger.sh
+          cur="$(gh api "repos/${GH_REPO}/actions/variables/POOL_WORKERS" --jq .value 2>/dev/null || true)"
+          new="$(ledger_remove "$cur" "${{ steps.port.outputs.port }}")"
+          if printf '%s' "$new" | gh variable set POOL_WORKERS --repo "$GH_REPO"; then
+            echo "rolled port ${{ steps.port.outputs.port }} back out of POOL_WORKERS"
+          else
+            echo "::warning::could not roll port ${{ steps.port.outputs.port }} out of POOL_WORKERS — check the variable by hand"
+          fi

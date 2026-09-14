@@ -39,6 +39,31 @@ GW_IP="${PUSH_GATEWAY_IP:?PUSH_GATEWAY_IP not set}"
 GW_USER="${PUSH_GATEWAY_USER:-fatesaikou}"
 HOST_KEY="${PUSH_HOST_KEY:-}"
 SOURCE="${PUSH_SOURCE:?PUSH_SOURCE not set}"
+SSH_KEY="${PUSH_SSH_KEY:-}"
+
+# The action is self-contained when a key is provided: start a temporary
+# ssh-agent and load the key from stdin — never a temp file, never in a
+# log, never on a command line (ssh-add - reads the agent protocol from
+# stdin). The agent is killed on exit so no socket outlives the step.
+# Without a key the caller's own agent (repair-gateway's "Start ssh-agent"
+# step) is used as before.
+SSH_AGENT_PID_OLD="${SSH_AGENT_PID:-}"
+SSH_AUTH_SOCK_OLD="${SSH_AUTH_SOCK:-}"
+cleanup_agent() {
+    if [[ -n "$SSH_AGENT_PID_OLD" && -n "$SSH_AGENT_PID" && "$SSH_AGENT_PID" != "$SSH_AGENT_PID_OLD" ]]; then
+        ssh-agent -k >/dev/null 2>&1 || true
+    fi
+}
+if [[ -n "$SSH_KEY" ]]; then
+    eval "$(ssh-agent -s)" >/dev/null
+    if ! printf '%s\n' "$SSH_KEY" | ssh-add - >/dev/null 2>&1; then
+        log ERROR "could not load the provided ssh key into the temporary agent"
+        cleanup_agent
+        exit 1
+    fi
+    log INFO "loaded the provided ssh key into a temporary agent (will be killed on exit)"
+    trap cleanup_agent EXIT
+fi
 
 STATE_LIB="${WS}/scripts/lib/state.sh"
 if [[ ! -f "$STATE_LIB" ]]; then

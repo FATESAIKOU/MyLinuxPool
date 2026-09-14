@@ -23,6 +23,16 @@ inputs:
   source:
     description: "<workflow>#<run_id> written into the state.json source field"
     required: true
+  ssh-key:
+    description: >-
+      Private key for <gateway-user> on the Gateway. When set, run.sh starts
+      a temporary ssh-agent, loads the key from stdin (never written to
+      disk, never in a log or command line) and kills the agent when done.
+      When empty, run.sh uses the caller's existing ssh-agent (e.g. a
+      workflow's own "Start ssh-agent" step). Providing it makes the action
+      self-contained — no hidden dependency on what the caller set up.
+    required: false
+    default: ""
 
 runs:
   using: composite
@@ -34,6 +44,7 @@ runs:
         PUSH_GATEWAY_USER: ${{ inputs.gateway-user }}
         PUSH_HOST_KEY: ${{ inputs.host-key }}
         PUSH_SOURCE: ${{ inputs.source }}
+        PUSH_SSH_KEY: ${{ inputs.ssh-key }}
         GH_TOKEN: ${{ env.GH_TOKEN }}
         GH_REPO: ${{ github.repository }}
       run: ${{ github.action_path }}/run.sh
