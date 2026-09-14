@@ -519,3 +519,51 @@ Gateway 是用它被建立當下的那個版本 provision 的，不會自動追�
 > 判斷方式：`pool-status` 若在 Gateway 相關檢查出現 FAIL，先確認現行機器是
 > 用哪個版本的 provision 建的（`NODE_GATEWAY.rotated_at` 對照 git log），
 > 再決定是補齊還是 rotate。
+
+---
+
+## 9. 傳送機密到遠端機器的唯一正確做法
+
+**絕對不要**把腳本與機密同時灌進 stdin：
+
+```bash
+# ❌ 錯的 —— 兩者黏在一起被當成指令執行，機密出現在錯誤訊息裡
+cat crypto_key | ssh host 'bash -s' <<'EOF'
+...
+EOF
+```
+
+這個錯誤在 2026-09-13 與 09-14 各犯過一次，兩次都導致 FILE_CRYPTO_KEY
+洩漏並必須輪替全部 9 個 `.crypted` 檔案。
+
+**正確做法**：腳本先落地成檔案，機密單獨走 stdin。
+
+```bash
+# ✅ 對的
+scp script.sh host:/tmp/script.sh
+ssh host 'bash /tmp/script.sh' < crypto_key
+```
+
+或者用環境變數，但值必須來自遠端已存在的檔案，不能經由命令列傳遞：
+
+```bash
+ssh host 'export K="$(cat /tmp/.key)"; bash /tmp/script.sh'
+```
+
+### 判斷法則
+
+問自己：**這個機密會不會出現在任何一層的命令列或錯誤訊息裡？**
+ssh、bash、cmd.exe、PowerShell 每多一層轉義就多一次機會出錯。層數超過兩層
+時，一律改用檔案。
+
+### 金鑰輪替程序
+
+若機密真的洩漏了：
+
+1. 用舊金鑰解出全部明文到暫存目錄
+2. 產生新金鑰（`tr -dc 'A-Za-z0-9' < /dev/urandom | head -c 32`）
+3. 以新金鑰重新加密回原位
+4. **逐一驗證可解**，並抽查內容健全性（私鑰開頭、授權金鑰數、設定段落數）
+5. 清除明文暫存
+6. `gh secret set FILE_CRYPTO_KEY`
+7. provider 上不存此金鑰（只在註冊當下用一次），無需同步
