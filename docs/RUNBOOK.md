@@ -533,6 +533,58 @@ ERROR .../shared-configs/ssh-tunnel-server/install.sh missing or not executable
 修法：`git update-index --chmod=+x <path>`。改本機的 `chmod` 不夠，
 要進版控的是 git index 裡的模式。
 
+### 7.6 「檔案已存在就跳過」把佈署變成靜默的空操作
+
+rotate 到 generation 4 之後，我從 Mac 進不去新 Gateway 了——
+`Permission denied (publickey)`，但我的公鑰明明在
+`ssh-admin/files/authorized_keys.crypted` 宣告的清單裡。
+
+原因在 `ssh-admin/install.sh`：
+
+```bash
+if [[ -f "${SSH_DIR}/authorized_keys" ]]; then
+    log INFO "already present, skipping decrypt"
+```
+
+cloud-init 建帳號時就會寫一份 `authorized_keys`（只含 Actions 那把 ed25519），
+所以這個 unit **每一次都跳過**，宣告的 10 把鑰匙一把也沒裝上去。而且它記的是
+`INFO`，接著回報「ssh-admin installed」，整條 rotate 一路綠燈。
+
+更糟的是 `--check` 只驗「三個檔案存不存在」，所以 `verify-profile` 對一台
+`authorized_keys` 根本不對的機器，一直回報 `matches`。
+
+**這是「不會失敗的檢查」的第七次。**（前六次見 §7.5 與
+`POOL_RUNTIME_SPEC.md` §8。）症狀每次都不同，形狀完全一樣：
+*我們驗了一個比在乎的東西更容易滿足的條件。*
+
+修法有三層：
+
+1. **install 改成聯集**，不是覆蓋也不是跳過：把宣告的鑰匙併進現有清單，
+   以金鑰本體去重。理由是**安裝動作永遠不該有能力踢掉一個當下可用的身分**；
+   撤銷鑰匙必須是刻意的行為，不能是佈署的副作用。
+2. **`--check` 改成比對內容**：缺少宣告的鑰匙 → 失敗；有未宣告的鑰匙 → 警告
+   （讓它保持可見，而不是被安靜接受）。
+3. **`ssh-tunnel-server` 同樣處理**。它今天沒出事只是因為 cloud-init 剛好
+   種了同一把 sshproxy 鑰匙，宣告清單一旦要增長就會踩到。
+
+還沒處理的：`rclone`、`ssh-tunnel-client`、`standalonescripts`、
+以及 `ssh-admin` 的 `id_rsa` / `id_rsa.pub` 也都是「存在就跳過」。
+單檔機密不覆蓋是合理的（避免蓋掉本機輪替過的金鑰），但 `--check`
+仍應該比對內容，否則漂移一樣看不見。
+
+### 7.7 rotate 會消滅自己的救援退路
+
+`scripts/rotate-gateway.sh` 用 `openssl rand -base64 24` 產生新機器的 root
+密碼，用完就丟。也就是說 `SECRETS.md` 裡記的那個 LISH 救援密碼，
+**在每次 rotate 完成的瞬間就對應到一台已經被刪掉的機器**——
+最需要退路的時候，退路剛好不存在。
+
+已改成優先取 `GATEWAY_ROOT_PASS`（workflow 由選用的 `GATEWAY_ROOT_PASSWORD`
+secret 餵入），沒設定才回退隨機並在 log 明說「這台無法用主控台救援」。
+
+Generation 4 這台是在修好之前建的，它的 root 密碼無人知曉。
+現階段的替代退路是 `repair-gateway` workflow（見 §8）。
+
 ---
 
 ## 8. 改了 provision-gateway.sh 之後
@@ -546,10 +598,27 @@ Gateway 是用它被建立當下的那個版本 provision 的，不會自動追�
 
 改完 provision 後選一條：
 
-1. **立刻 rotate** —— 最乾淨，機器與程式碼重新對齊。但要花約 6 分鐘且會有
-   數十秒的隧道中斷。
-2. **手動補齊並記錄** —— 適合小改動或剛 rotate 過不久。補完要在此處記一筆，
-   否則下次有人查「為什麼這台機器上有 X 但 provision-gateway.sh 沒裝 X」會很困惑。
+1. **跑 `repair-gateway` workflow**（多數情況選這個）——
+   對**現役**機器重跑 provision，不換硬體、不換 IP、不碰 `NODE_GATEWAY`。
+   需要輸入現役 IP 當確認字串，避免手滑打到別台。
+   ```
+   gh workflow run repair-gateway.yml -f confirm=<現役 Gateway IP>
+   ```
+   它跟 rotate 共用 concurrency group，所以不會在 rotate 進行中插隊。
+2. **立刻 rotate** —— 機器與程式碼徹底重新對齊（連 cloud-config 的改動也生效）。
+   約 6 分鐘，隧道中斷數十秒，而且**現役的 worker 容器會失聯**（見下）。
+3. **手動補齊並記錄** —— 只在前兩者都不可行時。補完要在此處記一筆。
+
+`repair-gateway` 還有第二個用途：**它是你進不去 Gateway 時的回家路。**
+Actions 手上有 `SSH_KEY_ACTIONS`，就算你的身分被漂移掉了它還進得去，
+可以把宣告狀態壓回機器上。2026-09-14 的 §7.6 事故就是這樣救回來的——
+比 LISH 快，也不需要 root 密碼。
+
+> **rotate 會讓現役 worker 失聯。** worker 跑在 `STATIC_GATEWAY` 模式
+> （`POOL_GATEWAY_HOST` 給死值，容器內才不需要任何 GitHub 憑證），
+> 而那個模式刻意關掉了 30 秒漂移偵測（`pool-tunnel:348`）。
+> 舊機器一刪，它們的隧道就永久斷了，容器要重建。
+> provider 不受影響——它們會自己跟過去，實測 1 秒。
 
 ### 已知的手動補齊紀錄
 
