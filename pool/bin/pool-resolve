@@ -1,0 +1,276 @@
+#!/usr/bin/env bash
+# pool-resolve — spec: docs/POOL_RUNTIME_SPEC.md §1
+# Reads and expands node definitions from GitHub repo variables.
+# This is the ONLY component allowed to call `gh` for node addressing.
+
+set -uo pipefail
+
+REPO="${POOL_REPO:-FATESAIKOU/MyLinuxPool}"
+STATE_DIR="${HOME}/.mylinuxpool"
+CACHE_DIR="${STATE_DIR}/cache"
+GH_TOKEN_FILE="${STATE_DIR}/gh_token"
+CACHE_TTL=30
+MAX_HOP_DEPTH=5
+
+log() {
+    local level="$1"; shift
+    local ts
+    ts="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    if [[ "$level" == "INFO" ]]; then
+        printf '[%s] %s %s\n' "$ts" "$level" "$*"
+    else
+        printf '[%s] %s %s\n' "$ts" "$level" "$*" >&2
+    fi
+}
+
+# `gh auth login` insists on a `read:org` scope we don't have and don't
+# need — register.sh instead drops the PAT in $GH_TOKEN_FILE (600) and gh
+# itself honors a bare GH_TOKEN env var with no login step at all. Load it
+# here so pool-tunnel.service doesn't need any environment wiring for it.
+load_gh_token() {
+    if [[ -z "${GH_TOKEN:-}" && -f "$GH_TOKEN_FILE" ]]; then
+        GH_TOKEN="$(cat "$GH_TOKEN_FILE")"
+        export GH_TOKEN
+    fi
+}
+
+# Never let a raw gh error blob leak the token into logs.
+redact() {
+    local s="$1"
+    if [[ -n "${GH_TOKEN:-}" ]]; then
+        s="${s//$GH_TOKEN/***REDACTED***}"
+    fi
+    printf '%s' "$s"
+}
+
+usage() {
+    echo "usage: pool-resolve <node-name> [--field <jq-path>] [--expand-hops] [--refresh]" >&2
+}
+
+var_name_for() {
+    local name="$1" upper
+    upper="$(printf '%s' "$name" | tr '[:lower:]' '[:upper:]' | tr '-' '_')"
+    printf 'NODE_%s' "$upper"
+}
+
+cache_path_for() {
+    printf '%s/%s.json' "$CACHE_DIR" "$1"
+}
+
+file_mtime() {
+    stat -c %Y "$1" 2>/dev/null || stat -f %m "$1" 2>/dev/null
+}
+
+cache_fresh() {
+    local f="$1" mtime now age
+    [[ -f "$f" ]] || return 1
+    mtime="$(file_mtime "$f")"
+    [[ -n "$mtime" ]] || return 1
+    now="$(date +%s)"
+    age=$(( now - mtime ))
+    (( age < CACHE_TTL ))
+}
+
+# Reads (and caches) the raw JSON for a node. Honors the 30s TTL cache and
+# falls back to a stale cache (with a WARN) when a live read fails, so a
+# transient network/API outage does not bring the tunnel down.
+resolve_node() {
+    local name="$1" refresh="$2" var cache
+    var="$(var_name_for "$name")"
+    cache="$(cache_path_for "$name")"
+
+    if [[ "$refresh" -ne 1 ]] && cache_fresh "$cache"; then
+        cat "$cache"
+        return 0
+    fi
+
+    mkdir -p "$CACHE_DIR"
+
+    # `gh variable get` needs a gh version newer than what fh-l's apt ships
+    # (2.45.0). `gh api` has existed forever and is equivalent here.
+    local out rc
+    out="$(gh api "repos/${REPO}/actions/variables/${var}" --jq .value 2>&1)"
+    rc=$?
+
+    if [[ $rc -eq 0 ]] && printf '%s' "$out" | jq empty >/dev/null 2>&1; then
+        printf '%s' "$out" > "$cache"
+        printf '%s\n' "$out"
+        return 0
+    fi
+
+    if [[ -f "$cache" ]]; then
+        log WARN "pool-resolve: live read of $var failed ($(redact "${out//$'\n'/ }")), using stale cache"
+        cat "$cache"
+        return 0
+    fi
+
+    # `gh api` reports a missing variable as "HTTP 404" on stderr, unlike
+    # `gh variable get`'s "not found" text — must not conflate this with an
+    # auth/network failure, which gets exit 4 instead.
+    if printf '%s' "$out" | grep -q '404'; then
+        log ERROR "pool-resolve: variable $var does not exist (HTTP 404): $(redact "${out//$'\n'/ }")"
+        return 3
+    fi
+
+    log ERROR "pool-resolve: failed to read $var via gh api: $(redact "${out//$'\n'/ }")"
+    return 4
+}
+
+# Synthesizes a single terminal hop from a node's own connection fields,
+# for a node that has no "hops" of its own (it IS the end of the chain,
+# e.g. the Gateway). Deliberately `.user`, not `.tunnel_user`: jump chains
+# use the management identity, reverse tunnels use the restricted
+# tunnel_user — they must never be mixed. Prints "" and returns 1 if the
+# node has neither hops nor enough fields (ip/user) to synthesize from.
+synthesize_terminal_hop() {
+    local node_json="$1" synth missing
+    synth="$(printf '%s' "$node_json" | jq -c '{host: .ip, port: (.port // 22), user: .user, key_secret: .key_secret}')"
+    missing="$(printf '%s' "$synth" | jq -r 'if (.host == null or .user == null) then "1" else "0" end')"
+    if [[ "$missing" == "1" ]]; then
+        return 1
+    fi
+    printf '%s' "$synth"
+    return 0
+}
+
+# Recursively expands a hops array: any element with a "via" key is replaced
+# in place by that named node's own (recursively expanded) hops array.
+# Depth > 5 or a cycle back to an already-visited node both return exit 5.
+expand_hops() {
+    local hops_json="$1" depth="$2" visited="$3" refresh="$4"
+
+    if (( depth > MAX_HOP_DEPTH )); then
+        log ERROR "pool-resolve: hop expansion exceeded max depth ${MAX_HOP_DEPTH}"
+        return 5
+    fi
+
+    local count
+    count="$(printf '%s' "$hops_json" | jq 'length')" || return 5
+
+    local result="[]" i
+    for (( i = 0; i < count; i++ )); do
+        local hop via
+        hop="$(printf '%s' "$hops_json" | jq -c ".[$i]")"
+        via="$(printf '%s' "$hop" | jq -r 'if has("via") then .via else empty end')"
+
+        if [[ -n "$via" ]]; then
+            if printf ',%s,' "$visited" | grep -qF ",${via},"; then
+                log ERROR "pool-resolve: cycle detected expanding hops (${visited} -> ${via})"
+                return 5
+            fi
+
+            local via_node via_rc
+            via_node="$(resolve_node "$via" "$refresh")"
+            via_rc=$?
+            if [[ $via_rc -ne 0 ]]; then
+                log ERROR "pool-resolve: could not resolve via-hop '$via'"
+                return $via_rc
+            fi
+
+            local has_hops
+            has_hops="$(printf '%s' "$via_node" | jq -r 'has("hops")')"
+
+            if [[ "$has_hops" == "true" ]]; then
+                local via_hops expanded exp_rc
+                via_hops="$(printf '%s' "$via_node" | jq -c '.hops')"
+                expanded="$(expand_hops "$via_hops" $((depth + 1)) "${visited},${via}" "$refresh")"
+                exp_rc=$?
+                if [[ $exp_rc -ne 0 ]]; then
+                    return $exp_rc
+                fi
+                result="$(jq -c -n --argjson a "$result" --argjson b "$expanded" '$a + $b')"
+            else
+                # Base case: X has no "hops" of its own — see
+                # synthesize_terminal_hop above.
+                local synth
+                if ! synth="$(synthesize_terminal_hop "$via_node")"; then
+                    log ERROR "pool-resolve: via-hop '$via' has neither 'hops' nor ip/user to synthesize a terminal hop"
+                    return 5
+                fi
+                result="$(jq -c -n --argjson a "$result" --argjson h "$synth" '$a + [$h]')"
+            fi
+        else
+            result="$(jq -c -n --argjson a "$result" --argjson h "$hop" '$a + [$h]')"
+        fi
+    done
+
+    printf '%s\n' "$result"
+    return 0
+}
+
+main() {
+    load_gh_token
+
+    if [[ $# -lt 1 ]]; then
+        usage
+        return 2
+    fi
+
+    local node="$1"; shift
+    local field="" expand=0 refresh=0
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --field)
+                [[ $# -ge 2 ]] || { usage; return 2; }
+                field="$2"; shift 2 ;;
+            --expand-hops)
+                expand=1; shift ;;
+            --refresh)
+                refresh=1; shift ;;
+            *)
+                log ERROR "pool-resolve: unknown argument: $1"
+                usage
+                return 2 ;;
+        esac
+    done
+
+    if [[ -z "$node" || "$node" == --* ]]; then
+        usage
+        return 2
+    fi
+
+    local json rc
+    json="$(resolve_node "$node" "$refresh")"
+    rc=$?
+    if [[ $rc -ne 0 ]]; then
+        return $rc
+    fi
+
+    if [[ "$expand" -eq 1 ]]; then
+        local has_hops expanded
+        has_hops="$(printf '%s' "$json" | jq -r 'has("hops")')"
+
+        if [[ "$has_hops" == "true" ]]; then
+            local hops
+            hops="$(printf '%s' "$json" | jq -c '.hops')"
+            expanded="$(expand_hops "$hops" 1 "$node" "$refresh")"
+            rc=$?
+            if [[ $rc -ne 0 ]]; then
+                return $rc
+            fi
+        else
+            # The requested node itself has no "hops" (e.g. `gateway`) —
+            # it IS the destination, so the chain is just itself.
+            local synth
+            if ! synth="$(synthesize_terminal_hop "$json")"; then
+                log ERROR "pool-resolve: node '$node' has neither 'hops' nor ip/user to synthesize a terminal hop"
+                return 5
+            fi
+            expanded="$(jq -c -n --argjson h "$synth" '[$h]')"
+        fi
+
+        printf '%s\n' "$expanded" | jq '.'
+        return 0
+    fi
+
+    if [[ -n "$field" ]]; then
+        printf '%s' "$json" | jq -r "$field"
+        return 0
+    fi
+
+    printf '%s\n' "$json" | jq '.'
+    return 0
+}
+
+main "$@"

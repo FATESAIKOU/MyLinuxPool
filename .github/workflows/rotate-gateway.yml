@@ -1,0 +1,332 @@
+name: Rotate Gateway
+
+# spec: docs/POOL_RUNTIME_SPEC.md §9.4 — flow: docs/ARCHITECTURE.md §5
+#
+# Blue/green rotate of the Gateway Linode. dry_run defaults to true because
+# this workflow replaces the one machine every provider tunnels through —
+# actually touching NODE_GATEWAY or deleting the live machine requires an
+# explicit dry_run: false.
+
+on:
+  workflow_dispatch:
+    inputs:
+      type:
+        description: Linode plan
+        required: false
+        default: g6-nanode-1
+      region:
+        description: Linode region
+        required: false
+        default: ap-northeast
+      image:
+        description: Linode image
+        required: false
+        default: linode/ubuntu24.04
+      dry_run:
+        description: >-
+          true = build + provision + verify a preview machine, then delete
+          it. Never touches NODE_GATEWAY or the live machine. false = the
+          real rotate.
+        required: false
+        type: boolean
+        default: true
+
+concurrency:
+  group: rotate-gateway
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  GH_TOKEN: ${{ secrets.GH_POOL_TOKEN }}
+  GH_REPO: ${{ github.repository }}
+
+jobs:
+  rotate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up linode-cli
+        uses: linode/action-linode-cli@v1
+        with:
+          token: ${{ secrets.LINODE_TOKEN }}
+
+      - name: Start ssh-agent, load Gateway + sshproxy keys
+        id: agent
+        shell: bash
+        env:
+          SSH_KEY_GATEWAY: ${{ secrets.SSH_KEY_GATEWAY }}
+          SSH_KEY_SSHPROXY: ${{ secrets.SSH_KEY_SSHPROXY }}
+        run: |
+          set -euo pipefail
+          eval "$(ssh-agent -s)" >/dev/null
+          echo "SSH_AUTH_SOCK=${SSH_AUTH_SOCK}" >> "$GITHUB_ENV"
+          echo "SSH_AGENT_PID=${SSH_AGENT_PID}" >> "$GITHUB_ENV"
+
+          ssh-add - <<< "$SSH_KEY_GATEWAY"
+          ssh-add - <<< "$SSH_KEY_SSHPROXY"
+
+          # Keys never touch disk: derive each public half straight out of
+          # the agent instead of writing the private key to a file for
+          # `ssh-keygen -y`. Order matches the two ssh-add calls above.
+          mapfile -t pubkeys < <(ssh-add -L)
+          {
+            echo "fatesaikou_pub=${pubkeys[0]}"
+            echo "sshproxy_pub=${pubkeys[1]}"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Read current Gateway state
+        id: read_old_gateway
+        shell: bash
+        run: |
+          set -euo pipefail
+          old_json="$(pool/bin/pool-resolve gateway --refresh)"
+          printf '%s' "$old_json" > "${RUNNER_TEMP}/old_gateway.json"
+          {
+            echo "old_ip=$(jq -r '.ip' <<<"$old_json")"
+            echo "old_generation=$(jq -r '.generation' <<<"$old_json")"
+            echo "old_label=$(jq -r '.linode_label // "fws"' <<<"$old_json")"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Create preview Gateway
+        id: create_preview
+        shell: bash
+        env:
+          FATESAIKOU_PUBKEY: ${{ steps.agent.outputs.fatesaikou_pub }}
+          SSHPROXY_PUBKEY: ${{ steps.agent.outputs.sshproxy_pub }}
+        run: |
+          set -euo pipefail
+          command -v envsubst >/dev/null 2>&1 || sudo apt-get install -y gettext-base
+
+          rendered="${RUNNER_TEMP}/cloud-config.yaml"
+          envsubst < gateway/cloud-config.yaml > "$rendered"
+
+          root_pass="$(openssl rand -base64 24 | tr -d '\n')"
+          create_json="$(linode-cli linodes create \
+            --no-defaults \
+            --label fws-preview \
+            --region "${{ inputs.region }}" \
+            --type "${{ inputs.type }}" \
+            --image "${{ inputs.image }}" \
+            --root_pass "$root_pass" \
+            --metadata.user_data "$(base64 -w0 < "$rendered")" \
+            --json)"
+
+          preview_id="$(jq -r '.[0].id' <<<"$create_json")"
+          preview_ip="$(jq -r '.[0].ipv4[0]' <<<"$create_json")"
+
+          if [[ -z "$preview_id" || "$preview_id" == "null" || -z "$preview_ip" || "$preview_ip" == "null" ]]; then
+            echo "::error::linode-cli did not return an id/ip for the preview machine"
+            exit 1
+          fi
+
+          {
+            echo "preview_id=${preview_id}"
+            echo "preview_ip=${preview_ip}"
+          } >> "$GITHUB_OUTPUT"
+          echo "::notice::created preview Linode ${preview_id} (${preview_ip})"
+
+      - name: Wait for preview to boot
+        shell: bash
+        env:
+          PREVIEW_IP: ${{ steps.create_preview.outputs.preview_ip }}
+        run: |
+          set -euo pipefail
+          for i in $(seq 1 60); do
+            if ssh -o StrictHostKeyChecking=accept-new -o ConnectTimeout=5 -o BatchMode=yes \
+                "fatesaikou@${PREVIEW_IP}" true 2>/dev/null; then
+              echo "preview reachable after ${i} attempt(s)"
+              exit 0
+            fi
+            sleep 5
+          done
+          echo "::error::preview machine never became reachable over ssh"
+          exit 1
+
+      - name: Deploy bundle (static_normal_files + decrypted static_secret_files)
+        shell: bash
+        env:
+          FILE_CRYPTO_KEY: ${{ secrets.FILE_CRYPTO_KEY }}
+          PREVIEW_IP: ${{ steps.create_preview.outputs.preview_ip }}
+        run: |
+          set -euo pipefail
+          stage="${RUNNER_TEMP}/bundle/home"
+          mkdir -p "$stage"
+
+          # static_normal_files: copied as-is.
+          if [[ -d static_normal_files/home ]]; then
+            cp -a static_normal_files/home/. "$stage/"
+          fi
+
+          # static_secret_files: every *.crypted decrypted next to its
+          # relative path with the suffix stripped. No S3, no AWS — that
+          # whole line is gone.
+          if [[ -d static_secret_files/home ]]; then
+            while IFS= read -r -d '' crypted; do
+              rel="${crypted#static_secret_files/home/}"
+              rel="${rel%.crypted}"
+              dest="${stage}/${rel}"
+              mkdir -p "$(dirname "$dest")"
+              scripts/decryptStdin.sh "$FILE_CRYPTO_KEY" < "$crypted" > "$dest"
+            done < <(find static_secret_files/home -type f -name '*.crypted' -print0)
+          fi
+
+          scp -o StrictHostKeyChecking=accept-new -r "$stage" "fatesaikou@${PREVIEW_IP}:/tmp/mlp-bundle-home"
+          ssh -o StrictHostKeyChecking=accept-new "fatesaikou@${PREVIEW_IP}" \
+            'sudo mkdir -p /home && sudo cp -a /tmp/mlp-bundle-home/. /home/ && sudo rm -rf /tmp/mlp-bundle-home'
+
+          rm -rf "${RUNNER_TEMP}/bundle"
+
+      - name: Run provision.sh on preview
+        id: provision
+        shell: bash
+        env:
+          PREVIEW_IP: ${{ steps.create_preview.outputs.preview_ip }}
+        run: |
+          set -euo pipefail
+          trusted_ips="$(gh variable get POOL_TRUSTED_IPS --repo "$GH_REPO")"
+          # shell-quote so commas/spaces in the IP list survive re-embedding
+          # into the remote command line.
+          ssh -o StrictHostKeyChecking=accept-new "fatesaikou@${PREVIEW_IP}" \
+            "sudo env POOL_TRUSTED_IPS=$(printf '%q' "$trusted_ips") bash -s" < gateway/provision.sh
+
+      - name: Switch NODE_GATEWAY to the new Gateway
+        id: switch_point
+        if: inputs.dry_run == false
+        shell: bash
+        env:
+          PREVIEW_IP: ${{ steps.create_preview.outputs.preview_ip }}
+        run: |
+          set -euo pipefail
+          old_json="$(cat "${RUNNER_TEMP}/old_gateway.json")"
+          new_gen=$(( ${{ steps.read_old_gateway.outputs.old_generation }} + 1 ))
+          now="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+
+          new_json="$(jq -n \
+            --argjson existing "$old_json" \
+            --arg ip "$PREVIEW_IP" \
+            --argjson generation "$new_gen" \
+            --arg rotated_at "$now" \
+            '$existing * {ip: $ip, generation: $generation, rotated_at: $rotated_at}')"
+
+          printf '%s' "$new_json" | gh variable set NODE_GATEWAY --repo "$GH_REPO"
+          echo "switched=true" >> "$GITHUB_OUTPUT"
+          echo "::notice::NODE_GATEWAY switched to ${PREVIEW_IP} (generation ${new_gen})"
+
+      - name: Wait for providers to reconnect
+        if: inputs.dry_run == false
+        shell: bash
+        env:
+          PREVIEW_IP: ${{ steps.create_preview.outputs.preview_ip }}
+        run: |
+          set -euo pipefail
+          ports_json="$(gh api "repos/${GH_REPO}/actions/variables" --paginate --jq \
+            '[.variables[] | select(.name | startswith("NODE_")) | .value | fromjson | select(.role == "provider") | .gateway_port]')"
+
+          mapfile -t ports < <(jq -r '.[]' <<<"$ports_json")
+          if (( ${#ports[@]} == 0 )); then
+            echo "::warning::no role=provider nodes found in NODE_* vars — nothing to wait for"
+            exit 0
+          fi
+
+          echo "waiting for providers on port(s): ${ports[*]}"
+          deadline=$(( $(date +%s) + 180 ))
+          pending=("${ports[@]}")
+
+          while (( ${#pending[@]} > 0 )) && (( $(date +%s) < deadline )); do
+            still_pending=()
+            for port in "${pending[@]}"; do
+              # Read the SSH banner over the new Gateway's own loopback,
+              # exactly like pool-tunnel's health check — a bare open port
+              # doesn't prove the tunnel is actually there (SPEC §3.2).
+              banner="$(timeout 5 ssh -o StrictHostKeyChecking=accept-new -o ConnectTimeout=3 \
+                "fatesaikou@${PREVIEW_IP}" "timeout 1 nc 127.0.0.1 ${port} </dev/null | head -c 4" 2>/dev/null || true)"
+              if [[ "$banner" != SSH-* ]]; then
+                still_pending+=("$port")
+              fi
+            done
+            pending=("${still_pending[@]}")
+            if (( ${#pending[@]} > 0 )); then
+              sleep 5
+            fi
+          done
+
+          if (( ${#pending[@]} > 0 )); then
+            echo "::error::providers never came back on port(s): ${pending[*]}"
+            exit 1
+          fi
+          echo "all providers reconnected"
+
+      - name: Promote preview to permanent Gateway
+        if: inputs.dry_run == false && success()
+        shell: bash
+        run: |
+          set -euo pipefail
+          old_label="${{ steps.read_old_gateway.outputs.old_label }}"
+          preview_id="${{ steps.create_preview.outputs.preview_id }}"
+
+          old_id="$(linode-cli linodes list --json | jq -r --arg l "$old_label" '.[] | select(.label == $l) | .id' | head -n1)"
+          if [[ -n "$old_id" && "$old_id" != "$preview_id" ]]; then
+            linode-cli linodes rm "$old_id"
+            echo "deleted old Gateway linode ${old_id} (label ${old_label})"
+          else
+            echo "::warning::could not find a distinct old Linode labeled '${old_label}' to delete"
+          fi
+
+          linode-cli linodes update "$preview_id" --label "$old_label"
+
+          current_json="$(gh api "repos/${GH_REPO}/actions/variables/NODE_GATEWAY" --jq .value)"
+          final_json="$(jq -n --argjson existing "$current_json" --arg label "$old_label" \
+            '$existing * {linode_label: $label}')"
+          printf '%s' "$final_json" | gh variable set NODE_GATEWAY --repo "$GH_REPO"
+
+          echo "::notice::rotate complete — new Gateway promoted to label '${old_label}'"
+
+      - name: Rollback NODE_GATEWAY (failure after the switch point)
+        if: failure() && steps.switch_point.outputs.switched == 'true'
+        shell: bash
+        run: |
+          old_json="$(cat "${RUNNER_TEMP}/old_gateway.json")"
+          if printf '%s' "$old_json" | gh variable set NODE_GATEWAY --repo "$GH_REPO"; then
+            echo "::error::rotate failed after switching — NODE_GATEWAY rolled back to the previous Gateway (ip ${{ steps.read_old_gateway.outputs.old_ip }}, generation ${{ steps.read_old_gateway.outputs.old_generation }})"
+          else
+            echo "::error::ROLLBACK FAILED — NODE_GATEWAY may still point at the dead preview (${{ steps.create_preview.outputs.preview_ip }})! Manual fix required NOW: gh variable set NODE_GATEWAY --repo ${GH_REPO} with ip=${{ steps.read_old_gateway.outputs.old_ip }} generation=${{ steps.read_old_gateway.outputs.old_generation }}"
+            exit 1
+          fi
+
+      - name: Clean up preview machine (dry run, or any failure before promotion)
+        if: always() && steps.create_preview.outputs.preview_id != '' && (inputs.dry_run == true || failure())
+        shell: bash
+        run: |
+          preview_id="${{ steps.create_preview.outputs.preview_id }}"
+          if linode-cli linodes rm "$preview_id"; then
+            echo "deleted preview linode ${preview_id}"
+          else
+            echo "::warning::could not delete preview linode ${preview_id} — the orphan sweep below will catch it after 2h"
+          fi
+
+      - name: Orphan sweep (delete stale *-preview machines)
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          now_epoch=$(date +%s)
+          linode-cli linodes list --json | jq -c '.[] | select(.label | endswith("-preview"))' | while read -r row; do
+            label="$(jq -r '.label' <<<"$row")"
+            id="$(jq -r '.id' <<<"$row")"
+            created="$(jq -r '.created' <<<"$row")"
+            created_epoch="$(date -u -d "$created" +%s)"
+            age=$(( now_epoch - created_epoch ))
+            if (( age > 7200 )); then
+              echo "deleting orphan '${label}' (id ${id}), age ${age}s"
+              linode-cli linodes rm "$id" || echo "::warning::failed to delete orphan '${label}' (id ${id})"
+            fi
+          done
+
+      - name: Stop ssh-agent
+        if: always()
+        shell: bash
+        run: ssh-agent -k >/dev/null 2>&1 || true

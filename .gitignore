@@ -1,0 +1,15 @@
+# 本機機密，絕不進版控
+pw
+*.key
+*.pem
+.env
+__pycache__/
+*.pyc
+.tasks/
+crypto_key
+gh_token
+crypto_key.old.bak
+gw_pw
+image copy.png
+*.screenshot.png
+fhproxy_pw
