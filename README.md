@@ -70,9 +70,11 @@
 | `SSH_KEY_ACTIONS` | GitHub Actions、管理員 | 由上往下進入所有機器 |
 | 隧道身分（`ssh-tunnel-client/files/id_rsa.crypted`） | provider / worker | 由下往上掛反向隧道 |
 
-**不變式**：`shared-configs/ssh-tunnel-client/files/id_rsa.pub.crypted` 的內容
-必須出現在 `shared-configs/ssh-tunnel-server/files/authorized_keys.crypted` 裡。
-兩者脫鉤時，所有 provider 會一起 `Permission denied (publickey)`。
+**不變式**：由 `shared-configs/ssh-tunnel-client/files/id_rsa.crypted` 用
+`ssh-keygen -y` 推導出的公鑰，必須出現在
+`shared-configs/ssh-tunnel-server/files/authorized_keys.crypted` 裡
+（公鑰不再另存一份，是私鑰的函數——N7）。兩者脫鉤時，所有 provider 會
+一起 `Permission denied (publickey)`。
 
 ## 隧道：`pool-tunnel`，不是 autossh
 

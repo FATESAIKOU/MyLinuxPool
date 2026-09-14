@@ -325,6 +325,24 @@ N7 要求「主本只有一個地方」。目前狀態盤查（2026-09-15）：
   `power.shutdown` 的（`power_targets` / `pick_power_target`）。
   一台直接用、多台 fzf 選、零台明確報錯。
 
+### repo 內的重複（2026-09-15 盤查後移除）
+
+除了寫死的清單，repo 裡還有兩份**可從既有檔案推導**的內容：
+
+```
+ssh-tunnel-server/files/id_rsa.pub.crypted  = ssh-keygen -y (ssh-tunnel-client 的私鑰)
+ssh-admin/files/id_rsa.pub.crypted          = ssh-keygen -y (同 unit 的私鑰)
+```
+
+公鑰是私鑰的函數，存第二份不增加任何資訊——卻製造了 `SPEC §4` 那條要手動
+維護的不變式，而歷史上它曾經不一致，導致所有 provider 掛不上隧道。
+
+兩個檔案都已刪除，不變式檢查改成從私鑰即時推導。
+**這讓把關更強而不是更弱**：推導出來的公鑰不可能與私鑰不一致，
+原本要靠人記得「兩個檔案要一起更新」的地方消失了。
+實測：正常時 `invariant OK`，把 authorized_keys 換成無關金鑰時
+`invariant violated` 並 exit 1。
+
 剩下 `gh_token` 一項，見 §2.8——消除它需要 rotate 在切換前主動推位址給
 provider，本次不做。
 

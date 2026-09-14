@@ -99,9 +99,8 @@ install() {
 CLEAN="$TMPROOT/clean"
 PRE="$TMPROOT/pre-existing"
 
-echo "repo still ships the crypted files (kept, just not deployed):"
+echo "repo ships the crypted files (kept, just not deployed):"
 expect_exists "id_rsa.crypted is kept" "shared-configs/ssh-admin/files/id_rsa.crypted"
-expect_exists "id_rsa.pub.crypted is kept" "shared-configs/ssh-admin/files/id_rsa.pub.crypted"
 expect_exists "authorized_keys.crypted is present" "shared-configs/ssh-admin/files/authorized_keys.crypted"
 
 echo "install into a clean fake HOME:"

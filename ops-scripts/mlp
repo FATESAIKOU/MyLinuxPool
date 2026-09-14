@@ -468,8 +468,12 @@ connect_by_name() {
 }
 
 cmd_ssh() {
-    resolve_gateway
     local target="${1:-}"
+    if [[ "$target" == -* ]]; then
+        echo "usage: mlp ssh [<node-name|worker-name|port>]  (fzf pick when omitted)" >&2
+        exit 2
+    fi
+    resolve_gateway
 
     if [[ -n "$target" ]]; then
         connect_by_name "$target"
@@ -542,8 +546,12 @@ pick_power_target() {
 }
 
 cmd_wake() {
-    resolve_gateway
     local node="${1:-}" json rc method via mac target_ip port waited state
+    if [[ "$node" == -* ]]; then
+        echo "usage: mlp wake [<node-name>]  (node must declare .power.launch; fzf pick when omitted)" >&2
+        exit 2
+    fi
+    resolve_gateway
 
     if [[ -n "$node" ]]; then
         json="$("$POOL_RESOLVE" "$node")"
@@ -598,8 +606,12 @@ cmd_wake() {
 }
 
 cmd_down() {
-    resolve_gateway
     local node="${1:-}" json rc method shutdown_cmd port confirm waited state
+    if [[ "$node" == -* ]]; then
+        echo "usage: mlp down [<node-name>]  (node must declare .power.shutdown; fzf pick when omitted)" >&2
+        exit 2
+    fi
+    resolve_gateway
 
     if [[ -n "$node" ]]; then
         json="$("$POOL_RESOLVE" "$node")"
@@ -927,6 +939,10 @@ worker_new() {
 
 worker_rm() {
     local name="${1:-}" confirm
+    if [[ "$name" == -* ]]; then
+        echo "usage: mlp worker rm [<worker-name>]  (fzf pick when omitted)" >&2
+        exit 2
+    fi
     if [[ -z "$name" ]]; then
         name="$(worker_targets \
                  | awk -F'\t' '$2 == "worker" { printf "%s\t(on %s, port %s)\n", $1, $3, $4 }' \

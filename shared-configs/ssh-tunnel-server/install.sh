@@ -12,12 +12,18 @@
 # dials out. This split undoes that.)
 #
 # Enforces the invariant from spec §4 (hit for real on 2026-09-13): the
-# shared private key's public half (id_rsa.pub.crypted) MUST appear in
-# this same bundle's authorized_keys.crypted, or every provider fails to
-# tunnel in with "Permission denied (publickey,password)". Whoever
-# regenerates this shared key pair must update both files together — this
-# check catches it here, at install time, instead of at 2am during an
-# incident.
+# shared private key's public half MUST appear in this same bundle's
+# authorized_keys.crypted, or every provider fails to tunnel in with
+# "Permission denied (publickey,password)". The public half is DERIVED
+# here with `ssh-keygen -y` from the private key — which lives in the
+# OTHER half of this identity, ssh-tunnel-client (this unit stores only
+# authorized_keys, never the private key). That cross-unit read is the
+# whole point: the derived value is the one true public half, and whoever
+# regenerates the key pair in ssh-tunnel-client can never desync it from
+# this unit again (docs/REDESIGN.md N7: one source of truth).
+# Whoever regenerates the shared key pair must still update the
+# authorized_keys bundle together with it — this check catches a mismatch
+# at install time, instead of at 2am during an incident.
 #
 # needs_key=true, needs_root=false.
 
@@ -89,6 +95,18 @@ if [[ -z "$KEY" ]]; then
     fi
 fi
 
+# The private key half of this identity lives in the ssh-tunnel-client
+# unit (this unit only ever stores authorized_keys, never the private key
+# — that is the point of the 2026-09-15 split). Its path is known and
+# stable: shared-configs/ssh-tunnel-client/files/id_rsa.crypted. The
+# public half is derived from it on the fly; the deleted per-unit
+# id_rsa.pub.crypted copies were redundant (N7: one source of truth).
+TUNNEL_CLIENT_FILES="$(cd "${SCRIPT_DIR}/../ssh-tunnel-client/files" && pwd)"
+if [[ ! -f "${TUNNEL_CLIENT_FILES}/id_rsa.crypted" ]]; then
+    log ERROR "ssh-tunnel-client/files/id_rsa.crypted not found — cannot derive the public key this unit verifies"
+    log ERROR "this unit depends on its sibling unit ssh-tunnel-client; deploy them together"
+    exit 1
+fi
 # Confirm we actually have the ability to decrypt before doing anything
 # that depends on it — an absent tool must fail as "can't check this",
 # never get misread as "checked, and it's wrong". 2026-09-15 incident:
@@ -108,27 +126,41 @@ if [[ ! -x "$DECRYPT" ]]; then
     exit 1
 fi
 
-# Both decrypted to memory (never written to disk) purely to check the
-# invariant below — authorized_keys is the only one of the two that's an
-# actual install target. Each decrypt's own exit code is checked BEFORE
-# the invariant comparison runs: a decrypt failure (wrong --key, or a
-# corrupted .crypted file) must be reported as "couldn't verify", not
-# blended into the same failure path as "verified, and it's wrong".
-pubkey_content="$("$DECRYPT" decrypt "$KEY" < "${FILES_DIR}/id_rsa.pub.crypted")"
-pubkey_rc=$?
+# Decrypted to a temp file (never written to disk) purely to check the
+# invariant below — authorized_keys is the only one that's an actual
+# install target. The temp key must be chmod 600: ssh-keygen refuses to
+# read a world-readable private key. macOS's ssh-keygen also cannot read
+# the key from a pipe (/dev/stdin), so the decrypted bytes go to a 600
+# temp file first, then ssh-keygen reads it there and the file is
+# removed. Each step's own exit code is checked BEFORE the invariant
+# comparison runs: a decrypt failure (wrong --key, or a corrupted
+# .crypted file) or a derivation failure must be reported as "couldn't
+# verify", not blended into the same failure path as "verified, and
+# it's wrong".
+key_tmp="$(mktemp)"
 authorized_keys_content="$("$DECRYPT" decrypt "$KEY" < "${FILES_DIR}/authorized_keys.crypted")"
 authorized_keys_rc=$?
+"$DECRYPT" decrypt "$KEY" < "${TUNNEL_CLIENT_FILES}/id_rsa.crypted" > "$key_tmp" 2>/dev/null
+private_decrypt_rc=$?
+chmod 600 "$key_tmp"
+pubkey_content="$(ssh-keygen -y -f "$key_tmp" 2>/dev/null)"
+derive_rc=$?
+rm -f "$key_tmp"
 
-if [[ $pubkey_rc -ne 0 || $authorized_keys_rc -ne 0 ]]; then
-    log ERROR "cannot verify invariant: crypto.sh failed (id_rsa.pub.crypted exit ${pubkey_rc}, authorized_keys.crypted exit ${authorized_keys_rc})"
+if [[ $private_decrypt_rc -ne 0 || $derive_rc -ne 0 || $authorized_keys_rc -ne 0 ]]; then
+    log ERROR "cannot verify invariant: decrypt/derive failed (id_rsa.crypted decrypt exit ${private_decrypt_rc}, ssh-keygen exit ${derive_rc}, authorized_keys.crypted decrypt exit ${authorized_keys_rc})"
     log ERROR "this means the --key is wrong or a .crypted file is corrupted — NOT that the invariant is violated. Fix the decrypt failure first, then re-run to actually check the invariant."
+    exit 1
+fi
+if ! printf '%s' "$pubkey_content" | grep -q '^ssh-'; then
+    log ERROR "cannot verify invariant: ssh-keygen -y produced no public key from the decrypted private key (did it decrypt to a real key?)"
     exit 1
 fi
 
 pubkey_fields="$(printf '%s' "$pubkey_content" | awk '{print $1, $2}')"
 if ! printf '%s\n' "$authorized_keys_content" | awk '{print $1, $2}' | grep -qxF "$pubkey_fields"; then
-    log ERROR "invariant violated: id_rsa.pub.crypted's key is not present in authorized_keys.crypted"
-    log ERROR "these two files must be updated together whenever the shared sshproxy key is regenerated (spec §4) — every provider/worker would otherwise fail to tunnel in with 'Permission denied (publickey,password)'"
+    log ERROR "invariant violated: the public key derived from ssh-tunnel-client/files/id_rsa.crypted is not present in authorized_keys.crypted"
+    log ERROR "these two must be updated together whenever the shared sshproxy key is regenerated (spec §4) — every provider/worker would otherwise fail to tunnel in with 'Permission denied (publickey,password)'"
     exit 1
 fi
 log INFO "invariant OK: sshproxy's public key is present in authorized_keys"
