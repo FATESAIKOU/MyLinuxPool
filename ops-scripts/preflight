@@ -73,10 +73,14 @@ done < <(git ls-files 'shared-configs/*/unit.json')
 ok "unit needs_key 與 files/ 一致"
 
 # 舊路徑殘留
+# 散文（docs/、README）談得起舊路徑——它們在解釋為什麼不要那樣寫。
+# 這支腳本自己也帶著那些字串，當然要排除，否則它永遠對自己告警。
 LEFT="$(grep -rlE 'shared_config/|ops-script/|(^|[^-a-z])(bin/mlp|provider/register\.sh|gateway/provision\.sh)' \
-        $(git ls-files | grep -vE '^docs/') 2>/dev/null | sort -u)"
+        $(git ls-files | grep -vE '^docs/|^README\.md$|^ops-scripts/preflight$') 2>/dev/null | sort -u)"
 if [ -n "$LEFT" ]; then
-    echo "$LEFT" | while read -r f; do bad "殘留舊路徑: $f"; done
+    # 不要用 `| while`：那會開 subshell，bad 的計數就丟了，
+    # 於是這支腳本會一邊印 FAIL 一邊 exit 0。
+    for f in $LEFT; do bad "殘留舊路徑: $f"; done
 else
     ok "無舊路徑殘留"
 fi
