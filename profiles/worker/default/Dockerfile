@@ -4,9 +4,9 @@
 # Build from the REPO ROOT, not this directory:
 #   docker build -f profiles/worker/default/Dockerfile -t mylinuxpool-worker-default .
 # This COPYs pool-tunnel and pool-resolve straight from the pool-runtime
-# shared_config unit so the worker runs the exact same tunnel supervisor a
+# shared-configs unit so the worker runs the exact same tunnel supervisor a
 # provider does — not a duplicated copy — which needs a build context wide
-# enough to reach shared_config/.
+# enough to reach shared-configs/.
 #
 # No secret ever gets baked in here (spec §7). WORKER_KEY,
 # WORKER_AUTHORIZED_KEYS, POOL_GATEWAY_PORT, POOL_NODE_NAME and GH_TOKEN /
@@ -42,7 +42,7 @@ RUN mkdir -p /etc/ssh/sshd_config.d && { \
         echo 'KbdInteractiveAuthentication no'; \
     } > /etc/ssh/sshd_config.d/10-mylinuxpool.conf
 
-COPY shared_config/pool-runtime/files/pool-tunnel shared_config/pool-runtime/files/pool-resolve /usr/local/bin/
+COPY shared-configs/pool-runtime/files/pool-tunnel shared-configs/pool-runtime/files/pool-resolve /usr/local/bin/
 RUN chmod +x /usr/local/bin/pool-tunnel /usr/local/bin/pool-resolve
 
 COPY profiles/worker/default/entrypoint.sh /usr/local/bin/docker-entrypoint.sh

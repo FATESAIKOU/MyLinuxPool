@@ -1,0 +1,86 @@
+#!/usr/bin/env bash
+# preflight —— 推 master 之前在本機跑一次，抓那些「語法檢查過但實際會壞」的問題。
+#
+# 存在的理由：2026-09-14 的改名重構語法全過、JSON 全合法、三台機器
+# verify-profile 都 matches，然後 create-worker 一跑就炸——Dockerfile 的
+# COPY 路徑是純字串，任何靜態檢查都碰不到它。
+#
+# 這支腳本檢查的是「引用的東西真的存在嗎」，不是「語法對嗎」。
+set -uo pipefail
+cd "$(dirname "${BASH_SOURCE[0]:-$0}")/.." || exit 1
+
+FAIL=0
+ok()   { printf '  \033[32mok\033[0m    %s\n' "$1"; }
+bad()  { printf '  \033[31mFAIL\033[0m  %s\n' "$1"; FAIL=1; }
+
+echo "preflight: $(pwd)"
+echo
+
+echo "── 語法 ──"
+n=0
+while IFS= read -r f; do
+    head -1 "$f" 2>/dev/null | grep -q python && continue
+    bash -n "$f" 2>/dev/null || { bad "bash -n $f"; continue; }
+    n=$((n+1))
+done < <(git ls-files | grep -E '\.sh$|^ops-scripts/(mlp|verify-profile|preflight)$|/files/pool-')
+ok "$n 支 shell 腳本"
+
+n=0
+while IFS= read -r f; do
+    python3 -c "import json;json.load(open('$f'))" 2>/dev/null || { bad "JSON $f"; continue; }
+    n=$((n+1))
+done < <(git ls-files '*.json')
+ok "$n 個 JSON"
+
+n=0
+while IFS= read -r f; do
+    python3 -c "import yaml;yaml.safe_load(open('$f'))" 2>/dev/null || { bad "YAML $f"; continue; }
+    n=$((n+1))
+done < <(git ls-files '*.yml' '*.yaml')
+ok "$n 個 YAML"
+
+echo
+echo "── 引用的檔案真的存在嗎（靜態檢查抓不到的那種）──"
+
+# Dockerfile 的 COPY 來源
+n=0
+while IFS= read -r df; do
+    while IFS= read -r src; do
+        [ -z "$src" ] && continue
+        case "$src" in --*|/*) continue ;; esac
+        if [ -e "$src" ]; then n=$((n+1)); else bad "COPY 來源不存在: $src  (${df})"; fi
+    done < <(grep -E '^\s*COPY ' "$df" 2>/dev/null | awk '{for(i=2;i<NF;i++) print $i}')
+done < <(git ls-files '*Dockerfile')
+ok "$n 個 Dockerfile COPY 來源"
+
+# profile.json 宣告的 unit 真的存在嗎
+n=0
+while IFS= read -r pf; do
+    while IFS= read -r u; do
+        [ -z "$u" ] && continue
+        if [ -f "shared-configs/$u/install.sh" ]; then n=$((n+1)); else bad "profile 宣告了不存在的 unit: $u  (${pf})"; fi
+    done < <(python3 -c "import json,sys;print('\n'.join(json.load(open('$pf')).get('shared_config',[])))" 2>/dev/null)
+done < <(git ls-files 'profiles/*/*/profile.json')
+ok "$n 個 profile→unit 引用"
+
+# unit.json 的 provides 對得上 files/ 嗎（僅提示）
+while IFS= read -r uj; do
+    d="$(dirname "$uj")"
+    if [ "$(python3 -c "import json;print(json.load(open('$uj')).get('needs_key'))" 2>/dev/null)" = "True" ]; then
+        ls "$d"/files/*.crypted >/dev/null 2>&1 || bad "unit 宣告 needs_key 但 files/ 裡沒有 .crypted: $d"
+    fi
+done < <(git ls-files 'shared-configs/*/unit.json')
+ok "unit needs_key 與 files/ 一致"
+
+# 舊路徑殘留
+LEFT="$(grep -rlE 'shared_config/|ops-script/|(^|[^-a-z])(bin/mlp|provider/register\.sh|gateway/provision\.sh)' \
+        $(git ls-files | grep -vE '^docs/') 2>/dev/null | sort -u)"
+if [ -n "$LEFT" ]; then
+    echo "$LEFT" | while read -r f; do bad "殘留舊路徑: $f"; done
+else
+    ok "無舊路徑殘留"
+fi
+
+echo
+if [ "$FAIL" -eq 0 ]; then echo "preflight: 全過"; else echo "preflight: 有問題，不要推"; fi
+exit "$FAIL"
