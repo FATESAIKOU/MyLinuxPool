@@ -1,11 +1,13 @@
 #!/usr/bin/env bash
 # shared-configs/ssh-admin/install.sh — docs/LAYOUT.md §1
-# fatesaikou's own ssh identity — used on the Gateway only (a provider
-# reaches Actions the other way around: SSH_KEY_ACTIONS' public half goes
-# into the PROVIDER's authorized_keys, which is a narrower operation
-# ops-scripts/register-provider.sh does itself, not this unit — this unit
-# is fatesaikou's FULL identity, private key included, and that must never
-# land on a provider).
+# Who may log in as fatesaikou on the Gateway: installs authorized_keys
+# from files/authorized_keys.crypted. That is the whole job.
+#
+# It does NOT install an identity key. The id_rsa / id_rsa.pub this unit
+# used to deploy are used by no automation (REDESIGN.md N2/D3) and are no
+# longer installed; files/id_rsa*.crypted stay in the repo only as backup.
+# An id_rsa left on a machine is drift — --check reports it as a WARN, and
+# install never deletes it: removing a private key is deliberate, manual.
 #
 # needs_key=true, needs_root=false: plain file installs into <home>/.ssh.
 
@@ -57,43 +59,16 @@ SSH_DIR="${HOME_DIR}/.ssh"
 # so a re-typed comment isn't mistaken for a different key.
 key_blobs() { awk '{ if ($2 != "") print $2 }' "$1" 2>/dev/null | sort -u; }
 
-# File existence proved nothing: cloud-init writes an authorized_keys of its
-# own, so "the file is there" was true on a machine that had exactly one of
-# the declared keys. Compare the contents.
-# Content, not existence. "The file is there" was true on a machine whose
-# authorized_keys had one of ten declared keys (RUNBOOK §7.6); the same
-# blindness applies to every decrypted file this unit installs.
-#   same_as_declared <declared.crypted> <installed-path>
-#     0 = matches, 1 = differs, 2 = cannot tell (decrypt failed)
-same_as_declared() {
-    local crypted="$1" installed="$2" tmp rc
-    [[ -f "$installed" ]] || return 1
-    tmp="$(mktemp)"
-    "$DECRYPT" decrypt "$KEY" < "$crypted" > "$tmp" 2>/dev/null
-    rc=$?
-    if [[ $rc -ne 0 ]]; then
-        rm -f "$tmp"
-        log ERROR "cannot verify $(basename "$installed"): ${crypted##*/} would not decrypt (wrong --key?)"
-        return 2
-    fi
-    if cmp -s "$tmp" "$installed"; then rm -f "$tmp"; return 0; fi
-    rm -f "$tmp"
-    return 1
-}
-
 check_installed() {
-    [[ -f "${SSH_DIR}/id_rsa" && -f "${SSH_DIR}/id_rsa.pub" && -f "${SSH_DIR}/authorized_keys" ]] || return 1
+    # This unit installs authorized_keys only; an id_rsa here is an
+    # identity this unit no longer deploys (REDESIGN.md N2/D3), so it
+    # counts as drift and is reported as a WARN — never a failure, and
+    # never deleted by install (removal is deliberate).
+    if [[ -f "${SSH_DIR}/id_rsa" ]]; then
+        log WARN "drift: ${SSH_DIR}/id_rsa is present but this unit no longer installs it (removed from deployment — REDESIGN N2/D3). Delete it manually if no longer needed."
+    fi
 
-    local f
-    for f in id_rsa id_rsa.pub; do
-        same_as_declared "${FILES_DIR}/${f}.crypted" "${SSH_DIR}/${f}"
-        case $? in
-            0) ;;
-            2) return 1 ;;
-            *) log ERROR "${SSH_DIR}/${f} differs from the declared version"; return 1 ;;
-        esac
-    done
-
+    [[ -f "${SSH_DIR}/authorized_keys" ]] || return 1
     local declared missing extra
     declared="$(mktemp)"
     if ! "$DECRYPT" decrypt "$KEY" < "${FILES_DIR}/authorized_keys.crypted" > "$declared" 2>/dev/null; then
@@ -147,33 +122,14 @@ fi
 mkdir -p "$SSH_DIR"
 chmod 700 "$SSH_DIR"
 
-if [[ -f "${SSH_DIR}/id_rsa" ]]; then
-    log INFO "${SSH_DIR}/id_rsa already present, skipping decrypt"
-else
-    "$DECRYPT" decrypt "$KEY" < "${FILES_DIR}/id_rsa.crypted" > "${SSH_DIR}/id_rsa"
-    rc=$?
-    if [[ $rc -ne 0 ]]; then
-        rm -f "${SSH_DIR}/id_rsa"
-        log ERROR "crypto.sh failed (exit ${rc}) while decrypting id_rsa.crypted — wrong --key, or the encrypted file is corrupted"
-        exit 1
-    fi
-    log INFO "decrypted id_rsa to ${SSH_DIR}/id_rsa"
-fi
-chmod 600 "${SSH_DIR}/id_rsa"
+# The authorized_keys install (below) is the whole job of this unit.
+# The old identity-key deploy is gone; if the machine still has an
+# id_rsa, say so (like --check does) but leave it alone — removing a
+# private key is deliberate, so it only happens by hand (REDESIGN N2/D3).
 
-if [[ -f "${SSH_DIR}/id_rsa.pub" ]]; then
-    log INFO "${SSH_DIR}/id_rsa.pub already present, skipping decrypt"
-else
-    "$DECRYPT" decrypt "$KEY" < "${FILES_DIR}/id_rsa.pub.crypted" > "${SSH_DIR}/id_rsa.pub"
-    rc=$?
-    if [[ $rc -ne 0 ]]; then
-        rm -f "${SSH_DIR}/id_rsa.pub"
-        log ERROR "crypto.sh failed (exit ${rc}) while decrypting id_rsa.pub.crypted — wrong --key, or the encrypted file is corrupted"
-        exit 1
-    fi
-    log INFO "decrypted id_rsa.pub to ${SSH_DIR}/id_rsa.pub"
+if [[ -f "${SSH_DIR}/id_rsa" ]]; then
+    log WARN "drift: ${SSH_DIR}/id_rsa is present but this unit no longer installs it (removed from deployment — REDESIGN N2/D3). Delete it manually if no longer needed."
 fi
-chmod 644 "${SSH_DIR}/id_rsa.pub"
 
 # "Skip if the file exists" looked idempotent and was actually a silent
 # no-op: cloud-init creates the account with its own authorized_keys, so

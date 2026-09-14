@@ -9,6 +9,7 @@ REPO="${POOL_REPO:-FATESAIKOU/MyLinuxPool}"
 STATE_DIR="${HOME}/.mylinuxpool"
 CACHE_DIR="${STATE_DIR}/cache"
 GH_TOKEN_FILE="${STATE_DIR}/gh_token"
+STATE_FILE="${POOL_STATE_FILE:-${STATE_DIR}/state.json}"
 CACHE_TTL=30
 MAX_HOP_DEPTH=5
 
@@ -53,8 +54,35 @@ var_name_for() {
     printf 'NODE_%s' "$upper"
 }
 
+# Normalizes a node name into the canonical cache-file key: lowercase,
+# underscores become hyphens. Callers pass the node name (fh-proxy) or a
+# var-derived spelling (fh_proxy from NODE_FH_PROXY); both must hit the
+# SAME cache file or --refresh silently refreshes only one spelling and
+# the other stays stale (the fh_proxy.json / fh-proxy.json split on my Mac
+# is exactly that bug).
+cache_key_for() {
+    printf '%s' "$1" | tr '[:upper:]' '[:lower:]' | tr '_' '-'
+}
+
 cache_path_for() {
-    printf '%s/%s.json' "$CACHE_DIR" "$1"
+    printf '%s/%s.json' "$CACHE_DIR" "$(cache_key_for "$1")"
+}
+
+# state_file_lookup <state_json> <node_name>
+#   Prints the node's full record from state.json's .nodes, or prints
+#   nothing and returns non-zero when the node is absent. Node keys in the
+#   file are the hyphenated spelling (STATE_CONTRACT.md §2 invariant 2);
+#   the query name is normalized the same way cache_key_for normalizes.
+state_file_lookup() {
+    local state_json="$1" node_name="$2" out
+    out="$(printf '%s' "$state_json" \
+        | jq -c --arg n "$(cache_key_for "$node_name")" \
+            '.nodes[$n] // empty' 2>/dev/null)"
+    if [[ -z "$out" ]]; then
+        return 1
+    fi
+    printf '%s\n' "$out"
+    return 0
 }
 
 file_mtime() {
@@ -74,10 +102,43 @@ cache_fresh() {
 # Reads (and caches) the raw JSON for a node. Honors the 30s TTL cache and
 # falls back to a stale cache (with a WARN) when a live read fails, so a
 # transient network/API outage does not bring the tunnel down.
+#
+# Source order (docs/STATE_CONTRACT.md §3): the local state.json snapshot
+# (when present and the node is in it), then GitHub, then the local 30s
+# cache. The Gateway itself is the ONE exception — its address must come
+# from GitHub or the cache, never from state.json, or gateway resolution
+# becomes circular (state.json is fetched FROM the gateway).
 resolve_node() {
     local name="$1" refresh="$2" var cache
     var="$(var_name_for "$name")"
     cache="$(cache_path_for "$name")"
+
+    local state_json=""
+    if [[ "$(cache_key_for "$name")" != "gateway" && -f "$STATE_FILE" ]]; then
+        # schema must be the known value, else the snapshot's shape is
+        # unknown and must not be interpreted (STATE_CONTRACT.md §2).
+        local schema_ok
+        schema_ok="$(jq -r 'if .schema == 1 then "1" else "0" end' "$STATE_FILE" 2>/dev/null)"
+        if [[ "$schema_ok" == "1" ]]; then
+            state_json="$(cat "$STATE_FILE" 2>/dev/null)"
+        fi
+    fi
+
+    if [[ -n "$state_json" ]]; then
+        local node_out node_rc
+        node_out="$(state_file_lookup "$state_json" "$name")"
+        node_rc=$?
+        if [[ $node_rc -eq 0 ]]; then
+            if [[ "$refresh" -eq 1 ]]; then
+                log INFO "pool-resolve: ${name}: serving from state.json (${STATE_FILE})"
+            fi
+            printf '%s\n' "$node_out"
+            return 0
+        fi
+        if [[ "$refresh" -eq 1 ]]; then
+            log INFO "pool-resolve: ${name}: state.json present but node not in it — falling through to GitHub"
+        fi
+    fi
 
     if [[ "$refresh" -ne 1 ]] && cache_fresh "$cache"; then
         cat "$cache"
