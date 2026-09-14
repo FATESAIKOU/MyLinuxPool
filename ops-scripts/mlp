@@ -89,6 +89,9 @@ usage: mlp [command]
   wake             wake fh-l (unicast WoL via fh-proxy)
   down             shut down fh-l (asks for confirmation first)
   status           run pool-status
+  rotate [--real]  rotate the Gateway (dry run unless --real)
+  worker new       build and start a worker on a provider
+  worker rm [name] stop a worker and release its port
   trust-gateway    re-accept the Gateway's host key after a rotate
   -h, --help       show this help
 
@@ -567,6 +570,195 @@ cmd_status() {
     "$POOL_STATUS" "$@"
 }
 
+# ---- workflow-backed commands ------------------------------------------------
+# rotate / create-worker / delete-worker run as GitHub Actions, and these
+# commands trigger them rather than reimplementing them.
+#
+# Not for convenience. Those flows need LINODE_TOKEN, FILE_CRYPTO_KEY,
+# SSH_KEY_ACTIONS and the ability to look up a secret by a name known only
+# at run time; doing them here would put all of that on a laptop that
+# travels. And the step ordering, the rollback that only arms after the
+# switch point, and the orphan sweep live in the workflow — a local
+# reimplementation would be a second copy of that logic, free to drift
+# from the one Actions actually runs.
+#
+# The line: anything needing credentials or orchestration goes through a
+# workflow; anything interactive or latency-sensitive (ssh/wake/down)
+# stays local.
+
+# wf_dispatch <workflow-file> <label> [-f k=v ...]
+wf_dispatch() {
+    local wf="$1" label="$2"; shift 2
+    local before after run_id i
+
+    # The dispatch API returns nothing identifying the run it creates, so
+    # remember the newest id first and watch for a different one.
+    before="$(gh run list --workflow="$wf" --repo "$REPO" --limit 1 \
+                --json databaseId --jq '.[0].databaseId // 0' 2>/dev/null)"
+
+    gh workflow run "$wf" --repo "$REPO" "$@" >/dev/null 2>&1 \
+        || die "could not dispatch ${wf} (is gh authenticated for ${REPO}?)"
+
+    printf '%s%s%s dispatched, waiting for the run to appear' "$C_BOLD" "$label" "$C_RESET"
+    run_id=""
+    for i in $(seq 1 20); do
+        sleep 3
+        after="$(gh run list --workflow="$wf" --repo "$REPO" --limit 1 \
+                   --json databaseId --jq '.[0].databaseId // 0' 2>/dev/null)"
+        if [[ -n "$after" && "$after" != "$before" ]]; then run_id="$after"; break; fi
+        printf '.'
+    done
+    echo ""
+    [[ -n "$run_id" ]] || die "the run never appeared — check https://github.com/${REPO}/actions"
+
+    echo "  https://github.com/${REPO}/actions/runs/${run_id}"
+    echo ""
+    wf_follow "$run_id"
+}
+
+# wf_follow <run-id> — prints each step as it settles; exits with the run's status.
+wf_follow() {
+    local run_id="$1" seen="" json cur new status conclusion line mark
+
+    while true; do
+        json="$(gh run view "$run_id" --repo "$REPO" --json status,conclusion,jobs 2>/dev/null)" || {
+            sleep 10; continue
+        }
+        cur="$(printf '%s' "$json" | jq -r '
+            .jobs[].steps[]
+            | select(.conclusion != null and .conclusion != "")
+            | "\(.number)\t\(.conclusion)\t\(.name)"' 2>/dev/null | sort -n)"
+
+        new="$(comm -13 <(printf '%s\n' "$seen") <(printf '%s\n' "$cur") 2>/dev/null)"
+        while IFS=$'\t' read -r _ conclusion line; do
+            [[ -n "$line" ]] || continue
+            case "$conclusion" in
+                success)  mark="${C_GREEN}ok${C_RESET}      " ;;
+                skipped)  mark="—       " ;;
+                *)        mark="${C_RED}${conclusion}${C_RESET} " ;;
+            esac
+            printf '  %s%s\n' "$mark" "$line"
+        done <<< "$new"
+        seen="$cur"
+
+        status="$(printf '%s' "$json" | jq -r '.status')"
+        if [[ "$status" == "completed" ]]; then
+            conclusion="$(printf '%s' "$json" | jq -r '.conclusion')"
+            echo ""
+            if [[ "$conclusion" == "success" ]]; then
+                printf '%srun finished: success%s\n' "$C_GREEN" "$C_RESET"
+                return 0
+            fi
+            printf '%srun finished: %s%s\n' "$C_RED" "$conclusion" "$C_RESET"
+            echo "  gh run view ${run_id} --repo ${REPO} --log-failed"
+            return 1
+        fi
+        sleep 10
+    done
+}
+
+cmd_rotate() {
+    local real=0 confirm gw_ip
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --real) real=1; shift ;;
+            *) die "usage: mlp rotate [--real]" ;;
+        esac
+    done
+
+    if [[ "$real" -eq 0 ]]; then
+        echo "dry run: builds, provisions and verifies a preview machine, then deletes it."
+        echo "NODE_GATEWAY and the live Gateway are not touched."
+        echo ""
+        wf_dispatch rotate-gateway.yml "rotate (dry run)" -f dry_run=true
+        return
+    fi
+
+    resolve_gateway
+    gw_ip="$GW_IP"
+    printf '%sThis replaces the live Gateway (%s).%s\n' "$C_YELLOW" "$gw_ip" "$C_RESET"
+    echo "  Providers reconnect on their own (~1s). Any running worker is"
+    echo "  stranded and has to be recreated — workers pin the Gateway"
+    echo "  address at docker-run time and cannot follow a rotate."
+    echo "  Run 'mlp rotate' (dry run) first if you haven't."
+    printf 'Type the current Gateway IP to confirm: '
+    read -r confirm
+    if [[ "$confirm" != "$gw_ip" ]]; then
+        echo "aborted (expected ${gw_ip})."
+        return 1
+    fi
+
+    wf_dispatch rotate-gateway.yml "rotate" -f dry_run=false || return 1
+    echo ""
+    echo "next: run 'mlp trust-gateway' to accept the new machine's host key."
+}
+
+cmd_worker() {
+    local sub="${1:-}"
+    [[ $# -gt 0 ]] && shift
+    case "$sub" in
+        new) worker_new "$@" ;;
+        rm)  worker_rm "$@" ;;
+        "")  die "usage: mlp worker {new|rm}" ;;
+        *)   die "unknown worker subcommand '${sub}' (expected new or rm)" ;;
+    esac
+}
+
+# The pickers read the same live view `ls` renders, so what you pick is
+# what you just saw — including the container-name spelling, which is the
+# one delete-worker did not accept until it was taught both.
+worker_targets() {
+    resolve_gateway
+    open_gateway_master || die "Gateway unreachable (${GW_USER}@${GW_IP})"
+    gather_targets
+}
+
+worker_new() {
+    local provider image
+
+    provider="$(worker_targets | awk -F'\t' '$2 == "provider" { print $1 }' \
+                 | fzf --prompt='provider> ' --height='~40%' \
+                       --header='which machine should host the worker?')"
+    [[ -n "$provider" ]] || { echo "aborted."; return 1; }
+
+    image="$(worker_images | fzf --prompt='image> ' --height='~40%' \
+               --header='which profiles/worker/<image> to build?')"
+    [[ -n "$image" ]] || { echo "aborted."; return 1; }
+
+    wf_dispatch create-worker.yml "create-worker (${provider}/${image})" \
+        -f provider="$provider" -f image="$image" || return 1
+    echo ""
+    echo "next: 'mlp ls' to see it, 'mlp ssh' to connect."
+}
+
+worker_rm() {
+    local name="${1:-}" confirm
+    if [[ -z "$name" ]]; then
+        name="$(worker_targets \
+                 | awk -F'\t' '$2 == "worker" { printf "%s\t(on %s, port %s)\n", $1, $3, $4 }' \
+                 | fzf --prompt='worker> ' --height='~40%' \
+                       --header='which worker to delete? (Esc to cancel)' \
+                 | cut -f1)"
+    fi
+    [[ -n "$name" ]] || { echo "aborted."; return 1; }
+
+    printf '%sDelete worker %s?%s Its container is removed and its port released.\n' \
+        "$C_YELLOW" "$name" "$C_RESET"
+    printf 'Type "yes" to confirm: '
+    read -r confirm
+    [[ "$confirm" == "yes" ]] || { echo "aborted."; return 1; }
+
+    wf_dispatch delete-worker.yml "delete-worker (${name})" -f name="$name"
+}
+
+worker_images() {
+    local d
+    for d in "${REPO_ROOT}"/profiles/worker/*/; do
+        [[ -d "$d" ]] && basename "$d"
+    done
+}
+
+
 # ---- main menu --------------------------------------------------------------
 main_menu() {
     local choice action
@@ -578,6 +770,9 @@ main_menu() {
                 "wake           wake fh-l" \
                 "down           shut down fh-l" \
                 "status         run pool-status" \
+                "rotate         rotate the Gateway (dry run; --real from the CLI)" \
+                "worker-new     build and start a worker on a provider" \
+                "worker-rm      stop a worker and release its port" \
                 "trust-gateway  re-accept the Gateway's host key after a rotate" \
                 "quit           exit" \
             | fzf --prompt='mlp> ' --height='~50%' --header='select an action (Esc to quit)'
@@ -592,6 +787,9 @@ main_menu() {
             wake) cmd_wake ;;
             down) cmd_down ;;
             status) cmd_status ;;
+            rotate) cmd_rotate ;;
+            worker-new) worker_new ;;
+            worker-rm) worker_rm ;;
             trust-gateway) cmd_trust_gateway ;;
             quit) break ;;
         esac
@@ -623,6 +821,8 @@ main() {
         wake) cmd_wake "$@" ;;
         down) cmd_down "$@" ;;
         status) cmd_status "$@" ;;
+        rotate) cmd_rotate "$@" ;;
+        worker) cmd_worker "$@" ;;
         trust-gateway) cmd_trust_gateway "$@" ;;
         *)
             echo "mlp: unknown command '${cmd}'" >&2
