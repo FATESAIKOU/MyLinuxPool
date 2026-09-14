@@ -3,18 +3,29 @@
 # Runs ON the Gateway (invoked remotely by a workflow via pool-ssh).
 # Allocates/releases worker ports out of NODE_GATEWAY.ports.worker.
 #
-# Truth is `ss` — the ~/pool/workers.d/<port>.json placeholder only
+# Truth is `ss` — the ~/.mylinuxpool/workers.d/<port>.json placeholder only
 # records whose port it is. A placeholder can outlive its listener (e.g.
 # it survives a Gateway rotate while the container behind it doesn't); ss
 # always wins that disagreement. Never calls `gh` directly — port range
 # comes from pool-resolve, same rule as every other component.
+#
+# The placeholder is only a CACHE: the master ledger is the POOL_WORKERS
+# repo variable (docs/STATE_CONTRACT.md §1), written by the workflows.
+# This script still keeps the Gateway-local placeholder because `ss` alone
+# cannot say WHICH provider/container a port belongs to (spec §10.1).
+#
+# Claims are WRITTEN only to ~/.mylinuxpool/workers.d (D1: everything else
+# lives there; ~/pool/ was the odd one out). The old path is still READ so
+# a claim made before the move cannot be reallocated underneath a running
+# worker — but it is never written to again.
 
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
 POOL_RESOLVE="${SCRIPT_DIR}/pool-resolve"
 
-WORKERS_DIR="${HOME}/pool/workers.d"
+WORKERS_DIR="${HOME}/.mylinuxpool/workers.d"
+LEGACY_WORKERS_DIR="${HOME}/pool/workers.d"
 LOCK_FILE="${WORKERS_DIR}/.lock"
 
 log() {
@@ -78,13 +89,16 @@ worker_port_range() {
 }
 
 # A port is free only if BOTH hold: nothing is listening on it (per `ss`,
-# the real state) AND no placeholder file claims it.
+# the real state) AND no placeholder file claims it. The legacy directory
+# is consulted too — a claim written before the path move still means the
+# port is taken; ignoring it is exactly how a port gets handed out twice.
 port_is_free() {
     local port="$1"
     if ss -Htln "sport = :${port}" 2>/dev/null | grep -q .; then
         return 1
     fi
     [[ -f "${WORKERS_DIR}/${port}.json" ]] && return 1
+    [[ -f "${LEGACY_WORKERS_DIR}/${port}.json" ]] && return 1
     return 0
 }
 
@@ -147,14 +161,26 @@ cmd_list() {
     exec 200>"$LOCK_FILE"
     flock -s 200
 
-    local files=("${WORKERS_DIR}"/*.json)
-    if [[ ! -e "${files[0]}" ]]; then
+    local files=("${WORKERS_DIR}"/*.json "${LEGACY_WORKERS_DIR}"/*.json)
+
+    # The globs may have left unexpanded literal paths behind; filter to
+    # real files first. Nothing real at all means no claims anywhere.
+    local real=()
+    local f
+    for f in "${files[@]}"; do
+        [[ -f "$f" ]] && real+=("$f")
+    done
+
+    if [[ ${#real[@]} -eq 0 ]]; then
         printf '[]\n'
         flock -u 200
         return 0
     fi
 
-    jq -s '.' "${files[@]}"
+    # When the same port has both a new and a legacy claim the NEW one
+    # wins — group by port and take the first (new path sorts before
+    # legacy).
+    jq -s --sort-keys 'group_by(.port) | map(first)' "${real[@]}"
     flock -u 200
     return 0
 }
