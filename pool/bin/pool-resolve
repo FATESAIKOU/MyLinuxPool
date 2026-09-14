@@ -116,6 +116,23 @@ resolve_node() {
     return 4
 }
 
+# Synthesizes a single terminal hop from a node's own connection fields,
+# for a node that has no "hops" of its own (it IS the end of the chain,
+# e.g. the Gateway). Deliberately `.user`, not `.tunnel_user`: jump chains
+# use the management identity, reverse tunnels use the restricted
+# tunnel_user — they must never be mixed. Prints "" and returns 1 if the
+# node has neither hops nor enough fields (ip/user) to synthesize from.
+synthesize_terminal_hop() {
+    local node_json="$1" synth missing
+    synth="$(printf '%s' "$node_json" | jq -c '{host: .ip, port: (.port // 22), user: .user, key_secret: .key_secret}')"
+    missing="$(printf '%s' "$synth" | jq -r 'if (.host == null or .user == null) then "1" else "0" end')"
+    if [[ "$missing" == "1" ]]; then
+        return 1
+    fi
+    printf '%s' "$synth"
+    return 0
+}
+
 # Recursively expands a hops array: any element with a "via" key is replaced
 # in place by that named node's own (recursively expanded) hops array.
 # Depth > 5 or a cycle back to an already-visited node both return exit 5.
@@ -163,16 +180,10 @@ expand_hops() {
                 fi
                 result="$(jq -c -n --argjson a "$result" --argjson b "$expanded" '$a + $b')"
             else
-                # Base case: X has no "hops" of its own — it's the end of
-                # the chain (e.g. the Gateway), so synthesize one hop from
-                # its own connection fields instead of expanding to nothing.
-                # Deliberately `.user`, not `.tunnel_user`: jump chains use
-                # the management identity, reverse tunnels use the
-                # restricted tunnel_user — they must never be mixed.
-                local synth missing
-                synth="$(printf '%s' "$via_node" | jq -c '{host: .ip, port: (.port // 22), user: .user, key_secret: .key_secret}')"
-                missing="$(printf '%s' "$synth" | jq -r 'if (.host == null or .user == null) then "1" else "0" end')"
-                if [[ "$missing" == "1" ]]; then
+                # Base case: X has no "hops" of its own — see
+                # synthesize_terminal_hop above.
+                local synth
+                if ! synth="$(synthesize_terminal_hop "$via_node")"; then
                     log ERROR "pool-resolve: via-hop '$via' has neither 'hops' nor ip/user to synthesize a terminal hop"
                     return 5
                 fi
@@ -227,13 +238,28 @@ main() {
     fi
 
     if [[ "$expand" -eq 1 ]]; then
-        local hops expanded
-        hops="$(printf '%s' "$json" | jq -c '.hops // []')"
-        expanded="$(expand_hops "$hops" 1 "$node" "$refresh")"
-        rc=$?
-        if [[ $rc -ne 0 ]]; then
-            return $rc
+        local has_hops expanded
+        has_hops="$(printf '%s' "$json" | jq -r 'has("hops")')"
+
+        if [[ "$has_hops" == "true" ]]; then
+            local hops
+            hops="$(printf '%s' "$json" | jq -c '.hops')"
+            expanded="$(expand_hops "$hops" 1 "$node" "$refresh")"
+            rc=$?
+            if [[ $rc -ne 0 ]]; then
+                return $rc
+            fi
+        else
+            # The requested node itself has no "hops" (e.g. `gateway`) —
+            # it IS the destination, so the chain is just itself.
+            local synth
+            if ! synth="$(synthesize_terminal_hop "$json")"; then
+                log ERROR "pool-resolve: node '$node' has neither 'hops' nor ip/user to synthesize a terminal hop"
+                return 5
+            fi
+            expanded="$(jq -c -n --argjson h "$synth" '[$h]')"
         fi
+
         printf '%s\n' "$expanded" | jq '.'
         return 0
     fi

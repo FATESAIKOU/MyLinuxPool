@@ -1,30 +1,38 @@
 #cloud-config
+# Gateway 是純 Gateway：cloud-init 只負責「開機後能被 ssh 進來」。
+# sshd 硬化、fail2ban ignoreip、runtime 安裝一律交給 provision.sh
+# （docs/POOL_RUNTIME_SPEC.md §9.2），不要在這裡加。
+
 users:
-- name: fatesaikou
-  groups: sudo
-  sudo: ALL=(ALL) NOPASSWD:ALL
-  shell: /bin/bash
-  lock_passwd: false
-  plain_text_passwd: ${FATESAIKOU_TMP_PASS}
-- name: sshproxy
-  shell: /bin/bash
-  lock_passwd: false
-  plain_text_passwd: ${SSHPROXY_PASS}
+  - name: fatesaikou
+    groups: sudo
+    sudo: "ALL=(ALL) NOPASSWD:ALL"
+    shell: /bin/bash
+    lock_passwd: true
+    ssh_authorized_keys:
+      - ${FATESAIKOU_PUBKEY}
+  - name: sshproxy
+    shell: /bin/bash
+    lock_passwd: true
+    ssh_authorized_keys:
+      - ${SSHPROXY_PUBKEY}
+
+# 純金鑰認證：不設密碼，公鑰由 rotate workflow 從 secrets 渲染進來（見上方
+# 佔位符）。舊版用 plain_text_passwd 注入臨時密碼再鎖定那套整條廢除。
+ssh_pwauth: false
 
 package_update: true
-package_upgrade: true
+# 不 upgrade：285 天沒重建的舊機正是因為累積更新債才出事，但在 cloud-init
+# 階段 upgrade 會拖長 rotate 且可能中途失敗。新機用的是最新 image，本來就
+# 不需要。
+package_upgrade: false
 
 packages:
-- gcc
-- make
-- curl
-- unzip
-- vim
-- tmux
-- git
-- rclone
-- python3
-- python3-pip
-- python3-ipython
-- nodejs
-- grc
+  - curl
+  - ca-certificates
+  - git
+  - jq
+  - netcat-openbsd
+  - util-linux
+  - iproute2
+  - fail2ban

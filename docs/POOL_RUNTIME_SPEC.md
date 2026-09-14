@@ -31,6 +31,11 @@ pool-resolve <node-name> [--field <jq-path>] [--expand-hops] [--refresh]
 - 預設輸出該 var 的完整 JSON。
 - `--field`：以 jq path 取單一欄位，輸出純值（例如 `--field .ip`）。
 - `--expand-hops`：輸出**完全展開**的 hop 陣列 JSON。展開規則：
+  - 若 `<node-name>` 本身沒有 `hops` 欄位（它就是終點，例如
+    `pool-resolve gateway --expand-hops`）→ 套用下面同一條 base case，
+    輸出只含一段、由它自己連線欄位合成的 hop。這是 `pool-ssh`
+    （§9.3）能直接對 `gateway` 這種單跳目標一致呼叫
+    `--expand-hops` 的前提，不要只在 `via` 分支裡做這件事。
   - hop 物件若含 `via`，以該名稱遞迴 resolve X。
     - 若 X 有 `hops` 欄位 → 遞迴展開，原地取代（既有邏輯）。
     - 若 X 沒有 `hops` 欄位（X 是鏈的終點，例如 Gateway）→ **base

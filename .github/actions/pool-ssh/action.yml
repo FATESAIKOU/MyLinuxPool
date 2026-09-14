@@ -1,0 +1,29 @@
+name: pool-ssh
+description: >-
+  Resolve a MyLinuxPool node's full jump chain via pool-resolve and run a
+  command on it through a temporary ssh-agent. Shared by every pool
+  workflow (rotate-gateway, launch-fh-l, shutdown-fh-l, create-worker,
+  delete-worker, pool-status). See docs/POOL_RUNTIME_SPEC.md §9.3.
+
+inputs:
+  node:
+    description: Node name to reach (e.g. gateway, fh-l, fh-proxy)
+    required: true
+  command:
+    description: Command to run on the final hop
+    required: true
+  timeout:
+    description: ssh ConnectTimeout in seconds
+    required: false
+    default: "10"
+
+runs:
+  using: composite
+  steps:
+    - name: Resolve jump chain and run command
+      shell: bash
+      env:
+        POOL_SSH_NODE: ${{ inputs.node }}
+        POOL_SSH_COMMAND: ${{ inputs.command }}
+        POOL_SSH_TIMEOUT: ${{ inputs.timeout }}
+      run: ${{ github.action_path }}/run.sh
