@@ -51,6 +51,21 @@ step1_sshd_harden() {
 PasswordAuthentication no
 PermitRootLogin no
 KbdInteractiveAuthentication no
+
+# Reap sessions whose peer has vanished. Without this, sshd's default
+# (ClientAliveInterval 0, plus TCP keepalive that waits ~2 hours) means a
+# provider that loses its network without closing the connection leaves a
+# session holding its forwarded port open indefinitely. When the machine
+# comes back, `-R 127.0.0.1:<port>` is refused by the port its own dead
+# session still owns, ExitOnForwardFailure kills the attempt, and the node
+# retries forever against a port nothing will release.
+#
+# Seen for real on 2026-09-14: a physical network cut left three ports
+# held by dead sessions; only the provider whose old session happened to
+# close cleanly came back. 15s x 3 puts the ceiling at ~45 seconds, well
+# inside pool-tunnel's own retry backoff.
+ClientAliveInterval 15
+ClientAliveCountMax 3
 EOF
 )"
 
