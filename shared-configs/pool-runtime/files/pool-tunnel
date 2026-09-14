@@ -120,7 +120,23 @@ next_backoff() {
 # a reader never sees a half-written file. Never fatal: publishing is a
 # convenience for others, and failing to do it must not take down a
 # working tunnel.
+#
+# N8 self-healing: called every 30s round, but only writes when the file
+# is missing or stale — the fields a follower actually reads (ip /
+# tunnel_user / generation / host_key) differ from what we currently
+# know. The published_at timestamp makes a full-content compare useless,
+# so the compare ignores it. In the steady state mtime never churns.
 publish_gateway() {
+    if [[ -f "$GATEWAY_PUBLISH_FILE" ]]; then
+        local current
+        current="$(jq -r --arg ip "$GW_IP" --arg user "$GW_USER" \
+            --arg gen "${GW_GEN:-}" --arg hk "${GW_HOST_KEY:-}" \
+            'select(.ip == $ip and .tunnel_user == $user
+                    and .generation == $gen and .host_key == $hk)' \
+            "$GATEWAY_PUBLISH_FILE" 2>/dev/null)"
+        [[ -n "$current" ]] && return 0
+    fi
+
     local tmp
     mkdir -p "$GATEWAY_PUBLISH_DIR" 2>/dev/null || return 0
     chmod 755 "$GATEWAY_PUBLISH_DIR" 2>/dev/null || true
@@ -131,6 +147,27 @@ publish_gateway() {
     }
     chmod 644 "$tmp" 2>/dev/null || true
     mv -f "$tmp" "$GATEWAY_PUBLISH_FILE" 2>/dev/null || rm -f "$tmp"
+    return 0
+}
+
+# pin_gateway_host_key — ensure the pinned host-key file matches the
+# Gateway we are connected to (start_master writes it too, but only at
+# tunnel build). N8 self-healing: called every 30s round, writes only
+# when missing or stale. No-op when GW_HOST_KEY is empty — start_master
+# then falls back to trust-on-first-use and never writes a pin.
+pin_gateway_host_key() {
+    [[ -n "$GW_HOST_KEY" ]] || return 0
+    if [[ -f "$KNOWN_HOSTS_FILE" ]] \
+       && [[ "$(cat "$KNOWN_HOSTS_FILE" 2>/dev/null)" == "$GW_IP $GW_HOST_KEY" ]]; then
+        return 0
+    fi
+    local tmp
+    tmp="$(mktemp "${STATE_DIR}/.known_hosts.XXXXXX" 2>/dev/null)" || return 0
+    printf '%s %s\n' "$GW_IP" "$GW_HOST_KEY" > "$tmp" 2>/dev/null || {
+        rm -f "$tmp"; return 0
+    }
+    chmod 600 "$tmp" 2>/dev/null || true
+    mv -f "$tmp" "$KNOWN_HOSTS_FILE" 2>/dev/null || rm -f "$tmp"
     return 0
 }
 
@@ -634,6 +671,17 @@ main() {
             last_state_fetch=$now
             fetch_state_cache
         fi
+
+        # N8 self-healing: the derived files a reader depends on (a worker
+        # following gateway.json, and the host-key pin) only get written at
+        # tunnel build, so a deleted file never comes back while the tunnel
+        # stays healthy. Each 30s round re-ensures them — write only when
+        # missing or stale, never a blind rewrite (mtime stays quiet).
+        # Followers never publish; that is the resolver's job.
+        if [[ "$FOLLOW_GATEWAY" -ne 1 && "$STATIC_GATEWAY" -ne 1 ]]; then
+            publish_gateway
+        fi
+        pin_gateway_host_key
     done
 }
 
