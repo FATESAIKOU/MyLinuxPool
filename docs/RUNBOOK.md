@@ -16,12 +16,12 @@
 
 ## 1. 新增一台 provider
 
-一台全新的機器加入叢集，只需要**人工跑一次** `provider/register.sh`。
+一台全新的機器加入叢集，只需要**人工跑一次** `ops-scripts/register-provider.sh`。
 之後無論 Gateway 換幾次，這台機器都不用再碰（見 §2）。
 
 ### 1.1 前置：兩個環境變數
 
-`register.sh` 需要兩個環境變數，缺任一個會以退出碼 `2` 中止：
+`register-provider.sh` 需要兩個環境變數，缺任一個會以退出碼 `2` 中止：
 
 | 變數 | 是什麼 | 從哪來 |
 |---|---|---|
@@ -33,7 +33,7 @@
 > **`GH_POOL_TOKEN` 只需要 repo 權限（Contents: Read、Variables:
 > Read/Write），不要多給。** 實測過：`gh auth login --with-token` 會強制要求
 > `read:org`，我們的操作（`gh api` 讀 variable、`gh variable set`、
-> `gh repo clone`）完全用不到，所以 `register.sh` 根本不呼叫
+> `gh repo clone`）完全用不到，所以 `register-provider.sh` 根本不呼叫
 > `gh auth login`——見 §1.3 第 2 步與 §3。多給 `read:org` 沒有壞處，但也
 > 沒有必要。
 
@@ -45,8 +45,8 @@
 export FILE_CRYPTO_KEY='...'   # 信任根
 export GH_POOL_TOKEN='...'     # 取得私有 repo 的鑰匙
 
-bash <(curl -fsSL ...)  # 或：先手動把 repo 的 provider/register.sh 傳上去再執行
-bash provider/register.sh --name <node-name> --gateway-port <port>
+bash <(curl -fsSL ...)  # 或：先手動把 repo 的 ops-scripts/register-provider.sh 傳上去再執行
+bash ops-scripts/register-provider.sh --name <node-name> --gateway-port <port>
 ```
 
 `--name` 是這台機器在叢集中的名字（`gateway`、`fh-l`、`fh-proxy`）。
@@ -57,7 +57,7 @@ bash provider/register.sh --name <node-name> --gateway-port <port>
 `master` 時，指向該測試分支，例如：
 
 ```bash
-bash provider/register.sh --name fh-l --gateway-port 2222 --branch feat/refactor-as-mylinuxpool
+bash ops-scripts/register-provider.sh --name fh-l --gateway-port 2222 --branch feat/refactor-as-mylinuxpool
 ```
 
 正式上線（分支已併回 `master`）之後，不帶 `--branch` 直接跑預設值即可。
@@ -127,7 +127,7 @@ loginctl show-user "$USER" | grep Linger   # 必須是 Linger=yes
 **叢集本身什麼都不用做。** 但有兩件屬於你個人的收尾：
 
 1. **第一次連線會需要 `mlp trust-gateway`** —— 新機器的主機金鑰不同，
-   這是預期的（見 §5 與 `bin/mlp` 的說明）。
+   這是預期的（見 §5 與 `ops-scripts/mlp` 的說明）。
 2. **`pws` 要重新下載** —— `dlpw`／`uppw` 操作的密碼檔是資料不是設定，
    不隨 rotate 帶過去。在新機上跑一次 `~/testSH/dlpw` 即可。
 
@@ -139,21 +139,21 @@ loginctl show-user "$USER" | grep Linger   # 必須是 Linger=yes
 
 - provider 上的 `NODE_<NAME>` 不用動 —— 它的 `hops` 是 `{"via":"gateway"}`，是遞迴引用，不是寫死 IP；
 - provider 上的金鑰、config、service 都不用動；
-- 不需要在 provider 上重跑 `register.sh`。
+- 不需要在 provider 上重跑 `register-provider.sh`。
 
 實際斷線時間 ≈ 一個輪詢週期 + 一次 ssh 重建，約 40 秒內自行恢復。
 
 > 若 rotate 後超過 **2 分鐘**還沒恢復，才需要人工介入 —— 直接跳 §5.1。
 
-**但操作者自己（用 `bin/mlp` 的那個人）第一次連線需要跑一次
-`bin/mlp trust-gateway`。** 這與上面「provider 什麼都不用做」是兩件事：
+**但操作者自己（用 `ops-scripts/mlp` 的那個人）第一次連線需要跑一次
+`ops-scripts/mlp trust-gateway`。** 這與上面「provider 什麼都不用做」是兩件事：
 provider 走的是程式化的 `pool-resolve`／`ExitOnForwardFailure`，本來就不
-做主機金鑰驗證；但 `bin/mlp` 是給人用的互動工具，Gateway 每次 rotate
-主機金鑰都會變，`bin/mlp` 把它記在專屬的 `~/.mylinuxpool/known_hosts`
+做主機金鑰驗證；但 `ops-scripts/mlp` 是給人用的互動工具，Gateway 每次 rotate
+主機金鑰都會變，`ops-scripts/mlp` 把它記在專屬的 `~/.mylinuxpool/known_hosts`
 （不是 `~/.ssh/known_hosts`）並用 `StrictHostKeyChecking=accept-new`。
-rotate 後第一次連線會因為金鑰不符被擋下，`bin/mlp` 會印出清楚的原因
+rotate 後第一次連線會因為金鑰不符被擋下，`ops-scripts/mlp` 會印出清楚的原因
 （"Gateway 的主機金鑰變了，通常表示它剛被 rotate 過"）；照著跑
-`bin/mlp trust-gateway`（移除舊項目、重新接受目前的金鑰）即可，之後
+`ops-scripts/mlp trust-gateway`（移除舊項目、重新接受目前的金鑰）即可，之後
 `ls`／`ssh`／`wake`／`down` 都會恢復正常。
 
 ---
@@ -215,13 +215,13 @@ export GH_POOL_TOKEN='<新 token>'
 export FILE_CRYPTO_KEY='...'
 
 # 冪等，可直接整支重跑；它會依序做：覆寫 ~/.mylinuxpool/gh_token → git pull → 重裝 bin
-bash ~/.mylinuxpool/repo/provider/register.sh \
+bash ~/.mylinuxpool/repo/ops-scripts/register-provider.sh \
   --name <node-name> --gateway-port <gateway-port>
 
-systemctl --user restart pool-tunnel   # register.sh 第 8 步會做，手動保險亦可
+systemctl --user restart pool-tunnel   # register-provider.sh 第 8 步會做，手動保險亦可
 ```
 
-對應到 `register.sh` 的**第 2 步（把新 token 寫進 `~/.mylinuxpool/gh_token`）與
+對應到 `register-provider.sh` 的**第 2 步（把新 token 寫進 `~/.mylinuxpool/gh_token`）與
 第 3 步（git pull + 更新 bin）**；第 6 步之後的登記與常駐設定若無變動會自動跳過。
 `pool-tunnel`／`pool-resolve` 下次執行時會自己從 `~/.mylinuxpool/gh_token` 讀到
 新 token，不需要任何 `gh auth` 狀態要處理。驗證：
@@ -369,7 +369,7 @@ timeout 2 nc -z -v 127.0.0.1 <port>
 
 **症狀**：provider 的 `pool-resolve` 回退出碼 `4`（API 失敗且無快取）、
 `pool-tunnel` journal 出現 `HTTP 401`。**沒有 `gh auth status` 這回事**——
-`register.sh` 不呼叫 `gh auth login`，token 是透過 `GH_TOKEN` 環境變數
+`register-provider.sh` 不呼叫 `gh auth login`，token 是透過 `GH_TOKEN` 環境變數
 （`pool-resolve` 從 `~/.mylinuxpool/gh_token` 讀入）直接餵給 `gh`。
 
 診斷：
@@ -384,7 +384,7 @@ GH_TOKEN="$(cat ~/.mylinuxpool/gh_token)" \
   並給 **repo 權限（Contents: Read、Variables: Read/Write）即可，不需要
   `read:org`**。
 - 401 → 依 §3 完整走一遍：改 secret → 重新加密 → commit → 各 provider 重跑
-  `register.sh`（第 2 步會覆寫 `~/.mylinuxpool/gh_token`）。
+  `register-provider.sh`（第 2 步會覆寫 `~/.mylinuxpool/gh_token`）。
 
 > 注意：`pool-tunnel` 自己**不會**直接呼叫 `gh`，一律經 `pool-resolve`；
 > 除錯時若看到 token 問題，要往 `pool-resolve` 的快取與 provider 上的
@@ -401,7 +401,7 @@ GH_TOKEN="$(cat ~/.mylinuxpool/gh_token)" \
 |---|---|---|
 | **Fh-proxy 的 Windows PowerShell 無法使用** | PowerShell 起不來 —— 連經 `cmd.exe` 呼叫、等 35 秒都沒有任何輸出（`cmd.exe` 本身正常、檔案存在）。舊的 `launchfhubuntuForWsl2` 100% 靠 PowerShell 送封包，所以它**從來沒有送出過任何東西** | WoL 一律在 WSL 內用 `pool-wol` 送 unicast；不要設計任何依賴 PowerShell 的流程 |
 | **WSL2 的 NAT 會丟掉 broadcast** | 從 WSL 送 `192.168.0.255` 與 `255.255.255.255`，目標端都收不到；**unicast 到 `192.168.0.136` 收得到**（tcpdump 實測）。此機 Windows 10 19045，無法用 mirrored networking | `pool-wol` 必須用 unicast；不要「優化」成廣播 |
-| **兩台 provider 的 sudo 都需要密碼** | `fh-l`、`fh-proxy` 皆然 | 只有兩條路：`register.sh` 寫入範圍極窄的 sudoers（`systemctl poweroff`、`ethtool`，見 §1.3 第 7 步），或註冊時互動輸入。**不要把 sudo 密碼放進 GitHub 或任何自動化** |
+| **兩台 provider 的 sudo 都需要密碼** | `fh-l`、`fh-proxy` 皆然 | 只有兩條路：`register-provider.sh` 寫入範圍極窄的 sudoers（`systemctl poweroff`、`ethtool`，見 §1.3 第 7 步），或註冊時互動輸入。**不要把 sudo 密碼放進 GitHub 或任何自動化** |
 | **Fh-proxy 的 Windows 側自動啟動無法從 Linux 自動化** | Windows 開機不會自動啟動 WSL；需要工作排程器（已存在，見 §4.1） | 在那之前，Fh-proxy 的「重開機自動復活」只涵蓋 WSL 內部，不涵蓋 Windows 重開機 |
 | **Rotate 期間有感知延遲** | provider 每 30 秒輪詢 + ssh 重建 | 斷線約 40 秒內自癒；超過 2 分鐘才需人工（§5.1） |
 
@@ -501,9 +501,9 @@ repo 佈署的 `sshproxy/.ssh/id_rsa.crypted`，其公鑰**必須**出現在
 
 ---
 
-## 8. 改了 provision.sh 之後
+## 8. 改了 provision-gateway.sh 之後
 
-`gateway/provision.sh` 的改動**只對下一台 rotate 出來的機器生效**。現行
+`scripts/provision-gateway.sh` 的改動**只對下一台 rotate 出來的機器生效**。現行
 Gateway 是用它被建立當下的那個版本 provision 的，不會自動追上。
 
 這是不可變基礎設施的固有性質：好處是可重現（機器狀態完全由程式碼決定），
@@ -515,7 +515,7 @@ Gateway 是用它被建立當下的那個版本 provision 的，不會自動追�
 1. **立刻 rotate** —— 最乾淨，機器與程式碼重新對齊。但要花約 6 分鐘且會有
    數十秒的隧道中斷。
 2. **手動補齊並記錄** —— 適合小改動或剛 rotate 過不久。補完要在此處記一筆，
-   否則下次有人查「為什麼這台機器上有 X 但 provision.sh 沒裝 X」會很困惑。
+   否則下次有人查「為什麼這台機器上有 X 但 provision-gateway.sh 沒裝 X」會很困惑。
 
 ### 已知的手動補齊紀錄
 
@@ -574,3 +574,68 @@ ssh、bash、cmd.exe、PowerShell 每多一層轉義就多一次機會出錯。�
 5. 清除明文暫存
 6. `gh secret set FILE_CRYPTO_KEY`
 7. provider 上不存此金鑰（只在註冊當下用一次），無需同步
+
+---
+
+## 10. 在外網（咖啡廳）使用
+
+`ops-scripts/mlp` **完全走公網路徑**，不依賴家用內網。已實測驗證：
+
+```
+經 mlp 連進 fh-l   SSH_CONNECTION = 127.0.0.1 → 127.0.0.1   （走 Gateway 的反向隧道）
+直接走 LAN         SSH_CONNECTION = 192.168.0.104 → 192.168.0.136
+```
+
+`mlp wake` 也安全：它讀 `NODE_FH_L.power.launch.target_ip`（`192.168.0.136`），
+但那個值是**傳給 fh-proxy 去用的**，你的機器從頭到尾不碰內網位址。
+
+### ⚠️ 唯一的風險：fail2ban
+
+`POOL_TRUSTED_IPS` 只有家裡的對外 IP。在外面，你的 IP **不在白名單**——
+連線失敗幾次（打錯、金鑰沒載入、網路抖動重試）就可能被封。
+
+症狀跟 §7.1 那次一樣：**所有 TCP 埠瞬間 refused，看起來像伺服器死了**。
+差別是在家還有 fh-l 的 LAN 直連當退路，在外面沒有。
+
+### 被封鎖時的救援程序（LISH 主控台）
+
+這條路需要兩樣東西，**出門前確認它們都在**：
+
+1. Mac 上的 `~/.ssh/id_rsa`（已註冊為 Linode profile 的 LISH 金鑰）
+2. Gateway 的 root 密碼（原本存在 repo 根目錄的 `gw_pw`）
+
+```bash
+# 1. 連進 LISH 主控台（不經 SSH 埠，因此不受 fail2ban 影響）
+ssh -t fatesaikou@lish-ap-northeast.linode.com fws
+
+# 2. 以 root 登入（密碼即 gw_pw 的內容）
+
+# 3. 查目前封了誰
+nft list ruleset | grep -A6 f2b-table
+
+# 4. 解封你現在的 IP
+fail2ban-client set sshd unbanip <你的IP>
+```
+
+> **LISH 金鑰要設在對的地方。** `linode-cli sshkeys create` 加的是「SSH Keys」
+> 清單（給建立新 Linode 時佈署用），**LISH 不看那個**。LISH 讀的是 profile 上
+> 另一個欄位：
+>
+> ```bash
+> linode-cli profile update --authorized_keys "$(cat ~/.ssh/id_rsa.pub)"
+> ```
+>
+> 這點在 2026-09-13 事故中卡了一段時間才發現。
+
+### 如果你想降低風險
+
+到新地點時把當地 IP 加進白名單：
+
+```bash
+gh variable set POOL_TRUSTED_IPS --repo FATESAIKOU/MyLinuxPool \
+  --body "127.0.0.1/8 ::1 138.64.68.94 $(curl -s https://api.ipify.org)"
+```
+
+但這只寫進 var——要真正生效還得在 Gateway 上重新渲染 fail2ban 設定
+（`scripts/provision-gateway.sh` 的 step 2 會做，或手動改
+`/etc/fail2ban/jail.d/mylinuxpool-ignore.conf` 後 restart）。

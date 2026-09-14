@@ -273,7 +273,7 @@ Provider 每 30 秒輪詢，實際斷線時間 ≈ 一個輪詢週期 + 一次 s
 # 新 provider 上，人工一次（整套系統中唯一的人工輸入機密）
 export FILE_CRYPTO_KEY=...    # 信任根
 export GH_POOL_TOKEN=...      # 取得私有 repo 的鑰匙
-bash provider/register.sh --name fh-l --gateway-port 2222
+bash ops-scripts/register-provider.sh --name fh-l --gateway-port 2222
 ```
 
 腳本做七件事：
@@ -297,23 +297,12 @@ bash provider/register.sh --name fh-l --gateway-port 2222
 
 ## 7. Repo 結構
 
-```
-MyLinuxPool/
-├── docs/{ARCHITECTURE.md,RUNBOOK.md}
-├── .github/
-│   ├── actions/pool-ssh/        跳板鏈 composite action
-│   └── workflows/{rotate-gateway,launch-fh-l,shutdown-fh-l,
-│                  create-worker,delete-worker,pool-status}.yml
-├── pool/                        三種角色共用的 runtime
-│   ├── bin/{pool-tunnel,pool-resolve,pool-port-alloc,pool-status}
-│   └── systemd/pool-tunnel.service
-├── provider/register.sh         RegisterProvider
-├── gateway/{cloud-config.yaml,provision.sh}
-├── workers/base/Dockerfile      WorkerDockerfile 資料夾
-├── static_normal_files/
-├── static_secret_files/
-└── scripts/{encryptStdin.sh,decryptStdin.sh}
-```
+**見 `docs/LAYOUT.md`**——那才是結構契約，這裡不重複維護一份會漂移的副本。
+2026-09-15 的教訓正是這個：這裡曾經自己畫了一份目錄樹，重構了兩輪之後完全
+對不上實際的 `pool/`、`static_normal_files/`、`workers/base/` 等路徑早就
+不存在了。簡短摘要（詳細以 `LAYOUT.md` 為準）：根目錄只有四個程式目錄——
+`profiles/`（角色設定）、`shared-configs/`（分發單位）、`scripts/`（業務
+邏輯）、`ops-scripts/`（人手動跑的東西）——加上 `.github/`、`docs/`。
 
 ## 8. 實作階段
 
@@ -325,7 +314,7 @@ MyLinuxPool/
 |---|---|---|
 | **E** | `pool-ssh` composite action | 跳板鏈解析、`{"via":...}` 遞迴展開；被其他四條共用，先做先測 |
 | **A** | `pool/bin/pool-tunnel` 與健康檢測 | 斷線、Gateway 換 IP、埠被佔、ControlMaster 殘留 四種情境實機測過 |
-| **B** | `provider/register.sh` ＋ systemd | 兩台 provider 各跑一次，重開機後隧道自己活過來（REQ 步驟 5） |
+| **B** | `ops-scripts/register-provider.sh` ＋ systemd | 兩台 provider 各跑一次，重開機後隧道自己活過來（REQ 步驟 5） |
 | **C** | Gateway rotate | 真的 rotate 一次，且 `dlpw`／`uppw` 在新機上可用（REQ 步驟 6） |
 | **D** | Worker | 兩台 provider 上各開一個 worker 並 ssh 進去（REQ 步驟 7） |
 

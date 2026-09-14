@@ -112,6 +112,17 @@ install.sh [--key <FILE_CRYPTO_KEY>] [--home <dir>] [--user <name>] [--check]
 
 **環境預載的每一項都要在這裡明確列出**，不再有「把整棵樹倒到 `/`」這種隱含行為。
 
+> **命名提醒（容易混淆，故意分開講）**：下面每份 `profile.json` 裡的
+> `"shared_config"` 是**JSON 欄位名**，用底線；目錄本身叫
+> **`shared-configs/`**，用連字號。兩者拼法不同是刻意的——前者是資料
+> （profile 宣告要哪些 unit），後者是路徑（那些 unit 實際住在哪個目錄）。
+> 讀 `profile.json` 時看到 `shared_config` 不要以為打錯字、也不要以為要去
+> 找一個叫 `shared_config/` 的目錄——它就是在講 `shared-configs/` 裡的
+> unit，只是欄位名沒有跟著目錄改名。2026-09-15 的 create-worker 建置失敗
+> （Dockerfile 裡 `COPY shared_config/...` 是純字串，語法檢查與
+> `verify-profile` 都測不到）就是這兩種寫法混淆之下，路徑那一份沒改乾淨
+> 才漏掉的。
+
 ### `profiles/gateway/<name>/`
 
 ```
