@@ -209,6 +209,12 @@ jobs:
       - name: Run the probe on fh-l
         id: probe_run
         continue-on-error: true
+        # pool-ssh resolves the hop chain and looks each hop's key_secret
+        # up as an env var. The rest of this workflow reaches machines
+        # through the ssh-agent started above, so the variable was never
+        # exported and the probe failed before it could even try.
+        env:
+          SSH_KEY_ACTIONS: ${{ secrets.SSH_KEY_ACTIONS }}
         uses: ./.github/actions/pool-ssh
         with:
           node: fh-l
