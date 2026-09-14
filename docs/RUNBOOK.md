@@ -138,6 +138,17 @@ loginctl show-user "$USER" | grep Linger   # 必須是 Linger=yes
 
 > 若 rotate 後超過 **2 分鐘**還沒恢復，才需要人工介入 —— 直接跳 §5.1。
 
+**但操作者自己（用 `bin/mlp` 的那個人）第一次連線需要跑一次
+`bin/mlp trust-gateway`。** 這與上面「provider 什麼都不用做」是兩件事：
+provider 走的是程式化的 `pool-resolve`／`ExitOnForwardFailure`，本來就不
+做主機金鑰驗證；但 `bin/mlp` 是給人用的互動工具，Gateway 每次 rotate
+主機金鑰都會變，`bin/mlp` 把它記在專屬的 `~/.mylinuxpool/known_hosts`
+（不是 `~/.ssh/known_hosts`）並用 `StrictHostKeyChecking=accept-new`。
+rotate 後第一次連線會因為金鑰不符被擋下，`bin/mlp` 會印出清楚的原因
+（"Gateway 的主機金鑰變了，通常表示它剛被 rotate 過"）；照著跑
+`bin/mlp trust-gateway`（移除舊項目、重新接受目前的金鑰）即可，之後
+`ls`／`ssh`／`wake`／`down` 都會恢復正常。
+
 ---
 
 ## 3. 更換 GH_POOL_TOKEN

@@ -34,12 +34,13 @@
 在 Mac 上用 `bin/mlp`：
 
 ```bash
-bin/mlp            # 互動式選單
-bin/mlp ls         # 列出所有節點與即時狀態
-bin/mlp ssh        # 選一個節點登入
-bin/mlp wake       # 喚醒 fh-l
-bin/mlp down       # 關閉 fh-l
-bin/mlp status     # 完整健康檢查
+bin/mlp                # 互動式選單
+bin/mlp ls             # 列出所有節點與即時狀態
+bin/mlp ssh            # 選一個節點登入
+bin/mlp wake           # 喚醒 fh-l
+bin/mlp down           # 關閉 fh-l
+bin/mlp status         # 完整健康檢查
+bin/mlp trust-gateway  # Gateway rotate 後第一次連線要跑這個
 ```
 
 需要 `fzf` / `jq` / `gh`（`brew install fzf jq gh`）。

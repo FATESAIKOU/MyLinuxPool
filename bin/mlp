@@ -18,6 +18,31 @@
 # already-established exception pool/bin/pool-status uses for the same
 # reason. No connection info (ip/port/user/...) is ever read from `gh`
 # directly — that always goes through pool-resolve.
+#
+# HOST KEY TRUST MODEL (2026-09-14 incident — read this before touching
+# any ssh call below):
+#   - The Gateway is the one real trust boundary here, and it IS a stable
+#     identity between rotates — its host key is checked, but against a
+#     DEDICATED known_hosts file ($GW_KNOWN_HOSTS), never the operator's
+#     own ~/.ssh/known_hosts. Rotating the Gateway changes its host key
+#     on purpose; polluting the user's real known_hosts with it would
+#     make a *future* rotate look like a MITM attack there instead
+#     ("REMOTE HOST IDENTIFICATION HAS CHANGED"), right when the operator
+#     most needs to get in. `mlp trust-gateway` clears and re-accepts it.
+#   - 127.0.0.1:<port> (every provider/worker, on the far side of the
+#     Gateway) is NOT a stable identity — worker ports get reused for a
+#     different container, and it's always 127.0.0.1 regardless of which
+#     machine is actually listening. Recording a host key for it would
+#     be pure false confidence: it doesn't verify anything real, and it
+#     actively causes spurious "changed" failures on ordinary port reuse.
+#     Every connection to that hop uses UserKnownHostsFile=/dev/null +
+#     StrictHostKeyChecking=no, on purpose — not laziness.
+#   - Multi-hop connections (any provider/worker) reach this mixed model
+#     via `-o ProxyCommand=...`, not `-J`: `-J` applies the SAME ssh
+#     options to every hop, which can't express "verify the Gateway,
+#     don't verify past it". ProxyCommand runs the Gateway leg as its own
+#     ssh invocation with its own options, entirely independent of the
+#     outer (destination-hop) ssh's options.
 
 set -uo pipefail
 
@@ -26,6 +51,9 @@ REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 POOL_RESOLVE="${REPO_ROOT}/pool/bin/pool-resolve"
 POOL_STATUS="${REPO_ROOT}/pool/bin/pool-status"
 REPO="${POOL_REPO:-FATESAIKOU/MyLinuxPool}"
+
+MLP_STATE_DIR="${HOME}/.mylinuxpool"
+GW_KNOWN_HOSTS="${MLP_STATE_DIR}/known_hosts"
 
 CTL_DIR=""
 CTL=""
@@ -58,6 +86,7 @@ usage: mlp [command]
   wake             wake fh-l (unicast WoL via fh-proxy)
   down             shut down fh-l (asks for confirmation first)
   status           run pool-status
+  trust-gateway    re-accept the Gateway's host key after a rotate
   -h, --help       show this help
 
 requires: fzf, jq, gh — install missing ones with `brew install <name>`
@@ -77,6 +106,8 @@ check_deps() {
     if [[ ! -x "$POOL_RESOLVE" ]]; then
         die "pool-resolve not found at ${POOL_RESOLVE} — run mlp from inside a MyLinuxPool checkout"
     fi
+    mkdir -p "$MLP_STATE_DIR"
+    touch "$GW_KNOWN_HOSTS"
 }
 
 # ---- gateway + shared ControlMaster --------------------------------------
@@ -97,14 +128,49 @@ resolve_gateway() {
 open_gateway_master() {
     CTL_DIR="$(mktemp -d "${TMPDIR:-/tmp}/mlp.XXXXXX")" || return 1
     CTL="${CTL_DIR}/ctl-gateway"
-    ssh -M -S "$CTL" -o ControlPersist=60 -o ConnectTimeout=8 \
-        -o StrictHostKeyChecking=accept-new -o BatchMode=yes \
-        -N -f "${GW_USER}@${GW_IP}" 2>/dev/null
+    local err rc
+    err="$(ssh -M -S "$CTL" -o ControlPersist=60 -o ConnectTimeout=8 \
+        -o UserKnownHostsFile="$GW_KNOWN_HOSTS" -o StrictHostKeyChecking=accept-new -o BatchMode=yes \
+        -N -f "${GW_USER}@${GW_IP}" < /dev/null 2>&1)"
+    rc=$?
+    if [[ $rc -ne 0 ]]; then
+        if printf '%s' "$err" | grep -qi 'REMOTE HOST IDENTIFICATION HAS CHANGED\|host key verification failed'; then
+            echo "mlp: Gateway's host key has changed — this usually means it was just rotated." >&2
+            echo "mlp: if you just ran rotate-gateway, this is expected: run 'mlp trust-gateway', then try again." >&2
+        else
+            echo "mlp: could not connect to Gateway (${GW_USER}@${GW_IP}):" >&2
+            printf '%s\n' "$err" >&2
+        fi
+    fi
+    return "$rc"
+}
+
+# Clears any stale entry for the Gateway's current IP from the DEDICATED
+# known_hosts file (never ~/.ssh/known_hosts — see the top-of-file trust
+# model note) and re-accepts whatever key it presents right now.
+cmd_trust_gateway() {
+    resolve_gateway
+    mkdir -p "$MLP_STATE_DIR"
+    touch "$GW_KNOWN_HOSTS"
+
+    # Unconditional and silent-if-nothing-to-do on purpose: macOS's default
+    # /etc/ssh/ssh_config sets HashKnownHosts yes, so entries in here won't
+    # be plaintext-grep-able — ssh-keygen -R already knows how to find a
+    # hashed entry, a plain grep pre-check would not.
+    ssh-keygen -R "$GW_IP" -f "$GW_KNOWN_HOSTS" >/dev/null 2>&1
+    echo "cleared any old host key entry for ${GW_IP} in ${GW_KNOWN_HOSTS}"
+
+    if ssh -o UserKnownHostsFile="$GW_KNOWN_HOSTS" -o StrictHostKeyChecking=accept-new \
+           -o ConnectTimeout=8 -o BatchMode=yes "${GW_USER}@${GW_IP}" true < /dev/null 2>/dev/null; then
+        printf '%strusted Gateway host key for %s%s → %s\n' "$C_GREEN" "$GW_IP" "$C_RESET" "$GW_KNOWN_HOSTS"
+    else
+        die "could not connect to ${GW_USER}@${GW_IP} to accept its host key — check connectivity first"
+    fi
 }
 
 close_gateway_master() {
     if [[ -n "$CTL" && -S "$CTL" ]]; then
-        ssh -S "$CTL" -O exit "${GW_USER}@${GW_IP}" >/dev/null 2>&1 || true
+        ssh -S "$CTL" -O exit "${GW_USER}@${GW_IP}" < /dev/null >/dev/null 2>&1 || true
     fi
     [[ -n "$CTL_DIR" ]] && rm -rf "$CTL_DIR" 2>/dev/null || true
     CTL=""
@@ -114,10 +180,19 @@ close_gateway_master() {
 # Rides the shared ControlMaster; the remote-side `timeout` (present on
 # the Gateway) bounds the actual check, so no local `timeout` binary is
 # needed here — macOS doesn't ship one by default. Echoes up|down.
+#
+# `< /dev/null` on the LOCAL ssh here is not optional (2026-09-14
+# incident): this runs inside `while read ... done < <(gather_targets)`
+# loops in cmd_ls/cmd_ssh. Without it, ssh inherits the loop's stdin —
+# which is the process-substitution pipe still holding unread rows — and
+# happily eats from it, so the outer `read` silently loses whatever
+# gather_targets hadn't produced yet (fh-proxy and one worker vanished
+# from `mlp ls` this way). The `</dev/null` *inside* the quoted remote
+# command string is unrelated: that one runs on the Gateway, for `nc`.
 gw_probe_port() {
     local port="$1" banner
     banner="$(ssh -S "$CTL" -o ConnectTimeout=5 "${GW_USER}@${GW_IP}" \
-        "timeout 2 nc 127.0.0.1 ${port} </dev/null | head -c 4" 2>/dev/null)"
+        "timeout 2 nc 127.0.0.1 ${port} </dev/null | head -c 4" < /dev/null 2>/dev/null)"
     if [[ "$banner" == SSH-* ]]; then
         printf 'up'
     else
@@ -125,21 +200,28 @@ gw_probe_port() {
     fi
 }
 
+# Same `< /dev/null` requirement as gw_probe_port above, for the same
+# reason — this is called from inside gather_targets, which itself feeds
+# a `while read ... done < <(...)` loop in more than one caller. Do not
+# "clean up" this redirection; removing it reproduces the bug where rows
+# after this call silently disappear from `mlp ls`/`mlp ssh`'s menu.
 gw_run() {
     # Runs one command on the Gateway over the shared ControlMaster.
-    ssh -S "$CTL" -o ConnectTimeout=8 "${GW_USER}@${GW_IP}" "$1" 2>/dev/null
+    ssh -S "$CTL" -o ConnectTimeout=8 "${GW_USER}@${GW_IP}" "$1" < /dev/null 2>/dev/null
 }
 
 # ---- generic "run a command on any registered node" ----------------------
-# Builds the -J chain from pool-resolve <node> --expand-hops and runs $2
-# there. Same hop-walking shape as .github/actions/pool-ssh/run.sh (plain
-# indexed array + a counting loop — no associative arrays, bash 3.2 safe),
-# just using the operator's own ambient ssh credentials instead of an
-# ssh-agent loaded from GitHub secrets.
+# Builds a connection from pool-resolve <node> --expand-hops and runs $2
+# there. Every real chain today is exactly gateway+1 (see ARCHITECTURE.md
+# §3 — no node is ever more than one hop past the Gateway), so this
+# handles exactly that shape rather than an arbitrary-depth `-J` chain —
+# which also matters for the trust model below: `-J` applies the SAME
+# ssh options to every hop, so it can't express "verify the Gateway,
+# don't verify past it" (see the top-of-file note). ProxyCommand can,
+# because it's a fully separate ssh invocation for the Gateway leg.
 run_on_node() {
     local node="$1" cmd="$2"
-    local hops_json count i hop host port user
-    local jump_specs final_host final_port final_user jump_str
+    local hops_json count hop0 host0 port0 user0 hop1 host1 port1 user1
 
     hops_json="$("$POOL_RESOLVE" "$node" --expand-hops 2>/dev/null)"
     if [[ $? -ne 0 || -z "$hops_json" ]]; then
@@ -156,35 +238,38 @@ run_on_node() {
         return 1
     fi
 
-    jump_specs=()
-    final_host=""; final_port="22"; final_user=""
+    hop0="$(printf '%s' "$hops_json" | jq -c '.[0]')"
+    host0="$(printf '%s' "$hop0" | jq -r '.host')"
+    port0="$(printf '%s' "$hop0" | jq -r '.port // 22')"
+    user0="$(printf '%s' "$hop0" | jq -r '.user')"
 
-    i=0
-    while [[ "$i" -lt "$count" ]]; do
-        hop="$(printf '%s' "$hops_json" | jq -c ".[$i]")"
-        host="$(printf '%s' "$hop" | jq -r '.host')"
-        port="$(printf '%s' "$hop" | jq -r '.port // 22')"
-        user="$(printf '%s' "$hop" | jq -r '.user')"
-        if [[ "$i" -lt "$((count - 1))" ]]; then
-            jump_specs+=("${user}@${host}:${port}")
-        else
-            final_host="$host"; final_port="$port"; final_user="$user"
-        fi
-        i=$((i + 1))
-    done
-
-    jump_str=""
-    if [[ "${#jump_specs[@]}" -gt 0 ]]; then
-        jump_str="$(IFS=,; echo "${jump_specs[*]}")"
+    if [[ "$count" -eq 1 ]]; then
+        # node has no hops of its own — it IS the Gateway. Direct
+        # connection, verified against the dedicated Gateway known_hosts.
+        ssh -o UserKnownHostsFile="$GW_KNOWN_HOSTS" -o StrictHostKeyChecking=accept-new \
+            -o ConnectTimeout=10 -o BatchMode=yes \
+            -p "$port0" "${user0}@${host0}" "$cmd" < /dev/null
+        return $?
     fi
 
-    if [[ -n "$jump_str" ]]; then
-        ssh -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 -o BatchMode=yes \
-            -J "$jump_str" -p "$final_port" "${final_user}@${final_host}" "$cmd"
-    else
-        ssh -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 -o BatchMode=yes \
-            -p "$final_port" "${final_user}@${final_host}" "$cmd"
+    if [[ "$count" -ne 2 ]]; then
+        echo "mlp: hop chain for '${node}' has ${count} hops — mlp only knows how to reach gateway+1" >&2
+        return 1
     fi
+
+    hop1="$(printf '%s' "$hops_json" | jq -c '.[1]')"
+    host1="$(printf '%s' "$hop1" | jq -r '.host')"
+    port1="$(printf '%s' "$hop1" | jq -r '.port // 22')"
+    user1="$(printf '%s' "$hop1" | jq -r '.user')"
+
+    # hop0 is the Gateway (verified via its dedicated known_hosts); hop1
+    # is 127.0.0.1:<port> on the far side of the reverse tunnel — not a
+    # stable identity (see top-of-file note), so no host-key checking at
+    # all for it, on purpose.
+    ssh -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no -o LogLevel=ERROR \
+        -o ConnectTimeout=10 -o BatchMode=yes \
+        -o ProxyCommand="ssh -o UserKnownHostsFile=${GW_KNOWN_HOSTS} -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 -W %h:%p ${user0}@${host0}" \
+        -p "$port1" "${user1}@${host1}" "$cmd" < /dev/null
 }
 
 # ---- gather providers + workers ------------------------------------------
@@ -282,10 +367,16 @@ do_connect() {
     local type="$1" port="$2" user="$3"
     case "$type" in
         gateway)
-            ssh "${GW_USER}@${GW_IP}"
+            ssh -o UserKnownHostsFile="$GW_KNOWN_HOSTS" -o StrictHostKeyChecking=accept-new \
+                "${GW_USER}@${GW_IP}"
             ;;
         provider|worker)
-            ssh -J "${GW_USER}@${GW_IP}" -p "$port" "${user}@127.0.0.1"
+            # See the top-of-file trust model note: the Gateway leg is
+            # verified (dedicated known_hosts, via ProxyCommand); the
+            # 127.0.0.1:<port> leg is not checked at all, on purpose.
+            ssh -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no -o LogLevel=ERROR \
+                -o ProxyCommand="ssh -o UserKnownHostsFile=${GW_KNOWN_HOSTS} -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 -W %h:%p ${GW_USER}@${GW_IP}" \
+                -p "$port" "${user}@127.0.0.1"
             ;;
         *)
             die "unknown target type: ${type}"
@@ -484,10 +575,11 @@ main_menu() {
             printf '%s\n' \
                 "ls      list providers/workers and their live state" \
                 "ssh     pick a node/worker and connect" \
-                "wake    wake fh-l" \
-                "down    shut down fh-l" \
-                "status  run pool-status" \
-                "quit    exit" \
+                "wake           wake fh-l" \
+                "down           shut down fh-l" \
+                "status         run pool-status" \
+                "trust-gateway  re-accept the Gateway's host key after a rotate" \
+                "quit           exit" \
             | fzf --prompt='mlp> ' --height='~50%' --header='select an action (Esc to quit)'
         )"
 
@@ -500,6 +592,7 @@ main_menu() {
             wake) cmd_wake ;;
             down) cmd_down ;;
             status) cmd_status ;;
+            trust-gateway) cmd_trust_gateway ;;
             quit) break ;;
         esac
 
@@ -530,6 +623,7 @@ main() {
         wake) cmd_wake "$@" ;;
         down) cmd_down "$@" ;;
         status) cmd_status "$@" ;;
+        trust-gateway) cmd_trust_gateway "$@" ;;
         *)
             echo "mlp: unknown command '${cmd}'" >&2
             usage
