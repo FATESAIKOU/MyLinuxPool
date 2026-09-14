@@ -1,0 +1,6 @@
+{
+  "name": "base",
+  "description": "標準 Linux 工作環境",
+  "secrets": {},
+  "env": {}
+}

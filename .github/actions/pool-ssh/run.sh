@@ -54,8 +54,10 @@ fi
 # are handed over via `ssh-add -` (stdin), so none of them ever touch disk.
 eval "$(ssh-agent -s)" >/dev/null
 
+STDOUT_FILE="$(mktemp)"
 cleanup() {
     ssh-agent -k >/dev/null 2>&1 || true
+    rm -f "$STDOUT_FILE"
 }
 trap cleanup EXIT
 
@@ -99,7 +101,22 @@ fi
 
 log INFO "running command on ${final_user}@${final_host}:${final_port} (${#jump_specs[@]} jump(s))"
 
-# Deliberately not captured/wrapped: stdout/stderr flow straight to the
-# step's log, and set -e lets ssh's own exit code end this script (the
-# EXIT trap above still fires to kill the agent either way).
-ssh "${ssh_args[@]}" -p "$final_port" "${final_user}@${final_host}" -- "$COMMAND"
+# stderr flows straight to the step's log, untouched. stdout is teed so it
+# still shows up live in the log AND gets captured for callers that need
+# the value programmatically (e.g. a port number printed by
+# pool-port-alloc) — PIPESTATUS keeps `tee`'s own exit code from masking
+# ssh's under `pipefail`.
+set +e
+ssh "${ssh_args[@]}" -p "$final_port" "${final_user}@${final_host}" -- "$COMMAND" | tee "$STDOUT_FILE"
+rc="${PIPESTATUS[0]}"
+set -e
+
+if [[ -n "${GITHUB_OUTPUT:-}" ]]; then
+    {
+        echo "stdout<<POOL_SSH_STDOUT_EOF"
+        cat "$STDOUT_FILE"
+        echo "POOL_SSH_STDOUT_EOF"
+    } >> "$GITHUB_OUTPUT"
+fi
+
+exit "$rc"

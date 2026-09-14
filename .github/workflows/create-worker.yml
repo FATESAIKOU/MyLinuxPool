@@ -1,0 +1,330 @@
+name: Create Worker
+
+# spec: docs/POOL_RUNTIME_SPEC.md §10.4 — flow: docs/ARCHITECTURE.md §5
+#
+# Every remote command goes through .github/actions/pool-ssh — this file
+# never constructs its own `ssh -J ...` chain.
+#
+# Prerequisite this workflow assumes but does not set up itself: the
+# `fatesaikou` account on each provider must be able to run `docker`
+# without `sudo` (i.e. already in the `docker` group). register.sh
+# installs docker.io but doesn't add that group membership, and a bare
+# `sudo docker ...` here would hang the same way the old register.sh
+# sudo bug did (non-interactive, no TTY, no cached ticket) — see that
+# incident for why this isn't worked around with sudo here.
+
+on:
+  workflow_dispatch:
+    inputs:
+      provider:
+        description: Provider to host the worker
+        required: true
+        type: choice
+        options:
+          - fh-l
+          - fh-proxy
+      image:
+        description: workers/<image> directory to build
+        required: false
+        default: base
+      name:
+        description: Optional worker name (defaults to <provider>-<image>-<run id>)
+        required: false
+
+permissions:
+  contents: read
+
+env:
+  GH_TOKEN: ${{ secrets.GH_POOL_TOKEN }}
+  GH_REPO: ${{ github.repository }}
+  # pool-ssh's agent needs every key_secret that could appear in either
+  # chain this workflow touches (gateway directly, and <provider>'s own
+  # chain, which also passes through gateway).
+  SSH_KEY_GATEWAY: ${{ secrets.SSH_KEY_GATEWAY }}
+  SSH_KEY_FH_L: ${{ secrets.SSH_KEY_FH_L }}
+  SSH_KEY_FH_PROXY: ${{ secrets.SSH_KEY_FH_PROXY }}
+  SSH_KEY_SSHPROXY: ${{ secrets.SSH_KEY_SSHPROXY }}
+  # The only way to look up a secret by a name only known at run time
+  # (from profile.json) — GitHub Actions has no `secrets[dynamicName]`.
+  # Masking still applies: any of these values appearing anywhere in a
+  # later log line gets redacted the same as a directly-referenced secret.
+  ALL_SECRETS_JSON: ${{ toJSON(secrets) }}
+
+jobs:
+  create:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # image/name feed straight into file paths and remote command text
+      # elsewhere below — constrain their character set here, at the
+      # boundary, so every later use of ${{ inputs.image }} / ${{
+      # inputs.name }} inline in a script is safe by construction (no
+      # quotes, `$`, `/`, etc. to break out with). The raw, not-yet-
+      # validated values are read via `env:` here, never inlined directly
+      # into this script's own body, since inlining is exactly what this
+      # step exists to make safe for every step after it.
+      - name: Validate inputs
+        shell: bash
+        env:
+          IMAGE_IN: ${{ inputs.image }}
+          NAME_IN: ${{ inputs.name }}
+        run: |
+          set -euo pipefail
+          if ! [[ "$IMAGE_IN" =~ ^[A-Za-z0-9._-]+$ ]]; then
+            echo "::error::'image' must match ^[A-Za-z0-9._-]+\$, got '${IMAGE_IN}'"
+            exit 1
+          fi
+          if [[ -n "$NAME_IN" ]] && ! [[ "$NAME_IN" =~ ^[A-Za-z0-9._-]+$ ]]; then
+            echo "::error::'name' must match ^[A-Za-z0-9._-]+\$, got '${NAME_IN}'"
+            exit 1
+          fi
+
+      - name: Validate image profile
+        shell: bash
+        run: |
+          set -euo pipefail
+          dockerfile="workers/${{ inputs.image }}/Dockerfile"
+          profile="workers/${{ inputs.image }}/profile.json"
+          if [[ ! -f "$dockerfile" ]]; then
+            echo "::error::${dockerfile} not found"
+            exit 1
+          fi
+          if [[ ! -f "$profile" ]]; then
+            echo "::error::${profile} not found — every workers/<image>/ needs a profile.json (spec §10.2b)"
+            exit 1
+          fi
+          python3 -c 'import json,sys; json.load(open(sys.argv[1]))' "$profile"
+
+      - name: Compute worker identity
+        id: identity
+        shell: bash
+        run: |
+          set -euo pipefail
+          name="${{ inputs.name }}"
+          if [[ -z "$name" ]]; then
+            name="${{ inputs.provider }}-${{ inputs.image }}-${{ github.run_id }}"
+          fi
+          {
+            echo "name=${name}"
+            echo "image_tag=mlp-worker-${{ inputs.image }}"
+            echo "container=mlp-${name}"
+          } >> "$GITHUB_OUTPUT"
+
+      # profile.json declares "container env name" -> "GitHub secret name"
+      # (spec §10.2b) — never a value. Resolve every declared secret here,
+      # failing loudly (naming exactly which one) if any isn't configured,
+      # rather than silently injecting an empty value. Deliberately just a
+      # presence check, no values leave this step: a %q-quoted secret
+      # value handed across a `${{ steps.X.outputs.Y }}` boundary gets
+      # re-interpreted as literal shell source by whatever step reads it
+      # (GH Actions substitutes that text before bash parses), which would
+      # mangle anything containing real escapes (a multi-line key, say)
+      # and can corrupt $GITHUB_OUTPUT itself. The actual docker_env_args
+      # construction happens inline in "Build docker-run command" below,
+      # in the same step that reads $ALL_SECRETS_JSON, so nothing quoted
+      # ever crosses a step boundary.
+      - name: Validate profile-declared secrets exist
+        shell: bash
+        run: |
+          set -euo pipefail
+          profile="workers/${{ inputs.image }}/profile.json"
+
+          missing=()
+          while IFS=$'\t' read -r container_var secret_name; do
+            [[ -z "$container_var" ]] && continue
+            val="$(jq -r --arg n "$secret_name" '.[$n] // empty' <<<"$ALL_SECRETS_JSON")"
+            [[ -z "$val" ]] && missing+=("$secret_name")
+          done < <(jq -r '.secrets // {} | to_entries[] | [.key, .value] | @tsv' "$profile")
+
+          if (( ${#missing[@]} > 0 )); then
+            echo "::error::${profile} declares secret(s) not configured in this repo: ${missing[*]}"
+            exit 1
+          fi
+
+      - name: Resolve Gateway
+        id: gateway
+        shell: bash
+        run: |
+          set -euo pipefail
+          gw_json="$(pool/bin/pool-resolve gateway)"
+          {
+            echo "ip=$(jq -r '.ip' <<<"$gw_json")"
+            echo "user=$(jq -r '.user' <<<"$gw_json")"
+            echo "tunnel_user=$(jq -r '.tunnel_user' <<<"$gw_json")"
+            echo "port_lo=$(jq -r '.ports.worker[0]' <<<"$gw_json")"
+            echo "port_hi=$(jq -r '.ports.worker[1]' <<<"$gw_json")"
+          } >> "$GITHUB_OUTPUT"
+
+      # pool-port-alloc runs ON the Gateway, but the Gateway has no
+      # persistent copy of it (or a GH token to fetch NODE_GATEWAY itself
+      # with) — so the script's own content is embedded and run over
+      # stdin via pool-ssh's single `command` string, and the (non-secret)
+      # port range is handed in directly instead of making pool-port-alloc
+      # call pool-resolve/gh remotely. `%q` avoids all quoting/heredoc
+      # fragility for both the range and the script body.
+      - name: Build claim-port command
+        id: claim_cmd
+        shell: bash
+        run: |
+          set -euo pipefail
+          script_q="$(printf '%q' "$(cat pool/bin/pool-port-alloc)")"
+          range_q="$(printf '%q' "${{ steps.gateway.outputs.port_lo }} ${{ steps.gateway.outputs.port_hi }}")"
+          provider_q="$(printf '%q' "${{ inputs.provider }}")"
+          image_q="$(printf '%q' "${{ inputs.image }}")"
+          echo "cmd=POOL_WORKER_PORT_RANGE=${range_q} bash -c ${script_q} _ --claim ${provider_q} ${image_q}" >> "$GITHUB_OUTPUT"
+
+      - name: Claim a worker port on the Gateway
+        id: claim
+        uses: ./.github/actions/pool-ssh
+        with:
+          node: gateway
+          command: ${{ steps.claim_cmd.outputs.cmd }}
+
+      - name: Parse claimed port
+        id: port
+        shell: bash
+        run: |
+          set -euo pipefail
+          port="$(printf '%s' "${{ steps.claim.outputs.stdout }}" | tr -d '[:space:]')"
+          if ! [[ "$port" =~ ^[0-9]+$ ]]; then
+            echo "::error::pool-port-alloc did not print a port number (got: '${{ steps.claim.outputs.stdout }}')"
+            exit 1
+          fi
+          echo "port=${port}" >> "$GITHUB_OUTPUT"
+
+      # Providers already keep a repo clone at ~/.mylinuxpool/repo
+      # (register.sh) — reuse it as the build context instead of shipping
+      # any files there ourselves, pinned to the exact commit this run
+      # was dispatched from.
+      - name: Build worker image on provider
+        id: build
+        uses: ./.github/actions/pool-ssh
+        with:
+          node: ${{ inputs.provider }}
+          timeout: "60"
+          command: >-
+            GH_TOKEN="$(cat ~/.mylinuxpool/gh_token 2>/dev/null)"
+            git -C ~/.mylinuxpool/repo fetch origin ${{ github.sha }} &&
+            git -C ~/.mylinuxpool/repo checkout ${{ github.sha }} &&
+            docker build -f ~/.mylinuxpool/repo/workers/${{ inputs.image }}/Dockerfile
+            -t ${{ steps.identity.outputs.image_tag }} ~/.mylinuxpool/repo
+
+      # Everything that touches a secret value happens in this one step —
+      # WORKER_KEY/its derived public half, and every profile-declared
+      # secret from $ALL_SECRETS_JSON — precisely so no already-%q-quoted
+      # secret ever has to cross a `${{ steps.X.outputs.Y }}` boundary
+      # (see the note on "Validate profile-declared secrets exist" above).
+      # Everything else referenced via ${{ }} here (name/port/ip/tag/...)
+      # is plain, unescaped text, which is safe to cross that boundary.
+      - name: Build docker-run command
+        id: run_cmd
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          eval "$(ssh-agent -s)" >/dev/null
+          trap 'ssh-agent -k >/dev/null 2>&1 || true' EXIT
+          ssh-add - <<< "$SSH_KEY_SSHPROXY" >/dev/null
+          worker_pub="$(ssh-add -L)"
+
+          container_q="$(printf '%q' "${{ steps.identity.outputs.container }}")"
+          image_q="$(printf '%q' "${{ steps.identity.outputs.image_tag }}")"
+          port_q="$(printf '%q' "${{ steps.port.outputs.port }}")"
+          host_q="$(printf '%q' "${{ steps.gateway.outputs.ip }}")"
+          tunnel_user_q="$(printf '%q' "${{ steps.gateway.outputs.tunnel_user }}")"
+          node_name_q="$(printf '%q' "${{ steps.identity.outputs.name }}")"
+          worker_key_q="$(printf '%q' "$SSH_KEY_SSHPROXY")"
+          authorized_key_q="$(printf '%q' "$worker_pub")"
+
+          cmd="docker rm -f ${container_q} >/dev/null 2>&1; docker run -d --restart unless-stopped --name ${container_q}"
+          cmd+=" -e POOL_GATEWAY_PORT=${port_q} -e POOL_GATEWAY_HOST=${host_q} -e POOL_GATEWAY_USER=${tunnel_user_q}"
+          cmd+=" -e POOL_NODE_NAME=${node_name_q}"
+          cmd+=" -e WORKER_KEY=${worker_key_q} -e WORKER_AUTHORIZED_KEYS=${authorized_key_q}"
+
+          profile="workers/${{ inputs.image }}/profile.json"
+          while IFS=$'\t' read -r container_var secret_name; do
+            [[ -z "$container_var" ]] && continue
+            val="$(jq -r --arg n "$secret_name" '.[$n] // empty' <<<"$ALL_SECRETS_JSON")"
+            cmd+=" -e $(printf '%q' "${container_var}=${val}")"
+          done < <(jq -r '.secrets // {} | to_entries[] | [.key, .value] | @tsv' "$profile")
+
+          while IFS=$'\t' read -r container_var literal_val; do
+            [[ -z "$container_var" ]] && continue
+            cmd+=" -e $(printf '%q' "${container_var}=${literal_val}")"
+          done < <(jq -r '.env // {} | to_entries[] | [.key, .value] | @tsv' "$profile")
+
+          cmd+=" ${image_q}"
+          echo "cmd=${cmd}" >> "$GITHUB_OUTPUT"
+
+      - name: Run worker container on provider
+        id: run
+        uses: ./.github/actions/pool-ssh
+        with:
+          node: ${{ inputs.provider }}
+          command: ${{ steps.run_cmd.outputs.cmd }}
+
+      # pool-port-alloc --claim never learns the container's name (it runs
+      # before docker build/run even happen) — record it into the
+      # placeholder now so delete-worker.yml can find this claim by name,
+      # not just by port.
+      - name: Record container name in the port placeholder
+        uses: ./.github/actions/pool-ssh
+        with:
+          node: gateway
+          command: >-
+            f=~/pool/workers.d/${{ steps.port.outputs.port }}.json &&
+            jq --arg c '${{ steps.identity.outputs.container }}' '.container = $c' "$f" > "$f.tmp" &&
+            mv "$f.tmp" "$f"
+
+      # The port being open only means *something* is listening — read
+      # the SSH banner off the Gateway's own loopback, same reasoning as
+      # pool-tunnel's own health check (SPEC §3.2): a bare port doesn't
+      # prove the worker's tunnel is what's actually there.
+      - name: Verify worker port on Gateway
+        id: verify
+        uses: ./.github/actions/pool-ssh
+        with:
+          node: gateway
+          timeout: "10"
+          command: >-
+            for i in $(seq 1 30); do
+              banner="$(timeout 2 nc 127.0.0.1 ${{ steps.port.outputs.port }} </dev/null | head -c 4)";
+              if [[ "$banner" == SSH-* ]]; then echo ok; exit 0; fi;
+              sleep 2;
+            done; echo "worker port ${{ steps.port.outputs.port }} never came up"; exit 1
+
+      - name: Connection command
+        shell: bash
+        run: |
+          echo "Worker '${{ steps.identity.outputs.name }}' is up on ${{ inputs.provider }} (port ${{ steps.port.outputs.port }})."
+          echo ""
+          echo "Connect with:"
+          echo "  ssh -J ${{ steps.gateway.outputs.user }}@${{ steps.gateway.outputs.ip }} -p ${{ steps.port.outputs.port }} worker@127.0.0.1"
+
+      # --- failure handling: never leave an orphaned port claim or a
+      # broken, unverified container behind. ---
+
+      - name: On failure, remove the (possibly broken) container
+        if: failure() && steps.identity.outputs.container != ''
+        uses: ./.github/actions/pool-ssh
+        with:
+          node: ${{ inputs.provider }}
+          command: docker rm -f ${{ steps.identity.outputs.container }} >/dev/null 2>&1 || true
+
+      - name: On failure, build release-port command
+        id: release_cmd
+        if: failure() && steps.port.outputs.port != ''
+        shell: bash
+        run: |
+          set -euo pipefail
+          script_q="$(printf '%q' "$(cat pool/bin/pool-port-alloc)")"
+          echo "cmd=bash -c ${script_q} _ --release ${{ steps.port.outputs.port }}" >> "$GITHUB_OUTPUT"
+
+      - name: Release claimed port on the Gateway
+        if: failure() && steps.port.outputs.port != ''
+        uses: ./.github/actions/pool-ssh
+        with:
+          node: gateway
+          command: ${{ steps.release_cmd.outputs.cmd }}

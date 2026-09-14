@@ -1,0 +1,143 @@
+name: Delete Worker
+
+# spec: docs/POOL_RUNTIME_SPEC.md §10.4
+#
+# Every remote command goes through .github/actions/pool-ssh — this file
+# never constructs its own `ssh -J ...` chain.
+
+on:
+  workflow_dispatch:
+    inputs:
+      port:
+        description: Worker's Gateway port (from Create Worker's output). Either this or name.
+        required: false
+      name:
+        description: Worker name (from Create Worker's output). Either this or port.
+        required: false
+
+permissions:
+  contents: read
+
+env:
+  GH_TOKEN: ${{ secrets.GH_POOL_TOKEN }}
+  GH_REPO: ${{ github.repository }}
+  SSH_KEY_GATEWAY: ${{ secrets.SSH_KEY_GATEWAY }}
+  SSH_KEY_FH_L: ${{ secrets.SSH_KEY_FH_L }}
+  SSH_KEY_FH_PROXY: ${{ secrets.SSH_KEY_FH_PROXY }}
+
+jobs:
+  delete:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # 'port'/'name' feed into remote command text below — validated here
+      # via `env:` (never inlined directly into this script's own body,
+      # since that's exactly what this step exists to make safe for every
+      # step after it).
+      - name: Validate inputs
+        shell: bash
+        env:
+          PORT_IN: ${{ inputs.port }}
+          NAME_IN: ${{ inputs.name }}
+        run: |
+          set -euo pipefail
+          if [[ -z "$PORT_IN" && -z "$NAME_IN" ]]; then
+            echo "::error::give either 'port' or 'name'"
+            exit 1
+          fi
+          if [[ -n "$PORT_IN" ]] && ! [[ "$PORT_IN" =~ ^[0-9]+$ ]]; then
+            echo "::error::'port' must be numeric, got '${PORT_IN}'"
+            exit 1
+          fi
+          if [[ -n "$NAME_IN" ]] && ! [[ "$NAME_IN" =~ ^[A-Za-z0-9._-]+$ ]]; then
+            echo "::error::'name' must match ^[A-Za-z0-9._-]+\$, got '${NAME_IN}'"
+            exit 1
+          fi
+
+      # pool-port-alloc runs on the Gateway with no persistent copy of
+      # itself and no GH token to fetch NODE_GATEWAY with — same reasoning
+      # as create-worker.yml: embed the script's own content and run it
+      # over stdin via pool-ssh's single `command` string.
+      - name: Build list-placeholders command
+        id: list_cmd
+        shell: bash
+        run: |
+          set -euo pipefail
+          script_q="$(printf '%q' "$(cat pool/bin/pool-port-alloc)")"
+          echo "cmd=bash -c ${script_q} _ --list" >> "$GITHUB_OUTPUT"
+
+      - name: List worker port claims on the Gateway
+        id: list
+        uses: ./.github/actions/pool-ssh
+        with:
+          node: gateway
+          command: ${{ steps.list_cmd.outputs.cmd }}
+
+      # The real state of a port is `ss` on the Gateway, not this
+      # placeholder (spec §10.1) — but we need it here regardless, to
+      # learn WHICH provider and container to reach, since neither `port`
+      # nor `name` alone tells us that.
+      - name: Find the matching claim
+        id: find
+        shell: bash
+        env:
+          # Passed as a real env var (not inlined via ${{ }} in the script
+          # body) so its content is never re-parsed as shell syntax —
+          # matters here since these placeholders can carry a name
+          # someone passed to create-worker.yml.
+          CLAIMS_JSON: ${{ steps.list.outputs.stdout }}
+        run: |
+          set -euo pipefail
+          claims="$CLAIMS_JSON"
+          port_in="${{ inputs.port }}"
+          name_in="${{ inputs.name }}"
+
+          if [[ -n "$port_in" ]]; then
+            match="$(jq -c --argjson p "$port_in" '[.[] | select(.port == $p)] | first // empty' <<<"$claims")"
+          else
+            container="mlp-${name_in}"
+            match="$(jq -c --arg c "$container" '[.[] | select(.container == $c)] | first // empty' <<<"$claims")"
+          fi
+
+          if [[ -z "$match" ]]; then
+            echo "::error::no worker port claim found for '${port_in}${name_in}' — check pool-port-alloc --list on the Gateway"
+            exit 1
+          fi
+
+          {
+            echo "port=$(jq -r '.port' <<<"$match")"
+            echo "provider=$(jq -r '.provider' <<<"$match")"
+            echo "container=$(jq -r '.container // empty' <<<"$match")"
+          } >> "$GITHUB_OUTPUT"
+
+      # Best-effort: a provider being briefly unreachable shouldn't block
+      # freeing the port below — but the step still shows red so it's not
+      # silently swallowed either.
+      - name: Stop and remove the container on the provider
+        if: steps.find.outputs.container != ''
+        continue-on-error: true
+        uses: ./.github/actions/pool-ssh
+        with:
+          node: ${{ steps.find.outputs.provider }}
+          command: docker rm -f ${{ steps.find.outputs.container }}
+
+      - name: Build release-port command
+        id: release_cmd
+        shell: bash
+        run: |
+          set -euo pipefail
+          script_q="$(printf '%q' "$(cat pool/bin/pool-port-alloc)")"
+          echo "cmd=bash -c ${script_q} _ --release ${{ steps.find.outputs.port }}" >> "$GITHUB_OUTPUT"
+
+      - name: Release the port on the Gateway
+        uses: ./.github/actions/pool-ssh
+        with:
+          node: gateway
+          command: ${{ steps.release_cmd.outputs.cmd }}
+
+      - name: Summary
+        shell: bash
+        run: |
+          echo "Deleted worker on ${{ steps.find.outputs.provider }} (container ${{ steps.find.outputs.container }}), released port ${{ steps.find.outputs.port }}."

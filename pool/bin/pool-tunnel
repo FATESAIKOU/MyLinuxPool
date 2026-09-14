@@ -29,6 +29,10 @@ GW_USER=""
 GW_GEN=""
 MY_PORT=""
 MASTER_PID=""
+# §10.3: set to 1 once resolve_connection_info sees all of
+# POOL_GATEWAY_PORT/HOST/USER — disables the pool-resolve-based 30s drift
+# check, which would otherwise fail forever with no GH credentials to use.
+STATIC_GATEWAY=0
 
 log() {
     local level="$1"; shift
@@ -44,6 +48,7 @@ log() {
 usage() {
     echo "usage: pool-tunnel [--name <node-name>] [--once]" >&2
     echo "       (or set POOL_GATEWAY_PORT / POOL_NODE_NAME — see spec §10.3, used by disposable workers)" >&2
+    echo "       (also set POOL_GATEWAY_HOST / POOL_GATEWAY_USER to skip pool-resolve entirely — no GH credentials needed)" >&2
 }
 
 load_name_from_config() {
@@ -77,8 +82,26 @@ next_backoff() {
 # if POOL_GATEWAY_PORT is set, take the port straight from the
 # environment and skip the pool-resolve "$NAME" lookup entirely. Providers
 # never set this env var, so their path below is unchanged.
+#
+# If POOL_GATEWAY_PORT, POOL_GATEWAY_HOST and POOL_GATEWAY_USER are ALL
+# set, the Gateway side is taken straight from the environment too, and
+# pool-resolve is never called at all — a worker in this mode needs zero
+# GitHub credentials to build its tunnel. The tradeoff (spec §10.3): it
+# can't detect a Gateway rotate, so STATIC_GATEWAY also disables the 30s
+# drift check below rather than let it spam errors with no way to
+# succeed. This is expected — workers are disposable; re-run
+# create-worker after a rotate.
 resolve_connection_info() {
     local self_json rc
+
+    if [[ -n "${POOL_GATEWAY_PORT:-}" && -n "${POOL_GATEWAY_HOST:-}" && -n "${POOL_GATEWAY_USER:-}" ]]; then
+        MY_PORT="$POOL_GATEWAY_PORT"
+        GW_IP="$POOL_GATEWAY_HOST"
+        GW_USER="$POOL_GATEWAY_USER"
+        GW_GEN=""
+        STATIC_GATEWAY=1
+        return 0
+    fi
 
     if [[ -n "${POOL_GATEWAY_PORT:-}" ]]; then
         MY_PORT="$POOL_GATEWAY_PORT"
@@ -322,7 +345,7 @@ main() {
         fi
 
         local now=$(date +%s)
-        if (( now - last_gw_check >= GATEWAY_CHECK_INTERVAL )); then
+        if [[ "$STATIC_GATEWAY" -ne 1 ]] && (( now - last_gw_check >= GATEWAY_CHECK_INTERVAL )); then
             last_gw_check=$now
             if gateway_changed; then
                 log WARN "rebuilding tunnel immediately due to gateway drift"

@@ -17,10 +17,16 @@ inputs:
     required: false
     default: "10"
 
+outputs:
+  stdout:
+    description: The remote command's stdout (also streamed live to the log)
+    value: ${{ steps.run.outputs.stdout }}
+
 runs:
   using: composite
   steps:
     - name: Resolve jump chain and run command
+      id: run
       shell: bash
       env:
         POOL_SSH_NODE: ${{ inputs.node }}
