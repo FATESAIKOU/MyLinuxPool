@@ -585,6 +585,48 @@ secret 餵入），沒設定才回退隨機並在 log 明說「這台無法用�
 Generation 4 這台是在修好之前建的，它的 root 密碼無人知曉。
 現階段的替代退路是 `repair-gateway` workflow（見 §8）。
 
+### 7.8 Linode 會回收 IP，而 `accept-new` 不接受「換過的」金鑰
+
+2026-09-14 的 rotate 切換後兩台 provider 都掛不上去，三分鐘後自動回滾。
+
+Linode 把 `172.105.219.60` 這個位址發了又發（generation 3 用過、之後兩次
+rotate 又拿到同一個）。provider 在 gen-3 時代就把那個位址的主機金鑰寫進
+`known_hosts` 了，而新機器的金鑰不一樣。
+
+**`StrictHostKeyChecking=accept-new` 接受「沒見過的主機」，但拒絕
+「見過但金鑰變了」的主機。** 所以每一台 provider 都拒絕連線。
+
+三個獨立的錯誤讓這件事變得難查：
+
+1. **`start_master` 把 ssh 的 stderr 丟掉**（`2>/dev/null 2>&1`），然後對任何
+   非零退出碼都印「remote forward was refused」——那件事程式碼從來沒檢查過。
+   唯一的線索被自己蓋掉了。
+2. **我用 `grep '172.105.219.60' ~/.ssh/known_hosts` 去查，得到 0 就下了結論。**
+   Ubuntu 預設 `HashKnownHosts yes`，那個檔案是雜湊過的，明文 grep 永遠是 0。
+   要用 `ssh-keygen -F <host>`。
+3. **rotate 先切換再驗證**。它切了 `NODE_GATEWAY` 才去看 provider 有沒有回來，
+   所以「發現問題」與「服務中斷」是同一件事。
+
+#### 修法
+
+- **主機金鑰改由 `NODE_GATEWAY` 攜帶。** rotate 在剛佈署完的那條連線上讀
+  `/etc/ssh/ssh_host_ed25519_key.pub`，寫進 var 的 `host_key` 欄位；
+  `pool-tunnel` 用它在**自己的** `~/.mylinuxpool/gateway_known_hosts` 裡釘選，
+  並用 `StrictHostKeyChecking=yes`。
+  這比原本的 TOFU **更嚴格**，而且對位址回收免疫。清 `known_hosts` 不是解法
+  ——下一個被回收的位址會再來一次。
+- **切換前先問一台 provider。** 新增的 probe 步驟從 fh-l 用**跟 pool-tunnel
+  完全相同的方式**（含釘選）對新機器建一條反向隧道（用 2999 這個備用埠，
+  才不會撞到它正在用的埠）。失敗就中止 rotate，現役 Gateway 完全沒被動到。
+  dry run 也會跑——證明一台真的 provider 連得上，本來就是 dry run 該做的事。
+- **`start_master` 保留並印出 ssh 的 stderr**，也不再宣稱自己知道原因。
+
+> 教訓（第八、九次）：**不要把症狀當成原因，也不要相信一個你沒確認過
+> 「有能力偵測失敗」的檢查。** 這次兩邊都犯了——程式碼替 ssh 編了一個理由，
+> 而我用一個對雜湊檔永遠回 0 的 grep 排除了正確答案。
+
+---
+
 ---
 
 ## 8. 改了 provision-gateway.sh 之後
