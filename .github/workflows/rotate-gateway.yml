@@ -65,10 +65,14 @@ jobs:
         env:
           # SSH_KEY_ACTIONS is Actions' one identity across the whole
           # cluster (management access to Gateway and every provider) —
-          # not to be confused with SSH_KEY_SSHPROXY, the separate tunnel
-          # identity providers/workers use to reverse-tunnel in.
+          # not to be confused with the tunnel identity below, which
+          # providers/workers use to reverse-tunnel in.
           SSH_KEY_ACTIONS: ${{ secrets.SSH_KEY_ACTIONS }}
-          SSH_KEY_SSHPROXY: ${{ secrets.SSH_KEY_SSHPROXY }}
+          # The tunnel identity is not a secret of its own: it already
+          # ships in the repo as ssh-tunnel-client/files/id_rsa.crypted,
+          # and Actions holds the key that opens it. One fewer secret to
+          # keep in sync with the .crypted file it duplicated.
+          FILE_CRYPTO_KEY: ${{ secrets.FILE_CRYPTO_KEY }}
         run: |
           set -euo pipefail
           eval "$(ssh-agent -s)" >/dev/null
@@ -76,7 +80,8 @@ jobs:
           echo "SSH_AGENT_PID=${SSH_AGENT_PID}" >> "$GITHUB_ENV"
 
           ssh-add - <<< "$SSH_KEY_ACTIONS"
-          ssh-add - <<< "$SSH_KEY_SSHPROXY"
+          scripts/lib/crypto.sh decrypt "$FILE_CRYPTO_KEY" \
+            < shared-configs/ssh-tunnel-client/files/id_rsa.crypted | ssh-add -
 
           # Keys never touch disk: derive each public half straight out of
           # the agent instead of writing the private key to a file for

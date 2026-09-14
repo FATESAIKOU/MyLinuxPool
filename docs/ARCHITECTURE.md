@@ -70,7 +70,6 @@
   "user": "fatesaikou",
   "tunnel_user": "sshproxy",
   "key_secret": "SSH_KEY_ACTIONS",
-  "tunnel_key_secret": "SSH_KEY_SSHPROXY",
   "linode_label": "fws",
   "ports": { "provider": [2220, 2299], "worker": [2300, 2399] },
   "generation": 7,
@@ -118,11 +117,18 @@
 > (straight to the Gateway), so the missing-secret gap on hop 2 went
 > unnoticed. Fixed by giving Actions one key — `SSH_KEY_ACTIONS` — and
 > pointing every node's `key_secret` (top-level and every hop) at it.
-> `tunnel_key_secret`/`SSH_KEY_SSHPROXY` stays a **separate** identity on
-> purpose: it authenticates the opposite direction (a provider/worker
-> dialing *in* to end its own reverse tunnel) and is deliberately
-> more restricted than Actions' own management access — collapsing the
-> two into one key would hand tunnel-only machines Actions-level reach.
+> The tunnel identity stays a **separate** key on purpose: it
+> authenticates the opposite direction (a provider/worker dialing *in* to
+> end its own reverse tunnel) and is deliberately more restricted than
+> Actions' own management access — collapsing the two into one key would
+> hand tunnel-only machines Actions-level reach.
+>
+> It is not, however, a separate *secret*. The same private key already
+> ships in the repo as `shared-configs/ssh-tunnel-client/files/id_rsa.crypted`,
+> which is how providers get it in the first place; Actions holds
+> `FILE_CRYPTO_KEY` and decrypts it when it needs the key in its agent.
+> `SSH_KEY_SSHPROXY` was a second copy of the same bytes that had to be
+> kept in sync by hand, so it was removed on 2026-09-14.
 
 ### NODE_FH_PROXY
 
@@ -143,7 +149,7 @@
 | `FILE_CRYPTO_KEY` | 保留 | 對稱解密 `.crypted`；維持 aes-256-cbc，現有檔案不動 |
 | `LINODE_TOKEN` | 保留 | Rotate 時建／刪／改名機器 |
 | `SSH_KEY_ACTIONS` | 新增（取代 `SSH_KEY_GATEWAY`/`SSH_KEY_FH_L`/`SSH_KEY_FH_PROXY`） | Actions 對整座叢集的**唯一**管理身分；每個 node var 的 `key_secret`（含每一跳）都指向它，不再依目的地各配一把 |
-| `SSH_KEY_SSHPROXY` | 新增 | Provider／worker 撥反向隧道用（沿用現有 sshproxy 金鑰）。**與 `SSH_KEY_ACTIONS`是兩個獨立身分，不可合併**——見上方 NODE_FH_L 範例後的說明 |
+| ~~`SSH_KEY_SSHPROXY`~~ | 2026-09-14 刪除 | 隧道身分本身仍然存在且**與 `SSH_KEY_ACTIONS` 不可合併**，但它不需要當成 secret 保存：同一把私鑰已經以 `shared-configs/ssh-tunnel-client/files/id_rsa.crypted` 隨 repo 分發，Actions 用 `FILE_CRYPTO_KEY` 自己解得開 |
 | `CSIE_IO_TOKEN` | 刪除 | DDNS 廢除後無用 |
 | `SSHPROXY_PASS` | 刪除 | 改純金鑰認證，Gateway 關閉 `PasswordAuthentication` |
 | `GH_POOL_TOKEN` | 加密佈署 | 放 `static_secret_files`，給 provider 讀 var／clone repo |

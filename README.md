@@ -68,7 +68,7 @@
 | 身分 | 誰用 | 走哪 |
 |---|---|---|
 | `SSH_KEY_ACTIONS` | GitHub Actions、管理員 | 由上往下進入所有機器 |
-| `SSH_KEY_SSHPROXY` | provider / worker | 由下往上掛反向隧道 |
+| 隧道身分（`ssh-tunnel-client/files/id_rsa.crypted`） | provider / worker | 由下往上掛反向隧道 |
 
 **不變式**：`shared-configs/ssh-tunnel-client/files/id_rsa.pub.crypted` 的內容
 必須出現在 `shared-configs/ssh-tunnel-server/files/authorized_keys.crypted` 裡。

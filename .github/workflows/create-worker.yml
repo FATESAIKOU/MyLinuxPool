@@ -44,9 +44,6 @@ env:
   # single key regardless of which chain (gateway or <provider>'s, which
   # also passes through gateway) it's resolving.
   SSH_KEY_ACTIONS: ${{ secrets.SSH_KEY_ACTIONS }}
-  # Separate tunnel identity, not to be confused with the above — providers
-  # and workers reverse-tunnel in using this, never Actions' own identity.
-  SSH_KEY_SSHPROXY: ${{ secrets.SSH_KEY_SSHPROXY }}
   # The only way to look up a secret by a name only known at run time
   # (from profile.json) — GitHub Actions has no `secrets[dynamicName]`.
   # Masking still applies: any of these values appearing anywhere in a
@@ -198,7 +195,7 @@ jobs:
       # Everything that touches a secret value happens inside
       # create_worker_build_run_cmd, in this one step — see the note on
       # "Validate profile-declared secrets exist" above for why. Only this
-      # step ever reads $SSH_KEY_SSHPROXY / $FILE_CRYPTO_KEY / the
+      # step ever reads the decrypted tunnel key / $FILE_CRYPTO_KEY / the
       # function's own %q-quoted output.
       - name: Build docker-run command
         id: run_cmd
@@ -212,7 +209,8 @@ jobs:
             "${{ steps.identity.outputs.container }}" "${{ steps.identity.outputs.image_tag }}" \
             "${{ steps.port.outputs.port }}" "${{ steps.gateway.outputs.ip }}" \
             "${{ steps.gateway.outputs.tunnel_user }}" "${{ steps.identity.outputs.name }}" \
-            "$SSH_KEY_SSHPROXY" "shared-configs/ssh-admin/files/authorized_keys.crypted" \
+            "$(scripts/lib/crypto.sh decrypt "$FILE_CRYPTO_KEY" < shared-configs/ssh-tunnel-client/files/id_rsa.crypted)" \
+            "shared-configs/ssh-admin/files/authorized_keys.crypted" \
             "$FILE_CRYPTO_KEY" "profiles/worker/${{ inputs.image }}/profile.json" "$ALL_SECRETS_JSON")" \
             || { echo "::error::could not build the docker-run command — see log above"; exit 1; }
           echo "cmd=${cmd}" >> "$GITHUB_OUTPUT"
