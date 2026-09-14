@@ -8,6 +8,9 @@
 set -uo pipefail
 
 STATE_DIR="${HOME}/.mylinuxpool"
+# Same path pool-resolve reads (POOL_STATE_FILE override included): the
+# local snapshot of the Gateway's state.json (STATE_CONTRACT.md §2/§3).
+STATE_FILE="${POOL_STATE_FILE:-${STATE_DIR}/state.json}"
 # Private to the tunnel: never the user's ~/.ssh/known_hosts, which other
 # tools also write and which outlives any single Gateway generation.
 KNOWN_HOSTS_FILE="${STATE_DIR}/gateway_known_hosts"
@@ -144,6 +147,83 @@ read_published_gateway() {
     hk="$(jq -r '.host_key // empty' < "$GATEWAY_FOLLOW_FILE" 2>/dev/null)"
     [[ -n "$ip" && -n "$user" ]] || return 1
     printf '%s\t%s\t%s\t%s\n' "$ip" "$user" "$gen" "$hk"
+}
+
+# install_state_cache <state_json> <dest_path>
+#   Pure function (no network): write <state_json> to <dest_path> iff it
+#   parses as JSON and has schema == 1 (STATE_CONTRACT.md §2 — an unknown
+#   schema must never be interpreted). Anything else exits non-zero and
+#   leaves <dest_path> untouched. Atomic install: write a temp file in the
+#   target's own directory, fsync, then mv — a reader can never see a
+#   half-written file, and the temp never straddles two filesystems.
+#   Mode 600: this snapshot is per-node private state (~/.mylinuxpool).
+install_state_cache() {
+    local json="${1:-}" dest="${2:-}" rc
+    [[ -n "$json" && -n "$dest" ]] || {
+        log WARN "install_state_cache: missing state_json or dest_path, not writing"
+        return 1
+    }
+
+    if ! jq -e '.schema == 1' >/dev/null 2>&1 <<<"$json"; then
+        log WARN "install_state_cache: rejecting state snapshot — not valid JSON or schema != 1, leaving ${dest} untouched"
+        return 1
+    fi
+
+    local dir tmp
+    dir="$(dirname "$dest")"
+    mkdir -p "$dir" 2>/dev/null || {
+        log WARN "install_state_cache: cannot create ${dir}"
+        return 1
+    }
+    tmp="$(mktemp "${dir}/.state.XXXXXX")" 2>/dev/null || {
+        log WARN "install_state_cache: cannot create temp file in ${dir}"
+        return 1
+    }
+
+    printf '%s\n' "$json" > "$tmp"
+    rc=$?
+    if [[ $rc -ne 0 ]]; then
+        rm -f "$tmp"
+        log WARN "install_state_cache: write to ${tmp} failed (rc=${rc}), not installing"
+        return 1
+    fi
+    sync -f "$tmp" 2>/dev/null || true
+    chmod 600 "$tmp"
+    mv -f "$tmp" "$dest" 2>/dev/null || {
+        rm -f "$tmp"
+        log WARN "install_state_cache: mv to ${dest} failed"
+        return 1
+    }
+    return 0
+}
+
+# fetch_state_cache — pull the Gateway's state.json over the existing
+# ControlMaster (no new handshake, no pool-resolve: that would be circular,
+# and the snapshot is exactly the thing pool-resolve would go read) and
+# install it locally. A failure is NEVER fatal: this is the cache layer of
+# the read path (STATE_CONTRACT.md §3), its absence only means readers
+# fall back to GitHub. WARN and keep the tunnel running — this rule is the
+# mirror of B1's "push failure fails the workflow"; both are correct
+# because the writer guarantees correctness and the reader must tolerate
+# absence.
+fetch_state_cache() {
+    local raw="" rc
+    if [[ ! -S "$CTL" ]] || ! control_alive; then
+        log WARN "state cache fetch skipped: no live ControlMaster at ${CTL}"
+        return 1
+    fi
+    raw="$(timeout 15 ssh -S "$CTL" "${GW_USER}@${GW_IP}" cat /var/lib/mylinuxpool/state.json 2>/dev/null)"
+    rc=$?
+    if [[ $rc -ne 0 || -z "$raw" ]]; then
+        log WARN "state cache fetch failed (ssh exit ${rc}), will retry next cycle"
+        return 1
+    fi
+    if ! install_state_cache "$raw" "$STATE_FILE"; then
+        log WARN "state cache fetch got an unusable snapshot, will retry next cycle"
+        return 1
+    fi
+    log INFO "state cache refreshed from gateway into ${STATE_FILE}"
+    return 0
 }
 
 resolve_connection_info() {
@@ -477,6 +557,7 @@ main() {
     local backoff=2
     local unhealthy_count=0
     local last_gw_check=0
+    local last_state_fetch=0
 
     while true; do
         # §3.5 scenario 4: startup with a leftover/dead ControlMaster socket.
@@ -544,7 +625,21 @@ main() {
                 teardown_master
             fi
         fi
+
+        # §3.3 round doubles as the state-cache refresh: the snapshot the
+        # drift check re-reads is also what pool-resolve serves first, so
+        # keep it current once per 30s cycle. Failure is never fatal —
+        # readers fall back to GitHub, and the tunnel keeps running.
+        if (( now - last_state_fetch >= GATEWAY_CHECK_INTERVAL )); then
+            last_state_fetch=$now
+            fetch_state_cache
+        fi
     done
 }
 
-main "$@"
+# Only run as a standalone command when actually executed, not sourced —
+# sourcing is how tests load the pure functions above (same pattern as
+# scripts/lib/crypto.sh).
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+    main "$@"
+fi

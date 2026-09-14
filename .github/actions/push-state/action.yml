@@ -1,0 +1,39 @@
+name: push-state
+description: >-
+  Push the state cache to a Gateway. Reads every NODE_* variable plus
+  POOL_WORKERS from GitHub, merges them with the Gateway's current
+  state.json (for the serial), validates the payload against the state
+  contract, and installs it atomically at /var/lib/mylinuxpool/state.json.
+  A failed push fails the step — readers trust this cache unconditionally,
+  so a stale half-written copy must never look like success
+  (docs/STATE_CONTRACT.md §2/§4).
+
+inputs:
+  gateway-ip:
+    description: IP of the Gateway machine to push to
+    required: true
+  gateway-user:
+    description: SSH user on the Gateway (must be able to sudo to root)
+    required: false
+    default: fatesaikou
+  host-key:
+    description: The Gateway's ssh host key line (e.g. "ssh-ed25519 AAAA..."); empty = trust-on-first-use
+    required: false
+    default: ""
+  source:
+    description: "<workflow>#<run_id> written into the state.json source field"
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - name: Push state cache
+      shell: bash
+      env:
+        PUSH_GATEWAY_IP: ${{ inputs.gateway-ip }}
+        PUSH_GATEWAY_USER: ${{ inputs.gateway-user }}
+        PUSH_HOST_KEY: ${{ inputs.host-key }}
+        PUSH_SOURCE: ${{ inputs.source }}
+        GH_TOKEN: ${{ env.GH_TOKEN }}
+        GH_REPO: ${{ github.repository }}
+      run: ${{ github.action_path }}/run.sh

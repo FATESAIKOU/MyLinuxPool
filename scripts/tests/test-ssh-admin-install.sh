@@ -40,7 +40,11 @@ need_key() { skip "$1 (FILE_CRYPTO_KEY unset; cannot decrypt, so this cannot be 
 
 OUT=""; RC=0
 
-run() { OUT="$("$@" 2>&1)"; RC=$?; }
+# stdin is /dev/null for every child: install.sh reads stdin for the key when
+# --key is absent (a needs_key unit), so an inherited tty/pipe would make the
+# no-key run hang forever instead of failing fast. A test that can hang eats
+# CI timeouts and explains nothing — never let a child wait on input.
+run() { OUT="$("$@" </dev/null 2>&1)"; RC=$?; }
 
 expect_rc() {
     if [[ "$RC" -eq "$2" ]]; then ok "$1"
