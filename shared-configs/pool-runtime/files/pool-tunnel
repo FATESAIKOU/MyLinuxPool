@@ -281,6 +281,13 @@ gateway_changed() {
     return 1
 }
 
+# NOTE: this probe reaches the Gateway's forwarded port, which means it
+# also counts as activity on that session. Measured 2026-09-14: probing a
+# dead forward every 15s kept sshd from reaping it for over 120s, versus
+# ~60s when left alone. Harmless at this 2s cadence for OUR OWN live
+# tunnel (we are the peer that answers), but it is why RUNBOOK §7.9 says
+# not to point an automated monitor at other nodes' ports.
+
 # Cheap liveness probe on the local mux socket, independent of GW_IP/GW_USER
 # so it works even right after process start when those aren't known yet
 # (scenario: a stale ControlMaster socket left over from a crashed run).
