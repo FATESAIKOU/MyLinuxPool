@@ -675,14 +675,21 @@ Actions 手上有 `SSH_KEY_ACTIONS`，就算你的身分被漂移掉了它還進
 可以把宣告狀態壓回機器上。2026-09-14 的 §7.6 事故就是這樣救回來的——
 比 LISH 快，也不需要 root 密碼。
 
-> **rotate 之後 worker 應該會自己跟過去**（2026-09-14 起）。它們讀所在 provider
-> 發布的 `~/.mylinuxpool/gateway/gateway.json`，30 秒內偵測到位址變更並重建；
+> **rotate 之後 worker 會自己跟過去**。它們讀所在 provider 發布的
+> `~/.mylinuxpool/gateway/gateway.json`，30 秒內偵測到位址變更並重建；
 >
-> **驗證程度（誠實版）**：機制本身已用「改寫發布檔的 generation」模擬驗證過
-> ——偵測 + 重建耗時 1 秒，雙向都測。但**尚未觀察到 worker 真的跟完一次
-> rotate**：generation 5 那次，兩個 worker 是用修正前的映像檔建的，反而被
-> §7.8 的回收位址問題卡住，最後是刪掉重建的。要宣稱「worker 會跟上 rotate」，
-> 還需要一次三邊都跑修正後程式碼的真實 rotate。
+> **實測（generation 5 → 6，2026-09-14）**——完全無人介入：
+>
+> | | 偵測到漂移 | 隧道重建完成 | 耗時 |
+> |---|---|---|---|
+> | fh-l（provider） | 09:02:46 | 09:02:48 | 2 秒 |
+> | fh-l 的 worker | 09:02:57 | 09:02:58 | 1 秒 |
+> | fh-proxy（provider） | 09:03:11 | 09:03:13 | 2 秒 |
+> | fh-proxy 的 worker | 09:03:31 | 09:03:32 | 1 秒 |
+>
+> 容器 ID 前後相同（`c119bfa47e86` / `2e0b01eaa7c3`），證明是**同一批容器
+> 跟過去**，不是被重建。四者各自獨立重連，沒有順序保證——切換當下短暫看到
+> 「worker up 而 provider down」（或反過來）是正常的。
 > rotate 也會把 `~/pool/workers.d` 帳本搬到新機器，所以 `mlp ls` 與
 > `delete-worker` 仍找得到它們。provider 本身重連實測 1 秒。
 >

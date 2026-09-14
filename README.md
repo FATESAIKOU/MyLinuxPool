@@ -189,8 +189,8 @@ Launch / Shutdown fh-l 不走 Actions，走 `mlp wake` / `mlp down`。
 3. 切換後在 Mac 上跑一次 `ops-scripts/mlp trust-gateway`（新機器的 host key）。
 4. provider 每 30 秒輪詢 `NODE_GATEWAY`，自己跟過去。實測**重連耗時 1 秒**，
    不需要登入任何一台 provider。
-5. **現役的 worker 應該會自己跟過去**（機制已驗證，但尚未觀察到跟完一次
-   真實 rotate——見 `RUNBOOK.md` §8）。它們讀 provider 發布的
+5. **現役的 worker 會自己跟過去，不需要重建。** 實測 gen 5 → 6：provider
+   2 秒、worker 1 秒，容器 ID 不變（`RUNBOOK.md` §8）。它們讀 provider 發布的
    `~/.mylinuxpool/gateway/gateway.json`（唯讀 bind mount），30 秒內偵測到
    位址變更並重建隧道；rotate 同時把埠帳本搬到新機器，所以 `mlp ls` 與
    `delete-worker` 也還找得到它們。
