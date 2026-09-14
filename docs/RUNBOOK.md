@@ -621,6 +621,25 @@ rotate 又拿到同一個）。provider 在 gen-3 時代就把那個位址的主
   dry run 也會跑——證明一台真的 provider 連得上，本來就是 dry run 該做的事。
 - **`start_master` 保留並印出 ssh 的 stderr**，也不再宣稱自己知道原因。
 
+#### 容器裡也有一份同樣的 known_hosts
+
+2026-09-14 的第二次 rotate（generation 5）成功了——provider 一切正常——
+但兩個 worker 掛不上去，錯誤一模一樣。原因是它們在**前一次失敗的 rotate**
+期間，短暫對 `172.105.219.60` 做過 TOFU，記下了那台後來被刪掉的機器的金鑰。
+Linode 這次又把同一個位址發出來，於是變成「金鑰換過」。
+
+修正在程式碼裡（worker 從發布檔的 `host_key` 釘選），但**worker 映像檔在
+build 時就把 pool-runtime 烤進去了**，所以修正之前建的容器帶著舊行為。
+處理方式是重建它們：
+
+```bash
+ops-scripts/mlp worker rm    # 兩個都刪
+ops-scripts/mlp worker new   # 重新建
+```
+
+**規則：改了 `shared-configs/pool-runtime/` 之後，provider 重跑 install 就好，
+但 worker 必須重建。**
+
 > 教訓（第八、九次）：**不要把症狀當成原因，也不要相信一個你沒確認過
 > 「有能力偵測失敗」的檢查。** 這次兩邊都犯了——程式碼替 ssh 編了一個理由，
 > 而我用一個對雜湊檔永遠回 0 的 grep 排除了正確答案。
