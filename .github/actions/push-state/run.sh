@@ -127,10 +127,15 @@ if ! state_validate "$PAYLOAD"; then
 fi
 
 # --- 6. install atomically on the Gateway ---
-INSTALL_CMD="$(state_install_cmd)"
+# The install snippet is a shell script (builtins like `umask`, `&&`
+# short-circuiting), so it must run inside a shell: `sudo bash -c` runs
+# the whole thing as root (profiles/gateway/default/cloud-config.yaml
+# grants passwordless sudo) while stdin still flows to `cat >` inside the
+# snippet. Plain `sudo umask ...` would only elevate the first word.
+INSTALL_CMD="$(state_install_cmd "/var/lib/mylinuxpool/state.json")"
 log INFO "pushing state (schema 1, serial ${SERIAL}, source ${SOURCE}) to ${GW_IP}"
 if ! printf '%s\n' "$PAYLOAD" \
-        | ssh "${SSH_OPTS[@]}" "${GW_USER}@${GW_IP}" "sudo ${INSTALL_CMD}"; then
+        | ssh "${SSH_OPTS[@]}" "${GW_USER}@${GW_IP}" "sudo bash -c $(printf '%q' "$INSTALL_CMD")"; then
     log ERROR "failed to install state.json on ${GW_IP} — readers trust this cache, so the workflow must fail"
     exit 1
 fi

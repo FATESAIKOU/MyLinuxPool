@@ -98,14 +98,16 @@ state_validate() {
 }
 
 # state_install_cmd <path>
-#   Prints a shell command to run ON the Gateway: read the state.json payload
-#   from stdin, create the parent directory, write to a temp file next to
-#   the target and atomically mv it into place, owned by root with mode 644.
-#   The target is always the contract path (contract §2) — never $HOME, which
-#   the sshproxy reader cannot see.
+#   Prints a shell command to run on the Gateway: read the state.json
+#   payload from stdin, create the parent directory, write to a temp file
+#   next to the target and atomically mv it into place, mode 644. The
+#   caller passes the contract path (/var/lib/mylinuxpool/state.json);
+#   never $HOME, which the sshproxy reader cannot see. Owner is not
+#   forced here — on the Gateway run.sh wraps the command in `sudo`, so
+#   the file ends up root-owned anyway; leaving chown out keeps the
+#   command runnable unprivileged too (tests install into a temp dir).
 state_install_cmd() {
     local path="${1:-/var/lib/mylinuxpool/state.json}"
-    [[ "$path" == /var/lib/mylinuxpool/state.json ]] || path="/var/lib/mylinuxpool/state.json"
-    printf 'umask 022 && install -d -o root -g root "$(dirname %s)" && cat > "%s.tmp.$$" && chown root:root "%s.tmp.$$" && chmod 644 "%s.tmp.$$" && mv -f "%s.tmp.$$" "%s"\n' \
-        "$path" "$path" "$path" "$path" "$path" "$path"
+    printf 'umask 022 && install -d "$(dirname %s)" && cat > "%s.tmp.$$" && chmod 644 "%s.tmp.$$" && mv -f "%s.tmp.$$" "%s"\n' \
+        "$path" "$path" "$path" "$path" "$path"
 }

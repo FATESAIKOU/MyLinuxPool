@@ -201,11 +201,15 @@ expect_reject "rejects invalid JSON"
 echo "state_install_cmd:"
 run state_install_cmd "/tmp/state.json.new"
 expect_rc "install_cmd exits 0" 0
-expect_contains "install command targets /var/lib/mylinuxpool" '/var/lib/mylinuxpool'
+expect_contains "caller-supplied path is honored, not rewritten" '/tmp/state.json.new'
 expect_not_contains "install command does not mention \$HOME" '$HOME'
 # A command that writes into the reader's home directory can look fine to
 # every other check here, so the ~ case must be tested too.
 expect_not_contains "install command does not mention ~" '~'
+
+run state_install_cmd
+expect_rc "install_cmd with no arg exits 0" 0
+expect_contains "no-arg default targets /var/lib/mylinuxpool" '/var/lib/mylinuxpool/state.json'
 
 echo
 if [[ "$fail" -eq 0 ]]; then
