@@ -214,7 +214,7 @@ jobs:
             -t ${{ steps.identity.outputs.image_tag }} ~/.mylinuxpool/repo
 
       # Everything that touches a secret value happens in this one step —
-      # WORKER_KEY/its derived public half, and every profile-declared
+      # WORKER_KEY, the authorized_keys bundle, and every profile-declared
       # secret from $ALL_SECRETS_JSON — precisely so no already-%q-quoted
       # secret ever has to cross a `${{ steps.X.outputs.Y }}` boundary
       # (see the note on "Validate profile-declared secrets exist" above).
@@ -223,13 +223,28 @@ jobs:
       - name: Build docker-run command
         id: run_cmd
         shell: bash
+        env:
+          FILE_CRYPTO_KEY: ${{ secrets.FILE_CRYPTO_KEY }}
         run: |
           set -euo pipefail
 
-          eval "$(ssh-agent -s)" >/dev/null
-          trap 'ssh-agent -k >/dev/null 2>&1 || true' EXIT
-          ssh-add - <<< "$SSH_KEY_SSHPROXY" >/dev/null
-          worker_pub="$(ssh-add -L)"
+          # Whoever can already SSH into the Gateway should be able to log
+          # into a worker the same way — so WORKER_AUTHORIZED_KEYS is that
+          # SAME bundle (personal keys + SSH_KEY_ACTIONS' public half),
+          # never something derived from SSH_KEY_SSHPROXY. sshproxy is the
+          # tunnel identity, not an interactive-login one (2026-09-14
+          # incident: workers came up with only that key authorized, so
+          # the tunnel worked but nobody could actually log in).
+          authorized_keys_crypted="static_secret_files/home/fatesaikou/.ssh/authorized_keys.crypted"
+          if [[ ! -f "$authorized_keys_crypted" ]]; then
+            echo "::error::${authorized_keys_crypted} not found"
+            exit 1
+          fi
+          authorized_keys_content="$(scripts/decryptStdin.sh "$FILE_CRYPTO_KEY" < "$authorized_keys_crypted")"
+          if [[ -z "$authorized_keys_content" ]]; then
+            echo "::error::decrypting ${authorized_keys_crypted} produced no content — wrong FILE_CRYPTO_KEY?"
+            exit 1
+          fi
 
           container_q="$(printf '%q' "${{ steps.identity.outputs.container }}")"
           image_q="$(printf '%q' "${{ steps.identity.outputs.image_tag }}")"
@@ -238,12 +253,12 @@ jobs:
           tunnel_user_q="$(printf '%q' "${{ steps.gateway.outputs.tunnel_user }}")"
           node_name_q="$(printf '%q' "${{ steps.identity.outputs.name }}")"
           worker_key_q="$(printf '%q' "$SSH_KEY_SSHPROXY")"
-          authorized_key_q="$(printf '%q' "$worker_pub")"
+          authorized_keys_q="$(printf '%q' "$authorized_keys_content")"
 
           cmd="docker rm -f ${container_q} >/dev/null 2>&1; docker run -d --restart unless-stopped --name ${container_q}"
           cmd+=" -e POOL_GATEWAY_PORT=${port_q} -e POOL_GATEWAY_HOST=${host_q} -e POOL_GATEWAY_USER=${tunnel_user_q}"
           cmd+=" -e POOL_NODE_NAME=${node_name_q}"
-          cmd+=" -e WORKER_KEY=${worker_key_q} -e WORKER_AUTHORIZED_KEYS=${authorized_key_q}"
+          cmd+=" -e WORKER_KEY=${worker_key_q} -e WORKER_AUTHORIZED_KEYS=${authorized_keys_q}"
 
           profile="workers/${{ inputs.image }}/profile.json"
           while IFS=$'\t' read -r container_var secret_name; do
@@ -280,22 +295,49 @@ jobs:
             jq --arg c '${{ steps.identity.outputs.container }}' '.container = $c' "$f" > "$f.tmp" &&
             mv "$f.tmp" "$f"
 
-      # The port being open only means *something* is listening — read
-      # the SSH banner off the Gateway's own loopback, same reasoning as
-      # pool-tunnel's own health check (SPEC §3.2): a bare port doesn't
-      # prove the worker's tunnel is what's actually there.
-      - name: Verify worker port on Gateway
-        id: verify
-        uses: ./.github/actions/pool-ssh
-        with:
-          node: gateway
-          timeout: "10"
-          command: >-
-            for i in $(seq 1 30); do
-              banner="$(timeout 2 nc 127.0.0.1 ${{ steps.port.outputs.port }} </dev/null | head -c 4)";
-              if [[ "$banner" == SSH-* ]]; then echo ok; exit 0; fi;
-              sleep 2;
-            done; echo "worker port ${{ steps.port.outputs.port }} never came up"; exit 1
+      # A bare SSH banner only proves *something* is listening and
+      # speaking SSH — it doesn't prove anyone can actually get in
+      # (2026-09-14 incident: this step reported success on a worker
+      # whose authorized_keys held only the tunnel identity, so the
+      # banner was real but every human login failed). Same lesson as
+      # pool-tunnel's own health check upgrade from `nc -z` to reading the
+      # banner (spec §3.2) — verify all the way to the thing that's
+      # actually being relied on: do a real authenticated connection
+      # through the Gateway and run a command. Not via pool-ssh (the
+      # worker itself isn't a resolvable node), so this uses its own
+      # temporary agent, same pattern as rotate-gateway.yml.
+      - name: Verify worker is actually reachable (not just alive)
+        shell: bash
+        env:
+          SSH_KEY_ACTIONS: ${{ secrets.SSH_KEY_ACTIONS }}
+        run: |
+          set -euo pipefail
+          eval "$(ssh-agent -s)" >/dev/null
+          trap 'ssh-agent -k >/dev/null 2>&1 || true' EXIT
+          ssh-add - <<< "$SSH_KEY_ACTIONS" >/dev/null
+
+          gw_user="${{ steps.gateway.outputs.user }}"
+          gw_ip="${{ steps.gateway.outputs.ip }}"
+          port="${{ steps.port.outputs.port }}"
+
+          ok=0
+          for i in $(seq 1 30); do
+            if out="$(ssh -o StrictHostKeyChecking=accept-new -o ConnectTimeout=5 -o BatchMode=yes \
+                -J "${gw_user}@${gw_ip}" -p "$port" worker@127.0.0.1 whoami 2>&1)"; then
+              if [[ "$out" == "worker" ]]; then
+                echo "authenticated ok (whoami=${out}) after ${i} attempt(s)"
+                ok=1
+                break
+              fi
+              echo "connected but got unexpected output from whoami: ${out}"
+            fi
+            sleep 2
+          done
+
+          if [[ "$ok" -ne 1 ]]; then
+            echo "::error::could not authenticate as worker@127.0.0.1:${port} via ${gw_user}@${gw_ip} — see attempts above"
+            exit 1
+          fi
 
       - name: Connection command
         shell: bash
