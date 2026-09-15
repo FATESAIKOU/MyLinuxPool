@@ -79,6 +79,7 @@
 | V13 | **provider 宣告漂移自癒** | 竄改 `bin/pool-status` 後 `pool-sync` 把它修回來；無漂移時不重啟 tunnel | ✅ 已驗——兩台各 17/17 |
 | V14 | **provider 不再留常駐 clone** | 部署後 `~/.mylinuxpool/` 無 `repo/`，且推導不出的資訊只剩 `config` + `gh_token` | ✅ 已驗——8.2 MB → 只剩衍生物；推 master 後兩台各自收斂到新的 unit 檔 |
 | V15 | **rotate 後 provider 狀態仍最小** | rotate 到 generation 11 之後，`~/.mylinuxpool/` 仍無 `repo/`，`pool-sync` 仍正常，worker 原地存活 | ✅ 已驗——fh-proxy 17/17；容器 `1bfa9e46f8ac` 未重建；`mlp state` consistent |
+| V16 | **完整生命週期序列** | fh-l 起 worker → fh-l 關機 → Gateway rotate → fh-l 開機，全程 fh-proxy 帶著自己的 worker | ✅ 已驗兩次（generation 12→13、13→14）——見下 |
 
 ### V12 實測（2026-09-14，generation 9 → 10）
 
@@ -132,3 +133,31 @@ mv ~/.mylinuxpool/gh_token{.bak,}
 | B3 `mlp state` | 未做——顯示主本與快取的差異，也是 V11 的工具 |
 | I1–I3 整合測試 | 未做 |
 | V5 / V10 / V11 | 未測 |
+
+---
+
+## V16 完整生命週期序列（2026-09-16）
+
+一次跑完四步，中間不介入。跑了兩次：第一次暴露一個缺陷，修掉後重跑。
+
+| 步驟 | 結果 |
+|---|---|
+| fh-l 起 worker | ✅ 配到未使用的埠（第二次跑時 fh-l 已有 2301，正確配到 2302） |
+| fh-l 關機 | ✅ 用 fh-proxy ping 區網位址確認真的斷電，不是只看隧道消失 |
+| Gateway rotate | ✅ 零回滾。`Run provision-gateway.sh` 這一步正是新的 stdin 傳金鑰路徑 |
+| fh-l 開機 | ✅ WoL 後 45–50 秒回來，**自己**解析到新 Gateway（它關機時還是舊 generation） |
+
+**第一次跑暴露的缺陷**：rotate 之後 `mlp status` 把健康的 Gateway 報成
+`FAIL: REMOTE HOST IDENTIFICATION HAS CHANGED`。根因是 `pool-status` 釘的是
+`~/.mylinuxpool/gateway_known_hosts`——那個檔在 provider 上由 `pool-tunnel`
+每 30 秒重寫，但操作者機器上沒有 pool-tunnel，所以它從某次 rotate 之後就凍結。
+Linode 又把 generation 11 用過的位址發給了 13，於是「同一個 IP、不同 host key」
+直接引爆。改成從 `NODE_GATEWAY.host_key`（宣告）寫暫存 pin。
+
+> 教訓：**衍生檔不該成為讀取「它所衍生自的宣告」的前提。** 兩個檔兩個維護者，
+> 而其中一個維護者只存在於某一類機器上——這種不對稱只會在那類機器以外的地方爆。
+
+**一個容易誤判的觀察**：fh-l 開機後 `mlp ls` 一度顯示它的兩個 worker 是 `down`。
+那是時間差——容器有 `--restart unless-stopped`，docker 已經把它們拉起來了
+（`Up 29 seconds`），只是反向隧道還沒建好。20 秒後全部 `up`。
+`mlp ls` 的 `up/down` 讀的是 Gateway 上有沒有 listener，會落後容器啟動。
