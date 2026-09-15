@@ -362,9 +362,9 @@ elif [[ "$GW_PORTS_OK" -ne 1 ]]; then
     report WARN "worker 埠" "略過（Gateway listener 清單不可得）"
 else
     W_LISTEN="$(printf '%s\n' "$GW_PORTS" | range_ports 2300 2399)"
-    W_LS="$(gw_ssh 'if [ -d "$HOME/pool/workers.d" ]; then ls -1 "$HOME/pool/workers.d"; else echo __POOL_WORKERS_D_MISSING__; fi')"
+    W_LS="$(gw_ssh 'if [ -d "$HOME/.mylinuxpool/workers.d" ]; then ls -1 "$HOME/.mylinuxpool/workers.d"; else echo __POOL_WORKERS_D_MISSING__; fi')"
     if printf '%s' "$W_LS" | grep -q '__POOL_WORKERS_D_MISSING__'; then
-        report WARN "worker 埠" "Gateway 上 ~/pool/workers.d/ 不存在"
+        report WARN "worker 埠" "Gateway 上 ~/.mylinuxpool/workers.d/ 不存在"
     else
         W_FILES="$(printf '%s\n' "$W_LS" | sed -n 's/^\([0-9][0-9]*\)\.json$/\1/p' | sort -n -u)"
         orphan_listeners=""

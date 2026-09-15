@@ -15,9 +15,17 @@
 # cannot say WHICH provider/container a port belongs to (spec §10.1).
 #
 # Claims are WRITTEN only to ~/.mylinuxpool/workers.d (D1: everything else
-# lives there; ~/pool/ was the odd one out). The old path is still READ so
-# a claim made before the move cannot be reallocated underneath a running
-# worker — but it is never written to again.
+# lives there; ~/pool/ was the odd one out).
+#
+# The legacy read of the OLD home-dir layout (the pre-move workers.d
+# under the bare home pool directory) is retired (task I): it existed so
+# a claim made before the path move could not be reallocated underneath a
+# running worker. That reason no longer holds — a Gateway rotate builds
+# a FRESH machine (provision-gateway.sh recreates workers.d empty), so no
+# claim from before the move can possibly survive on a live Gateway, and
+# the placeholder is only a cache anyway (the master ledger is
+# POOL_WORKERS). Reading a path that rotate keeps recreating empty is what
+# produced the false "orphan port" report in pool-status.
 
 set -uo pipefail
 
@@ -25,7 +33,6 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
 POOL_RESOLVE="${SCRIPT_DIR}/pool-resolve"
 
 WORKERS_DIR="${HOME}/.mylinuxpool/workers.d"
-LEGACY_WORKERS_DIR="${HOME}/pool/workers.d"
 LOCK_FILE="${WORKERS_DIR}/.lock"
 
 log() {
@@ -89,16 +96,13 @@ worker_port_range() {
 }
 
 # A port is free only if BOTH hold: nothing is listening on it (per `ss`,
-# the real state) AND no placeholder file claims it. The legacy directory
-# is consulted too — a claim written before the path move still means the
-# port is taken; ignoring it is exactly how a port gets handed out twice.
+# the real state) AND no placeholder file claims it.
 port_is_free() {
     local port="$1"
     if ss -Htln "sport = :${port}" 2>/dev/null | grep -q .; then
         return 1
     fi
     [[ -f "${WORKERS_DIR}/${port}.json" ]] && return 1
-    [[ -f "${LEGACY_WORKERS_DIR}/${port}.json" ]] && return 1
     return 0
 }
 
@@ -161,9 +165,9 @@ cmd_list() {
     exec 200>"$LOCK_FILE"
     flock -s 200
 
-    local files=("${WORKERS_DIR}"/*.json "${LEGACY_WORKERS_DIR}"/*.json)
+    local files=("${WORKERS_DIR}"/*.json)
 
-    # The globs may have left unexpanded literal paths behind; filter to
+    # The glob may have left an unexpanded literal path behind; filter to
     # real files first. Nothing real at all means no claims anywhere.
     local real=()
     local f
@@ -177,9 +181,6 @@ cmd_list() {
         return 0
     fi
 
-    # When the same port has both a new and a legacy claim the NEW one
-    # wins — group by port and take the first (new path sorts before
-    # legacy).
     jq -s --sort-keys 'group_by(.port) | map(first)' "${real[@]}"
     flock -u 200
     return 0

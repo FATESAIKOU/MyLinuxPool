@@ -68,12 +68,43 @@ SSH_DIR="${HOME_DIR}/.ssh"
 key_blobs() { awk '{ if ($2 != "") print $2 }' "$1" 2>/dev/null | sort -u; }
 
 check_installed() {
-    # This unit installs authorized_keys only; an id_rsa here is an
-    # identity this unit no longer deploys (REDESIGN.md N2/D3), so it
-    # counts as drift and is reported as a WARN — never a failure, and
-    # never deleted by install (removal is deliberate).
+    # Retired-key drift detection (REDESIGN N2/D3): this unit used to
+    # deploy files/id_rsa.crypted as an identity key, so a leftover of
+    # THAT key on a machine is residue attributable to this unit and
+    # worth a WARN. Any other id_rsa is the machine's own business and
+    # stays silent — warning about it was a false alarm on every provider
+    # (their id_rsa predates this unit: fh-l's 2b61545dd6a2 and fh-proxy's
+    # 7b8d8b8ecb4b are neither the retired key's 255867521c45).
+    #
+    # Comparison is on the public halves derived with ssh-keygen -y via a
+    # temp 600 copy (ssh-keygen refuses world-readable private keys, and
+    # the machine's own key must not be chmod'ed). Only type+blob is
+    # compared, so a different comment cannot fool it.
+    #
+    # This stays WARN-level, and a decrypt/derive failure here silently
+    # skips the notice instead of failing --check: the notice is
+    # advisory, and verifying authorized_keys must not hinge on being
+    # able to read some unrelated private key (wrong --key, corrupt
+    # .crypted, or an id_rsa that isn't even a real key).
     if [[ -f "${SSH_DIR}/id_rsa" ]]; then
-        log WARN "drift: ${SSH_DIR}/id_rsa is present but this unit no longer installs it (removed from deployment — REDESIGN N2/D3). Delete it manually if no longer needed."
+        local machine_pub="" retired_pub="" kt rc
+        kt="$(mktemp)"
+        cp -f "${SSH_DIR}/id_rsa" "$kt" 2>/dev/null
+        chmod 600 "$kt"
+        machine_pub="$(ssh-keygen -y -f "$kt" 2>/dev/null || true)"
+        rm -f "$kt"
+        kt="$(mktemp)"
+        rc=0
+        "$DECRYPT" decrypt "$KEY" < "${FILES_DIR}/id_rsa.crypted" > "$kt" 2>/dev/null || rc=1
+        if [[ $rc -eq 0 ]]; then
+            chmod 600 "$kt"
+            retired_pub="$(ssh-keygen -y -f "$kt" 2>/dev/null || true)"
+        fi
+        rm -f "$kt"
+        if [[ -n "$machine_pub" && -n "$retired_pub" \
+              && "$(printf '%s' "$machine_pub" | awk '{print $1, $2}')" == "$(printf '%s' "$retired_pub" | awk '{print $1, $2}')" ]]; then
+            log WARN "drift: ${SSH_DIR}/id_rsa is the identity key this unit retired (REDESIGN N2/D3) — delete it manually if no longer needed."
+        fi
     fi
 
     [[ -f "${SSH_DIR}/authorized_keys" ]] || return 1
@@ -87,25 +118,46 @@ check_installed() {
 
     missing="$(comm -23 <(key_blobs "$declared") <(key_blobs "${SSH_DIR}/authorized_keys") | wc -l | tr -d ' ')"
     extra="$(comm -13 <(key_blobs "$declared") <(key_blobs "${SSH_DIR}/authorized_keys") | wc -l | tr -d ' ')"
-    rm -f "$declared"
-
-    [[ "$extra" -gt 0 ]] && log WARN "authorized_keys has ${extra} key(s) not declared by this unit"
-    if [[ "$missing" -gt 0 ]]; then
-        log ERROR "authorized_keys is missing ${missing} declared key(s)"
+    if [[ "$extra" -gt 0 ]]; then
+        # The security-relevant direction: a key the declaration does not
+        # know about can log in — someone (or some old process) granted
+        # access behind the declaration's back, and that is exactly what
+        # must surface, not be waved through as a WARN. List WHO (comment)
+        # plus the fingerprint prefix of each offender so the decision to
+        # prune or to declare is easy.
+        #
+        # Timing: tightening now is safe — on all three live machines
+        # authorized_keys currently equals the declaration exactly, so no
+        # red lights need cleaning up first. Waiting any longer just
+        # accumulates machine-specific keys to triage.
+        local blob line comment fp fpfile
+        while IFS= read -r blob; do
+            [[ -n "$blob" ]] || continue
+            line="$(grep -F "$blob" "${SSH_DIR}/authorized_keys" 2>/dev/null | head -1)"
+            comment="$(awk '{$1=""; $2=""; sub(/^  */, ""); print}' <<<"$line")"
+            fpfile="$(mktemp)"
+            printf '%s\n' "$line" > "$fpfile"
+            fp="$(ssh-keygen -lf "$fpfile" 2>/dev/null | awk '{print $2}' | sed 's/^SHA256://' | cut -c1-16)"
+            rm -f "$fpfile"
+            printf '  undeclared key: comment=%q fingerprint=SHA256:%s\n' "$comment" "${fp:-<unavailable>}" >&2
+        done < <(comm -13 <(key_blobs "$declared") <(key_blobs "${SSH_DIR}/authorized_keys"))
+        log ERROR "authorized_keys has ${extra} undeclared key(s) — remove them or add them to files/authorized_keys.crypted"
+        rm -f "$declared"
         return 1
     fi
+    if [[ "$missing" -gt 0 ]]; then
+        log ERROR "authorized_keys is missing ${missing} declared key(s)"
+        rm -f "$declared"
+        return 1
+    fi
+    rm -f "$declared"
     return 0
 }
 
-if [[ "$CHECK_ONLY" -eq 1 ]]; then
-    if check_installed; then
-        log INFO "ssh-admin already installed"
-        exit 0
-    fi
-    log INFO "ssh-admin not fully installed"
-    exit 1
-fi
-
+# The key is read before ANY branch — --check needs it too (check_installed
+# decrypts authorized_keys.crypted to compare content, and the retired-key
+# drift probe decrypts id_rsa.crypted). Production callers feed it on
+# stdin (RUNBOOK.md §9); --key remains accepted for backward compat.
 if [[ -z "$KEY" ]]; then
     if [[ ! -t 0 ]]; then
         KEY="$(cat)"
@@ -114,6 +166,15 @@ if [[ -z "$KEY" ]]; then
         log ERROR "--key <FILE_CRYPTO_KEY> required (or pipe it via stdin)"
         exit 2
     fi
+fi
+
+if [[ "$CHECK_ONLY" -eq 1 ]]; then
+    if check_installed; then
+        log INFO "ssh-admin already installed"
+        exit 0
+    fi
+    log INFO "ssh-admin not fully installed"
+    exit 1
 fi
 
 # Confirm we actually have the ability to decrypt before doing anything

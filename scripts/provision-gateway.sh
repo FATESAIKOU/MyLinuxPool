@@ -8,18 +8,22 @@
 # now happens per-unit, right here, so each unit's install.sh can find its
 # own co-located files/). Idempotent — safe to re-run.
 #
-# FILE_CRYPTO_KEY must be exported in this process's environment (the
-# workflow passes it the same way it already passes POOL_TRUSTED_IPS:
-# `sudo env FILE_CRYPTO_KEY=... POOL_TRUSTED_IPS=... bash -s < provision-gateway.sh`).
-# It is never written to disk or logged here — each unit gets it via
-# --key on its own argv, the one pre-existing, accepted exception to "no
-# secrets as CLI args" (spec §7) that scripts/lib/crypto.sh already set.
+# FILE_CRYPTO_KEY arrives on STDIN, read exactly once at startup (the
+# caller pipes it: `printf '%s' "$key" | ssh host 'sudo env ... bash <this>'`).
+# It is never written to disk or logged here. Units that need the key get
+# it on their own stdin via `printf '%s' ... | "$install" ...` — never as
+# `--key <value>`, which would land the value in this process's argv
+# (readable by every user via ps). Why stdin and not an environment
+# variable: env is visible in /proc/PID/environ to the same user and root
+# only — already better than argv — but stdin leaves nothing behind at
+# all, not even a process-memory-adjacent artifact. POOL_TRUSTED_IPS is
+# not a secret and stays an environment variable.
 
 set -euo pipefail
 
 REPO_DIR="/home/fatesaikou/.mylinuxpool/repo"
 SHARED_CONFIG_DIR="${REPO_DIR}/shared-configs"
-WORKERS_DIR="/home/fatesaikou/pool/workers.d"
+WORKERS_DIR="/home/fatesaikou/.mylinuxpool/workers.d"
 SSHD_CONF="/etc/ssh/sshd_config.d/10-mylinuxpool.conf"
 FAIL2BAN_CONF="/etc/fail2ban/jail.d/mylinuxpool-ignore.conf"
 
@@ -37,6 +41,15 @@ log() {
 if [[ "$(id -u)" -ne 0 ]]; then
     log ERROR "provision-gateway.sh must run as root"
     exit 1
+fi
+
+# The key arrives on stdin, read ONCE up front — `$(cat)` consumes the
+# whole stream, so reading it again later (in a loop, say) would get
+# nothing. This must be the FIRST stdin read in the script.
+FILE_CRYPTO_KEY="$(cat)"
+if [[ -z "$FILE_CRYPTO_KEY" ]]; then
+    log ERROR "no FILE_CRYPTO_KEY on stdin — the caller must pipe it (see RUNBOOK.md §9)"
+    exit 2
 fi
 
 # ---- step 1: sshd hardening --------------------------------------------------
@@ -154,8 +167,8 @@ step3_install_shared_config() {
         exit 1
     fi
 
-    if [[ -z "${FILE_CRYPTO_KEY:-}" ]]; then
-        log ERROR "FILE_CRYPTO_KEY is not set in the environment — needed to install several units"
+    if [[ -z "$FILE_CRYPTO_KEY" ]]; then
+        log ERROR "FILE_CRYPTO_KEY is empty — it must arrive on stdin, piped by the caller (see RUNBOOK.md §9)"
         exit 2
     fi
 
@@ -170,7 +183,9 @@ step3_install_shared_config() {
             exit 1
         fi
         log INFO "installing unit '${unit}' for ${target_user}"
-        "$install" --key "$FILE_CRYPTO_KEY" --home "$home" --user "$target_user"
+        # Key on the unit's stdin, never --key: a value on argv is visible
+        # to every user via ps (RUNBOOK.md §9).
+        printf '%s' "$FILE_CRYPTO_KEY" | "$install" --home "$home" --user "$target_user"
     done
 
     home="/home/sshproxy"
@@ -181,7 +196,7 @@ step3_install_shared_config() {
         exit 1
     fi
     log INFO "installing unit 'ssh-tunnel-server' for ${target_user}"
-    "$install" --key "$FILE_CRYPTO_KEY" --home "$home" --user "$target_user"
+    printf '%s' "$FILE_CRYPTO_KEY" | "$install" --home "$home" --user "$target_user"
 }
 
 # ---- step 4: remaining runtime packages --------------------------------------

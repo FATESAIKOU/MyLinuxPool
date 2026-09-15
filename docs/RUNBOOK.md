@@ -933,6 +933,21 @@ ssh host 'export K="$(cat /tmp/.key)"; bash /tmp/script.sh'
 ssh、bash、cmd.exe、PowerShell 每多一層轉義就多一次機會出錯。層數超過兩層
 時，一律改用檔案。
 
+### 實作對照（2026-09-16 盤點，改動時請維持）
+
+| 路徑 | 傳遞方式 | 機密出現的位置 |
+|---|---|---|
+| `scripts/rotate-gateway.sh` `rotate_run_provision` | 腳本已是遠端檔案（`rotate_deploy_repo_bundle` 先 scp），金鑰 `printf` 走 ssh stdin | stdin 管道，argv 無 |
+| `scripts/provision-gateway.sh` | 開頭 `FILE_CRYPTO_KEY="$(cat)"` 讀一次，unit 呼叫用 `printf '%s' "$FILE_CRYPTO_KEY" \| "$install" --home ... --user ...` | 本機與 unit 的 stdin，無 argv |
+| `ops-scripts/register-provider.sh` | `printf '%s' "$FILE_CRYPTO_KEY" \| "$install" --home ... --user ...` | unit 的 stdin，無 argv |
+| `ops-scripts/verify-profile` | 遠端 run.sh 從 stdin 讀 `POOL_KEY`，unit 呼叫走 `--key` | 僅遠端本機 argv（`--check` 情境，可接受） |
+| `scripts/lib/crypto.sh` | `crypto.sh <op> <password>`，password 在 argv | 既有、文件化的例外（RUNBOOK §9 之外） |
+| unit 端（5 個 needs_key） | 沒給 `--key` 且 stdin 非 TTY 時 `KEY="$(cat)"` | stdin |
+| GitHub Actions workflows | `secrets.*` 注入 env，由上述腳本接手 | Actions 的 secret masking |
+
+通則：機密一律 stdin；`--key <值>` 只在「已確認無其他使用者會看 argv」的地方
+殘留（verify-profile 的遠端 `--check`），新增呼叫一律不要複製 `--key` 模式。
+
 ### 金鑰輪替程序
 
 若機密真的洩漏了：

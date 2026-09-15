@@ -393,7 +393,10 @@ step3_fetch_runtime() {
             exit 1
         fi
         log INFO "installing unit '${unit}' from temp clone ${REPO_DIR} (profiles/provider/${PROFILE_NAME})"
-        "$install" --key "$FILE_CRYPTO_KEY" --home "$HOME" --user "$(whoami)"
+        # Key on the unit's stdin, never --key: argv is visible to every
+        # user via ps (RUNBOOK.md §9). The units that need the key
+        # (ssh-admin, ssh-tunnel-client) read stdin when --key is absent.
+        printf '%s' "$FILE_CRYPTO_KEY" | "$install" --home "$HOME" --user "$(whoami)"
     done
 }
 

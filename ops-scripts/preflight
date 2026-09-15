@@ -93,7 +93,7 @@ fi
 # 舊路徑殘留
 # 散文（docs/、README）談得起舊路徑——它們在解釋為什麼不要那樣寫。
 # 這支腳本自己也帶著那些字串，當然要排除，否則它永遠對自己告警。
-LEFT="$(grep -rlE 'shared_config/|ops-script/|(^|[^-a-z])(bin/mlp|provider/register\.sh|gateway/provision\.sh)' \
+LEFT="$(grep -rlE 'shared_config/|ops-script/|(^|[^-a-z])(bin/mlp|provider/register\.sh|gateway/provision\.sh)|(^|[^a-z0-9])pool/workers' \
         $(git ls-files | grep -vE '^docs/|^README\.md$|^ops-scripts/preflight$') 2>/dev/null | sort -u)"
 if [ -n "$LEFT" ]; then
     # 不要用 `| while`：那會開 subshell，bad 的計數就丟了，

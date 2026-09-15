@@ -40,11 +40,27 @@ need_key() { skip "$1 (FILE_CRYPTO_KEY unset; cannot decrypt, so this cannot be 
 
 OUT=""; RC=0
 
-# stdin is /dev/null for every child: install.sh reads stdin for the key when
-# --key is absent (a needs_key unit), so an inherited tty/pipe would make the
-# no-key run hang forever instead of failing fast. A test that can hang eats
-# CI timeouts and explains nothing — never let a child wait on input.
-run() { OUT="$("$@" </dev/null 2>&1)"; RC=$?; }
+# run <command...> — capture stdout+stderr and exit code. When KEY_IN is
+# set, the child's stdin is a pipe carrying exactly that string (the
+# production stdin route, RUNBOOK.md §9); otherwise stdin is /dev/null so
+# a no-key run fails fast instead of hanging on a tty/pipe.
+# A temp file carries the output instead of command substitution: bash 3.2
+# (macOS) does not populate PIPESTATUS inside $(...), so the child's exit
+# code would be lost — with a file, $? after the pipeline is the pipe's
+# last command (tee/cat), not the child.
+run() {
+    local tmp
+    tmp="$(mktemp "${TMPDIR:-/tmp}/test-ssh-admin.XXXXXX")"
+    if [[ -n "${KEY_IN:-}" ]]; then
+        printf '%s' "$KEY_IN" | "$@" > "$tmp" 2>&1
+        RC=${PIPESTATUS[1]}
+    else
+        "$@" </dev/null > "$tmp" 2>&1
+        RC=$?
+    fi
+    OUT="$(cat "$tmp")"
+    rm -f "$tmp"
+}
 
 expect_rc() {
     if [[ "$RC" -eq "$2" ]]; then ok "$1"
@@ -88,12 +104,17 @@ fi
 # install <home> [--check] — HOME is overridden for the child too.
 # Without a key the installer is expected to refuse; that refusal is itself
 # useful, because it must not delete or modify anything on its way out.
+# The key is fed on the child's stdin (the current production path,
+# RUNBOOK.md §9) — never --key, which is the retired argv route this
+# project is eliminating.
 install() {
     local home="$1" mode="${2:-}"
     local -a args=(--home "$home")
     [[ -n "$mode" ]] && args+=("$mode")
-    [[ "$KEY_SET" -eq 1 ]] && args=(--key "$FILE_CRYPTO_KEY" "${args[@]}")
+    KEY_IN=""
+    [[ "$KEY_SET" -eq 1 ]] && KEY_IN="$FILE_CRYPTO_KEY"
     run env HOME="$home" bash "$INSTALL_SH" "${args[@]}"
+    KEY_IN=""
 }
 
 CLEAN="$TMPROOT/clean"
@@ -124,7 +145,10 @@ fi
 # rewrite an id_rsa that was already there.
 echo "install over a machine that already has id_rsa:"
 mkdir -p "$PRE/.ssh"
-printf 'fake pre-existing key, must survive the install\n' > "$PRE/.ssh/id_rsa"
+# A REAL unrelated private key (not a text file): the drift check compares
+# derived public halves, so a fake text file would never match and could
+# not exercise either branch.
+ssh-keygen -t ed25519 -N '' -C "machine-local@fwm" -f "$PRE/.ssh/id_rsa" -q >/dev/null 2>&1
 before="$(cksum "$PRE/.ssh/id_rsa")"
 install "$PRE"
 if [[ "$KEY_SET" -eq 1 ]]; then
@@ -140,18 +164,17 @@ else
     bad "existing id_rsa changed (before [$before], after [${after:-<missing>}])"
 fi
 
-# --check needs no decryption to notice a leftover id_rsa, so this runs
-# unconditionally. Only the exit-code expectation is key-dependent: without
-# a key the unit cannot be "fully installed", so drift alone is not what
-# the exit code reflects.
-echo "--check with a leftover id_rsa:"
+# --check with an UNRELATED id_rsa must be silent about it (task H: only
+# the retired identity key — files/id_rsa.crypted — counts as drift; a
+# machine's own key is its business). Exit code depends on the key.
+echo "--check with an unrelated leftover id_rsa:"
 install "$PRE" --check
-expect_output_matches "--check reports the leftover id_rsa as drift (WARN)" "$DRIFT_RE"
+expect_not_output_matches "unrelated id_rsa is NOT reported as drift" "$DRIFT_RE"
 expect_exists "id_rsa survives --check (no cleanup deletion)" "$PRE/.ssh/id_rsa"
 if [[ "$KEY_SET" -eq 1 ]]; then
-    expect_rc "--check drift is a warning, not a failure (exit 0)" 0
+    expect_rc "unrelated id_rsa is not a failure (exit 0)" 0
 else
-    skip "--check drift is a warning, not a failure (exit 0) (FILE_CRYPTO_KEY unset)"
+    skip "unrelated id_rsa is not a failure (exit 0) (FILE_CRYPTO_KEY unset)"
 fi
 
 # Negative control: a --check that always prints the drift notice must fail.
@@ -164,6 +187,30 @@ if [[ "$KEY_SET" -eq 1 ]]; then
 else
     need_key "no drift notice on a clean home"
     need_key "--check on a fully installed clean home exits 0"
+fi
+
+# The RETIRED identity key (files/id_rsa.crypted) left on a machine IS
+# drift attributable to this unit and must still WARN (task H). Needs the
+# key to decrypt the retired private key.
+echo "--check with the retired identity key:"
+RET="$TMPROOT/retired"
+if [[ "$KEY_SET" -eq 1 ]]; then
+    mkdir -p "$RET/.ssh"
+    if scripts/lib/crypto.sh decrypt "$FILE_CRYPTO_KEY" \
+            < shared-configs/ssh-admin/files/id_rsa.crypted > "$RET/.ssh/id_rsa" 2>/dev/null; then
+        chmod 600 "$RET/.ssh/id_rsa"
+        # --check returns 1 when authorized_keys is missing — install it
+        # first so the ONLY failure signal left is the drift warning.
+        install "$RET"
+        install "$RET" --check
+        expect_output_matches "retired id_rsa is reported as drift (WARN)" "$DRIFT_RE"
+        expect_rc "retired id_rsa drift is a warning, not a failure (exit 0)" 0
+    else
+        bad "retired id_rsa could not be decrypted — positive drift case cannot run"
+    fi
+else
+    need_key "retired id_rsa is reported as drift (WARN)"
+    need_key "retired id_rsa drift is a warning, not a failure (exit 0)"
 fi
 
 # ===========================================================================
@@ -357,6 +404,215 @@ if [[ "$KEY_SET" -eq 1 ]]; then
 else
     need_key "install exits 0"
     need_key "the undeclared key is still present after install (union kept it)"
+fi
+
+# ===========================================================================
+# Task H: --check tightened.
+#   - extra (undeclared) keys are drift → exit non-zero, and the message names
+#     the offending key (comment or fingerprint)
+#   - the id_rsa drift notice fires ONLY for the retired key (the one in
+#     files/id_rsa.crypted), not for any id_rsa — the old check warned on any
+#     id_rsa at all, which was a false positive for an unrelated identity
+#   - a WARN never changes the exit code
+#
+# All homes are branches of one freshly installed "good" home, so every case
+# differs from the exact-match baseline by exactly the mutation under test.
+# ===========================================================================
+echo "── H: --check 收緊 ──"
+
+expect_rc_nonzero() {
+    if [[ "$RC" -ne 0 ]]; then ok "$1"
+    else bad "$1 (exit 0, should be non-zero; output: ${OUT:-<empty>})"; fi
+}
+
+# need_good_home <label> — used when the baseline could not be prepared.
+# Never a pass: the root cause already produced a FAIL, this only stops the
+# dependent assertions from masquerading as verified.
+need_good_home() {
+    skip "$1 (good home not prepared — see the FAIL above)"
+}
+
+H_GOOD="$TMPROOT/h-good"
+H_READY=0
+
+echo "H1: authorized_keys exactly equals the declared list:"
+if [[ "$KEY_SET" -eq 1 ]]; then
+    mkdir -p "$H_GOOD"
+    install "$H_GOOD"
+    expect_rc "install into a fresh home exits 0" 0
+    if [[ "$RC" -eq 0 ]]; then H_READY=1; fi
+
+    h_declared="$(scripts/lib/crypto.sh decrypt "$FILE_CRYPTO_KEY" \
+        < shared-configs/ssh-admin/files/authorized_keys.crypted 2>/dev/null \
+        | awk '$2 != "" { print $2 }' | sort -u)"
+    h_declared_n="$(printf '%s\n' "$h_declared" | grep -c . || true)"
+    h_installed="$(awk '$2 != "" { print $2 }' "$H_GOOD/.ssh/authorized_keys" 2>/dev/null | sort -u)"
+    if [[ "$h_declared_n" -ge 1 && "$h_installed" == "$h_declared" ]]; then
+        ok "premise: installed set is byte-for-byte the declared set (${h_declared_n} keys)"
+    else
+        bad "premise failed: installed set differs from the declared set; exact-match checks cannot run"
+    fi
+    install "$H_GOOD" --check
+    expect_rc "exact match → --check exits 0" 0
+    expect_not_output_matches "exact match → no WARN at all" 'WARN'
+else
+    need_key "install into a fresh home exits 0"
+    need_key "premise: installed set is byte-for-byte the declared set"
+    need_key "exact match → --check exits 0"
+    need_key "exact match → no WARN at all"
+fi
+
+echo "H2: one declared key missing → still non-zero:"
+if [[ "$KEY_SET" -eq 1 ]]; then
+    if [[ "$H_READY" -ne 1 ]]; then
+        need_good_home "premise: exactly one declared key was removed"
+        need_good_home "missing a declared key → --check non-zero"
+    else
+        H_MISSING="$TMPROOT/h-missing"
+        rm -rf "$H_MISSING"; cp -R "$H_GOOD" "$H_MISSING"
+        h_first_declared="$(printf '%s\n' "$h_declared" | head -1)"
+        awk -v b="$h_first_declared" '!($2 == b)' "$H_MISSING/.ssh/authorized_keys" \
+            > "$H_MISSING/.ssh/ak.tmp" && mv "$H_MISSING/.ssh/ak.tmp" "$H_MISSING/.ssh/authorized_keys"
+        h_now_n="$(awk '$2 != "" { print $2 }' "$H_MISSING/.ssh/authorized_keys" 2>/dev/null | sort -u | grep -c . || true)"
+        if [[ "$h_now_n" -eq "$((h_declared_n - 1))" ]]; then
+            ok "premise: exactly one declared key was removed (${h_declared_n} → ${h_now_n})"
+        else
+            bad "premise failed: removal left ${h_now_n} key(s), expected $((h_declared_n - 1))"
+        fi
+        install "$H_MISSING" --check
+        expect_rc_nonzero "missing a declared key → --check non-zero"
+    fi
+else
+    need_key "premise: exactly one declared key was removed"
+    need_key "missing a declared key → --check non-zero"
+fi
+
+echo "H3: an undeclared key present → non-zero, and the message names it:"
+if [[ "$KEY_SET" -eq 1 ]]; then
+    if [[ "$H_READY" -ne 1 ]]; then
+        need_good_home "premise: an undeclared key was appended"
+        need_good_home "undeclared key → --check non-zero (tightened behaviour)"
+        need_good_home "undeclared key → the message names its comment or fingerprint"
+    else
+        H_EXTRA="$TMPROOT/h-extra"
+        rm -rf "$H_EXTRA"; mkdir -p "$H_EXTRA/.ssh"
+        cp "$H_GOOD/.ssh/authorized_keys" "$H_EXTRA/.ssh/authorized_keys"
+        EXTRA_COMMENT='h-extra-undeclared@test'
+        EXTRA_FP=""
+        if command -v ssh-keygen >/dev/null 2>&1; then
+            if ssh-keygen -q -t ed25519 -N '' -C "$EXTRA_COMMENT" \
+                    -f "$TMPROOT/h-extrakey" </dev/null >/dev/null 2>&1; then
+                EXTRA_FP="$(ssh-keygen -lf "$TMPROOT/h-extrakey.pub" 2>/dev/null | awk '{print $2}')"
+                cat "$TMPROOT/h-extrakey.pub" >> "$H_EXTRA/.ssh/authorized_keys"
+            fi
+        fi
+        if [[ -z "$EXTRA_FP" ]]; then
+            printf 'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIHextraKeyForTestingOnly %s\n' \
+                "$EXTRA_COMMENT" >> "$H_EXTRA/.ssh/authorized_keys"
+        fi
+        h_extra_n="$(awk '$2 != "" { print $2 }' "$H_EXTRA/.ssh/authorized_keys" 2>/dev/null | sort -u | grep -c . || true)"
+        if [[ "$h_extra_n" -eq "$((h_declared_n + 1))" ]]; then
+            ok "premise: authorized_keys holds declared + 1 undeclared key (${h_extra_n})"
+        else
+            bad "premise failed: expected $((h_declared_n + 1)) keys, found ${h_extra_n}"
+        fi
+        install "$H_EXTRA" --check
+        expect_rc_nonzero "undeclared key → --check non-zero (tightened behaviour)"
+        if grep -qF "$EXTRA_COMMENT" <<<"$OUT"; then
+            ok "undeclared key → the message names its comment"
+        elif [[ -n "$EXTRA_FP" ]] && grep -qF "$EXTRA_FP" <<<"$OUT"; then
+            ok "undeclared key → the message names its fingerprint (${EXTRA_FP})"
+        else
+            bad "undeclared key → the message names neither its comment (${EXTRA_COMMENT}) nor its fingerprint (${EXTRA_FP:-<n/a>})"
+        fi
+    fi
+else
+    need_key "premise: an undeclared key was appended"
+    need_key "undeclared key → --check non-zero (tightened behaviour)"
+    need_key "undeclared key → the message names its comment or fingerprint"
+fi
+
+echo "H4: id_rsa is the RETIRED key → WARN that names id_rsa:"
+H_RETIRED="$TMPROOT/h-retired"
+H_RETIRED_OK=0
+if [[ "$KEY_SET" -eq 1 && "$H_READY" -eq 1 ]]; then
+    rm -rf "$H_RETIRED"; mkdir -p "$H_RETIRED/.ssh"
+    cp "$H_GOOD/.ssh/authorized_keys" "$H_RETIRED/.ssh/authorized_keys"
+    if scripts/lib/crypto.sh decrypt "$FILE_CRYPTO_KEY" \
+            < shared-configs/ssh-admin/files/id_rsa.crypted > "$H_RETIRED/.ssh/id_rsa" 2>/dev/null; then
+        chmod 600 "$H_RETIRED/.ssh/id_rsa"
+        H_RETIRED_OK=1
+        ok "premise: the retired id_rsa.crypted decrypted into the fake home"
+        install "$H_RETIRED" --check
+        expect_output_matches "retired id_rsa → WARN is printed" 'WARN'
+        expect_output_matches "retired id_rsa → the WARN names id_rsa" 'id_rsa'
+        expect_rc "retired id_rsa does not change the exit code → 0" 0
+    else
+        bad "premise failed: id_rsa.crypted would not decrypt with the provided key"
+        skip "retired id_rsa → WARN is printed (retired key could not be prepared)"
+        skip "retired id_rsa → the WARN names id_rsa (retired key could not be prepared)"
+        skip "retired id_rsa does not change the exit code → 0 (retired key could not be prepared)"
+    fi
+else
+    need_key "premise: the retired id_rsa.crypted decrypted into the fake home"
+    need_key "retired id_rsa → WARN is printed"
+    need_key "retired id_rsa → the WARN names id_rsa"
+    need_key "retired id_rsa does not change the exit code → 0"
+fi
+
+echo "H5: id_rsa is SOME OTHER key → no WARN (the false positive that was fixed):"
+H_OTHER="$TMPROOT/h-other"
+if [[ "$KEY_SET" -eq 1 && "$H_READY" -eq 1 ]] && command -v ssh-keygen >/dev/null 2>&1; then
+    rm -rf "$H_OTHER"; mkdir -p "$H_OTHER/.ssh"
+    cp "$H_GOOD/.ssh/authorized_keys" "$H_OTHER/.ssh/authorized_keys"
+    if ssh-keygen -q -t ed25519 -N '' -C 'h-other-identity@test' \
+            -f "$TMPROOT/h-otherkey" </dev/null >/dev/null 2>&1; then
+        cp "$TMPROOT/h-otherkey" "$H_OTHER/.ssh/id_rsa"
+        chmod 600 "$H_OTHER/.ssh/id_rsa"
+        retired_pub=""
+        if [[ "$H_RETIRED_OK" -eq 1 ]]; then
+            retired_pub="$(ssh-keygen -y -f "$H_RETIRED/.ssh/id_rsa" 2>/dev/null | awk '{print $2}')"
+        fi
+        other_pub="$(ssh-keygen -y -f "$H_OTHER/.ssh/id_rsa" 2>/dev/null | awk '{print $2}')"
+        if [[ -z "$other_pub" ]]; then
+            bad "premise failed: could not derive the public half of the generated key"
+        elif [[ -z "$retired_pub" ]]; then
+            skip "premise: the generated key differs from the retired one (retired key unavailable)"
+        elif [[ "$other_pub" == "$retired_pub" ]]; then
+            bad "premise failed: the generated key equals the retired key"
+        else
+            ok "premise: the generated key differs from the retired one"
+        fi
+        install "$H_OTHER" --check
+        expect_not_output_matches "other id_rsa → NO WARN (false positive fixed)" 'WARN'
+        expect_rc "other id_rsa does not change the exit code → 0" 0
+    else
+        skip "premise: the generated key differs from the retired one (ssh-keygen failed)"
+        skip "other id_rsa → NO WARN (false positive fixed) (ssh-keygen failed)"
+        skip "other id_rsa does not change the exit code → 0 (ssh-keygen failed)"
+    fi
+else
+    need_key "premise: the generated key differs from the retired one"
+    need_key "other id_rsa → NO WARN (false positive fixed)"
+    need_key "other id_rsa does not change the exit code → 0"
+fi
+
+echo "H6: no id_rsa at all → no WARN:"
+if [[ "$KEY_SET" -eq 1 && "$H_READY" -eq 1 ]]; then
+    if [[ ! -e "$H_GOOD/.ssh/id_rsa" ]]; then
+        ok "premise: the good home has no id_rsa"
+        install "$H_GOOD" --check
+        expect_not_output_matches "no id_rsa → NO WARN" 'WARN'
+        expect_rc "no id_rsa does not change the exit code → 0" 0
+    else
+        bad "premise failed: the good home unexpectedly has an id_rsa"
+        skip "no id_rsa → NO WARN (premise failed)"
+        skip "no id_rsa does not change the exit code → 0 (premise failed)"
+    fi
+else
+    need_key "premise: the good home has no id_rsa"
+    need_key "no id_rsa → NO WARN"
+    need_key "no id_rsa does not change the exit code → 0"
 fi
 
 echo

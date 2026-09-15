@@ -264,16 +264,23 @@ rotate_deploy_repo_bundle() {
 }
 
 # rotate_run_provision <user> <ip> <trusted_ips> <file_crypto_key>
+#   Runs provision-gateway.sh on the (preview) Gateway. RUNBOOK.md §9's
+#   correct shape: the script is ALREADY a file on the remote
+#   (/home/fatesaikou/.mylinuxpool/repo/scripts/ — rotate_deploy_repo_bundle
+#   put it there, same REPO_DIR constant provision-gateway.sh uses), so
+#   nothing ships over stdin; the KEY travels alone on stdin, read once by
+#   provision-gateway.sh at startup. It must never appear on the remote
+#   command line: argv of a process on the Gateway is visible to every user
+#   there via ps, and any echo of that command in an error message leaks
+#   it too.
 #   The key never gets logged: no -x here, and the caller (a GH Actions
-#   step) has both values masked in its own log regardless.
+#   step) has the value masked in its own log regardless.
 rotate_run_provision() {
     local user="$1" ip="$2" trusted_ips="$3" file_crypto_key="$4"
-    local repo_root
-    repo_root="$(cd "${SCRIPT_DIR}/.." && pwd)"
+    local provision_script="/home/fatesaikou/.mylinuxpool/repo/scripts/provision-gateway.sh"
 
-    ssh -o StrictHostKeyChecking=accept-new "${user}@${ip}" \
-        "sudo env POOL_TRUSTED_IPS=$(printf '%q' "$trusted_ips") FILE_CRYPTO_KEY=$(printf '%q' "$file_crypto_key") bash -s" \
-        < "${repo_root}/scripts/provision-gateway.sh"
+    printf '%s' "$file_crypto_key" | ssh -o StrictHostKeyChecking=accept-new "${user}@${ip}" \
+        "sudo env POOL_TRUSTED_IPS=$(printf '%q' "$trusted_ips") bash ${provision_script}"
 }
 
 # rotate_compute_new_gateway_json <old_json> <new_ip> <new_generation> <rotated_at>

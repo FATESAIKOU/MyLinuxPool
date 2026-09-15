@@ -76,7 +76,7 @@ for u in $UNITS_LIST; do
     if [[ ! -f "shared-configs/$u/install.sh" ]]; then
         echo "MISSING UNIT"; fail=1; continue
     fi
-    if bash "shared-configs/$u/install.sh" --check --key "$POOL_KEY" >/tmp/vp.out 2>&1; then
+    if printf '%s' "$POOL_KEY" | bash "shared-configs/$u/install.sh" --check >/tmp/vp.out 2>&1; then
         echo "ok"
     else
         echo "DRIFT: $(tail -1 /tmp/vp.out | sed 's/^\[[^]]*\] [A-Z]* //' | cut -c1-56)"
