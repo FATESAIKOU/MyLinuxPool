@@ -14,16 +14,23 @@ STATE_DIR="${HOME}/.mylinuxpool"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
 POOL_RESOLVE="${SCRIPT_DIR}/pool-resolve"
 
-# Share pool-tunnel's pinned known_hosts rather than the user's own.
-# accept-new against ~/.ssh/known_hosts breaks the moment Linode reissues
-# an address a previous Gateway used — it accepts a new host but refuses
-# a changed one (RUNBOOK §7.8). pool-tunnel maintains this file from the
-# host key NODE_GATEWAY carries, so pointing at it means a status check
-# verifies the same identity the tunnel does.
-GW_KNOWN_HOSTS="${HOME}/.mylinuxpool/gateway_known_hosts"
+# Host key handling: the DECLARATION is the source of truth, never a
+# derived file. When NODE_GATEWAY carries a host_key, pool-status writes
+# it into a TEMP known_hosts (see below) and pins it — it does NOT use the
+# resident gateway_known_hosts that pool-tunnel maintains: this tool also
+# runs on the operator's machine, where no pool-tunnel exists to refresh
+# that file, so it can sit on a key from an old Gateway forever and blow
+# up the moment Linode recycles an address onto a new machine (a false
+# "REMOTE HOST IDENTIFICATION HAS CHANGED", exactly what this fixes).
+# The old file is only a fallback for NODE_GATEWAY records that predate
+# the host_key field.
+GW_KNOWN_HOSTS_FALLBACK="${HOME}/.mylinuxpool/gateway_known_hosts"
 SSH_OPTS=(-o BatchMode=yes -o ConnectTimeout=5
-          -o UserKnownHostsFile="$GW_KNOWN_HOSTS"
+          -o UserKnownHostsFile="$GW_KNOWN_HOSTS_FALLBACK"
           -o StrictHostKeyChecking=accept-new)
+# Set when the declared host_key was pinned into a temp file; the EXIT
+# trap below removes it so the operator machine gains no resident state.
+GW_KNOWN_HOSTS_TMP=""
 
 BRIEF=0
 ok_count=0
@@ -45,6 +52,13 @@ parse_args() {
 }
 
 parse_args "$@"
+
+# Removes the temp known_hosts (if the declared host key was pinned) on
+# every exit path — no resident state is left behind on this machine.
+cleanup_known_hosts() {
+    [[ -n "$GW_KNOWN_HOSTS_TMP" ]] && rm -f "$GW_KNOWN_HOSTS_TMP"
+}
+trap cleanup_known_hosts EXIT INT TERM
 
 report() {
     local st="$1" name="$2" desc="${3:-}"
@@ -164,6 +178,22 @@ else
         GW_IP="$(printf '%s' "$GW_JSON" | jq -r '.ip // empty' 2>/dev/null)"
         GW_USER="$(printf '%s' "$GW_JSON" | jq -r '.user // empty' 2>/dev/null)"
         GW_TUNNEL_USER="$(printf '%s' "$GW_JSON" | jq -r '.tunnel_user // empty' 2>/dev/null)"
+
+        # Declaration wins: pin the host key NODE_GATEWAY carries into a
+        # temp known_hosts ("<ip> <host_key>" one line) and point ssh at
+        # it. No temp file is left behind (EXIT trap). When the record
+        # predates the host_key field, fall back to the resident
+        # gateway_known_hosts — the old accept-new behavior — rather than
+        # failing the check.
+        GW_HOST_KEY="$(printf '%s' "$GW_JSON" | jq -r '.host_key // empty' 2>/dev/null)"
+        if [[ -n "$GW_HOST_KEY" && -n "$GW_IP" ]]; then
+            GW_KNOWN_HOSTS_TMP="$(mktemp "${TMPDIR:-/tmp}/pool-status-kh.XXXXXX")"
+            printf '%s %s\n' "$GW_IP" "$GW_HOST_KEY" > "$GW_KNOWN_HOSTS_TMP"
+            SSH_OPTS=(-o BatchMode=yes -o ConnectTimeout=5
+                      -o UserKnownHostsFile="$GW_KNOWN_HOSTS_TMP"
+                      -o StrictHostKeyChecking=yes)
+        fi
+
         if [[ -z "$GW_IP" ]]; then
             report FAIL "gateway var" "缺少 .ip"
         fi
