@@ -1,7 +1,7 @@
 {
   "name": "default",
   "role": "provider",
-  "shared_config": ["pool-runtime", "ssh-tunnel-client", "gh"],
+  "shared_config": ["pool-runtime", "ssh-tunnel-client", "gh", "ssh-admin"],
   "systemd_user_services": ["pool-tunnel.service", "pool-sync.timer"],
   "linger": true,
   "sudoers_rules": [

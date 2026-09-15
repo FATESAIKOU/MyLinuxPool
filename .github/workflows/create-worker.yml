@@ -190,10 +190,15 @@ jobs:
           fi
           echo "port=${port}" >> "$GITHUB_OUTPUT"
 
-      # Providers already keep a repo clone at ~/.mylinuxpool/repo
-      # (register-provider.sh) — reuse it as the build context instead of
-      # shipping any files there ourselves, pinned to the exact commit
-      # this run was dispatched from.
+      # The build context is fetched into a TEMPORARY directory on the
+      # provider, per dispatch, pinned to this run's commit. There is no
+      # persistent ~/.mylinuxpool/repo to reuse anymore: since
+      # 2026-09-15 the declarations live on GitHub alone (register-provider
+      # no longer keeps a clone on the provider), so that path no longer
+      # exists — a build that depended on it failed on every provider.
+      # `git clone --depth 1` cannot pin a SHA, hence init + remote add +
+      # fetch --depth 1 <sha> + checkout FETCH_HEAD. The temp dir is
+      # removed on every exit path (trap), including docker build failure.
       # `GH_TOKEN=... git fetch` (the previous form here) does nothing on
       # its own — plain git doesn't consult that env var at all, only `gh`
       # does. register-provider.sh configures a global git credential
@@ -203,17 +208,30 @@ jobs:
       # `gh auth login` state predating the switch away from it). This
       # `-c` is a second line of defense: it makes this one invocation
       # work even on a provider that hasn't been re-registered since that
-      # fix.
+      # fix, and it reads the token from the file — never on argv or in a
+      # log line.
       - name: Build worker image on provider
         id: build
         uses: ./.github/actions/pool-ssh
         with:
           node: ${{ inputs.provider }}
           timeout: "60"
-          command: >-
-            git -c credential.https://github.com.helper='!f() { echo username=x-access-token; echo "password=$(cat $HOME/.mylinuxpool/gh_token 2>/dev/null)"; }; f' -C ~/.mylinuxpool/repo fetch origin ${{ github.sha }} &&
-            git -C ~/.mylinuxpool/repo checkout ${{ github.sha }} &&
-            docker build -f ~/.mylinuxpool/repo/profiles/worker/${{ inputs.image }}/Dockerfile -t ${{ steps.identity.outputs.image_tag }} ~/.mylinuxpool/repo
+          command: |
+            set -euo pipefail
+            tmp="$(mktemp -d)"
+            trap 'rm -rf "$tmp"' EXIT INT TERM
+            git -C "$tmp" init
+            # `-c key=value` applies to THAT ONE invocation only — putting
+            # it on `git init` would configure nothing, since the credential
+            # helper is only consulted by the fetch that comes later. Write
+            # it into this temp repo's own config instead; the directory
+            # dies with the trap, so nothing outlives the build.
+            git -C "$tmp" config credential.https://github.com.helper '!f() { echo username=x-access-token; echo "password=$(cat $HOME/.mylinuxpool/gh_token 2>/dev/null)"; }; f'
+            git -C "$tmp" remote add origin https://github.com/${{ env.GH_REPO }}.git
+            git -C "$tmp" fetch --depth 1 origin ${{ github.sha }}
+            git -C "$tmp" checkout FETCH_HEAD
+            docker build -f "$tmp/profiles/worker/${{ inputs.image }}/Dockerfile" \
+              -t ${{ steps.identity.outputs.image_tag }} "$tmp"
 
       # Everything that touches a secret value happens inside
       # create_worker_build_run_cmd, in this one step — see the note on

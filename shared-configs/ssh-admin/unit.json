@@ -1,6 +1,6 @@
 {
   "name": "ssh-admin",
-  "description": "fatesaikou 的 ssh 身分（Gateway）",
+  "description": "fatesaikou 與 Actions 的 authorized_keys（Gateway／provider／worker 共用同一份）",
   "needs_key": true,
   "needs_root": false,
   "provides": []

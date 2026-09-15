@@ -166,6 +166,199 @@ else
     need_key "--check on a fully installed clean home exits 0"
 fi
 
+# ===========================================================================
+# Task G: profile-declared ssh-admin, and the removal of register-provider's
+# "extract the mylinuxpool-actions line" special case.
+#
+# Semantics below are checked with parsers (jq for JSON, a YAML parser for
+# the workflow), never by grepping raw text — grep-found strings have
+# produced four false positives in this project already.
+# ===========================================================================
+
+# --- 1) both provider profiles declare ssh-admin (jq, not grep) -----------
+echo "provider profiles declare ssh-admin (jq array membership):"
+for pf in profiles/provider/default/profile.json profiles/provider/no-sudo/profile.json; do
+    if jq -e '.shared_config | index("ssh-admin") != null' "$pf" >/dev/null 2>&1; then
+        ok "${pf} shared_config contains ssh-admin"
+    else
+        bad "${pf} shared_config does not contain ssh-admin (jq .shared_config)"
+    fi
+done
+
+# --- 2) all three roles source fatesaikou's authorized_keys ---------------
+echo "three roles, one authorization source:"
+if jq -e '.shared_config | index("ssh-admin") != null' profiles/gateway/default/profile.json >/dev/null 2>&1; then
+    ok "gateway profile declares ssh-admin"
+else
+    bad "gateway profile does not declare ssh-admin"
+fi
+for pf in profiles/provider/default/profile.json profiles/provider/no-sudo/profile.json; do
+    if jq -e '.shared_config | index("ssh-admin") != null' "$pf" >/dev/null 2>&1; then
+        ok "provider (${pf%%/profile.json}) declares ssh-admin"
+    else
+        bad "provider (${pf%%/profile.json}) does not declare ssh-admin"
+    fi
+done
+
+WORKER_AK_REF='shared-configs/ssh-admin/files/authorized_keys.crypted'
+WORKER_AK_FOUND=no
+WORKER_YAML_ERR=""
+if python3 -c 'import yaml' >/dev/null 2>&1; then
+    WORKER_AK_OUT="$(python3 - "$WORKER_AK_REF" <<'PY' 2>&1
+import sys
+import yaml
+target = sys.argv[1]
+try:
+    doc = yaml.safe_load(open(".github/workflows/create-worker.yml"))
+except Exception as exc:
+    print("YAML-ERROR: %s" % exc)
+    sys.exit(3)
+found = []
+def walk(node):
+    if isinstance(node, dict):
+        for k, v in node.items():
+            if k == "run" and isinstance(v, str) and target in v:
+                found.append(v)
+            walk(v)
+    elif isinstance(node, list):
+        for item in node:
+            walk(item)
+walk(doc)
+print("FOUND" if found else "NOTFOUND")
+sys.exit(0 if found else 1)
+PY
+)"
+else
+    WORKER_AK_OUT="$(ruby -ryaml -e '
+begin
+  doc = YAML.load_file(".github/workflows/create-worker.yml")
+rescue => e
+  puts "YAML-ERROR: #{e}"
+  exit 3
+end
+target = ARGV[0]
+found = []
+walk = lambda do |o|
+  case o
+  when Hash then o.each { |k, v| found << v if k == "run" && v.is_a?(String) && v.include?(target); walk.call(v) }
+  when Array then o.each { |i| walk.call(i) }
+  end
+end
+walk.call(doc)
+puts found.empty? ? "NOTFOUND" : "FOUND"
+exit(found.empty? ? 1 : 0)
+' "$WORKER_AK_REF" 2>&1)"
+fi
+WORKER_AK_LAST="$(printf '%s\n' "$WORKER_AK_OUT" | tr -d '\r' | tail -1)"
+if [[ "$WORKER_AK_LAST" == "FOUND" ]]; then
+    WORKER_AK_FOUND=yes
+fi
+if [[ "$WORKER_AK_FOUND" == yes ]]; then
+    ok "create-worker.yml (worker role) references ${WORKER_AK_REF} (YAML-parsed run blocks)"
+elif [[ "$WORKER_AK_OUT" == YAML-ERROR* ]]; then
+    bad "cannot parse create-worker.yml to verify the worker's authorized_keys source (${WORKER_AK_OUT})"
+elif [[ -z "$WORKER_AK_OUT" ]]; then
+    bad "no YAML parser available (python3+pyyaml or ruby) to verify the worker's authorized_keys source"
+else
+    bad "create-worker.yml does not reference ${WORKER_AK_REF} in any run block"
+fi
+expect_exists "the referenced ssh-admin bundle exists" "$WORKER_AK_REF"
+
+# --- 3) install deploys the FULL declared list, not one extracted line -----
+# register-provider no longer pulls a single mylinuxpool-actions line out of
+# the bundle; the ssh-admin unit (now profile-declared) installs all of it.
+# A regression to the old behaviour would drop every other declared key.
+echo "ssh-admin install deploys the full declared list:"
+FULL="$TMPROOT/full-list"
+if [[ "$KEY_SET" -eq 1 ]]; then
+    mkdir -p "$FULL"
+    install "$FULL"
+    expect_rc "install exits 0" 0
+
+    declared_blobs="$(scripts/lib/crypto.sh decrypt "$FILE_CRYPTO_KEY" \
+        < shared-configs/ssh-admin/files/authorized_keys.crypted 2>/dev/null \
+        | awk '$2 != "" { print $2 }' | sort -u)"
+    n_declared="$(printf '%s\n' "$declared_blobs" | grep -c . || true)"
+    installed_blobs="$(awk '$2 != "" { print $2 }' "$FULL/.ssh/authorized_keys" 2>/dev/null | sort -u)"
+    n_installed="$(printf '%s\n' "$installed_blobs" | grep -c . || true)"
+    n_missing="$(comm -23 <(printf '%s\n' "$declared_blobs") <(printf '%s\n' "$installed_blobs") | grep -c . || true)"
+
+    # Precondition: with a single-key bundle, "all keys" and "one line" are
+    # indistinguishable, so the check below would be vacuous.
+    if [[ "$n_declared" -ge 2 ]]; then
+        ok "declared bundle holds ${n_declared} keys (one-line extraction would be detectable)"
+    else
+        bad "declared bundle holds only ${n_declared} key(s); the full-list check cannot distinguish anything"
+    fi
+    if [[ "$n_missing" -eq 0 ]]; then
+        ok "every declared key is present in the installed authorized_keys"
+    else
+        bad "installed authorized_keys is missing ${n_missing} of ${n_declared} declared key(s) — looks like the old one-line extraction"
+    fi
+    if [[ "$n_installed" -eq "$n_declared" ]]; then
+        ok "installed set equals the declared set (${n_installed} keys)"
+    else
+        bad "installed has ${n_installed} key(s), declared has ${n_declared}"
+    fi
+else
+    need_key "install exits 0"
+    need_key "declared bundle holds >=2 keys (one-line extraction would be detectable)"
+    need_key "every declared key is present in the installed authorized_keys"
+    need_key "installed set equals the declared set"
+fi
+
+# --- 4) register-provider step numbering: 1..N contiguous, one M -----------
+echo "register-provider step numbering is contiguous:"
+STEP_PAIRS="$(grep -oE 'step [0-9]+/[0-9]+' ops-scripts/register-provider.sh 2>/dev/null | sed 's/^step //')"
+if [[ -z "$STEP_PAIRS" ]]; then
+    bad "no 'step N/M' messages found in register-provider.sh"
+else
+    STEP_COUNT="$(printf '%s\n' "$STEP_PAIRS" | grep -c . || true)"
+    expected=1; contiguous=1; denoms=""
+    while IFS='/' read -r num den; do
+        [[ -n "$num" && -n "$den" ]] || continue
+        [[ "$num" -eq "$expected" ]] || contiguous=0
+        expected=$((expected + 1))
+        denoms="${denoms}${den}"$'\n'
+    done <<< "$STEP_PAIRS"
+    uniq_denoms="$(printf '%s' "$denoms" | sort -u | grep -c . || true)"
+    first_den="$(printf '%s' "$denoms" | grep . | head -1)"
+    if [[ "$contiguous" -eq 1 ]]; then
+        ok "steps 1..${STEP_COUNT} are contiguous (no gap from removing a step)"
+    else
+        bad "step numbers are not contiguous (found: $(printf '%s' "$STEP_PAIRS" | tr '\n' ' '))"
+    fi
+    if [[ "$uniq_denoms" -eq 1 ]]; then
+        ok "every step shares one denominator M=${first_den}"
+    else
+        bad "mixed step denominators: $(printf '%s' "$denoms" | grep . | sort -u | tr '\n' ' ')"
+    fi
+    if [[ "$STEP_COUNT" -eq "${first_den:-0}" ]]; then
+        ok "denominator M=${first_den} matches the ${STEP_COUNT} real steps"
+    else
+        bad "denominator M=${first_den} does not match the ${STEP_COUNT} real steps"
+    fi
+fi
+
+# --- 5) union semantics: install never revokes an undeclared key -----------
+echo "install never revokes an undeclared key (union without --prune):"
+UNION="$TMPROOT/union"
+mkdir -p "$UNION/.ssh"
+UNION_BLOB='AAAAC3NzaC1lZDI1NTE5AAAAIUNDECLAREDkeyOnlyInThisTest'
+printf 'ssh-ed25519 %s undeclared@test\n' "$UNION_BLOB" > "$UNION/.ssh/authorized_keys"
+if [[ "$KEY_SET" -eq 1 ]]; then
+    install "$UNION"
+    expect_rc "install exits 0" 0
+    if awk -v b="$UNION_BLOB" '$2 == b' "$UNION/.ssh/authorized_keys" 2>/dev/null | grep -q .; then
+        ok "the undeclared key is still present after install (union kept it)"
+    else
+        bad "the undeclared key was removed by a plain install (must require --prune)"
+    fi
+else
+    need_key "install exits 0"
+    need_key "the undeclared key is still present after install (union kept it)"
+fi
+
 echo
 if [[ "$fail" -eq 0 ]]; then
     if [[ "$skipped" -gt 0 ]]; then
@@ -176,4 +369,5 @@ if [[ "$fail" -eq 0 ]]; then
 else
     echo "test-ssh-admin-install: ${fail} FAILED, ${pass} passed, ${skipped} skipped"
 fi
+printf 'passed %d / failed %d\n' "$pass" "$fail"
 exit "$fail"

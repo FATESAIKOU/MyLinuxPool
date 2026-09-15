@@ -194,7 +194,7 @@ install_user_gh() {
 
 # ---- step 1: preflight -----------------------------------------------------
 step1_preflight() {
-    log INFO "step 1/9: preflight checks"
+    log INFO "step 1/8: preflight checks"
 
     command -v bash >/dev/null 2>&1 || { log ERROR "bash not found"; exit 1; }
 
@@ -293,7 +293,7 @@ step1_preflight_no_sudo() {
 # all, so we drop the token in a file for pool-resolve to pick up later
 # and export it for the rest of this run.
 step2_store_token() {
-    log INFO "step 2/9: store gh token + git credential helper"
+    log INFO "step 2/8: store gh token + git credential helper"
 
     mkdir -p "$STATE_DIR"
 
@@ -354,10 +354,10 @@ step2_store_token() {
 # present, pull" branch is gone because there is nothing to pull: the
 # clone dies with the trap at the end of this run.
 step3_fetch_runtime() {
-    log INFO "step 3/9: fetch runtime (shallow clone into temp ${REPO_DIR}, install profile-declared units)"
+    log INFO "step 3/8: fetch runtime (shallow clone into temp ${REPO_DIR}, install profile-declared units)"
 
     # BIN_DIR is what pool-runtime's own install.sh derives as
-    # <home>/.mylinuxpool/bin — kept as our own constant too since step9
+    # <home>/.mylinuxpool/bin — kept as our own constant too since step8
     # invokes pool-resolve directly.
     mkdir -p "$STATE_DIR"
 
@@ -397,63 +397,17 @@ step3_fetch_runtime() {
     done
 }
 
-# ---- step 4: Actions authorized_keys -----------------------------------------
-# The sshproxy private key itself is now installed generically in step 3
-# (whichever unit the profile declares for it — ssh-tunnel-client today).
-# This step is the one piece of step 4's old job that has no unit of its
-# own: a narrow "pull just the mylinuxpool-actions line out of ssh-admin's
-# authorized_keys bundle" extraction, not a wholesale unit install.
-step4_key() {
-    log INFO "step 4/9: Actions authorized_keys"
-
-    # Actions reaches this machine directly, as the last hop of its own
-    # NODE_<NAME> var, using SSH_KEY_ACTIONS (see docs/ARCHITECTURE.md §3)
-    # — without its public half in our own authorized_keys, a freshly
-    # registered provider is unreachable past the Gateway. Pull it from
-    # ssh-admin's encrypted bundle (fatesaikou's FULL identity, Gateway-only
-    # — we only ever take the one line tagged for Actions out of it, never
-    # the private key) rather than trusting whatever's already on disk.
-    mkdir -p "$SSH_DIR"
-    chmod 700 "$SSH_DIR"
-
-    local authorized_keys_crypted="${REPO_DIR}/shared-configs/ssh-admin/files/authorized_keys.crypted"
-    if [[ ! -f "$authorized_keys_crypted" ]]; then
-        log ERROR "encrypted authorized_keys bundle not found at ${authorized_keys_crypted}"
-        exit 1
-    fi
-
-    local actions_line
-    actions_line="$("${REPO_DIR}/scripts/lib/crypto.sh" decrypt "$FILE_CRYPTO_KEY" \
-        < "$authorized_keys_crypted" | grep -F 'mylinuxpool-actions' | head -n1 || true)"
-
-    if [[ -z "$actions_line" ]]; then
-        log ERROR "no line tagged 'mylinuxpool-actions' found in ${authorized_keys_crypted}"
-        exit 1
-    fi
-
-    local authorized_keys="${SSH_DIR}/authorized_keys"
-    touch "$authorized_keys"
-    chmod 600 "$authorized_keys"
-
-    if grep -qF "$actions_line" "$authorized_keys" 2>/dev/null; then
-        log INFO "Actions key already present in ${authorized_keys}, skipping"
-    else
-        printf '%s\n' "$actions_line" >> "$authorized_keys"
-        log INFO "added Actions key to ${authorized_keys}"
-    fi
-}
-
-# ---- step 5: local identity --------------------------------------------------
-step5_config() {
-    log INFO "step 5/9: write local identity config"
+# ---- step 4: local identity --------------------------------------------------
+step4_config() {
+    log INFO "step 4/8: write local identity config"
     mkdir -p "$STATE_DIR"
     printf 'NODE_NAME=%s\n' "$NAME" > "${STATE_DIR}/config"
     log INFO "wrote NODE_NAME=${NAME} to ${STATE_DIR}/config"
 }
 
-# ---- step 6: register NODE_<NAME> var (deep-merge, never clobber) ----------
-step6_register_var() {
-    log INFO "step 6/9: register ${VAR_NAME} (merge with existing if present)"
+# ---- step 5: register NODE_<NAME> var (deep-merge, never clobber) ----------
+step5_register_var() {
+    log INFO "step 5/8: register ${VAR_NAME} (merge with existing if present)"
 
     # `gh variable get` doesn't exist on gh 2.45.0 (fh-l's apt version) —
     # `gh api` has always existed and is equivalent.
@@ -509,15 +463,15 @@ step6_register_var() {
     log INFO "wrote ${VAR_NAME}"
 }
 
-# ---- step 7: sudoers rules (profile-declared) --------------------------------
+# ---- step 6: sudoers rules (profile-declared) --------------------------------
 # Which rules (if any) this host gets comes from profiles/provider/<name>/
 # profile.json's "sudoers_rules" array, not a NO_SUDO-gated hardcoded
 # rule. default declares the poweroff/ethtool rule; no-sudo declares an
 # empty list — a host that can't apply sudo rules remotely (no password,
 # no TTY to prompt on) simply has a profile that asks for none, so this
 # step is a correct, declared no-op there rather than a special case.
-step7_sudoers() {
-    log INFO "step 7/9: sudoers rules (declared in ${PROFILE_JSON})"
+step6_sudoers() {
+    log INFO "step 6/8: sudoers rules (declared in ${PROFILE_JSON})"
 
     local rules
     rules="$(jq -r '.sudoers_rules[]?' "$PROFILE_JSON")"
@@ -564,7 +518,7 @@ step7_sudoers() {
     log INFO "installed ${target}"
 }
 
-# ---- step 8: systemd user service + linger -----------------------------------
+# ---- step 7: systemd user service + linger -----------------------------------
 
 # NOTE (2026-09-15): there is deliberately NO post-install patching of
 # installed unit files here anymore. pool-sync enforces that installed
@@ -609,8 +563,8 @@ enable_linger() {
     log INFO "enabled linger for ${who}"
 }
 
-step8_systemd() {
-    log INFO "step 8/9: enable profile-declared systemd --user services + linger"
+step7_systemd() {
+    log INFO "step 7/8: enable profile-declared systemd --user services + linger"
 
     # Whichever unit was installed in step 3 already placed each service's
     # unit file under ~/.config/systemd/user/ — nothing to copy here,
@@ -621,8 +575,8 @@ step8_systemd() {
     #
     # pool-sync.timer is deliberately NOT enabled here: enabling it with
     # --now fires it immediately, and the first sync can restart
-    # pool-tunnel mid-run. Verify the freshly built tunnel FIRST (step 9),
-    # then enable the thing that may restart it (step 9.5).
+    # pool-tunnel mid-run. Verify the freshly built tunnel FIRST (step 8),
+    # then enable the thing that may restart it (step 8.5).
     local services
     services="$(jq -r '.systemd_user_services[]?' "$PROFILE_JSON")"
 
@@ -653,9 +607,9 @@ step8_systemd() {
     fi
 }
 
-# ---- step 9: verify from the Gateway side ------------------------------------
-step9_verify() {
-    log INFO "step 9/9: verifying tunnel from the gateway side"
+# ---- step 8: verify from the Gateway side ------------------------------------
+step8_verify() {
+    log INFO "step 8/8: verifying tunnel from the gateway side"
 
     local gw_json gw_ip gw_user
     gw_json="$("${BIN_DIR}/pool-resolve" gateway)" || {
@@ -688,13 +642,13 @@ step9_verify() {
     log INFO "verified: gateway sees an SSH banner on 127.0.0.1:${GATEWAY_PORT}"
 }
 
-# ---- step 9.5: enable pool-sync.timer -----------------------------------------
-# Deliberately AFTER step9_verify: enabling with --now fires the sync
+# ---- step 8.5: enable pool-sync.timer ----------------------------------------
+# Deliberately AFTER step8_verify: enabling with --now fires the sync
 # immediately, and a first sync that detects drift would restart
-# pool-tunnel while step 9 is still verifying it. With the post-install
-# patching gone (see step 8's note) the first sync has nothing to drift on,
+# pool-tunnel while step 8 is still verifying it. With the post-install
+# patching gone (see step 7's note) the first sync has nothing to drift on,
 # but ordering verify → enable keeps the race impossible regardless.
-step95_enable_pool_sync() {
+step85_enable_pool_sync() {
     local services
     services="$(jq -r '.systemd_user_services[]?' "$PROFILE_JSON")"
 
@@ -717,13 +671,12 @@ main() {
     step1_preflight
     step2_store_token
     step3_fetch_runtime
-    step4_key
-    step5_config
-    step6_register_var
-    step7_sudoers
-    step8_systemd
-    step9_verify
-    step95_enable_pool_sync
+    step4_config
+    step5_register_var
+    step6_sudoers
+    step7_systemd
+    step8_verify
+    step85_enable_pool_sync
     log INFO "registration complete for node '${NAME}' (gateway_port=${GATEWAY_PORT})"
 }
 

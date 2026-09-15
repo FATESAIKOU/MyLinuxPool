@@ -1,7 +1,15 @@
 #!/usr/bin/env bash
 # shared-configs/ssh-admin/install.sh — docs/LAYOUT.md §1
-# Who may log in as fatesaikou on the Gateway: installs authorized_keys
-# from files/authorized_keys.crypted. That is the whole job.
+# Who may log in as fatesaikou: installs authorized_keys from
+# files/authorized_keys.crypted. That is the whole job.
+#
+# Declared by the gateway AND provider profiles, and the same decrypted
+# bundle is injected into worker containers as WORKER_AUTHORIZED_KEYS
+# (create-worker.yml) — so all three kinds of machine take "who may log
+# in" from this one list. Until 2026-09-16 a provider got only the
+# mylinuxpool-actions line, extracted by a special case in
+# register-provider.sh; your own key was on those machines by accident,
+# not by declaration.
 #
 # It does NOT install an identity key. The id_rsa / id_rsa.pub this unit
 # used to deploy are used by no automation (REDESIGN.md N2/D3) and are no
