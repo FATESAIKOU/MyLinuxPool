@@ -31,6 +31,7 @@ cd "$(dirname "${BASH_SOURCE[0]}")/../.." || exit 1
 
 REFRESH="scripts/refresh-authkeys.sh"
 AUTHKEYS="scripts/lib/authkeys.sh"
+ROTATE="scripts/rotate-gateway.sh"
 
 SANDBOX="$(mktemp -d "${TMPDIR:-/tmp}/test-refresh-authkeys.XXXXXX")"
 trap 'rm -rf "$SANDBOX"' EXIT INT TERM
@@ -122,6 +123,16 @@ if [[ ! -f "$REFRESH" ]]; then
 else
     # shellcheck source=../refresh-authkeys.sh
     source "$REFRESH"
+fi
+# R1-R4（事故迴歸）測的共用函式 rotate_assemble_sshproxy_keys 住在
+# rotate-gateway.sh——它設定自己的 SCRIPT_DIR 並 source lib/log.sh，
+# 可以安全地整支 source（test-rotate-authkeys.sh 已如此做）。
+if [[ ! -f "$ROTATE" ]]; then
+    MISSING=1
+    echo "test-refresh-authkeys: ${ROTATE} is missing — R1-R4 事故迴歸無法執行" >&2
+else
+    # shellcheck source=../rotate-gateway.sh
+    source "$ROTATE"
 fi
 
 pass=0; fail=0
@@ -340,6 +351,86 @@ authkeys_assemble \"\$1\" \"\$2\"
         printf '  inj ok    %s\n' "注入後 assemble 回 0 且有輸出——第 11 條會紅（自鎖防線被拿掉）"
     else
         bad "注入後 assemble 仍失敗/無輸出——注入沒生效（harness 問題）"
+    fi
+fi
+
+# ---------------------------------------------------------------------------
+# R1–R4: 事故迴歸測試（優先度最高）——2026-09-16 實機事故。
+# refresh-authorized-keys.yml 把 Gateway 的 sshproxy authorized_keys 整份
+# 覆蓋成只有一把新的各機鑰，把共用公鑰刷掉了。當時只有 fh-l 有自產鑰，
+# fh-proxy 唯一能用的就是共用那把、而且它沒有任何遠端退路——差一次隧道
+# 重啟就永久失聯。根因：rotate_assemble_sshproxy_keys 有「共用鑰必須在
+# 結果裡」的防線，但 refresh 那條路走的是另一套邏輯，沒有。
+# 修法是兩條路共用同一個函式（rotate_assemble_sshproxy_keys）；下面用
+# 事故情境直接測那支共用函式——它必須包含共用鑰、即使已有各機鑰存在。
+# 這幾條會擋住一個已經真的發生過的失聯事故，不得刪。
+# ---------------------------------------------------------------------------
+R_SHARED="ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFIXTURESHARED legacy-shared"
+R_FHL="ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFIXTURERFHL fh-l"
+R_FHPROXY="ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFIXTURERFHPROXY fh-proxy"
+
+# refresh 路的 tunnel_keys = refresh_collect_tunnel_keys 的輸出（各機新鑰）
+TUNNEL_KEYS="$R_FHL"$'\n'"$R_FHPROXY"
+
+echo "── R1-R2. 事故迴歸：refresh 的 sshproxy 清單必定含共用公鑰 ──"
+if ! declare -F rotate_assemble_sshproxy_keys >/dev/null 2>&1; then
+    bad "R1-R2. rotate_assemble_sshproxy_keys 未定義（scripts/rotate-gateway.sh 尚未落地）"
+else
+    OUT="$(rotate_assemble_sshproxy_keys "$R_SHARED" "$TUNNEL_KEYS" </dev/null 2>/dev/null)"; RC=$?
+    if [[ $RC -eq 0 ]] && printf '%s\n' "$OUT" | grep -qF "$R_SHARED"; then
+        ok "R1. 已有各機鑰時清單仍含共用公鑰（事故情境防線）"
+    else
+        bad "R1. 共用公鑰不在清單裡（rc=$RC, out=[${OUT:0:200}]）——事故重演：fh-proxy 會被鎖在外面"
+    fi
+    if printf '%s\n' "$OUT" | grep -qF "$R_SHARED" && printf '%s\n' "$OUT" | grep -qF "$R_FHL" \
+       && printf '%s\n' "$OUT" | grep -qF "$R_FHPROXY"; then
+        ok "R2. 共用鑰 + 各機鑰同時在（事故當下：只有 fh-l 有鑰、fh-proxy 靠共用）"
+    else
+        bad "R2. 清單缺共用或各機鑰（out=[${OUT:0:200}]）——事故重演：fh-proxy 唯一能用的共用鑰被刷掉"
+    fi
+fi
+
+echo "── R3. 共用公鑰取不到（解密失敗）→ 中止、不寫入 ──"
+if ! declare -F rotate_assemble_sshproxy_keys >/dev/null 2>&1; then
+    bad "R3. rotate_assemble_sshproxy_keys 未定義"
+else
+    OUT="$(rotate_assemble_sshproxy_keys "" "$TUNNEL_KEYS" </dev/null 2>/dev/null)"; RC=$?
+    if [[ $RC -ne 0 && -z "$OUT" ]]; then
+        ok "R3. 共用公鑰取不到 → 中止、非 0、不輸出（絕不寫出沒有共用鑰的清單）"
+    else
+        bad "R3. 共用公鑰取不到卻 rc=$RC、out=[${OUT:0:200}]——正是事故的寫入行為"
+    fi
+fi
+
+echo "── R4. 注入：拿掉共用鑰 union（模擬事故當下行為）──"
+if ! declare -F rotate_assemble_sshproxy_keys >/dev/null 2>&1; then
+    bad "R4. rotate_assemble_sshproxy_keys 未定義，無從注入"
+else
+    INJ_R="$SANDBOX/rotate-inj-r.sh"
+    python3 - "scripts/rotate-gateway.sh" "$INJ_R" <<'PY'
+import re, sys
+src = open(sys.argv[1], encoding="utf-8").read()
+# 模擬事故當下的 refresh 路：union 只含各機鑰（共用鑰不併入），
+# 且沒有「共用鑰必須在結果裡」的防線（事故就是這樣把共用鑰刷掉的）。
+src = src.replace(
+    'all="$(printf \'%s\\n%s\\n\' "$shared_pubkey" "$tunnel_keys" \\',
+    'all="$(printf \'%s\\n\' "$tunnel_keys" \\')
+# 防線一起拿掉：guard 改 if false（等同事故路的「沒有防線直接寫」）
+pat = re.compile(r'if \[\[ -z "\$shared_pubkey" \]\][^\n]*\n(?:[^\n]*\n)*?^\s*fi\n', re.M)
+src = pat.sub('if false; then\n    :\nfi\n', src)
+open(sys.argv[2], "w", encoding="utf-8").write(src)
+PY
+    INJ_OUT="$(bash -c "
+set -uo pipefail
+source '$INJ_R'
+rotate_assemble_sshproxy_keys \"\$1\" \"\$2\"
+" _ "$R_SHARED" "$TUNNEL_KEYS" </dev/null 2>/dev/null)"; RC=$?
+    if printf '%s\n' "$INJ_OUT" | grep -qF "$R_SHARED"; then
+        bad "R4. 注入後共用鑰仍在——注入沒生效（harness 問題）"
+    elif printf '%s\n' "$INJ_OUT" | grep -qF "$R_FHL"; then
+        printf '  inj ok    %s\n' "注入後（union 只含各機鑰）共用鑰被刷掉——R1/R2 條會紅（事故行為被重現並擋住）"
+    else
+        bad "R4. 注入後無輸出——注入沒生效（harness 問題）"
     fi
 fi
 

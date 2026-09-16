@@ -838,6 +838,44 @@ restart 前先 `daemon-reload`、register 把 timer 的啟用移到驗證之後�
 > 做法就全部作廢。** 要改就改宣告檔。這條適用於未來每一個 unit——
 > 任何 post-install 的微調都會被下一次 `pool-sync` 還原，而且不會有人發現。
 
+### 7.12 一條規則寫進一條路徑，另一條路徑就會咬人
+
+2026-09-16，隧道金鑰從「全叢集共用一把」遷移到「每台自產」的當天。
+
+`MIGRATION.md` §2 寫得很清楚：**遷移期間組裝出來的 sshproxy 授權清單
+必須包含現行共用公鑰**——因為還沒自產金鑰的機器只有那一把能用。
+那條規則被實作進了 `rotate_assemble_sshproxy_keys`（rotate 的路徑），
+卻沒有進 `refresh-authorized-keys.yml`（refresh 的路徑），
+因為我只把它寫進了前者的工作說明。
+
+於是：
+
+```
+fh-l 自產金鑰 → 發布公鑰 → 派發 refresh
+refresh 把 sshproxy 的 authorized_keys 整份覆蓋成「只有 fh-l 那一把」
+共用公鑰消失
+```
+
+此時 fh-proxy **還沒有**自產金鑰，它唯一能用的就是剛被刪掉的共用鑰。
+`mlp ls` 仍顯示它 `up`——**既有的 ssh 連線不會重新認證**，所以看起來一切正常。
+它距離永久失聯只差一次隧道重啟，而 fh-proxy 是 WSL2、**沒有任何遠端退路**
+（實測過：fh-proxy 連不進 fh-l 的區網，它自己更是只能人到機器前）。
+
+處置：立刻把共用公鑰追加回 Gateway，然後**強制 fh-proxy 重連一次驗證**
+——不能只看 `up` 就當作沒事，那個 `up` 正是騙人的東西。
+
+三個教訓：
+
+1. **同一條規則不要有兩份實作。** 兩條路徑都要組同一份清單，就該呼叫同一個
+   函式。修法是讓 refresh 改用 `rotate_assemble_sshproxy_keys`，
+   它內建「共用鑰不在結果裡就中止」。
+2. **`up` 不等於「還連得上」。** 反向隧道的既有連線會繼續存活，
+   authorized_keys 改壞要到下一次重連才顯形。驗證撤銷或改寫授權之後，
+   一定要**主動觸發一次重連**。
+3. **先問「失敗了要怎麼回去」。** 這次能救回來，只因為 Gateway 上
+   `fatesaikou` 是另一個帳號、而且有 NOPASSWD sudo。
+   如果改壞的是 `fatesaikou` 那份，退路就只剩 rotate 重建。
+
 ## 8. 改了 provision-gateway.sh 之後
 
 `scripts/provision-gateway.sh` 的改動**只對下一台 rotate 出來的機器生效**。現行
