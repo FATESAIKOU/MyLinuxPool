@@ -54,7 +54,7 @@ create_worker_compute_identity() {
 #   no key reuse). Runs on the Actions runner, never on a provider.
 #
 #   Output, exactly two lines on stdout:
-#     line 1: the PRIVATE key, base64-encoded
+#     line 1: the PRIVATE key, base64-encoded, ONE line
 #     line 2: the PUBLIC key, one full line (type, blob, optional
 #             comment — callers may overwrite the comment)
 #
@@ -63,19 +63,58 @@ create_worker_compute_identity() {
 #   is never written to a persistent file and never logged. Base64 is
 #   used (rather than raw key bytes) so the caller can carry it through
 #   a single step-output boundary without mangling newlines.
+#
+#   THE BASE64 MUST BE A SINGLE LINE, AND THIS IS A SECURITY ISSUE, NOT
+#   COSMETIC: GNU coreutils base64 wraps output at 76 columns, so on Linux
+#   (the Actions runner) the private key's base64 spans several lines and
+#   "line 2" is a private-key fragment, not the public key. macOS base64
+#   does NOT wrap, so tests running on macOS never see the difference —
+#   this is the second time this exact Linux/macOS wrap difference has
+#   caused a real incident (same shape as refresh_build_install_cmd's
+#   `| base64 | tr -d '\n'` fix days ago). We do NOT use -w0: it is GNU
+#   coreutils-only and macOS base64 does not accept it. Instead the output
+#   is tr'd flat and a self-check asserts line 2 is a real public key
+#   BEFORE anything leaves the function — a "private key published as a
+#   public key" error must be caught here, not by a careful caller.
 create_worker_mint_tunnel_key() {
-    local tmp rc
+    local tmp rc line1 line2
     tmp="$(mktemp -d "${TMPDIR:-/tmp}/mlp-worker-key.XXXXXX")" || return 1
     if ! ssh-keygen -t ed25519 -N "" -f "$tmp/id" >/dev/null 2>&1; then
         rm -rf "$tmp"
         log ERROR "ssh-keygen failed — cannot mint a worker tunnel key"
         return 1
     fi
-    base64 < "$tmp/id"
+
+    # tr -d '\n' then a newline: guarantees exactly one line on Linux
+    # (which wraps) and macOS (which does not) alike.
+    line1="$(base64 < "$tmp/id" | tr -d '\n')"
     rc=$?
-    cat "${tmp}/id.pub" || rc=1
+    line2="$(cat "${tmp}/id.pub" 2>/dev/null)"
+    rc=$((rc || $?))
     rm -rf "$tmp"
-    return "$rc"
+
+    # Self-check: the private-key line MUST be a single line, and line 2
+    # MUST be a public key line, never a private-key fragment. The
+    # wrapped-base64 failure mode puts a PRIVATE-key fragment on stdout's
+    # line 2 while the `line2` variable (read from id.pub directly) still
+    # looks fine — so check the base64 line for embedded newlines too,
+    # not just line2's shape. Any violation aborts before a caller can
+    # publish a fragment.
+    if [[ $rc -ne 0 || -z "$line1" || -z "$line2" ]]; then
+        log ERROR "could not read the minted key material — nothing was output"
+        return 1
+    fi
+    if [[ "$line1" == *$'\n'* ]]; then
+        log ERROR "minted output self-check failed: the private-key line is wrapped (Linux base64 folds at 76 cols) — line 2 would be a private-key fragment; aborting"
+        return 1
+    fi
+    if ! [[ "$line2" =~ ^ssh-[a-z0-9-]+[[:space:]]+[A-Za-z0-9+/=]+ ]]; then
+        log ERROR "minted output self-check failed: line 2 is not a public key (a private-key fragment must never be published) — aborting"
+        return 1
+    fi
+
+    printf '%s\n%s\n' "$line1" "$line2"
+    return 0
 }
 
 # create_worker_dispatch_refresh_and_wait [<timeout_seconds>]

@@ -876,6 +876,62 @@ refresh 把 sshproxy 的 authorized_keys 整份覆蓋成「只有 fh-l 那一把
    `fatesaikou` 是另一個帳號、而且有 NOPASSWD sudo。
    如果改壞的是 `fatesaikou` 那份，退路就只剩 rotate 重建。
 
+### 7.13 私鑰外洩兩次，同一天，兩個不同的管道
+
+2026-09-16，worker 改用「每次建立產一把新金鑰」的當天。實跑時
+**worker 的私鑰被當成公鑰發布到 GitHub var 與 Gateway 的 authorized_keys**。
+
+#### 管道一：Linux 的 base64 會折行
+
+```bash
+base64 < "$tmp/id"        # Linux 每 76 字元折行 → 多行
+cat  "${tmp}/id.pub"
+```
+契約是「第 1 行私鑰 base64、第 2 行公鑰」。折行之後**第 2 行變成私鑰的第二段
+base64**，呼叫端照契約取第 2 行當公鑰發布出去。
+
+**測試抓不到，因為 macOS 的 `base64` 預設不折行。** 測試跑在 Mac，
+程式跑在 Linux runner——這個差異測試套件結構上看不見。
+
+而且這是**同一個坑的第二次**：`refresh_build_install_cmd` 幾天前才因為
+一模一樣的原因炸過（多行值寫不進 `$GITHUB_OUTPUT`），當時的修法
+`| base64 | tr -d '\n'` 沒有被套用到新函式上。
+
+#### 管道二：GitHub 不遮蔽 step output
+
+```yaml
+WORKER_KEY_B64: ${{ steps.mint.outputs.private_key_b64 }}
+```
+`secrets.*` 會被遮成 `***`，**step output 不會**。Actions 在 log 裡回顯步驟
+原始碼時會把 `${{ }}` 展開，於是私鑰的 base64 進了**永久保存**的執行紀錄。
+
+這條規則 repo 自己就有——`scripts/create-worker.sh` 裡那句
+「a %q-quoted secret value must never cross a step-output boundary」。
+新加的步驟違反了它。
+
+#### 影響與處置
+
+實際影響為零：那兩把鑰匙屬於**從未成功建立**的 worker，回滾已把容器與帳本
+條目都清掉，它們不授權任何東西。但仍然：
+
+1. 清掉 Gateway 上那行殘留（跑一次 refresh，從 var 重建）
+2. **刪掉三個含私鑰材料的 workflow run**（log 是持久的）
+3. 掃過近期所有 run 確認乾淨
+
+修法三道，缺一不可：
+- `base64 | tr -d '\n'` 保證單行（`-w0` 是 GNU 專屬，不可攜）
+- 函式輸出前**自我檢查第 2 行以 `ssh-` 開頭**，否則中止
+  ——「把私鑰當公鑰送出去」不能只靠呼叫端小心
+- 私鑰**完全不跨 step 邊界**（在同一個 step 內 mint 並組指令），
+  外加 `::add-mask::` 當保險
+
+#### 通則
+
+> **跨平台的工具差異，是測試套件結構上的盲區。** 測試在哪個平台跑，
+> 就只看得到那個平台的行為。`base64`、`sed`、`date`、`stat` 都有這個問題。
+> 對策是在測試裡**模擬另一個平台的行為**（放一個會折行的假 `base64`），
+> 而不是期待哪天在對的平台上跑到。
+
 ## 8. 改了 provision-gateway.sh 之後
 
 `scripts/provision-gateway.sh` 的改動**只對下一台 rotate 出來的機器生效**。現行
