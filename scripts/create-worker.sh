@@ -17,6 +17,14 @@ source "${SCRIPT_DIR}/lib/log.sh"
 # shellcheck source=lib/profile.sh
 source "${SCRIPT_DIR}/lib/profile.sh"
 
+# A copy of this file may be sourced from an injected location where the
+# relative lib/ paths no longer resolve (e.g. a test that sed-mutates the
+# file and sources it from a temp dir). Without this fallback, log() would
+# be undefined and an ERROR call would hit macOS's /usr/bin/log with the
+# level word as a subcommand ("Unknown subcommand 'ERROR'"). Only defines
+# when the lib source above actually provided nothing.
+declare -F log >/dev/null 2>&1 || log() { printf '[%s] %s\n' "$1" "${*:2}" >&2; }
+
 # create_worker_validate_name <value> <field-name>
 #   image/name feed straight into remote command text and file paths
 #   elsewhere — constrain the character set at this one boundary so every
@@ -68,6 +76,77 @@ create_worker_mint_tunnel_key() {
     cat "${tmp}/id.pub" || rc=1
     rm -rf "$tmp"
     return "$rc"
+}
+
+# create_worker_dispatch_refresh_and_wait [<timeout_seconds>]
+#   Dispatches refresh-authorized-keys.yml and waits until the run is
+#   ACTUALLY completed. Returns 0 iff the run finished with conclusion ==
+#   "success"; non-zero on dispatch failure, timeout, or a non-success
+#   conclusion — with timeout and failure messages distinguishable.
+#
+#   The poll waits for status == "completed" before ever reading the
+#   conclusion. Breaking out on `status != "queued"` (the old bug) exits
+#   the moment the run goes in_progress, and an in_progress run has no
+#   conclusion yet — an empty value then got reported as '<unknown>' and
+#   FAILED a refresh that had actually succeeded (real run 35047640983).
+#   GH_REPO comes from the calling workflow's env (docs/LAYOUT.md §3:
+#   the workflow is the thin caller).
+create_worker_dispatch_refresh_and_wait() {
+    local timeout_seconds="${1:-300}"
+    # Overridable so tests can run a queued→in_progress→completed sequence
+    # in seconds instead of the production default's ~10s+; the default
+    # keeps production behaviour unchanged.
+    local poll_interval="${POOL_REFRESH_POLL_INTERVAL:-5}"
+    local repo="${GH_REPO:-}"
+    local workflow="refresh-authorized-keys.yml"
+    local deadline start now
+
+    if [[ -z "$repo" ]]; then
+        log ERROR "GH_REPO is not set — cannot dispatch ${workflow}"
+        return 1
+    fi
+
+    start="$(date +%s)"
+    deadline=$((start + timeout_seconds))
+
+    if ! gh workflow run "$workflow" --repo "$repo" >/dev/null 2>&1; then
+        log ERROR "could not dispatch ${workflow} (${repo})"
+        return 1
+    fi
+
+    local run_id="" row status conclusion
+    while :; do
+        now="$(date +%s)"
+        if (( now >= deadline )); then
+            log ERROR "timed out after ${timeout_seconds}s waiting for ${workflow} to finish (still not completed)"
+            return 1
+        fi
+        row="$(gh run list --workflow="$workflow" --repo "$repo" --limit 1 \
+            --json databaseId,status --jq '.[0] | "\(.databaseId) \(.status)"' 2>/dev/null || true)"
+        if [[ -z "$row" ]]; then
+            # The dispatch was accepted but the run is not listed yet.
+            sleep "$poll_interval"
+            continue
+        fi
+        run_id="${row%% *}"
+        status="${row#* }"
+        if [[ "$status" == "completed" ]]; then
+            break
+        fi
+        sleep "$poll_interval"
+    done
+
+    # `gh run view --json conclusion` returns an OBJECT in real gh; some
+    # gh versions / test fakes return an ARRAY of the same record. Tolerate
+    # both shapes so a conclusion read is never a null-by-mismatch.
+    conclusion="$(gh run view "$run_id" --repo "$repo" --json conclusion --jq \
+        'if type == "array" then .[0].conclusion else .conclusion end' 2>/dev/null || true)"
+    if [[ "$conclusion" != "success" ]]; then
+        log ERROR "refresh workflow ${run_id} finished with conclusion '${conclusion:-<unknown>}'"
+        return 1
+    fi
+    log INFO "refresh workflow ${run_id} succeeded"
+    return 0
 }
 
 # create_worker_missing_secrets <profile_json> <all_secrets_json>

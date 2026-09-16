@@ -283,33 +283,16 @@ jobs:
       # The Gateway must authorize this worker's tunnel key BEFORE the
       # container starts (brief-T §流程順序). A dispatch or run failure
       # here fails the whole create — the failure handler below rolls the
-      # ledger entry back out.
+      # ledger entry back out. Logic lives in
+      # create_worker_dispatch_refresh_and_wait (thin caller, LAYOUT §3).
       - name: Refresh the Gateway authorized keys
         shell: bash
         run: |
           set -euo pipefail
-          if ! gh workflow run refresh-authorized-keys.yml --repo "$GH_REPO"; then
-            echo "::error::could not dispatch refresh-authorized-keys.yml — the worker's key would never be authorized"
-            exit 1
-          fi
-          # Dispatching is not the same as done: wait for the refresh to
-          # actually finish and succeed.
-          run_id=""
-          for _ in $(seq 1 30); do
-            sleep 5
-            run_id="$(gh run list --workflow=refresh-authorized-keys.yml --repo "$GH_REPO" --limit 1 --json databaseId,status --jq '.[0] | select(.status != "queued") | .databaseId' 2>/dev/null || true)"
-            [[ -n "$run_id" ]] && break
-          done
-          if [[ -z "$run_id" ]]; then
-            echo "::error::refresh workflow did not start within the wait window"
-            exit 1
-          fi
-          conclusion="$(gh run view "$run_id" --repo "$GH_REPO" --json conclusion --jq '.conclusion' 2>/dev/null || true)"
-          if [[ "$conclusion" != "success" ]]; then
-            echo "::error::refresh workflow ${run_id} finished with conclusion '${conclusion:-<unknown>}' — the worker's key may not be authorized"
-            exit 1
-          fi
-          echo "refresh workflow ${run_id} succeeded"
+          source scripts/create-worker.sh
+          # dispatches refresh-authorized-keys.yml and waits for it to complete
+          create_worker_dispatch_refresh_and_wait 300 \
+            || { echo "::error::could not refresh the Gateway authorized keys — see log above"; exit 1; }
 
       - name: Build docker-run command
         id: run_cmd

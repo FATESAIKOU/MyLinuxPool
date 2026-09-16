@@ -18,8 +18,15 @@
 # dropping the ledger entry. Ordering is checked by parsing the YAML step
 # list, never by grepping line numbers.
 #
+# Task T2 addition: create_worker_dispatch_refresh_and_wait must wait for
+# status == "completed" before reading .conclusion. The 2026-09-16 run
+# broke because the poll treated "left queued" as "finished": an
+# in_progress run has no conclusion, so a successful refresh was read as
+# <unknown> and the create was rolled back for nothing.
+#
 # Injection demo at the end: the same order checker is run against a copy
-# with the two steps swapped, and must go red.
+# with the two steps swapped, and must go red; and (task T2) the refresh
+# waiter is mutated back to the != "queued" poll, which must redden case R1.
 #
 # Run: scripts/tests/test-worker-tunnel-key.sh
 set -uo pipefail
@@ -96,6 +103,140 @@ exec "$REAL_SSH_KEYGEN" "$@"
 FAKE_KEYGEN
     chmod +x "$SANDBOX/fakebin/ssh-keygen"
 fi
+
+# ---------------------------------------------------------------------------
+# Fake gh for task T2's refresh-wait tests. It records every argv and models
+# the run life cycle from FAKE_GH_STATUS_SEQ, applying --jq exactly like real
+# gh does — so the FUNCTION's own filter decides when it believes the run is
+# finished. That is precisely where the 2026-09-16 bug lived: a filter that
+# left the queue at in_progress saw a run with no conclusion yet.
+#
+# A `run list` call advances the sequence by one observation; `run view`
+# advances only when it asks for `status` (a poll), and otherwise reports
+# the last observed status (so a conclusion read after an early exit sees
+# the in-progress state, reproducing the bug deterministically).
+# ---------------------------------------------------------------------------
+cat > "$SANDBOX/fakebin/gh" <<'FAKE_GH'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "${FAKE_GH_LOG:?}"
+
+_apply_jq() {
+    local json="$1"; shift
+    local filter="" prev=""
+    for a in "$@"; do
+        [[ "$prev" == "--jq" ]] && filter="$a"
+        prev="$a"
+    done
+    if [[ -n "$filter" ]]; then
+        printf '%s' "$json" | jq -r "$filter"
+    else
+        printf '%s\n' "$json"
+    fi
+}
+
+# observe: report the next status in the sequence and remember it.
+_observe() {
+    local idx_file="${FAKE_GH_STATE_DIR:?}/next.idx"
+    local cur_file="${FAKE_GH_STATE_DIR}/cur.status"
+    local n=0 last cur
+    [[ -f "$idx_file" ]] && n="$(cat "$idx_file")"
+    IFS=',' read -r -a seq <<< "${FAKE_GH_STATUS_SEQ:-queued}"
+    last=$(( ${#seq[@]} - 1 ))
+    [[ "$n" -gt "$last" ]] && n="$last"
+    cur="${seq[$n]}"
+    if [[ "$n" -lt "$last" ]]; then
+        printf '%s' "$((n + 1))" > "$idx_file"
+    else
+        printf '%s' "$n" > "$idx_file"
+    fi
+    printf '%s' "$cur" > "$cur_file"
+    printf '%s' "$cur"
+}
+
+# read_state: the last observed status (no advance).
+_read_state() {
+    local cur_file="${FAKE_GH_STATE_DIR:?}/cur.status"
+    if [[ -f "$cur_file" ]]; then
+        cat "$cur_file"
+    else
+        IFS=',' read -r -a seq <<< "${FAKE_GH_STATUS_SEQ:-queued}"
+        printf '%s' "${seq[0]}"
+    fi
+}
+
+_asks_status() {
+    local prev="" a
+    for a in "$@"; do
+        if [[ "$prev" == "--json" ]]; then
+            case "$a" in *status*) return 0 ;; esac
+        fi
+        prev="$a"
+    done
+    return 1
+}
+
+# _emit <cur> [gh-args...] — shapes the payload the way the real subcommand
+# does: `gh run list` prints an ARRAY, `gh run view` prints a bare OBJECT.
+# Getting this wrong makes `.conclusion` unreachable on a view and turns a
+# successful refresh into '<unknown>' — which is exactly the 2026-09-16 bug
+# shape, so the fake must not manufacture it accidentally.
+_emit() {
+    local cur="$1" sub="$2"; shift 2
+    local concl=""
+    [[ "$cur" == "completed" ]] && concl="${FAKE_GH_CONCLUSION:-success}"
+    local raw
+    if [[ "$sub" == "view" ]]; then
+        raw="$(jq -c -n --argjson id "${FAKE_GH_RUN_ID:-42}" --arg s "$cur" --arg c "$concl" \
+            '{databaseId:$id,status:$s,conclusion:$c}')"
+    else
+        raw="$(jq -c -n --argjson id "${FAKE_GH_RUN_ID:-42}" --arg s "$cur" --arg c "$concl" \
+            '[{databaseId:$id,status:$s,conclusion:$c}]')"
+    fi
+    _apply_jq "$raw" "$@"
+}
+
+case "${1:-} ${2:-}" in
+    "workflow run")
+        if [[ "${FAKE_GH_DISPATCH_MODE:-ok}" == "fail" ]]; then
+            echo "gh: could not create workflow dispatch event" >&2
+            exit 1
+        fi
+        exit 0
+        ;;
+    "run list")
+        _emit "$(_observe)" list "$@"
+        exit 0
+        ;;
+    "run view")
+        if _asks_status "$@"; then
+            _emit "$(_observe)" view "$@"
+        else
+            _emit "$(_read_state)" view "$@"
+        fi
+        exit 0
+        ;;
+    "run watch")
+        # Blocks like the real thing: observe once per second until the run
+        # completes, or until a wall-clock deadline (exit 3 = "still running",
+        # which is what a caller's own timeout should treat as a timeout).
+        local deadline=$(( $(date +%s) + ${FAKE_GH_WATCH_SECS:-30} ))
+        local st
+        while :; do
+            st="$(_observe)"
+            [[ "$st" == "completed" ]] && break
+            if (( $(date +%s) >= deadline )); then exit 3; fi
+            sleep "$poll_interval"
+        done
+        if [[ "$(cat "${FAKE_GH_STATE_DIR}/cur.status")" == "completed" ]]; then
+            if [[ "${FAKE_GH_CONCLUSION:-success}" == "success" ]]; then exit 0; fi
+            exit 1
+        fi
+        exit 3
+        ;;
+esac
+exit 0
+FAKE_GH
+chmod +x "$SANDBOX/fakebin/gh"
 
 # ---------------------------------------------------------------------------
 # Assertions (same shape as the rest of scripts/tests/).
@@ -488,6 +629,346 @@ YML
         else
             inj_ok "對調 refresh 與 docker run 後，第 6 條轉紅（${ORDER_REASON}）——待真實 workflow 落地後會直接對它做同一件事"
         fi
+    fi
+fi
+
+# ===========================================================================
+# Task T2: create_worker_dispatch_refresh_and_wait — wait for the refresh to
+# actually COMPLETE before trusting its conclusion.
+#
+# The 2026-09-16 real run failed here: the poll left the loop as soon as the
+# run stopped being `queued` (i.e. on `in_progress`), then read an empty
+# `.conclusion` and reported `<unknown>` for a refresh that in fact
+# succeeded. Case R1 below is that exact sequence.
+# ===========================================================================
+echo "create_worker_dispatch_refresh_and_wait:"
+
+GHFAKE_LOG="$SANDBOX/gh.log"
+: > "$GHFAKE_LOG"
+
+T2_STATE="$SANDBOX/gh-state"
+
+# run_refresh_wait <status_seq> <conclusion> <dispatch_mode> <watch_secs> [timeout_arg] [poll_interval]
+# Returns the function's exit code; combined stdout+stderr lands in
+# T2_OUT/T2_ERR so "timeout" vs "failure" wording can be told apart.
+#
+# poll_interval is exported as POOL_REFRESH_POLL_INTERVAL: production
+# defaults to 5s, which would make the R1 state sequence take ~10s and the
+# outer timeout (30s) the thing that ends the run. Fast cases pass 0 (the
+# implementation's `sleep 0` is a no-op); R3, which must genuinely time out,
+# passes 1 and a 1-second function timeout instead.
+T2_RC=0; T2_OUT=""; T2_ERR=""
+run_refresh_wait() {
+    local seq="$1" concl="$2" dispatch="$3" watch="$4" timeout_arg="${5:-}" poll="${6:-1}"
+    : > "$GHFAKE_LOG"
+    rm -rf "$T2_STATE"; mkdir -p "$T2_STATE"
+    printf '0' > "$T2_STATE/next.idx"
+    T2_RC=0; T2_OUT=""; T2_ERR=""
+    if ! declare -F create_worker_dispatch_refresh_and_wait >/dev/null 2>&1; then
+        T2_RC=127
+        T2_ERR="<undefined function: create_worker_dispatch_refresh_and_wait>"
+        return 127
+    fi
+    local -a args=()
+    [[ -n "$timeout_arg" ]] && args=("$timeout_arg")
+    HOME="$SANDBOX/home" TMPDIR="$SANDBOX/tmp" \
+    PATH="$SANDBOX/fakebin:$PATH" \
+    GH_REPO="testowner/testrepo" \
+    POOL_REFRESH_POLL_INTERVAL="$poll" \
+    FAKE_GH_LOG="$GHFAKE_LOG" FAKE_GH_STATE_DIR="$T2_STATE" \
+    FAKE_GH_STATUS_SEQ="$seq" FAKE_GH_CONCLUSION="$concl" \
+    FAKE_GH_DISPATCH_MODE="$dispatch" FAKE_GH_WATCH_SECS="$watch" \
+    FAKE_GH_RUN_ID=35047640983 \
+    $TIMEOUT bash -c '
+        source "$1" >/dev/null 2>&1
+        create_worker_dispatch_refresh_and_wait ${2:+"$2"}
+    ' _ "$CREATE_WORKER_SH" "${timeout_arg:-}" \
+        </dev/null > "$SANDBOX/t2.out" 2> "$SANDBOX/t2.err"
+    T2_RC=$?
+    T2_OUT="$(cat "$SANDBOX/t2.out")"
+    T2_ERR="$(cat "$SANDBOX/t2.err")"
+    return "$T2_RC"
+}
+
+t2_report() {
+    local label="$1" want_desc="$2" rc="$3" msg="$4"
+    ok "$label"
+}
+
+t2_fail() {
+    printf '  FAIL  %s (%s)\n' "$1" "$2"
+    fail=$((fail + 1))
+}
+
+# R1: queued -> in_progress -> completed/success must return 0. The
+# in_progress observation must NOT be treated as "finished".
+run_refresh_wait "queued,in_progress,completed" success ok 30 30 0 || true
+if ! declare -F create_worker_dispatch_refresh_and_wait >/dev/null 2>&1; then
+    t2_fail "R1. queued→in_progress→completed/success 回 0" "函式不存在"
+else
+    if [[ "$T2_RC" -eq 0 ]]; then
+        ok "R1. queued→in_progress→completed/success 回 0（in_progress 未被誤判為完成）"
+    else
+        t2_fail "R1. queued→in_progress→completed/success 回 0" \
+            "rc=${T2_RC}; $(printf '%s %s' "$T2_OUT" "$T2_ERR" | tr '\n' ' ' | head -c 200)"
+    fi
+fi
+
+# R1b: an early exit on in_progress leaves no conclusion — the fake reports
+# the empty value the real gh reported, so this also documents the bug shape.
+run_refresh_wait "in_progress,completed" success ok 30 30 0 || true
+if ! declare -F create_worker_dispatch_refresh_and_wait >/dev/null 2>&1; then
+    t2_fail "R1b. 首見即 in_progress 仍等到 completed" "函式不存在"
+elif [[ "$T2_RC" -eq 0 ]]; then
+    ok "R1b. 首見即 in_progress 仍等到 completed（回 0）"
+else
+    t2_fail "R1b. 首見即 in_progress 仍等到 completed" "rc=${T2_RC}; $(printf '%s %s' "$T2_OUT" "$T2_ERR" | tr '\n' ' ' | head -c 200)"
+fi
+
+# R2: completed/failure → non-zero.
+run_refresh_wait "queued,completed" failure ok 30 30 0 || true
+if ! declare -F create_worker_dispatch_refresh_and_wait >/dev/null 2>&1; then
+    t2_fail "R2. completed/failure 回非 0" "函式不存在"
+elif [[ "$T2_RC" -ne 0 ]]; then
+    ok "R2. completed/failure 回非 0"
+else
+    t2_fail "R2. completed/failure 回非 0" "rc=0"
+fi
+
+# R3: never completes → non-zero, and the message says TIMEOUT (not failure).
+# This case must genuinely time out: poll interval stays 1 (not 0, so the
+# deadline is actually respected between polls) and the function's own
+# timeout is 1 second with a status sequence that never reaches completed.
+run_refresh_wait "queued,in_progress,in_progress,in_progress" success ok 30 1 1 || true
+T2_MSG="$(printf '%s %s' "$T2_OUT" "$T2_ERR" | tr '\n' ' ')"
+if ! declare -F create_worker_dispatch_refresh_and_wait >/dev/null 2>&1; then
+    t2_fail "R3. 逾時回非 0" "函式不存在"
+    t2_fail "R3. 逾時訊息看得出是逾時" "函式不存在"
+else
+    if [[ "$T2_RC" -ne 0 ]]; then
+        ok "R3. 逾時回非 0（rc=${T2_RC}）"
+    else
+        t2_fail "R3. 逾時回非 0" "rc=0"
+    fi
+    if printf '%s' "$T2_MSG" | grep -Eqi 'timeout|timed out|逾時'; then
+        ok "R3. 逾時訊息看得出是逾時（$(printf '%s' "$T2_MSG" | tr '\n' ' ' | head -c 120)）"
+    else
+        t2_fail "R3. 逾時訊息看得出是逾時" "訊息：[$(printf '%s' "$T2_MSG" | head -c 160)]"
+    fi
+    # Distinguishability: the timeout message must not be the failure wording.
+    if printf '%s' "$T2_MSG" | grep -Eqi "conclusion"; then
+        # Reporting a conclusion at all when none was ever produced means the
+        # timeout path was conflated with the failure path.
+        t2_fail "R3. 逾時與失敗訊息可區分" "逾時卻報了 conclusion：[$(printf '%s' "$T2_MSG" | head -c 160)]"
+    else
+        ok "R3. 逾時與失敗訊息可區分（逾時路徑未報 conclusion）"
+    fi
+    # The timeout must have actually been reached, not merely some non-zero
+    # exit: R3's message has to name the timeout window.
+    if printf '%s' "$T2_MSG" | grep -Eq '1s|1 s|1 seconds?'; then
+        ok "R3. 訊息指出逾時的門檻（1s），可與其他失敗區分"
+    else
+        t2_fail "R3. 訊息指出逾時的門檻（1s）" "訊息：[$(printf '%s' "$T2_MSG" | head -c 160)]"
+    fi
+fi
+
+# R4: dispatch itself fails → non-zero, and no waiting happens (no run
+# list/view/watch call may follow).
+: > "$GHFAKE_LOG"; run_refresh_wait "queued,completed" success fail 30 30 0 || true
+if ! declare -F create_worker_dispatch_refresh_and_wait >/dev/null 2>&1; then
+    t2_fail "R4. 派發失敗回非 0" "函式不存在"
+    t2_fail "R4. 派發失敗不進入等待" "函式不存在"
+else
+    if [[ "$T2_RC" -ne 0 ]]; then
+        ok "R4. 派發失敗回非 0"
+    else
+        t2_fail "R4. 派發失敗回非 0" "rc=0"
+    fi
+    if grep -q 'workflow run' "$GHFAKE_LOG" 2>/dev/null; then
+        ok "R4. 有嘗試派發（前提成立）"
+        if grep -Eq 'run (list|view|watch)' "$GHFAKE_LOG" 2>/dev/null; then
+            t2_fail "R4. 派發失敗不進入等待" \
+                "派發失敗後仍有等待呼叫：$(grep -E 'run (list|view|watch)' "$GHFAKE_LOG" | head -1)"
+        else
+            ok "R4. 派發失敗不進入等待（沒有 run list/view/watch）"
+        fi
+    else
+        t2_fail "R4. 有嘗試派發（前提成立）" "gh 未收到 workflow run：[$(head -2 "$GHFAKE_LOG" | tr '\n' ' ')]"
+    fi
+fi
+
+# R5: the workflow step must call the function now, not carry its own poll.
+# This is the point of the extraction: YAML-embedded logic is what broke.
+if [[ -f "$CREATE_WF" ]] && python3 -c 'import yaml' >/dev/null 2>&1; then
+    wf_call="$(python3 - "$CREATE_WF" <<'PY' 2>/dev/null
+import json, sys, yaml
+doc = yaml.safe_load(open(sys.argv[1]))
+steps = doc["jobs"]["create"]["steps"]
+for i, s in enumerate(steps):
+    blob = json.dumps(s, default=str)
+    if "refresh-authorized-keys" in blob:
+        body = s.get("run", "") or ""
+        has_call = "create_worker_dispatch_refresh_and_wait" in body
+        has_own_poll = "run list" in body or "run view" in body
+        print(json.dumps({"index": i, "has_call": has_call, "has_own_poll": has_own_poll}))
+        break
+PY
+)"
+    if [[ -z "$wf_call" ]]; then
+        t2_fail "R5. workflow 那步改呼叫 create_worker_dispatch_refresh_and_wait" "找不到 refresh 步驟"
+    elif jq -e '.has_call == true' >/dev/null 2>&1 <<<"$wf_call"; then
+        ok "R5. workflow 那步有呼叫 create_worker_dispatch_refresh_and_wait"
+        if jq -e '.has_own_poll == false' >/dev/null 2>&1 <<<"$wf_call"; then
+            ok "R5b. workflow 不再自己輪詢（沒有 run list/view）"
+        else
+            t2_fail "R5b. workflow 不再自己輪詢" "步驟內仍有 run list/view"
+        fi
+    else
+        t2_fail "R5. workflow 那步改呼叫 create_worker_dispatch_refresh_and_wait" \
+            "步驟 $(jq -r '.index' <<<"$wf_call") 沒有呼叫它"
+    fi
+else
+    t2_fail "R5. workflow 那步改呼叫 create_worker_dispatch_refresh_and_wait" "workflow 不存在或 YAML 不可用"
+    t2_fail "R5b. workflow 不再自己輪詢" "workflow 不存在或 YAML 不可用"
+fi
+
+# ---------------------------------------------------------------------------
+# T2 injection: rewrite the waiter's completion condition back to the buggy
+# `!= "queued"` shape and show R1 reddens. The mutation is text-level on a
+# copy, so it exercises whatever the implementer actually wrote.
+# ---------------------------------------------------------------------------
+echo "injection (refresh waiter):"
+T2_INJ="$SANDBOX/create-worker-inj.sh"
+T2_INJ_OK=0
+if [[ -f "$CREATE_WORKER_SH" ]]; then
+    python3 - "$CREATE_WORKER_SH" "$T2_INJ" <<'PY'
+import re, sys
+src = open(sys.argv[1], encoding="utf-8").read()
+# Find the function and neuter "completed" checks inside it: any comparison
+# against completed becomes the historical != queued shape. Then, if that
+# leaves no in_progress exclusion at all, insert the buggy filter directly.
+m = re.search(r'create_worker_dispatch_refresh_and_wait\s*\(\)\s*\{', src)
+if not m:
+    sys.exit(1)
+# body: to the first line that is exactly "}" at column 0 after the start
+rest = src[m.end():]
+endm = re.search(r'\n\}', rest)
+body = rest[:endm.start()] if endm else rest
+mutated = re.sub(r'"completed"', '"in_progress"', body)
+mutated = re.sub(r"'completed'", "'in_progress'", mutated)
+out = src[:m.end()] + mutated + rest[endm.start():] if endm else src[:m.end()] + mutated
+open(sys.argv[2], "w", encoding="utf-8").write(out)
+PY
+    if [[ -s "$T2_INJ" ]] && ! cmp -s "$CREATE_WORKER_SH" "$T2_INJ"; then
+        T2_INJ_OK=1
+    fi
+fi
+
+if [[ "$T2_INJ_OK" -eq 1 ]]; then
+    # Same scenario as R1, against the mutated copy. The fast poll interval
+    # is essential here: without it the mutant would simply time out at the
+    # outer 30s bound for the same timing reason R1's first run did, and the
+    # injection would prove nothing about the completion condition.
+    : > "$GHFAKE_LOG"
+    rm -rf "$T2_STATE"; mkdir -p "$T2_STATE"; printf '0' > "$T2_STATE/next.idx"
+    HOME="$SANDBOX/home" TMPDIR="$SANDBOX/tmp" PATH="$SANDBOX/fakebin:$PATH" \
+    GH_REPO="testowner/testrepo" \
+    POOL_REFRESH_POLL_INTERVAL=0 \
+    FAKE_GH_LOG="$GHFAKE_LOG" FAKE_GH_STATE_DIR="$T2_STATE" \
+    FAKE_GH_STATUS_SEQ="queued,in_progress,completed" FAKE_GH_CONCLUSION=success \
+    FAKE_GH_DISPATCH_MODE=ok FAKE_GH_WATCH_SECS=30 FAKE_GH_RUN_ID=35047640983 \
+    timeout 30 bash -c '
+        source "$1" >/dev/null 2>&1
+        create_worker_dispatch_refresh_and_wait 10
+    ' _ "$T2_INJ" </dev/null > "$SANDBOX/inj.out" 2>&1
+    INJ_RC=$?
+    INJ_MSG="$(tr '\n' ' ' < "$SANDBOX/inj.out")"
+    # The mutant must fail for the RIGHT reason: an early exit on in_progress
+    # leaves no conclusion, so it reports the empty/'<unknown>' value — the
+    # exact 2026-09-16 symptom. Exiting non-zero for some unrelated reason
+    # (missing GH_REPO, outer timeout) would not demonstrate anything.
+    if [[ "$INJ_RC" -eq 124 ]]; then
+        inj_bad "注入後外層 timeout（124）——注入情境的輪詢沒跑起來，無從證明"
+    elif [[ "$INJ_RC" -eq 0 ]]; then
+        inj_bad "注入後 R1 情境仍回 0——R1 擋不住這個 bug"
+    elif printf '%s' "$INJ_MSG" | grep -Eq "conclusion|<unknown>"; then
+        inj_ok "把等待條件改回「離開 queued 就算完成」後，R1 的相同情境回非 0 且報出 <unknown>（rc=${INJ_RC}；${INJ_MSG:0:120}）——R1 條擋得住這個 bug"
+    else
+        inj_bad "注入後回非 0，但不是結論誤判的症狀（訊息：${INJ_MSG:0:140}）——證明不了 R1"
+    fi
+else
+    # Positive control while the real function does not exist yet: drive the
+    # same scenario through a reference implementation (correct) and through
+    # the historical buggy shape, proving R1's check discriminates.
+    cat > "$SANDBOX/ref-correct.sh" <<'REF'
+create_worker_dispatch_refresh_and_wait() {
+    local timeout_secs="${1:-5}"
+    local poll_interval="${POOL_REFRESH_POLL_INTERVAL:-1}"
+    gh workflow run refresh-authorized-keys.yml --repo r >/dev/null 2>&1 || return 1
+    local deadline=$(( $(date +%s) + timeout_secs )) run_id="" status=""
+    while :; do
+        run_id="$(gh run list --workflow=refresh-authorized-keys.yml --repo r --limit 1 --json databaseId,status --jq '.[0] | select(.status == "completed") | .databaseId' 2>/dev/null || true)"
+        [[ -n "$run_id" ]] && break
+        status="$(gh run list --workflow=refresh-authorized-keys.yml --repo r --limit 1 --json status --jq '.[0].status' 2>/dev/null || true)"
+        if (( $(date +%s) >= deadline )); then
+            if [[ "$status" == "completed" ]]; then
+                :
+            else
+                printf 'timeout: refresh run did not complete in %ss\n' "$timeout_secs" >&2
+                return 1
+            fi
+        fi
+        sleep "$poll_interval"
+    done
+    local c
+    c="$(gh run view "$run_id" --repo r --json conclusion --jq '.conclusion' 2>/dev/null || true)"
+    [[ "$c" == "success" ]] || { printf 'failure: conclusion=%s\n' "${c:-<unknown>}" >&2; return 1; }
+    return 0
+}
+REF
+    cat > "$SANDBOX/ref-buggy.sh" <<'REF'
+create_worker_dispatch_refresh_and_wait() {
+    local timeout_secs="${1:-5}"
+    local poll_interval="${POOL_REFRESH_POLL_INTERVAL:-1}"
+    gh workflow run refresh-authorized-keys.yml --repo r >/dev/null 2>&1 || return 1
+    local deadline=$(( $(date +%s) + timeout_secs )) run_id=""
+    while :; do
+        run_id="$(gh run list --workflow=refresh-authorized-keys.yml --repo r --limit 1 --json databaseId,status --jq '.[0] | select(.status != "queued") | .databaseId' 2>/dev/null || true)"
+        [[ -n "$run_id" ]] && break
+        if (( $(date +%s) >= deadline )); then
+            printf 'timeout: refresh run did not complete in %ss\n' "$timeout_secs" >&2
+            return 1
+        fi
+        sleep 1
+    done
+    local c
+    c="$(gh run view "$run_id" --repo r --json conclusion --jq '.conclusion' 2>/dev/null || true)"
+    [[ "$c" == "success" ]] || { printf 'failure: conclusion=%s\n' "${c:-<unknown>}" >&2; return 1; }
+    return 0
+}
+REF
+    t2_probe() {
+        local impl="$1"
+        : > "$GHFAKE_LOG"
+        rm -rf "$T2_STATE"; mkdir -p "$T2_STATE"; printf '0' > "$T2_STATE/next.idx"
+        HOME="$SANDBOX/home" TMPDIR="$SANDBOX/tmp" PATH="$SANDBOX/fakebin:$PATH" \
+        POOL_REFRESH_POLL_INTERVAL=0 \
+        FAKE_GH_LOG="$GHFAKE_LOG" FAKE_GH_STATE_DIR="$T2_STATE" \
+        FAKE_GH_STATUS_SEQ="queued,in_progress,completed" FAKE_GH_CONCLUSION=success \
+        FAKE_GH_WATCH_SECS=30 FAKE_GH_RUN_ID=35047640983 \
+        timeout 30 bash -c 'source "$1" >/dev/null 2>&1; create_worker_dispatch_refresh_and_wait 3' \
+            _ "$impl" </dev/null > "$SANDBOX/probe.out" 2>&1
+        return $?
+    }
+    if t2_probe "$SANDBOX/ref-correct.sh"; then
+        inj_ok "正向控制：正確的等待（等到 completed）在 R1 情境回 0"
+    else
+        inj_bad "正向控制失敗（checker/harness 壞了）：$(tr '\n' ' ' < "$SANDBOX/probe.out" | head -c 160)"
+    fi
+    if t2_probe "$SANDBOX/ref-buggy.sh"; then
+        inj_bad "歷史 bug 形狀（!= queued）在 R1 情境竟回 0——R1 擋不住"
+    else
+        inj_ok "歷史 bug 形狀（!= queued）在 R1 情境回非 0（$(tr '\n' ' ' < "$SANDBOX/probe.out" | head -c 100)）——R1 判別得出來"
     fi
 fi
 
