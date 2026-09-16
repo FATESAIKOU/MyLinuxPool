@@ -187,15 +187,29 @@ reset_capture() {
 # ---------------------------------------------------------------------------
 # Shared assertion helpers for the two unit-install loops.
 # ---------------------------------------------------------------------------
-# check_unit_transport <label> <log-file> — every recorded install call must
-# (a) carry no --key and no key value on argv, and (b) for calls that are
-# not --check, have received the exact key on stdin. A multi-unit loop that
-# reads stdin inside the loop gets the key only for the first unit — the
+# check_unit_transport <label> <log-file> <expect-stdin> — every recorded
+# install call must (a) carry no --key and no key value on argv, and (b) when
+# expect-stdin=key, have received the exact key on stdin. A multi-unit loop
+# that reads stdin inside the loop gets the key only for the first unit — the
 # stdin half is what catches that.
+#
+# expect-stdin=none is the provider-registration contract after KEY-DESIGN
+# §8: every unit a provider installs is needs_key=false, so registration
+# pipes nothing at all. Asserting a key there would demand a key nobody
+# consumes (and re-introduce the very coupling §8 removed).
 check_unit_transport() {
-    local label="$1" log="$2"
+    local label="$1" log="$2" expect_stdin="${3:-key}"
     local tag unit idx args f got
-    local n_calls=0 n_real=0 n_bad_argv=0 n_bad_stdin=0 n_empty=0
+    local n_calls=0 n_real=0 n_bad_argv=0 n_bad_stdin=0 n_empty=0 n_with_key=0
+
+    # First pass: what did the calls actually receive?
+    local any_stdin=0
+    while IFS='|' read -r tag unit idx args; do
+        [[ "$tag" == "unit" ]] || continue
+        case "$args" in *--check*) continue ;; esac
+        f="${STDIN_DIR}/${unit}.${idx}.stdin"
+        [[ -s "$f" ]] && any_stdin=1
+    done < "$log"
 
     if [[ ! -s "$log" ]]; then
         bad "${label}: no install calls were recorded at all"
@@ -239,15 +253,23 @@ check_unit_transport() {
     else
         bad "${label}: ${n_bad_argv} install call(s) had --key or the key value on argv"
     fi
-    if [[ "$n_empty" -eq 0 ]]; then
-        ok "${label}: no install call was handed an empty key"
+    if [[ "$expect_stdin" == "none" ]]; then
+        if [[ "$any_stdin" -eq 0 ]]; then
+            ok "${label}: no key was piped at all (every unit needs_key=false since KEY-DESIGN §8)"
+        else
+            bad "${label}: a key was piped to an install call, but no provider unit consumes one"
+        fi
     else
-        bad "${label}: ${n_empty} install call(s) received an EMPTY key on stdin (stdin was consumed earlier)"
-    fi
-    if [[ "$n_bad_stdin" -eq 0 ]]; then
-        ok "${label}: every non-check install call received exactly the key on stdin"
-    else
-        bad "${label}: ${n_bad_stdin} install call(s) received something other than the key"
+        if [[ "$n_empty" -eq 0 ]]; then
+            ok "${label}: no install call was handed an empty key"
+        else
+            bad "${label}: ${n_empty} install call(s) received an EMPTY key on stdin (stdin was consumed earlier)"
+        fi
+        if [[ "$n_bad_stdin" -eq 0 ]]; then
+            ok "${label}: every non-check install call received exactly the key on stdin"
+        else
+            bad "${label}: ${n_bad_stdin} install call(s) received something other than the key"
+        fi
     fi
 }
 
@@ -378,7 +400,7 @@ if [[ "$PROV_TRUSTED" -eq 1 ]]; then
     else
         bad "provision-gateway.sh exited ${prov_rc}: $(sanitize "$(tail -3 "$SANDBOX/prov.out" | tr '\n' ' ')")"
     fi
-    check_unit_transport "provision loop" "$ARGV_LOG"
+    check_unit_transport "provision loop" "$ARGV_LOG" key
 else
     bad "provision loop: harness copy untrusted; transport not verified"
     bad "provision loop: multi-unit loop not exercised"
@@ -432,7 +454,7 @@ if [[ "$REG_TRUSTED" -eq 1 ]]; then
     else
         bad "register-provider.sh exited ${reg_rc}: $(sanitize "$(tail -3 "$SANDBOX/reg.out" | tr '\n' ' ')")"
     fi
-    check_unit_transport "register loop" "$ARGV_LOG"
+    check_unit_transport "register loop" "$ARGV_LOG" none
 else
     bad "${REG_SRC} is missing"
     bad "register loop: multi-unit loop not exercised"

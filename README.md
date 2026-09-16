@@ -151,9 +151,11 @@ provider 只放**衍生物**。宣告在 GitHub 有一份，機器上不留第�
 它**不記版本戳記**。判斷漂移靠的是 unit 自己的內容比對，不是 commit SHA，
 所以連被手動改過的 `bin/` 也會被修回來——而且 provider 上一個新檔案都不會多。
 
-需要 `FILE_CRYPTO_KEY` 的 unit（`rclone`/`dotfiles`/`standalonescripts`）一律
-跳過：provider 邊緣刻意不放解密金鑰，那些只在註冊時處理（`ssh-tunnel-client`
-已在 KEY-DESIGN §8 刪除，不再有需要它的 provider unit）。
+需要 `FILE_CRYPTO_KEY` 的 unit（`rclone`、`standalonescripts`）與需要 root 的
+（`gh`）一律跳過。**provider 的 profile 現在只宣告 `pool-runtime` 與 `gh`**，
+所以實際上 `pool-sync` 收斂的就是 `pool-runtime`——而那正是唯一會漂移的部分。
+provider 邊緣刻意不放解密金鑰；KEY-DESIGN §8 之後也不再有任何 provider unit
+需要它。
 
 盤查下來，provider 上**推導不出來的資訊只剩 59 bytes**——
 `config` 裡的 `NODE_NAME` 和 `gh_token`。

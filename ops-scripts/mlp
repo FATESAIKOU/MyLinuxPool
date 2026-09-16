@@ -94,6 +94,11 @@ usage: mlp [command]
   rotate [--real]  rotate the Gateway (dry run unless --real)
   worker new       build and start a worker on a provider
   worker rm [name] stop a worker and release its port
+  register client  register THIS machine (the one you are on) as a client
+                   — uploads your public key. Run it on the machine you
+                   will connect FROM.
+  register provider  register a NEW machine into the pool. Run it ON
+                   that new machine, not here on the Mac.
   ssh-config       print an ssh_config for the pool (--write to install it)
   trust-gateway    re-accept the Gateway's host key after a rotate
   -h, --help       show this help
@@ -969,6 +974,53 @@ worker_images() {
 }
 
 
+# ---- register ---------------------------------------------------------------
+# Thin forwarders to the real registration scripts — the logic lives in
+# ops-scripts/register-client / register-provider.sh, never duplicated
+# here (RUNBOOK §7.12: one rule, one implementation). IMPORTANT WHERE
+# THEY RUN (people get this wrong):
+#   - `mlp register client` runs on the machine YOU will connect FROM
+#     (the operator's Mac) — it uploads YOUR public key to GitHub.
+#   - `mlp register provider` runs ON THE NEW MACHINE being added to the
+#     pool — NOT on the Mac. It provisions that box itself.
+cmd_register() {
+    local sub="${1:-}"
+    [[ $# -gt 0 ]] && shift
+    local script
+    case "$sub" in
+        client)   script="${SCRIPT_DIR}/register-client" ;;
+        provider) script="${SCRIPT_DIR}/register-provider.sh" ;;
+        "")
+            cat >&2 <<'EOF'
+usage: mlp register {client|provider} [args...]
+
+  register client    register THIS machine (the one you are on) as a
+                     client: uploads your public key to CLIENT_<NAME>.
+                     Run it on the machine you will connect FROM.
+                     forwards to ops-scripts/register-client
+  register provider  register a NEW machine into the pool. Run it ON
+                     that new machine, not here on the Mac.
+                     forwards to ops-scripts/register-provider.sh
+EOF
+            return 2
+            ;;
+        *)
+            echo "mlp: unknown register subcommand '${sub}' (expected client or provider)" >&2
+            return 2
+            ;;
+    esac
+    if [[ ! -x "$script" ]]; then
+        echo "mlp: ${script} not found or not executable" >&2
+        return 127
+    fi
+    "$script" "$@"
+}
+
+
+# Emits a normal ssh_config so plain `ssh fh-l`, `scp`, `rsync`, `-L`/`-R`
+# and anything else that speaks ssh_config work against the pool — without
+# going through mlp at all.
+#
 # ---- ssh-config export -------------------------------------------------------
 # Emits a normal ssh_config so plain `ssh fh-l`, `scp`, `rsync`, `-L`/`-R`
 # and anything else that speaks ssh_config work against the pool — without
@@ -1158,6 +1210,7 @@ main() {
         state) cmd_state "$@" ;;
         rotate) cmd_rotate "$@" ;;
         worker) cmd_worker "$@" ;;
+        register) cmd_register "$@" ;;
         ssh-config) cmd_ssh_config "$@" ;;
         trust-gateway) cmd_trust_gateway "$@" ;;
         *)

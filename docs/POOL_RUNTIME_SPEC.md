@@ -160,16 +160,18 @@ register.sh --name <node-name> --gateway-port <port> [--role provider]
 2. `gh auth login --with-token`（吃 `GH_POOL_TOKEN`）。
 3. clone repo 到 `~/.mylinuxpool/repo`（已存在則 `git pull`）。
    把 `pool/bin/*` 複製到 `~/.mylinuxpool/bin/` 並 `chmod +x`。
-4. **金鑰**：若 `~/.ssh/id_pool` 不存在，從 repo 的
-   `static_secret_files/home/sshproxy/.ssh/id_rsa.crypted` 以 `FILE_CRYPTO_KEY`
-   解密取得（所有 provider 共用這把 sshproxy 金鑰）。權限 `600`。
+4. **金鑰**：路徑由 `pool-runtime/files/tunnel-identity.sh` 單一定義
+   （目前是 `~/.ssh/id_tunnel`）。不存在時由 `pool-sync` 當場產一對
+   ed25519，**只把公鑰**寫進 `NODE_<NAME>.tunnel_public_key`。權限 `600`。
+   私鑰永遠不離開產生它的那台機器。
 
-   > **不變式（2026-09-13 實機踩到）**：由 `ssh-tunnel-client/files/id_rsa.crypted`
-   > 推導出的公鑰（`ssh-keygen -y`，在 `ssh-tunnel-server/install.sh` 裡做）**必須**
-   > 出現在 `authorized_keys.crypted` 之中。這兩個檔案原本是不一致的 ——
-   > repo 佈署了一把私鑰，但它的公鑰不在授權清單裡，導致所有 provider 都
-   > 無法建立隧道（`Permission denied (publickey,password)`）。已修正。
-   > 日後若更換這把共用金鑰，**私鑰與授權清單必須一起更新**，否則整個叢集斷線。
+   > **2026-09-16（KEY-DESIGN §5/§8）之前**這裡是另一套：repo 裡放一把
+   > 全叢集共用的 `ssh-tunnel-client/files/id_rsa.crypted`，每台 provider
+   > 解密後共用。連帶有一條不變式——由那把私鑰推導的公鑰必須出現在
+   > `ssh-tunnel-server` 的授權清單裡，兩者不同步就會讓**所有** provider
+   > 一起 `Permission denied (publickey)`（2026-09-13 實機踩過）。
+   > 改成每機自產之後，那把共用私鑰與那條不變式都不存在了：
+   > 沒有共用私鑰，也就沒有「兩個檔案要一起更新」這回事。
 5. **寫 `~/.mylinuxpool/config`**：`NODE_NAME=<name>`。
 6. **`gh variable set NODE_<NAME>`**：依 `ARCHITECTURE.md` §3 的 schema 組出 JSON。
    已存在則**合併**而非覆蓋（保留既有的 `power` 等欄位）。

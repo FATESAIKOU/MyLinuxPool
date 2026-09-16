@@ -123,10 +123,12 @@
 > Actions' own management access — collapsing the two into one key would
 > hand tunnel-only machines Actions-level reach.
 >
-> It is not, however, a separate *secret*. The same private key already
-> ships in the repo as `shared-configs/ssh-tunnel-client/files/id_rsa.crypted`,
-> which is how providers get it in the first place; Actions holds
-> `FILE_CRYPTO_KEY` and decrypts it when it needs the key in its agent.
+> It is not, however, a separate *secret*. Until 2026-09-16 the same private
+> key shipped in the repo as `ssh-tunnel-client/files/id_rsa.crypted`, which
+> is how providers got it; Actions held `FILE_CRYPTO_KEY` and decrypted it
+> into its agent. **KEY-DESIGN §5/§8 ended that**: every machine now mints
+> its own tunnel key and publishes only the public half, so there is no
+> shared private key left to keep in either place.
 > `SSH_KEY_SSHPROXY` was a second copy of the same bytes that had to be
 > kept in sync by hand, so it was removed on 2026-09-14.
 

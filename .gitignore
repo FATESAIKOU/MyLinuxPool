@@ -16,3 +16,6 @@ fhproxy_pw
 .claude/
 SECRETS.md
 secrets.env
+
+# gh CLI 的本機狀態，曾被 git add -A 掃進版控（2026-09-16）
+.local/

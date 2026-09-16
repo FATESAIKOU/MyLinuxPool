@@ -97,10 +97,13 @@ install.sh [--key <FILE_CRYPTO_KEY>] [--home <dir>] [--user <name>] [--check]
 | `rclone` | rclone 本體 + `rclone.conf.crypted` | true |
 | `gh` | gh 本體 + token 檔 + git credential helper | true |
 | `dotfiles` | `.bashrc` `.vimrc` `.tmux.conf` | false |
-| `ssh-admin` | `fatesaikou` 的 ssh 身分（Gateway） | false |
-| `ssh-tunnel-client` | `sshproxy` 隧道私鑰（撥出的一方：provider／worker） | false |
-| `ssh-tunnel-server` | `sshproxy` 帳號的 authorized_keys（被撥入的一方：Gateway） | false |
 | `standalonescripts` | `dlpw` `uppw`（依賴 rclone） | false |
+
+> **2026-09-16（KEY-DESIGN §8）刪除了三個 unit**：`ssh-admin`、
+> `ssh-tunnel-client`、`ssh-tunnel-server`。它們的工作分別被取代了——
+> 登入清單由 `CLIENT_*` var 組出來（`pool-sync` 在 provider 上收斂、
+> rotate／refresh 寫 Gateway），隧道身分改成每台機器自產、只上傳公鑰。
+> repo 裡因此不再有任何私鑰。下面那段講的是它們被刪之前的歷史。
 
 > **2026-09-15 修正**：`ssh-tunnel-client`／`ssh-tunnel-server` 原本是同一個
 > `ssh-tunnel` unit，裝的是 sshproxy 的私鑰——這在 provider/worker（撥出的

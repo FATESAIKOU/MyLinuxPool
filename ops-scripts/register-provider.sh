@@ -85,8 +85,12 @@ if ! [[ "$GATEWAY_PORT" =~ ^[0-9]+$ ]]; then
     exit 2
 fi
 
-if [[ -z "${FILE_CRYPTO_KEY:-}" || -z "${GH_POOL_TOKEN:-}" ]]; then
-    log ERROR "FILE_CRYPTO_KEY and GH_POOL_TOKEN must both be set in the environment"
+# FILE_CRYPTO_KEY is deliberately NOT required: since KEY-DESIGN §8 the
+# provider profile installs only pool-runtime and gh, both needs_key=false.
+# Registering a machine, like adding a person, no longer touches that key —
+# it now guards nothing but the Gateway's rclone/dotfiles/standalonescripts.
+if [[ -z "${GH_POOL_TOKEN:-}" ]]; then
+    log ERROR "GH_POOL_TOKEN must be set in the environment"
     exit 2
 fi
 
@@ -393,10 +397,12 @@ step3_fetch_runtime() {
             exit 1
         fi
         log INFO "installing unit '${unit}' from temp clone ${REPO_DIR} (profiles/provider/${PROFILE_NAME})"
-        # Key on the unit's stdin, never --key: argv is visible to every
-        # user via ps (RUNBOOK.md §9). The units that need the key
-        # (ssh-admin, ssh-tunnel-client) read stdin when --key is absent.
-        printf '%s' "$FILE_CRYPTO_KEY" | "$install" --home "$HOME" --user "$(whoami)"
+        # No key is piped: every unit a provider installs is
+        # needs_key=false since KEY-DESIGN §8 deleted the two that were not.
+        # Should a key-bearing unit ever return to this profile, feed it on
+        # the unit's STDIN — never --key, because argv is visible to every
+        # user via ps (RUNBOOK.md §9).
+        "$install" --home "$HOME" --user "$(whoami)" < /dev/null
     done
 }
 
