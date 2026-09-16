@@ -1,0 +1,32 @@
+#!/usr/bin/env bash
+# worker-authkeys — sshd's AuthorizedKeysCommand inside a worker container.
+#
+# WHY A COMMAND AND NOT A FILE: the provider bind-mounts its assembled
+# client list at /run/mlp-clients (read-only) and its own pool-sync keeps
+# that file current, so revoking a client reaches every worker on that
+# provider within one sync tick. Pointing sshd's AuthorizedKeysFile at the
+# mount directly does not work — StrictModes checks the file's owner, and
+# the mounted file is owned by the provider's uid, not by `worker`.
+# AuthorizedKeysCommand is exempt from that check (sshd instead verifies
+# THIS script is root-owned and not group/world-writable, which the image
+# guarantees).
+#
+# Before this, the list arrived once as -e WORKER_AUTHORIZED_KEYS and was
+# written to ~worker/.ssh/authorized_keys at container start. That made
+# adding a client invisible to workers already running, and — worse — made
+# removing one never take effect at all: the static file kept authorising
+# a key the pool had revoked, for the life of the container.
+#
+# sshd passes the connecting username as $1. Only `worker` is a real
+# account here; anything else gets an empty list rather than someone
+# else's keys.
+set -uo pipefail
+
+[[ "${1:-}" == "worker" ]] || exit 0
+
+# Absent mount (a provider running an older pool-runtime) prints nothing
+# and exits 0 — sshd then simply finds no keys, which is the correct
+# answer. Failing loudly here would only turn a stale provider into an
+# unexplained "Permission denied".
+cat /run/mlp-clients/authorized_keys 2>/dev/null || true
+exit 0

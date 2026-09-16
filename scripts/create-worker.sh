@@ -206,11 +206,11 @@ create_worker_build_run_cmd() {
     local authorized_keys_content="$8" profile_json="${9}" all_secrets_json="${10}"
 
     if [[ -z "$authorized_keys_content" ]]; then
-        log ERROR "WORKER_AUTHORIZED_KEYS is empty — refusing to start a worker nobody can log into"
+        log ERROR "the assembled client list is empty — refusing to start a worker nobody can log into"
         return 1
     fi
 
-    local container_q image_q port_q host_q tunnel_user_q node_name_q worker_key_q authorized_keys_q
+    local container_q image_q port_q host_q tunnel_user_q node_name_q worker_key_q
     container_q="$(printf '%q' "$container")"
     image_q="$(printf '%q' "$image_tag")"
     port_q="$(printf '%q' "$port")"
@@ -218,13 +218,26 @@ create_worker_build_run_cmd() {
     tunnel_user_q="$(printf '%q' "$tunnel_user")"
     node_name_q="$(printf '%q' "$node_name")"
     worker_key_q="$(printf '%q' "$worker_key")"
-    authorized_keys_q="$(printf '%q' "$authorized_keys_content")"
+
+    # The client list travels as base64: `base64` on a Linux runner wraps
+    # at 76 columns and `-w0` is GNU-only, so the newlines come off with
+    # tr — a wrapped value silently truncates at the first line when it
+    # lands in a single-line context (RUNBOOK §7.13).
+    local ak_b64
+    ak_b64="$(printf '%s\n' "$authorized_keys_content" | base64 | tr -d '\n')"
 
     local cmd
-    # Create the mount source first. Docker creates a missing bind-mount
+    # Create the mount sources first. Docker creates a missing bind-mount
     # source itself, as root — and then the provider's pool-tunnel, which
     # runs as the user, cannot write the file the worker is waiting for.
-    cmd="mkdir -p \$HOME/.mylinuxpool/gateway; "
+    cmd="mkdir -p \$HOME/.mylinuxpool/gateway \$HOME/.mylinuxpool/clients; "
+    # Who may log in arrives as a FILE the provider keeps current, not as
+    # an env var frozen at creation time. pool-sync rewrites it from the
+    # CLIENT_* vars every tick, so revoking a client actually reaches the
+    # workers already running here. Seeded now so the mount is correct
+    # from the container's first second, before the next sync tick.
+    cmd+="printf '%s' ${ak_b64} | base64 -d > \$HOME/.mylinuxpool/clients/authorized_keys; "
+    cmd+="chmod 600 \$HOME/.mylinuxpool/clients/authorized_keys; "
     cmd+="docker rm -f ${container_q} >/dev/null 2>&1; docker run -d --restart unless-stopped --name ${container_q}"
     # The provider's own pool-tunnel publishes the Gateway it is currently
     # attached to into ~/.mylinuxpool/gateway/. Mount that directory
@@ -240,10 +253,11 @@ create_worker_build_run_cmd() {
     # HOST/USER are still passed as a fallback for the first moments before
     # the file exists, and for a provider running an older pool-runtime.
     cmd+=" -v \$HOME/.mylinuxpool/gateway:/run/mlp-gateway:ro"
+    cmd+=" -v \$HOME/.mylinuxpool/clients:/run/mlp-clients:ro"
     cmd+=" -e POOL_GATEWAY_FILE=/run/mlp-gateway/gateway.json"
     cmd+=" -e POOL_GATEWAY_PORT=${port_q} -e POOL_GATEWAY_HOST=${host_q} -e POOL_GATEWAY_USER=${tunnel_user_q}"
     cmd+=" -e POOL_NODE_NAME=${node_name_q}"
-    cmd+=" -e WORKER_KEY=${worker_key_q} -e WORKER_AUTHORIZED_KEYS=${authorized_keys_q}"
+    cmd+=" -e WORKER_KEY=${worker_key_q}"
 
     local container_var secret_name val literal_val
     while IFS=$'\t' read -r container_var secret_name; do

@@ -237,6 +237,24 @@ main() {
             log WARN "authorized_keys convergence failed (see above) — leaving ${HOME}/.ssh/authorized_keys untouched"
             return 0
         }
+
+        # The same list again, into the directory every worker container on
+        # this provider bind-mounts read-only. Their sshd reads it through
+        # AuthorizedKeysCommand on each login, so this is what makes adding
+        # OR REVOKING a client reach workers that are already running —
+        # before this, the list was injected once as -e
+        # WORKER_AUTHORIZED_KEYS and a revoked key stayed valid for the life
+        # of the container.
+        #
+        # Deliberately the same function, called twice, rather than a second
+        # assembly: one implementation of "what belongs in an
+        # authorized_keys", including the self-lockout guard (RUNBOOK §7.12).
+        # Non-zero is a WARN — a provider with no workers loses nothing, and
+        # the next tick retries.
+        refresh_sync_local_authorized_keys "$vars_json" \
+            "${HOME}/.mylinuxpool/clients/authorized_keys" || {
+            log WARN "could not converge the worker client list — workers keep the list they already have"
+        }
         return 0
     }
 

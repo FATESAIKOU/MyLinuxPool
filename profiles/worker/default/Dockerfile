@@ -9,9 +9,10 @@
 # enough to reach shared-configs/.
 #
 # No secret ever gets baked in here (spec §7). WORKER_KEY,
-# WORKER_AUTHORIZED_KEYS, POOL_GATEWAY_PORT, POOL_NODE_NAME and GH_TOKEN /
-# GH_WORKER_TOKEN all arrive at `docker run` time via -e / mounts — see
-# entrypoint.sh.
+# POOL_GATEWAY_PORT, POOL_NODE_NAME and GH_TOKEN / GH_WORKER_TOKEN all
+# arrive at `docker run` time via -e / mounts — see entrypoint.sh. The
+# list of who may log in arrives as a read-only mount, not an env var, so
+# that it can keep changing after the container has started.
 
 FROM ubuntu:24.04
 
@@ -36,10 +37,21 @@ RUN useradd --create-home --shell /bin/bash --groups sudo worker \
     && passwd -l worker
 
 # Key-only auth, same hardening as the Gateway (POOL_RUNTIME_SPEC.md §9.2).
-RUN mkdir -p /etc/ssh/sshd_config.d && { \
+#
+# AuthorizedKeysCommand reads the client list the provider bind-mounts at
+# /run/mlp-clients, so a client added or REVOKED on GitHub reaches this
+# worker on the provider's next pool-sync tick instead of being frozen at
+# whatever was true when the container started. sshd requires the command
+# to be root-owned and not group/world-writable — both guaranteed by the
+# COPY below, which lands as root:root 0755.
+COPY profiles/worker/default/worker-authkeys /usr/local/bin/worker-authkeys
+RUN chmod 0755 /usr/local/bin/worker-authkeys \
+    && mkdir -p /etc/ssh/sshd_config.d && { \
         echo 'PasswordAuthentication no'; \
         echo 'PermitRootLogin no'; \
         echo 'KbdInteractiveAuthentication no'; \
+        echo 'AuthorizedKeysCommand /usr/local/bin/worker-authkeys'; \
+        echo 'AuthorizedKeysCommandUser root'; \
     } > /etc/ssh/sshd_config.d/10-mylinuxpool.conf
 
 COPY shared-configs/pool-runtime/files/pool-tunnel shared-configs/pool-runtime/files/pool-resolve \
