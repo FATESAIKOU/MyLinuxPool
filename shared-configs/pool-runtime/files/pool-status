@@ -13,6 +13,12 @@ REPO="${POOL_REPO:-FATESAIKOU/MyLinuxPool}"
 STATE_DIR="${HOME}/.mylinuxpool"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
 POOL_RESOLVE="${SCRIPT_DIR}/pool-resolve"
+# The tunnel identity path is the SINGLE source (tunnel-identity.sh) — the
+# same key pool-tunnel and the rotate probe use (RUNBOOK §7.12, third
+# incident: id_pool was hard-coded in two places and only one got
+# migrated).
+# shellcheck source=tunnel-identity.sh
+source "${SCRIPT_DIR}/tunnel-identity.sh"
 
 # Host key handling: the DECLARATION is the source of truth, never a
 # derived file. When NODE_GATEWAY carries a host_key, pool-status writes
@@ -241,21 +247,23 @@ if [[ -n "$GW_IP" ]]; then
 
     if [[ "$TCP_CLASS" == "ok" && -n "$GW_USER" ]]; then
         # Management login first (that is the Actions path); fall back to the
-        # tunnel identity with the shared id_pool key when running on a
-        # provider that has no management access to the Gateway.
+        # tunnel identity with the per-machine TUNNEL_KEY when running on a
+        # provider that has no management access to the Gateway. TUNNEL_KEY
+        # is the single source (tunnel-identity.sh) — the same key
+        # pool-tunnel and the rotate probe use (RUNBOOK §7.12).
         ssh_err="$(tmo 12 ssh "${SSH_OPTS[@]}" "${GW_USER}@${GW_IP}" true 2>&1)"
         ssh_rc=$?
         if [[ $ssh_rc -eq 0 ]]; then
             GW_LOGIN_USER="$GW_USER"
             GW_SSH_EXTRA=()
             GW_LOGIN_OK=1
-        elif [[ -f "${HOME}/.ssh/id_pool" && -n "$GW_TUNNEL_USER" ]]; then
-            ssh_err="$(tmo 12 ssh "${SSH_OPTS[@]}" -i "${HOME}/.ssh/id_pool" -o IdentitiesOnly=yes \
+        elif [[ -f "$TUNNEL_KEY" && -n "$GW_TUNNEL_USER" ]]; then
+            ssh_err="$(tmo 12 ssh "${SSH_OPTS[@]}" -i "$TUNNEL_KEY" -o IdentitiesOnly=yes \
                 "${GW_TUNNEL_USER}@${GW_IP}" true 2>&1)"
             ssh_rc=$?
             if [[ $ssh_rc -eq 0 ]]; then
                 GW_LOGIN_USER="$GW_TUNNEL_USER"
-                GW_SSH_EXTRA=(-i "${HOME}/.ssh/id_pool" -o IdentitiesOnly=yes)
+                GW_SSH_EXTRA=(-i "$TUNNEL_KEY" -o IdentitiesOnly=yes)
                 GW_LOGIN_OK=1
             fi
         fi

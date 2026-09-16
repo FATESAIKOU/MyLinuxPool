@@ -31,9 +31,14 @@ WORKER_HOME="/home/worker"
 mkdir -p "${WORKER_HOME}/.ssh"
 chmod 700 "${WORKER_HOME}/.ssh"
 
+# The key path has ONE definition, shared with pool-tunnel — writing it
+# here by hand is how the container ended up on id_pool while the host had
+# moved to id_tunnel (KEY-DESIGN §8).
+HOME="$WORKER_HOME" . /usr/local/bin/tunnel-identity.sh
+
 if [[ -n "${WORKER_KEY:-}" ]]; then
-    printf '%s\n' "$WORKER_KEY" > "${WORKER_HOME}/.ssh/id_pool"
-    chmod 600 "${WORKER_HOME}/.ssh/id_pool"
+    printf '%s\n' "$WORKER_KEY" > "$TUNNEL_KEY"
+    chmod 600 "$TUNNEL_KEY"
 else
     echo "WARNING: WORKER_KEY not set — pool-tunnel has no key to reverse-tunnel with" >&2
 fi

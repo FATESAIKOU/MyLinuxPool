@@ -274,24 +274,39 @@ rotate_live_providers() {
 #   difference is the port: a scratch port, so the probe cannot collide
 #   with the forward the provider is currently holding open on the live
 #   Gateway.
+#
+#   The tunnel IDENTITY is the same single source pool-tunnel uses:
+#   TUNNEL_KEY comes from tunnel-identity.sh (sourced below) — it is
+#   never hard-coded here. RUNBOOK §7.12's third incident was exactly
+#   that: the probe still asked for the deleted ~/.ssh/id_pool while
+#   pool-tunnel had moved to id_tunnel, and the rotate failed with
+#   "Permission denied (publickey)".
+# shellcheck source=../shared-configs/pool-runtime/files/tunnel-identity.sh
+source "$(cd "${SCRIPT_DIR}/../shared-configs/pool-runtime/files" && pwd)/tunnel-identity.sh"
 rotate_build_tunnel_probe_cmd() {
     local new_ip="$1" tunnel_user="$2" probe_port="$3" host_key="${4:-}"
     local hostkey_part
+    # TUNNEL_KEY has ONE definition (pool-runtime/files/tunnel-identity.sh);
+    # the probe must source it ON THE PROVIDER rather than spell the path
+    # again. Referencing $TUNNEL_KEY without sourcing leaves `-i` empty,
+    # and hardcoding it is how the probe stayed on id_pool after §8 moved
+    # everything to id_tunnel.
+    local identity_part=". \$HOME/.mylinuxpool/bin/tunnel-identity.sh;"
 
     if [[ -n "$host_key" ]]; then
         # Pin exactly the way pool-tunnel will. A probe that verified the
         # host differently from the real tunnel would pass on a machine
         # every provider then refuses — which is the failure it exists to
         # catch.
-        hostkey_part="KH=\$(mktemp); printf '%s %s\\n' '${new_ip}' '${host_key}' > \$KH; chmod 600 \$KH; \
+        hostkey_part="${identity_part} KH=\$(mktemp); printf '%s %s\\n' '${new_ip}' '${host_key}' > \$KH; chmod 600 \$KH; \
 ssh -o UserKnownHostsFile=\$KH -o StrictHostKeyChecking=yes"
     else
-        hostkey_part="KH=\$(mktemp); ssh -o UserKnownHostsFile=\$KH -o StrictHostKeyChecking=accept-new"
+        hostkey_part="${identity_part} KH=\$(mktemp); ssh -o UserKnownHostsFile=\$KH -o StrictHostKeyChecking=accept-new"
     fi
 
     printf '%s\n' "${hostkey_part} -o BatchMode=yes \
 -o ExitOnForwardFailure=yes -o AddressFamily=inet -o ConnectTimeout=10 \
--i \$HOME/.ssh/id_pool -o IdentitiesOnly=yes \
+-i \$TUNNEL_KEY -o IdentitiesOnly=yes \
 -R 127.0.0.1:${probe_port}:localhost:22 ${tunnel_user}@${new_ip} \
 'echo TUNNEL_PROBE_OK'; rc=\$?; rm -f \$KH; exit \$rc"
 }

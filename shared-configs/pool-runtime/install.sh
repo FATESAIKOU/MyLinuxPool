@@ -1,13 +1,18 @@
 #!/usr/bin/env bash
 # shared-configs/pool-runtime/install.sh — docs/LAYOUT.md §1
 #
-# Installs pool-resolve/pool-tunnel/pool-wol/pool-status/pool-port-alloc
-# and pool-sync to <home>/.mylinuxpool/bin/ (the canonical location —
-# POOL_RUNTIME_SPEC.md §0's state-dir layout, and what
-# pool-tunnel.service's ExecStart=%h/... already hardcodes) and the
+# Installs pool-resolve/pool-tunnel/pool-wol/pool-status/pool-port-alloc,
+# pool-sync and tunnel-identity.sh to <home>/.mylinuxpool/bin/ (the
+# canonical location — POOL_RUNTIME_SPEC.md §0's state-dir layout, and
+# what pool-tunnel.service's ExecStart=%h/... already hardcodes) and the
 # systemd user units (pool-tunnel.service, pool-sync.service,
 # pool-sync.timer) to <home>/.config/systemd/user/. No root needed
 # anywhere in this unit.
+#
+# tunnel-identity.sh is the SINGLE source of the tunnel identity path —
+# pool-tunnel / pool-status / pool-sync source it at runtime, so it MUST
+# ship next to them or those consumers die at startup (RUNBOOK §7.12,
+# third incident).
 #
 # This install.sh only gets the FILES in place. Enabling/starting the
 # systemd services, and `loginctl enable-linger`, are role-specific
@@ -61,7 +66,11 @@ done
 
 BIN_DIR="${HOME_DIR}/.mylinuxpool/bin"
 UNIT_DIR="${HOME_DIR}/.config/systemd/user"
-BINARIES="pool-resolve pool-tunnel pool-wol pool-status pool-port-alloc pool-sync"
+# tunnel-identity.sh is sourced by pool-tunnel / pool-status / pool-sync,
+# so it MUST ship with them: without it every one of them dies at source
+# time and the machine loses its tunnel (2026-09-16 — the test caught
+# this before it reached a provider, which is the only reason it did not).
+BINARIES="pool-resolve pool-tunnel pool-wol pool-status pool-port-alloc pool-sync tunnel-identity.sh"
 UNITS="pool-tunnel.service pool-sync.service pool-sync.timer"
 
 # file_matches <installed-path> <repo-source>
@@ -96,6 +105,7 @@ fi
 mkdir -p "$BIN_DIR"
 cp -f "${FILES_DIR}"/pool-resolve "${FILES_DIR}"/pool-tunnel "${FILES_DIR}"/pool-wol \
       "${FILES_DIR}"/pool-status "${FILES_DIR}"/pool-port-alloc "${FILES_DIR}"/pool-sync \
+      "${FILES_DIR}"/tunnel-identity.sh \
       "${BIN_DIR}/"
 chmod +x "${BIN_DIR}"/pool-resolve "${BIN_DIR}"/pool-tunnel "${BIN_DIR}"/pool-wol \
          "${BIN_DIR}"/pool-status "${BIN_DIR}"/pool-port-alloc "${BIN_DIR}"/pool-sync

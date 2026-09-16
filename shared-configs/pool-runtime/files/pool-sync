@@ -28,11 +28,20 @@
 
 set -uo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
+
 REPO="${POOL_REPO:-FATESAIKOU/MyLinuxPool}"
 BRANCH="${POOL_BRANCH:-master}"
 STATE_DIR="${HOME}/.mylinuxpool"
 CONFIG_FILE="${STATE_DIR}/config"
 GH_TOKEN_FILE="${STATE_DIR}/gh_token"
+
+# The tunnel identity path is the SINGLE source in tunnel-identity.sh —
+# the same file pool-tunnel and rotate's tunnel probe read, so the minted
+# key path can never diverge from the path the tunnel actually uses
+# (RUNBOOK §7.12, third incident).
+# shellcheck source=tunnel-identity.sh
+source "${SCRIPT_DIR}/tunnel-identity.sh"
 
 # Global on purpose: the EXIT trap below runs after main() returns, when
 # its locals are already gone — referencing a local under `set -u` would
@@ -246,7 +255,7 @@ main() {
     # when its tunnel_public_key is missing or differs.
     ensure_tunnel_key() {
         local ssh_dir="${HOME}/.ssh"
-        local tunnel_key="${ssh_dir}/id_tunnel"
+        local tunnel_key="${TUNNEL_KEY}"
         local pub_key=""
 
         if [[ ! -f "$tunnel_key" ]]; then

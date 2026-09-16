@@ -42,7 +42,8 @@ RUN mkdir -p /etc/ssh/sshd_config.d && { \
         echo 'KbdInteractiveAuthentication no'; \
     } > /etc/ssh/sshd_config.d/10-mylinuxpool.conf
 
-COPY shared-configs/pool-runtime/files/pool-tunnel shared-configs/pool-runtime/files/pool-resolve /usr/local/bin/
+COPY shared-configs/pool-runtime/files/pool-tunnel shared-configs/pool-runtime/files/pool-resolve \
+     shared-configs/pool-runtime/files/tunnel-identity.sh /usr/local/bin/
 RUN chmod +x /usr/local/bin/pool-tunnel /usr/local/bin/pool-resolve
 
 COPY profiles/worker/default/entrypoint.sh /usr/local/bin/docker-entrypoint.sh

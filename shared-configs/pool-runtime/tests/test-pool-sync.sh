@@ -318,6 +318,12 @@ build_fixture() {
         mkdir -p "$SANDBOX/fixture/scripts"
         cp scripts/refresh-authkeys.sh "$SANDBOX/fixture/scripts/refresh-authkeys.sh"
     fi
+    # tunnel-identity.sh：pool-sync 從這裡取 TUNNEL_KEY（單一來源）。
+    # 注入版的 SCRIPT_DIR 指向 sandbox 自己的目錄——沒有這份副本，
+    # source 會失敗、TUNNEL_KEY unbound，讓 Q-Inj1/Q-Inj2 假紅。
+    if [[ -f "$UNIT_ROOT/files/tunnel-identity.sh" ]]; then
+        cp "$UNIT_ROOT/files/tunnel-identity.sh" "$SANDBOX/tunnel-identity.sh"
+    fi
 }
 
 GIT_MODE="ok"

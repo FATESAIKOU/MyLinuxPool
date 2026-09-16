@@ -16,14 +16,15 @@ STATE_FILE="${POOL_STATE_FILE:-${STATE_DIR}/state.json}"
 KNOWN_HOSTS_FILE="${STATE_DIR}/gateway_known_hosts"
 RUN_DIR="${STATE_DIR}/run"
 CTL="${RUN_DIR}/ctl-gateway.sock"
-# Per-machine tunnel key (KEY-DESIGN §3.2): generated and published by
-# pool-sync; the ONLY identity since the shared legacy key was deleted in
-# §8 (MIGRATION completed — providers proved they connect with id_tunnel
-# alone before the shared key was removed).
-TUNNEL_KEY="${HOME}/.ssh/id_tunnel"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
 POOL_RESOLVE="${SCRIPT_DIR}/pool-resolve"
+
+# The tunnel identity path is the SINGLE source in tunnel-identity.sh —
+# the rotate probe sources the same file, so "which key dials the tunnel"
+# can never diverge again (RUNBOOK §7.12, third incident).
+# shellcheck source=tunnel-identity.sh
+source "${SCRIPT_DIR}/tunnel-identity.sh"
 
 HEALTH_INTERVAL=2
 HEALTH_TIMEOUT=2
