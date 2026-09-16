@@ -169,13 +169,7 @@ jobs:
           source scripts/create-worker.sh
           cmd="$(create_worker_build_claim_cmd "${{ steps.gateway.outputs.port_lo }}" "${{ steps.gateway.outputs.port_hi }}" \
             "${{ inputs.provider }}" "${{ inputs.image }}")"
-          # Built here, next to the run command it pairs with, so both
-          # agree on the container name without the workflow restating it.
-          read_pubkey_cmd="$(create_worker_read_pubkey_cmd "${{ steps.identity.outputs.container }}")"
-          {
-            echo "cmd=${cmd}"
-            echo "read_pubkey_cmd=${read_pubkey_cmd}"
-          } >> "$GITHUB_OUTPUT"
+          echo "cmd=${cmd}" >> "$GITHUB_OUTPUT"
 
       - name: Claim a worker port on the Gateway
         id: claim
@@ -302,7 +296,14 @@ jobs:
             "$worker_authorized_keys" \
             "profiles/worker/${{ inputs.image }}/profile.json" "$ALL_SECRETS_JSON")" \
             || { echo "::error::could not build the docker-run command — see log above"; exit 1; }
-          echo "cmd=${cmd}" >> "$GITHUB_OUTPUT"
+
+          # Built here, next to the run command it pairs with, so both
+          # agree on the container name without the workflow restating it.
+          read_pubkey_cmd="$(create_worker_read_pubkey_cmd "${{ steps.identity.outputs.container }}")"
+          {
+            echo "cmd=${cmd}"
+            echo "read_pubkey_cmd=${read_pubkey_cmd}"
+          } >> "$GITHUB_OUTPUT"
 
       # Nothing is authorized yet and that is fine: pool-tunnel inside the
       # container retries every 2 seconds, so it connects the moment the
