@@ -32,7 +32,27 @@ print(j, l['user'], l['host'], l['port'])")"
 
 KNOWN_HOSTS="${HOME}/.mylinuxpool/known_hosts"
 
+# 用哪把金鑰登入不在這裡決定——tunnel-identity.sh 是唯一的答案來源
+# （RUNBOOK §7.12）。不帶 -i 時 ssh 只會試它內建的那幾個候選
+# （id_rsa、id_ed25519…），`mlp register client` 產生的 id_mlp 不在其中，
+# 每一跳都會以 Permission denied 收場。SSH_IDENTITY 已設就尊重呼叫端。
+if [[ -z "${SSH_IDENTITY:-}" ]]; then
+    for _ti in "${HOME}/.mylinuxpool/bin/tunnel-identity.sh" \
+               "${REPO_ROOT}/shared-configs/pool-runtime/files/tunnel-identity.sh"; do
+        # shellcheck source=/dev/null
+        [[ -f "$_ti" ]] && { . "$_ti"; break; }
+    done
+    SSH_IDENTITY="${CLIENT_KEY:-}"
+fi
+IDENT_OPTS=()
+IDENT_LEG=""
+if [[ -n "${SSH_IDENTITY:-}" ]]; then
+    IDENT_OPTS=(-i "$SSH_IDENTITY" -o IdentitiesOnly=yes)
+    IDENT_LEG="-i ${SSH_IDENTITY} -o IdentitiesOnly=yes "
+fi
+
 SSH_OPTS=(-o BatchMode=yes -o ConnectTimeout=10
+          ${IDENT_OPTS[@]+"${IDENT_OPTS[@]}"}
           # 不轉送 Mac 的 en_US.UTF-8——provider 上沒有那個 locale，
           # 遠端每開一次 bash 就警告一行，把真正的輸出淹掉。
           -o SetEnv=LC_ALL=C)
@@ -50,7 +70,7 @@ else
     IFS=',' read -r -a hops <<< "$JUMPS"
     for h in "${hops[@]}"; do
         hu="${h%@*}"; hr="${h#*@}"; hh="${hr%:*}"; hp="${hr##*:}"
-        leg="ssh -o UserKnownHostsFile=${KNOWN_HOSTS} -o StrictHostKeyChecking=accept-new"
+        leg="ssh ${IDENT_LEG}-o UserKnownHostsFile=${KNOWN_HOSTS} -o StrictHostKeyChecking=accept-new"
         leg+=" -o BatchMode=yes -o ConnectTimeout=10"
         [[ -n "$proxy" ]] && leg+=" -o ProxyCommand=\"${proxy}\""
         leg+=" -p ${hp} -W %h:%p ${hu}@${hh}"

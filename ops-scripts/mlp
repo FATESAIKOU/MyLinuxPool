@@ -160,9 +160,7 @@ resolve_gateway() {
     fi
 }
 
-open_gateway_master() {
-    CTL_DIR="$(mktemp -d "${TMPDIR:-/tmp}/mlp.XXXXXX")" || return 1
-    # client_identity_path — the key this client authenticates with.
+# client_identity_path — the key this client authenticates with.
 #   ONE definition, used both by mlp's own ssh calls and by the ssh_config
 #   it writes. id_mlp is what `mlp register client` creates and publishes;
 #   ssh's built-in candidates (id_rsa, id_ed25519, ...) do NOT include it,
@@ -196,11 +194,13 @@ client_identity_opts() {
     printf '%s' "-i ${key} -o IdentitiesOnly=yes"
 }
 
+open_gateway_master() {
+    CTL_DIR="$(mktemp -d "${TMPDIR:-/tmp}/mlp.XXXXXX")" || return 1
     CTL="${CTL_DIR}/ctl-gateway"
     local err rc
     local ident; read -r -a ident <<< "$(client_identity_opts)"
     err="$(ssh -M -S "$CTL" -o ControlPersist=60 -o ConnectTimeout=8 \
-        "${ident[@]}" \
+        ${ident[@]+"${ident[@]}"} \
         -o UserKnownHostsFile="$GW_KNOWN_HOSTS" -o StrictHostKeyChecking=accept-new -o BatchMode=yes \
         -N -f "${GW_USER}@${GW_IP}" < /dev/null 2>&1)"
     rc=$?
@@ -448,6 +448,10 @@ do_connect() {
     # ssh_gateway_only/ssh_via_gateway in this file, or a key needing a
     # passphrase would fail instead of prompting.
     local SSH_BATCH_MODE=no
+    # Without this, ssh falls back to its own candidates and never tries
+    # id_mlp — `mlp ssh` then fails with Permission denied while a direct
+    # `ssh -i ~/.ssh/id_mlp` works. Same single source as ssh_config.
+    local SSH_IDENTITY; SSH_IDENTITY="$(client_identity_path 2>/dev/null || true)"
     case "$type" in
         gateway)
             ssh_gateway_only "$GW_KNOWN_HOSTS" "$GW_USER" "$GW_IP" 22

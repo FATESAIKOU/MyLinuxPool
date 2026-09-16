@@ -30,9 +30,23 @@
 # ssh_gateway_only <known_hosts> <user> <host> <port> [remote_cmd...]
 #   Direct connection to the Gateway itself — the node being reached IS
 #   the Gateway, no second hop. With no remote_cmd, connects interactively.
+# SSH_IDENTITY (optional) — path of the key to authenticate with.
+#   Set it when the caller knows which key to use and ssh would not find it
+#   on its own: ssh's built-in candidates are id_rsa, id_ed25519 and
+#   friends, so a client registered with `mlp register client` (~/.ssh/
+#   id_mlp) is invisible to it and every hop fails with Permission denied.
+#   Left empty by Actions, which loads SSH_KEY_ACTIONS into an ssh-agent —
+#   forcing -i there would ignore the agent and break every workflow.
+_ssh_identity_opts() {
+    [[ -n "${SSH_IDENTITY:-}" ]] || return 0
+    printf '%s' "-i ${SSH_IDENTITY} -o IdentitiesOnly=yes"
+}
+
 ssh_gateway_only() {
     local known_hosts="$1" user="$2" host="$3" port="$4"; shift 4
+    local ident; read -r -a ident <<< "$(_ssh_identity_opts)"
     ssh -o UserKnownHostsFile="$known_hosts" -o StrictHostKeyChecking=accept-new \
+        ${ident[@]+"${ident[@]}"} \
         -o ConnectTimeout="${SSH_CONNECT_TIMEOUT:-10}" -o BatchMode="${SSH_BATCH_MODE:-yes}" \
         -p "$port" "${user}@${host}" "$@"
 }
@@ -43,9 +57,16 @@ ssh_gateway_only() {
 ssh_via_gateway() {
     local known_hosts="$1" gw_user="$2" gw_host="$3" gw_port="$4"
     local dst_user="$5" dst_host="$6" dst_port="$7"; shift 7
+    # The identity is needed on BOTH legs: the ProxyCommand authenticates
+    # to the Gateway in its own right, so omitting it there fails before
+    # the inner hop is ever attempted.
+    local ident; read -r -a ident <<< "$(_ssh_identity_opts)"
+    local proxy_ident=""
+    [[ -n "${SSH_IDENTITY:-}" ]] && proxy_ident="-i ${SSH_IDENTITY} -o IdentitiesOnly=yes "
     ssh -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no -o LogLevel=ERROR \
+        ${ident[@]+"${ident[@]}"} \
         -o ConnectTimeout="${SSH_CONNECT_TIMEOUT:-10}" -o BatchMode="${SSH_BATCH_MODE:-yes}" \
-        -o ProxyCommand="ssh -o UserKnownHostsFile=${known_hosts} -o StrictHostKeyChecking=accept-new -o ConnectTimeout=${SSH_CONNECT_TIMEOUT:-10} -p ${gw_port} -W %h:%p ${gw_user}@${gw_host}" \
+        -o ProxyCommand="ssh ${proxy_ident}-o UserKnownHostsFile=${known_hosts} -o StrictHostKeyChecking=accept-new -o ConnectTimeout=${SSH_CONNECT_TIMEOUT:-10} -p ${gw_port} -W %h:%p ${gw_user}@${gw_host}" \
         -p "$dst_port" "${dst_user}@${dst_host}" "$@"
 }
 
