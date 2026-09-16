@@ -136,7 +136,17 @@ fi
 if [[ ! -f "$KEY_PATH" ]]; then
     mkdir -p "$(dirname "$KEY_PATH")"
     chmod 700 "$(dirname "$KEY_PATH")"
-    log INFO "no key at ${KEY_PATH} — generating an ed25519 pair (passphrase is your choice; leave empty for none)"
+    # -N "" is deliberate and NOT negotiable here: this script has to run
+    # non-interactively (tests, and any registration driven over ssh), and
+    # ssh-keygen without -N prompts. The log used to say "passphrase is
+    # your choice; leave empty for none", which promised a prompt that
+    # never came — anyone reading it believed they had declined a
+    # passphrase rather than never being offered one.
+    #
+    # To use a passphrase-protected key, generate it yourself and point
+    # --key at it; an existing key is used as-is (the else branch below).
+    log INFO "no key at ${KEY_PATH} — generating an ed25519 pair WITHOUT a passphrase"
+    log INFO "  (want one? ssh-keygen it yourself, then re-run with --key <that path>)"
     ssh-keygen -t ed25519 -N "" -C "$NAME" -f "$KEY_PATH"
     log INFO "generated ${KEY_PATH} (public half: ${KEY_PATH}.pub)"
 else
