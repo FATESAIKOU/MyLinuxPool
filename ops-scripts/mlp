@@ -194,6 +194,17 @@ client_identity_opts() {
     printf '%s' "-i ${key} -o IdentitiesOnly=yes"
 }
 
+# Every ssh in this file ultimately goes through scripts/lib/ssh.sh, which
+# reads SSH_IDENTITY. Set it ONCE, here, for the whole program.
+#
+# Setting it per call site is how `mlp down` kept failing with Permission
+# denied after `mlp ssh` had been fixed: do_connect declared it `local`, so
+# run_on_node — a different path to the same two helpers — still had none.
+# That is the same "one rule, several implementations" mistake the rule
+# itself exists to prevent (RUNBOOK §7.12). A global assignment cannot be
+# half-applied.
+SSH_IDENTITY="$(client_identity_path 2>/dev/null || true)"
+
 open_gateway_master() {
     CTL_DIR="$(mktemp -d "${TMPDIR:-/tmp}/mlp.XXXXXX")" || return 1
     CTL="${CTL_DIR}/ctl-gateway"
@@ -448,10 +459,6 @@ do_connect() {
     # ssh_gateway_only/ssh_via_gateway in this file, or a key needing a
     # passphrase would fail instead of prompting.
     local SSH_BATCH_MODE=no
-    # Without this, ssh falls back to its own candidates and never tries
-    # id_mlp — `mlp ssh` then fails with Permission denied while a direct
-    # `ssh -i ~/.ssh/id_mlp` works. Same single source as ssh_config.
-    local SSH_IDENTITY; SSH_IDENTITY="$(client_identity_path 2>/dev/null || true)"
     case "$type" in
         gateway)
             ssh_gateway_only "$GW_KNOWN_HOSTS" "$GW_USER" "$GW_IP" 22

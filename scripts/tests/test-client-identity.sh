@@ -115,10 +115,33 @@ fi
 
 # ---- 5. mlp 的 do_connect 要去問單一來源 ---------------------------------
 echo "=== 5-6. 呼叫端有沒有接上 ==="
-if awk '/^do_connect\(\)/,/^}/' "$MLP" | grep -q 'SSH_IDENTITY=.*client_identity_path'; then
-    ok "5. do_connect 由 client_identity_path 決定身分"
+# 必須設在檔案層級，而且只有一處。設在某個函式裡（哪怕是對的那個函式）
+# 只會修好那一條路徑：2026-09-16 先把它設在 do_connect 裡，`mlp ssh` 好了，
+# 但 `mlp down` 走的是 run_on_node，照樣 Permission denied。
+GLOBAL_SET="$(grep -cE '^SSH_IDENTITY=' "$MLP")"
+LOCAL_SET="$(grep -cE '^[[:space:]]+(local[[:space:]]+)?SSH_IDENTITY[=;[:space:]]' "$MLP")"
+if [[ "$GLOBAL_SET" -eq 1 && "$LOCAL_SET" -eq 0 ]]; then
+    ok "5. mlp 在檔案層級設定 SSH_IDENTITY 一次，所有呼叫端都吃得到"
 else
-    bad "5. do_connect 沒有設定 SSH_IDENTITY——mlp ssh 會退回 ssh 內建候選金鑰"
+    bad "5. SSH_IDENTITY 的設定位置不對（檔案層級 ${GLOBAL_SET} 處、函式內 ${LOCAL_SET} 處）——函式內設定只會修好那一條路徑"
+fi
+
+# 每個呼叫 helper 的函式都必須被涵蓋。全域設定天然涵蓋全部，這條是為了
+# 萬一有人改回逐點設定時，能指出漏了哪些。
+if [[ "$GLOBAL_SET" -ne 1 ]]; then
+    UNCOVERED=""
+    while IFS= read -r fn; do
+        body="$(awk "/^${fn}\\(\\)/,/^}/" "$MLP")"
+        printf '%s' "$body" | grep -q 'ssh_gateway_only\|ssh_via_gateway' || continue
+        printf '%s' "$body" | grep -q 'SSH_IDENTITY=' || UNCOVERED+="${fn} "
+    done < <(grep -oE '^[a-z_]+\(\)' "$MLP" | tr -d '()')
+    if [[ -n "$UNCOVERED" ]]; then
+        bad "5b. 這些函式呼叫了 ssh helper 卻沒有身分：${UNCOVERED}"
+    else
+        ok "5b. 每個呼叫 ssh helper 的函式都設了身分"
+    fi
+else
+    ok "5b. 全域設定涵蓋所有呼叫端（run_on_node、do_connect、…）"
 fi
 
 # ---- 6. verify-profile 的兩段 -------------------------------------------
@@ -172,6 +195,23 @@ if grep -qE '^[[:space:]]+client_identity_path\(\)[[:space:]]*\{' "$inj2"; then
     fi
 else
     inj_bad "8. 注入沒生效（needle 落空）——harness 問題"
+fi
+
+inj3="$SANDBOX/mlp-local-ident"
+python3 - "$MLP" "$inj3" <<'INJ3'
+import sys, re
+s = open(sys.argv[1], encoding='utf-8').read()
+# 重現當時的修法：拿掉全域設定，改成只在 do_connect 裡設
+s = re.sub(r'^SSH_IDENTITY="\$\(client_identity_path 2>/dev/null \|\| true\)"\n', '', s, count=1, flags=re.M)
+s = s.replace('do_connect() {\n', 'do_connect() {\n    local SSH_IDENTITY; SSH_IDENTITY="$(client_identity_path 2>/dev/null || true)"\n', 1)
+open(sys.argv[2], 'w', encoding='utf-8').write(s)
+INJ3
+if grep -qE '^SSH_IDENTITY=' "$inj3"; then
+    inj_bad "11. 注入沒生效（全域設定還在）——harness 問題"
+elif grep -qE '^[[:space:]]+local[[:space:]]+SSH_IDENTITY[=;[:space:]]' "$inj3"; then
+    inj_ok "11. 改回只在 do_connect 裡設身分後第 5 條會紅（正是 mlp down 失敗的那個版本）"
+else
+    inj_bad "11. 注入沒生效（needle 落空）——harness 問題"
 fi
 
 echo
