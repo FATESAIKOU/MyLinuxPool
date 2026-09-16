@@ -112,6 +112,10 @@ jobs:
         env:
           FATESAIKOU_PUBKEY: ${{ steps.agent.outputs.fatesaikou_pub }}
           SSHPROXY_PUBKEY: ${{ steps.agent.outputs.sshproxy_pub }}
+          # The shared tunnel key is still inside ssh-tunnel-server's
+          # encrypted file during the migration (MIGRATION.md §2) — the
+          # same FILE_CRYPTO_KEY the agent step above uses.
+          FILE_CRYPTO_KEY: ${{ secrets.FILE_CRYPTO_KEY }}
           # Optional. Set it and every rotated Gateway keeps the same root
           # password, so the LISH console rescue documented in SECRETS.md
           # stays valid instead of expiring with each rotate. Unset, rotate
@@ -121,10 +125,58 @@ jobs:
           set -euo pipefail
           command -v envsubst >/dev/null 2>&1 || sudo apt-get install -y gettext-base
           source scripts/rotate-gateway.sh
+          source scripts/refresh-authkeys.sh
+
+          # Assemble the two authorized_keys lists from the repo variables
+          # (KEY-DESIGN §3.4/§9.7): a rotated Gateway must be born with
+          # them already assembled — waiting for a refresh would leave the
+          # per-machine tunnel keys missing and the current providers
+          # unable to dial in.
+          #   login: CLIENT_* via authkeys_assemble (required = Actions)
+          #   sshproxy: the SHARED legacy key (from the encrypted file,
+          #     MIGRATION add-before-remove) ∪ all tunnel_public_key
+          vars_json="$(gh api "repos/${GH_REPO}/actions/variables?per_page=100" --paginate)"
+          workers_json="$(gh api "repos/${GH_REPO}/actions/variables/POOL_WORKERS" --jq .value 2>/dev/null || echo '[]')"
+
+          clients="$(refresh_collect_clients "$vars_json")"
+          actions_pk="$(printf '%s' "$clients" | jq -r '.[] | select(.name == "actions") | .public_key // empty' 2>/dev/null || true)"
+          if [[ -z "$actions_pk" ]]; then
+            echo "::error::CLIENT_ACTIONS is missing — cannot assemble a login list that provably keeps Actions in. Refusing to build the Gateway."
+            exit 1
+          fi
+          login_keys="$(rotate_assemble_login_keys "$clients" "$actions_pk")" || {
+            echo "::error::login list assembly failed — aborting (self-lockout guard)"
+            exit 1
+          }
+
+          # The shared tunnel key is still the fleet's dial-in identity
+          # during the migration (MIGRATION.md §2); decrypt it from the
+          # encrypted file exactly like the tunnel identity is decrypted
+          # elsewhere.
+          shared_tunnel_key="$(scripts/lib/crypto.sh decrypt "$FILE_CRYPTO_KEY" \
+              < shared-configs/ssh-tunnel-server/files/authorized_keys.crypted 2>/dev/null \
+              | sed '/^[[:space:]]*$/d' | head -1 || true)"
+          if [[ -z "$shared_tunnel_key" ]]; then
+            echo "::error::could not decrypt the shared tunnel key — refusing to build a Gateway the fleet cannot reach"
+            exit 1
+          fi
+          tunnel_keys="$(refresh_collect_tunnel_keys "$vars_json" "$workers_json")"
+          sshproxy_keys="$(rotate_assemble_sshproxy_keys "$shared_tunnel_key" "$tunnel_keys")" || {
+            echo "::error::sshproxy list assembly failed — aborting (migration add-before-remove guard)"
+            exit 1
+          }
 
           rendered="${RUNNER_TEMP}/cloud-config.yaml"
           rotate_render_cloud_config profiles/gateway/default/cloud-config.yaml \
-              "$FATESAIKOU_PUBKEY" "$SSHPROXY_PUBKEY" > "$rendered"
+              "$login_keys" "$sshproxy_keys" > "$rendered"
+
+          # The rendered file must be valid YAML: ssh_authorized_keys
+          # expanded to several items, so a broken expansion fails the
+          # rotate BEFORE any machine is built.
+          python3 -c "import yaml; yaml.safe_load(open('$rendered'))" || {
+            echo "::error::rendered cloud-config is not valid YAML — refusing to create the preview"
+            exit 1
+          }
 
           output="$(rotate_create_preview_linode "${{ inputs.region }}" "${{ inputs.type }}" "${{ inputs.image }}" "$rendered")" || {
             echo "::error::could not create the preview Gateway — see log above"

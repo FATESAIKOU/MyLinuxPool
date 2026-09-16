@@ -10,15 +10,17 @@ users:
     shell: /bin/bash
     lock_passwd: true
     ssh_authorized_keys:
-      - ${FATESAIKOU_PUBKEY}
+      - ${FATESAIKOU_PUBKEYS}
   - name: sshproxy
     shell: /bin/bash
     lock_passwd: true
     ssh_authorized_keys:
-      - ${SSHPROXY_PUBKEY}
+      - ${SSHPROXY_PUBKEYS}
 
-# 純金鑰認證：不設密碼，公鑰由 rotate workflow 從 secrets 渲染進來（見上方
-# 佔位符）。舊版用 plain_text_passwd 注入臨時密碼再鎖定那套整條廢除。
+# 純金鑰認證：不設密碼，公鑰由 rotate workflow 渲染進來（見上方佔位符）。
+# 佔位符是「單一序列項目」的合法形狀；rotate_render_cloud_config 把值
+# 展開成多行——第一行承接模板的 `      - `，其餘行在值內自帶縮排，
+# 於是多把公鑰會展開成多個序列項目（ssh_authorized_keys 是陣列）。
 ssh_pwauth: false
 
 package_update: true

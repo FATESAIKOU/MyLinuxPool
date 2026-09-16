@@ -22,13 +22,72 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
 # shellcheck source=lib/log.sh
 source "${SCRIPT_DIR}/lib/log.sh"
 
-# rotate_render_cloud_config <template> <fatesaikou_pubkey> <sshproxy_pubkey>
+# rotate_render_cloud_config <template> <fatesaikou_pubkeys> <sshproxy_pubkeys>
 #   Prints the rendered cloud-config to stdout. envsubst itself is assumed
 #   present (a runner-environment concern, not business logic).
+#
+#   The two *pubkeys args are MULTI-LINE lists (one key per line). The
+#   cloud-config template expands them as pre-indented YAML sequence
+#   items — ssh_authorized_keys is an array, so each key becomes its own
+#   `- <key>` line under the right indentation (envsubst substitutes the
+#   literal value, indentation included).
 rotate_render_cloud_config() {
-    local template="$1" fatesaikou_pubkey="$2" sshproxy_pubkey="$3"
-    FATESAIKOU_PUBKEY="$fatesaikou_pubkey" SSHPROXY_PUBKEY="$sshproxy_pubkey" \
+    local template="$1" fatesaikou_pubkeys="$2" sshproxy_pubkeys="$3"
+
+    # Expand to YAML sequence items. The template's placeholder line is
+    # `      - ${FATESAIKOU_PUBKEYS}` — a legal single-item shape — so the
+    # FIRST key rides the template's own `- `, and every SUBSEQUENT key
+    # carries the `      - ` indentation inside the substituted value.
+    # Keys are single-line by construction; blank lines (from trailing
+    # newlines) are dropped first.
+    local fk sk
+    fk="$(printf '%s\n' "$fatesaikou_pubkeys" \
+        | sed '/^[[:space:]]*$/d' \
+        | awk 'NR==1 {print} NR>1 {print "      - " $0}')"
+    sk="$(printf '%s\n' "$sshproxy_pubkeys" \
+        | sed '/^[[:space:]]*$/d' \
+        | awk 'NR==1 {print} NR>1 {print "      - " $0}')"
+
+    FATESAIKOU_PUBKEYS="$fk" SSHPROXY_PUBKEYS="$sk" \
         envsubst < "$template"
+}
+
+# rotate_assemble_login_keys <clients_json> <actions_pubkey>
+#   Assembles the fatesaikou login list from CLIENT_* (the same
+#   authkeys_assemble the refresh workflow uses). Prints the multi-line
+#   authorized_keys content. Non-zero (and no output) when the assembly
+#   fails or the Actions key is missing from the result — the self-lockout
+#   guard (KEY-DESIGN §6): a rotated Gateway whose login list does not
+#   provably contain Actions is a Gateway nobody can manage.
+rotate_assemble_login_keys() {
+    local clients_json="$1" actions_pubkey="$2"
+    source "${SCRIPT_DIR}/lib/authkeys.sh"
+    authkeys_assemble "$clients_json" "$actions_pubkey"
+}
+
+# rotate_assemble_sshproxy_keys <shared_pubkey> <tunnel_keys>
+#   Assembles the sshproxy (tunnel) list: the SHARED legacy public key
+#   (MIGRATION.md §2 — add-before-remove, it stays until KEY-DESIGN §8)
+#   UNION every provider/worker tunnel_public_key. Prints one key per
+#   line. The shared key MUST be present in the result — it is what every
+#   current provider dials in with; a list without it would lock the whole
+#   fleet out of a fresh Gateway. Non-zero, no output when it is missing
+#   or the input is empty.
+rotate_assemble_sshproxy_keys() {
+    local shared_pubkey="$1" tunnel_keys="$2"
+    local all
+    all="$(printf '%s\n%s\n' "$shared_pubkey" "$tunnel_keys" \
+        | sed '/^[[:space:]]*$/d' | sort -u)"
+    # The shared key is a REQUIRED input, not something the union happens
+    # to contain: during the migration every current provider dials in
+    # with it, so a list without it locks the whole fleet out of a fresh
+    # Gateway. Guard its presence explicitly — an empty shared key (e.g.
+    # decryption failed) must abort, not silently produce a list.
+    if [[ -z "$shared_pubkey" ]] || ! printf '%s\n' "$all" | grep -qF "$shared_pubkey"; then
+        log ERROR "sshproxy list would miss the shared tunnel key — refusing (MIGRATION add-before-remove)"
+        return 1
+    fi
+    printf '%s\n' "$all"
 }
 
 # rotate_create_preview_linode <region> <type> <image> <rendered_cloud_config_path>

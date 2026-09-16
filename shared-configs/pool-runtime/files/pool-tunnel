@@ -16,7 +16,13 @@ STATE_FILE="${POOL_STATE_FILE:-${STATE_DIR}/state.json}"
 KNOWN_HOSTS_FILE="${STATE_DIR}/gateway_known_hosts"
 RUN_DIR="${STATE_DIR}/run"
 CTL="${RUN_DIR}/ctl-gateway.sock"
+# Shared legacy tunnel key (all providers/workers until KEY-DESIGN §8
+# deletes it) — the migration keeps it as the fallback identity.
 PRIVATE_KEY="${HOME}/.ssh/id_pool"
+# Per-machine tunnel key (KEY-DESIGN §3.2): generated and published by
+# pool-sync; tried first, falls back to PRIVATE_KEY while both are
+# authorized on the Gateway (MIGRATION.md §1).
+TUNNEL_KEY="${HOME}/.ssh/id_tunnel"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
 POOL_RESOLVE="${SCRIPT_DIR}/pool-resolve"
@@ -456,6 +462,20 @@ start_master() {
         log WARN "NODE_GATEWAY carries no host_key — falling back to trust-on-first-use"
     fi
 
+    # Migration-period identity (MIGRATION.md §1 — the safety net):
+    # BOTH keys are offered, id_tunnel first, id_pool second, with
+    # IdentitiesOnly so ssh tries exactly these. ssh tries them in order,
+    # and the Gateway authorizes both during the migration, so a broken
+    # new key automatically falls back to the shared old one and the
+    # tunnel never drops. Neither provider has a remote fallback, so the
+    # tunnel cannot afford to break even for a second. Missing keys are
+    # skipped (a fresh install may not have id_pool yet). After KEY-DESIGN
+    # §8 removes the shared key, this reduces back to a single -i.
+    local -a identity_opts=()
+    [[ -f "$TUNNEL_KEY" ]] && identity_opts+=(-i "$TUNNEL_KEY")
+    [[ -f "$PRIVATE_KEY" ]] && identity_opts+=(-i "$PRIVATE_KEY")
+    [[ ${#identity_opts[@]} -gt 0 ]] && identity_opts+=(-o IdentitiesOnly=yes)
+
     local -a cmd=(
         ssh -M -S "$CTL"
         -o ControlPersist=no
@@ -464,7 +484,7 @@ start_master() {
         -o ServerAliveCountMax=2
         "${hostkey_opts[@]}"
         -o AddressFamily=inet
-        -i "$PRIVATE_KEY" -o IdentitiesOnly=yes
+        "${identity_opts[@]}"
         -N -R "127.0.0.1:${MY_PORT}:localhost:22"
         "${GW_USER}@${GW_IP}"
     )

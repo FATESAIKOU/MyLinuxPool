@@ -34,6 +34,8 @@ mkdir -p "$SANDBOX/fakebin" "$SANDBOX/home/.mylinuxpool" "$SANDBOX/tmpdir"
 : > "$SANDBOX/systemctl.log"
 : > "$SANDBOX/git.log"
 : > "$SANDBOX/gh.log"
+: > "$SANDBOX/gh-payload.log"
+: > "$SANDBOX/ssh.log"
 : > "$SANDBOX/out"
 : > "$SANDBOX/err"
 : > "$SANDBOX/combined"
@@ -86,6 +88,20 @@ printf 'args=%s\n' "$*" >> "$FAKE_GH_LOG"
 if [[ "${FAKE_GH_MODE:-ok}" == "missing" ]]; then
     echo "gh: HTTP 404: Not Found (variable)" >&2
     exit 1
+fi
+# writefail (task Q §7): reads keep working, writes fail — the shape of a
+# GitHub hiccup while the old shared tunnel key still holds the tunnel up.
+if [[ "${FAKE_GH_MODE:-ok}" == "writefail" ]]; then
+    case "${1:-} ${2:-}" in
+        "variable set"|"variable delete"|"workflow run")
+            echo "gh: simulated write failure" >&2
+            exit 1 ;;
+    esac
+fi
+# Capture the payload piped into `gh variable set` (task Q §3): the JSON
+# pool-sync writes must still carry the node's other fields.
+if [[ "${1:-}" == "variable" && "${2:-}" == "set" && -n "${FAKE_GH_PAYLOAD_LOG:-}" ]]; then
+    printf 'PAYLOAD|%s\n' "$(cat)" >> "$FAKE_GH_PAYLOAD_LOG"
 fi
 is_list=0
 for a in "$@"; do
@@ -312,6 +328,7 @@ FAKE_CLIENT_VARS=""
 run_sync() {
     : > "$SANDBOX/install.log"; : > "$SANDBOX/systemctl.log"
     : > "$SANDBOX/git.log"; : > "$SANDBOX/gh.log"
+    : > "$SANDBOX/gh-payload.log"; : > "$SANDBOX/ssh.log"
     rm -rf "$SANDBOX/tmpdir"; mkdir -p "$SANDBOX/tmpdir"
     SYNC_RC=0; RAN=0
     if [[ ! -x "$POOL_SYNC" ]]; then
@@ -333,6 +350,7 @@ run_sync() {
         FAKE_INSTALL_RC="$SANDBOX/install-rc" \
         FAKE_GIT_LOG="$SANDBOX/git.log" \
         FAKE_GH_LOG="$SANDBOX/gh.log" \
+        FAKE_GH_PAYLOAD_LOG="$SANDBOX/gh-payload.log" \
         FAKE_SYSTEMCTL_LOG="$SANDBOX/systemctl.log" \
         FAKE_GIT_MODE="$GIT_MODE" \
         FAKE_GH_MODE="$GH_MODE" \
@@ -978,6 +996,438 @@ else
     fail_line "A10. 注入後仍沒寫入——注入沒生效（harness 問題）"
 fi
 POOL_SYNC_SUBJECT=""
+
+# ===========================================================================
+# Q1–Q7: provider 自產隧道金鑰（MIGRATION.md §3 / KEY-DESIGN §3.3、§9.4）。
+# pool-sync 在每次收斂時確保 ~/.ssh/id_tunnel 存在（不存在才產）、把公鑰
+# 併進自己的 NODE_<NAME> var（merge，絕不覆蓋其他欄位）、發布成功才派發
+# refresh-authorized-keys.yml，而任何 GitHub 失敗都只 WARN、不讓整支失敗。
+# ===========================================================================
+TUNNEL_KEY_FILE="$SANDBOX/home/.ssh/id_tunnel"
+TUNNEL_PUB_FILE="$SANDBOX/home/.ssh/id_tunnel.pub"
+
+# 記下私鑰的內容指紋。用 sha256 而非 mtime：同一秒內重產會讓 mtime 看起來
+# 沒變，那個假陰性會讓 Q2（不該重產）與 Q-Inj1（該重產）都誤判。
+tunnel_fingerprint() {
+    if [[ -f "$TUNNEL_KEY_FILE" ]]; then
+        shasum -a 256 "$TUNNEL_KEY_FILE" 2>/dev/null | awk '{print $1}'
+    fi
+}
+tunnel_key_perm() {
+    if stat -f '%Lp' "$TUNNEL_KEY_FILE" >/dev/null 2>&1; then
+        stat -f '%Lp' "$TUNNEL_KEY_FILE"
+    else
+        stat -c '%a' "$TUNNEL_KEY_FILE" 2>/dev/null
+    fi
+}
+
+echo "── Q1 id_tunnel 不存在 → 產生一對、私鑰 600 ──"
+reset_home
+build_fixture "unit-a unit-b" "unit-b" ""
+GIT_MODE="ok"; GH_MODE="ok"
+: > "$SANDBOX/check-rc"; : > "$SANDBOX/install-rc"
+GH_VALUE='{"name":"testnode","role":"provider","registered_with":"register-provider.sh"}'
+write_clients "$AUB_KEY_A" "$AUB_KEY_B" "$AUB_ACTIONS"
+run_sync
+check_rc 0 "Q1. 產金鑰的這輪仍 exit 0"
+if [[ "$RAN" -ne 1 ]]; then
+    fail_line "Q1. id_tunnel 被產生（被測物沒有真的執行，無從證明）"
+elif [[ -f "$TUNNEL_KEY_FILE" && -f "$TUNNEL_PUB_FILE" ]]; then
+    ok_line "Q1. id_tunnel 與 id_tunnel.pub 都被產生"
+else
+    fail_line "Q1. id_tunnel 未被產生（$TUNNEL_KEY_FILE）"
+fi
+if [[ "$RAN" -eq 1 && -f "$TUNNEL_KEY_FILE" ]]; then
+    perm="$(tunnel_key_perm)"
+    if [[ "$perm" == "600" ]]; then
+        ok_line "Q1. 私鑰權限是 600（實際 ${perm}）"
+    else
+        fail_line "Q1. 私鑰權限不是 600（實際 ${perm:-<無法取得>}）"
+    fi
+elif [[ "$RAN" -eq 1 ]]; then
+    fail_line "Q1. 私鑰權限是 600（檔案不存在，無從檢查）"
+fi
+
+echo "── Q2 已存在 → 不重新產生（換鑰會讓機器失聯）──"
+if [[ "$RAN" -ne 1 || ! -f "$TUNNEL_KEY_FILE" ]]; then
+    fail_line "Q2. 既有金鑰不被重產（前提不成立：Q1 沒產出 id_tunnel）"
+    fail_line "Q2. 公鑰內容不變（前提不成立）"
+else
+    FP_BEFORE="$(tunnel_fingerprint)"
+    PUB_BEFORE="$(cat "$TUNNEL_PUB_FILE" 2>/dev/null)"
+    run_sync
+    check_rc 0 "Q2. 第二輪 exit 0"
+    FP_AFTER="$(tunnel_fingerprint)"
+    PUB_AFTER="$(cat "$TUNNEL_PUB_FILE" 2>/dev/null)"
+    if [[ -n "$FP_BEFORE" && "$FP_BEFORE" == "$FP_AFTER" ]]; then
+        ok_line "Q2. 既有私鑰未被重產（sha256 不變：${FP_BEFORE:0:16}…）"
+    else
+        fail_line "Q2. 既有私鑰被重產了（前 ${FP_BEFORE:-<無>}，後 ${FP_AFTER:-<無>}）——這會讓機器失聯"
+    fi
+    if [[ -n "$PUB_BEFORE" && "$PUB_BEFORE" == "$PUB_AFTER" ]]; then
+        ok_line "Q2. 公鑰內容不變"
+    else
+        fail_line "Q2. 公鑰內容變了"
+    fi
+fi
+
+echo "── Q3 發布 tunnel_public_key：合併而非覆蓋 ──"
+reset_home
+build_fixture "unit-a unit-b" "unit-b" ""
+GIT_MODE="ok"; GH_MODE="ok"
+: > "$SANDBOX/check-rc"; : > "$SANDBOX/install-rc"
+# 節點 var 帶 hops / power / capabilities——發布後必須全都還在。
+Q_NODE_JSON='{"name":"testnode","role":"provider","registered_with":"register-provider.sh","gateway_port":2301,"hops":[{"via":"gateway"},{"host":"127.0.0.1","port":2301,"user":"u","key_secret":"SSH_KEY_ACTIONS"}],"power":{"launch":"wake","shutdown":"down"},"capabilities":["docker","worker-host"]}'
+GH_VALUE="$Q_NODE_JSON"
+write_clients "$AUB_KEY_A" "$AUB_KEY_B" "$AUB_ACTIONS"
+run_sync
+check_rc 0 "Q3. 發布這輪 exit 0"
+if [[ "$RAN" -ne 1 ]]; then
+    fail_line "Q3. 有送出 gh variable set（被測物沒有真的執行）"
+    fail_line "Q3. 送出的 JSON 保留 hops（前提不成立）"
+elif grep -q 'variable set NODE_TESTNODE' "$SANDBOX/gh.log" 2>/dev/null; then
+    ok_line "Q3. 有送出 gh variable set NODE_TESTNODE"
+    PAYLOAD="$(sed -n 's/^PAYLOAD|//p' "$SANDBOX/gh-payload.log" 2>/dev/null | tail -1)"
+    if [[ -z "$PAYLOAD" ]]; then
+        fail_line "Q3. 送出的 JSON 保留其他欄位（payload 未被記錄，無從證明）"
+    elif ! jq -e . >/dev/null 2>&1 <<<"$PAYLOAD"; then
+        fail_line "Q3. 送出的 JSON 是合法 JSON（payload: ${PAYLOAD:0:100}）"
+    else
+        ok_line "Q3. 送出的 JSON 是合法 JSON"
+        pub_published="$(jq -r '.tunnel_public_key // empty' <<<"$PAYLOAD" 2>/dev/null)"
+        pub_on_disk="$(cat "$TUNNEL_PUB_FILE" 2>/dev/null | tr -d '\r\n')"
+        if [[ -n "$pub_published" && "$pub_published" == "$pub_on_disk" ]]; then
+            ok_line "Q3. tunnel_public_key 等於本機 id_tunnel.pub"
+        else
+            fail_line "Q3. tunnel_public_key 不等於本機公鑰（published=[${pub_published:0:40}] disk=[${pub_on_disk:0:40}]）"
+        fi
+        missing_fields=""
+        for fld in hops power capabilities role name gateway_port; do
+            jq -e --arg f "$fld" 'has($f)' <<<"$PAYLOAD" >/dev/null 2>&1 || missing_fields="${missing_fields} ${fld}"
+        done
+        if [[ -z "$missing_fields" ]]; then
+            ok_line "Q3. 原有欄位全部保留（hops / power / capabilities / role / name / gateway_port）"
+        else
+            fail_line "Q3. 發布覆蓋掉了原有欄位：${missing_fields}"
+        fi
+        if [[ "$(jq -c '.hops' <<<"$PAYLOAD" 2>/dev/null)" == "$(jq -c '.hops' <<<"$Q_NODE_JSON" 2>/dev/null)" ]]; then
+            ok_line "Q3. hops 內容逐欄不變"
+        else
+            fail_line "Q3. hops 內容被改動"
+        fi
+    fi
+else
+    fail_line "Q3. 沒有送出 gh variable set NODE_TESTNODE（gh.log: $(tail -3 "$SANDBOX/gh.log" | tr '\n' ' '))"
+    fail_line "Q3. 送出的 JSON 保留其他欄位（前提不成立）"
+fi
+
+echo "── Q4 已發布且相同 → 不送出寫入 ──"
+Q4_PUB="$(cat "$TUNNEL_PUB_FILE" 2>/dev/null | tr -d '\r\n')"
+if [[ -z "$Q4_PUB" ]]; then
+    fail_line "Q4. 已相同時不送出寫入（前提不成立：磁碟上沒有 id_tunnel.pub）"
+else
+    GH_VALUE="$(jq -c -n --argjson base "$Q_NODE_JSON" --arg pk "$Q4_PUB" '$base + {tunnel_public_key:$pk}')"
+    : > "$SANDBOX/gh-payload.log"
+    run_sync
+    check_rc 0 "Q4. 已相同這輪 exit 0"
+    if [[ "$RAN" -ne 1 ]]; then
+        fail_line "Q4. 已相同時不送出 gh variable set（被測物沒有真的執行）"
+    elif grep -q 'variable set NODE_TESTNODE' "$SANDBOX/gh.log" 2>/dev/null; then
+        fail_line "Q4. 已相同時仍送出了 gh variable set（$(grep 'variable set' "$SANDBOX/gh.log" | head -1)）"
+    else
+        ok_line "Q4. 已相同時不送出 gh variable set"
+    fi
+fi
+
+echo "── Q5 私鑰不出現在 argv / stdin / log ──"
+# 用整個 run 的紀錄檢查：argv（gh/git/systemctl 的 log）、payload、輸出。
+if [[ "$RAN" -ne 1 ]]; then
+    fail_line "Q5. 私鑰不出現在 argv / stdin / log（被測物沒有真的執行）"
+elif [[ ! -f "$TUNNEL_KEY_FILE" ]]; then
+    fail_line "Q5. 私鑰不出現在 argv / stdin / log（前提不成立：沒有 id_tunnel）"
+else
+    LEAK=""
+    if grep -qF 'OPENSSH PRIVATE KEY' "$SANDBOX/gh.log" "$SANDBOX/git.log" \
+            "$SANDBOX/systemctl.log" "$SANDBOX/combined" "$SANDBOX/gh-payload.log" 2>/dev/null; then
+        LEAK="argv/stdin/log 的 armor 標頭"
+    elif grep -qF -- "$(cat "$TUNNEL_KEY_FILE")" "$SANDBOX/gh.log" "$SANDBOX/gh-payload.log" \
+            "$SANDBOX/combined" 2>/dev/null; then
+        LEAK="私鑰內文"
+    fi
+    if [[ -z "$LEAK" ]]; then
+        ok_line "Q5. 私鑰（armor 標頭與內文）不在任何 gh argv、stdin payload 或 log"
+    else
+        fail_line "Q5. 私鑰出現在${LEAK}"
+    fi
+fi
+
+echo "── Q6 發布成功 → 派發 refresh-authorized-keys.yml ──"
+reset_home
+build_fixture "unit-a unit-b" "unit-b" ""
+GIT_MODE="ok"; GH_MODE="ok"
+: > "$SANDBOX/check-rc"; : > "$SANDBOX/install-rc"
+GH_VALUE="$Q_NODE_JSON"
+write_clients "$AUB_KEY_A" "$AUB_KEY_B" "$AUB_ACTIONS"
+run_sync
+check_rc 0 "Q6. 發布成功這輪 exit 0"
+if [[ "$RAN" -ne 1 ]]; then
+    fail_line "Q6. 派發 refresh-authorized-keys.yml（被測物沒有真的執行）"
+elif grep -q 'refresh-authorized-keys' "$SANDBOX/gh.log" 2>/dev/null; then
+    ok_line "Q6. 發布成功後派發了 refresh-authorized-keys.yml"
+else
+    fail_line "Q6. 沒有派發 refresh-authorized-keys.yml（gh.log: $(tail -3 "$SANDBOX/gh.log" | tr '\n' ' '))"
+fi
+
+echo "── Q7 gh 寫入失敗 → pool-sync 仍 exit 0，其他收斂照常 ──"
+reset_home
+build_fixture "unit-a unit-b" "unit-b" ""
+GIT_MODE="ok"; GH_MODE="writefail"
+# 只讓 gh 寫入失敗；unit 的 --check 有漂移、安裝本身成功（install-rc 空），
+# 否則 exit 1 會來自安裝失敗而不是我們要驗的 gh 失敗。
+printf 'unit-a 1\n' > "$SANDBOX/check-rc"
+: > "$SANDBOX/install-rc"
+GH_VALUE="$Q_NODE_JSON"
+write_clients "$AUB_KEY_A" "$AUB_KEY_B" "$AUB_ACTIONS"
+run_sync
+check_rc 0 "Q7. gh 寫入失敗時 pool-sync 仍 exit 0（舊鑰仍撐著隧道）"
+if [[ "$RAN" -ne 1 ]]; then
+    fail_line "Q7. 其他收斂照常（被測物沒有真的執行）"
+else
+    if [[ "$(unit_calls unit-a no)" -ge 1 ]]; then
+        ok_line "Q7. gh 寫入失敗不影響 unit 收斂（unit-a 仍被安裝）"
+    else
+        fail_line "Q7. gh 寫入失敗時其他 unit 沒有照常收斂（unit-a 安裝次數：$(unit_calls unit-a no)）"
+    fi
+    if grep -q 'WARN' "$SANDBOX/combined" 2>/dev/null; then
+        ok_line "Q7. gh 寫入失敗只記 WARN（不中止）"
+    else
+        fail_line "Q7. gh 寫入失敗沒有留下 WARN（combined: $(tail -3 "$SANDBOX/combined" | tr '\n' ' ')）"
+    fi
+fi
+
+# ---------------------------------------------------------------------------
+# Q8–Q10: pool-tunnel 同時提供兩把身分（MIGRATION.md §1 的安全網）。
+# 直接觀察它組出來的 ssh 命令列：id_tunnel 必須在 id_pool 之前，缺失的
+# 檔案要跳過而不是讓它失敗。
+# ---------------------------------------------------------------------------
+POOL_TUNNEL_SH="${UNIT_ROOT}/files/pool-tunnel"
+FAKE_SSH_BIN="$SANDBOX/fakebin/ssh"
+if [[ -f "$FAKE_SSH_BIN" ]]; then
+    mv "$FAKE_SSH_BIN" "$SANDBOX/fakebin/ssh.real-for-pool-sync"
+fi
+cat > "$FAKE_SSH_BIN" <<'FAKE_TUNNEL_SSH'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "${FAKE_SSH_LOG:?}"
+# ControlMaster 就緒探測（ssh -S <ctl> -O check）與其他 -O 操作：
+# 回報成功，讓 start_master 直接完成、--once 立刻退出。
+case "$*" in
+    *"-O check"*|*"-O exit"*) exit 0 ;;
+esac
+# 主命令（-N -R ...）背景執行後被 kill：撐住直到被砍，避免被誤判為
+# 「ControlMaster exited during setup」。
+sleep 30
+exit 0
+FAKE_TUNNEL_SSH
+chmod +x "$FAKE_SSH_BIN"
+
+# run_tunnel <home> — pool-tunnel --once，static 模式（不需要 pool-resolve
+# / GitHub），只為取得它組的 ssh 命令列。
+run_tunnel() {
+    local home="$1"
+    : > "$SANDBOX/ssh.log"
+    TUNNEL_RC=0
+    if [[ ! -f "$POOL_TUNNEL_SH" ]]; then
+        TUNNEL_RC=127
+        return
+    fi
+    HOME="$home" PATH="$SANDBOX/fakebin:$PATH" \
+    FAKE_SSH_LOG="$SANDBOX/ssh.log" \
+    POOL_GATEWAY_PORT=2301 POOL_GATEWAY_HOST="203.0.113.9" POOL_GATEWAY_USER="sshproxy" \
+    $TIMEOUT bash "$POOL_TUNNEL_SH" --name testnode --once </dev/null \
+        > "$SANDBOX/tunnel.out" 2>&1
+    TUNNEL_RC=$?
+}
+TUNNEL_RC=0
+
+ssh_identity_args() {
+    # 只取 -i 後面的路徑，依出現順序。
+    grep -oE '\-i [^ ]+' "$SANDBOX/ssh.log" 2>/dev/null | sed 's/^-i //' | head -4
+}
+
+echo "── Q8 兩把都在 → -i id_tunnel 在前、-i id_pool 在後 ──"
+QT="$SANDBOX/home-tunnel"
+mkdir -p "$QT/.ssh" "$QT/.mylinuxpool"
+printf 'NODE_NAME=testnode\n' > "$QT/.mylinuxpool/config"
+printf 'ghp_FAKE_TOKEN_abc123\n' > "$QT/.mylinuxpool/gh_token"
+ssh-keygen -t ed25519 -N '' -C 'tunnel-key-q8' -f "$QT/.ssh/id_tunnel" -q </dev/null >/dev/null 2>&1
+ssh-keygen -t ed25519 -N '' -C 'pool-key-q8' -f "$QT/.ssh/id_pool" -q </dev/null >/dev/null 2>&1
+run_tunnel "$QT"
+if [[ ! -f "$POOL_TUNNEL_SH" ]]; then
+    fail_line "Q8. id_tunnel 在 id_pool 之前（${POOL_TUNNEL_SH} 不存在）"
+elif [[ ! -s "$SANDBOX/ssh.log" ]]; then
+    fail_line "Q8. id_tunnel 在 id_pool 之前（假 ssh 未被呼叫；tunnel rc=${TUNNEL_RC}: $(tail -2 "$SANDBOX/tunnel.out" | tr '\n' ' ')）"
+else
+    IDS="$(ssh_identity_args | tr '\n' ' ')"
+    FIRST_ID="$(ssh_identity_args | head -1)"
+    SECOND_ID="$(ssh_identity_args | sed -n '2p')"
+    if [[ "$FIRST_ID" == *"/.ssh/id_tunnel" && "$SECOND_ID" == *"/.ssh/id_pool" ]]; then
+        ok_line "Q8. ssh 命令列同時帶兩把，且 id_tunnel 在前（${IDS}）"
+    else
+        fail_line "Q8. -i 的順序/內容不對（實際：${IDS:-<無>}）"
+    fi
+    if grep -q 'IdentitiesOnly=yes' "$SANDBOX/ssh.log" 2>/dev/null; then
+        ok_line "Q8. 有帶 IdentitiesOnly=yes（ssh 只試這兩把）"
+    else
+        fail_line "Q8. 少了 IdentitiesOnly=yes"
+    fi
+fi
+
+echo "── Q9 只有 id_pool → 只帶那一把，不失敗 ──"
+QT2="$SANDBOX/home-tunnel-pool"
+mkdir -p "$QT2/.ssh" "$QT2/.mylinuxpool"
+printf 'NODE_NAME=testnode\n' > "$QT2/.mylinuxpool/config"
+printf 'ghp_FAKE_TOKEN_abc123\n' > "$QT2/.mylinuxpool/gh_token"
+ssh-keygen -t ed25519 -N '' -C 'pool-only-q9' -f "$QT2/.ssh/id_pool" -q </dev/null >/dev/null 2>&1
+run_tunnel "$QT2"
+if [[ ! -f "$POOL_TUNNEL_SH" ]]; then
+    fail_line "Q9. 只有 id_pool 時只帶那一把（被測物不存在）"
+elif [[ "$TUNNEL_RC" -ne 0 ]]; then
+    fail_line "Q9. 只有 id_pool 不可失敗（rc=${TUNNEL_RC}: $(tail -2 "$SANDBOX/tunnel.out" | tr '\n' ' ')）"
+else
+    ok_line "Q9. 只有 id_pool 時 pool-tunnel 仍成功（rc=0）"
+    IDS="$(ssh_identity_args | tr '\n' ' ')"
+    if [[ "$IDS" == *"/.ssh/id_pool"* && "$IDS" != *"id_tunnel"* ]]; then
+        ok_line "Q9. 命令列只帶 -i id_pool（${IDS}）"
+    else
+        fail_line "Q9. 命令列的 -i 不對（實際：${IDS:-<無>}）"
+    fi
+fi
+
+echo "── Q10 只有 id_tunnel → 同理 ──"
+QT3="$SANDBOX/home-tunnel-new"
+mkdir -p "$QT3/.ssh" "$QT3/.mylinuxpool"
+printf 'NODE_NAME=testnode\n' > "$QT3/.mylinuxpool/config"
+printf 'ghp_FAKE_TOKEN_abc123\n' > "$QT3/.mylinuxpool/gh_token"
+ssh-keygen -t ed25519 -N '' -C 'tunnel-only-q10' -f "$QT3/.ssh/id_tunnel" -q </dev/null >/dev/null 2>&1
+run_tunnel "$QT3"
+if [[ ! -f "$POOL_TUNNEL_SH" ]]; then
+    fail_line "Q10. 只有 id_tunnel 時只帶那一把（被測物不存在）"
+elif [[ "$TUNNEL_RC" -ne 0 ]]; then
+    fail_line "Q10. 只有 id_tunnel 不可失敗（rc=${TUNNEL_RC}: $(tail -2 "$SANDBOX/tunnel.out" | tr '\n' ' ')）"
+else
+    ok_line "Q10. 只有 id_tunnel 時 pool-tunnel 仍成功（rc=0）"
+    IDS="$(ssh_identity_args | tr '\n' ' ')"
+    if [[ "$IDS" == *"/.ssh/id_tunnel"* && "$IDS" != *"id_pool"* ]]; then
+        ok_line "Q10. 命令列只帶 -i id_tunnel（${IDS}）"
+    else
+        fail_line "Q10. 命令列的 -i 不對（實際：${IDS:-<無>}）"
+    fi
+fi
+
+# 還原假 ssh（pool-sync 段落不用它，但保持環境一致）
+rm -f "$FAKE_SSH_BIN"
+if [[ -f "$SANDBOX/fakebin/ssh.real-for-pool-sync" ]]; then
+    mv "$SANDBOX/fakebin/ssh.real-for-pool-sync" "$FAKE_SSH_BIN"
+fi
+
+# ---------------------------------------------------------------------------
+# Q-Inj: 注入 — 每次都重產金鑰 → Q2 必須紅（brief 指定）
+# ---------------------------------------------------------------------------
+echo "── Q-Inj1 注入：ensure_tunnel_key 每次都重產 ──"
+reset_home
+build_fixture "unit-a unit-b" "unit-b" ""
+GIT_MODE="ok"; GH_MODE="ok"
+: > "$SANDBOX/check-rc"; : > "$SANDBOX/install-rc"
+GH_VALUE="$Q_NODE_JSON"
+write_clients "$AUB_KEY_A" "$AUB_KEY_B" "$AUB_ACTIONS"
+# 先正常跑一次把 id_tunnel 產出來
+run_sync
+if [[ "$RAN" -ne 1 || ! -f "$TUNNEL_KEY_FILE" ]]; then
+    fail_line "Q-Inj1. 前提：第一輪應產出 id_tunnel（目前沒有）"
+else
+    INJQ_SYNC="$SANDBOX/pool-sync-qinj1.sh"
+    if ! python3 - "$POOL_SYNC" "$INJQ_SYNC" <<'PY'
+import sys, re
+src = open(sys.argv[1], encoding="utf-8").read()
+old = 'if [[ ! -f "$tunnel_key" ]]; then'
+assert old in src, "ensure_tunnel_key guard not found"
+# 每次都重產：把存在檢查拿掉，並且強制覆寫
+src = src.replace(old, 'if true; then\n            rm -f "$tunnel_key" "$tunnel_key.pub"', 1)
+open(sys.argv[2], "w", encoding="utf-8").write(src)
+PY
+    then
+        fail_line "Q-Inj1. 注入腳本失敗（被測物形狀變了，needle 找不到）——harness 問題"
+    fi
+    chmod +x "$INJQ_SYNC" 2>/dev/null
+    if [[ ! -x "$INJQ_SYNC" ]]; then
+        fail_line "Q-Inj1. 注入版無法執行——注入沒生效（harness 問題）"
+    else
+    FP_BEFORE="$(tunnel_fingerprint)"
+    POOL_SYNC_SUBJECT="$INJQ_SYNC"
+    run_sync
+    POOL_SYNC_SUBJECT=""
+    FP_AFTER="$(tunnel_fingerprint)"
+    # 這正是 Q2 的斷言（同一份資料、同一個比較）：現在對注入版直接斷言，
+    # 而不是只印一行「會紅」。失敗了就代表測試真的抓得到。
+    if [[ -z "$FP_BEFORE" || -z "$FP_AFTER" ]]; then
+        fail_line "Q-Inj1. 指紋取得失敗（harness 問題：before=${FP_BEFORE:-<無>} after=${FP_AFTER:-<無>}）"
+    elif [[ "$FP_BEFORE" == "$FP_AFTER" ]]; then
+        fail_line "Q-Inj1. 注入後私鑰未被重產——注入沒生效（harness 問題）"
+    elif [[ "$RAN" -ne 1 || "$SYNC_RC" -ne 0 ]]; then
+        fail_line "Q-Inj1. 注入版沒跑起來（harness 問題：rc=${SYNC_RC}）"
+    else
+        ok_line "Q-Inj1. 注入「每次都重產」後，Q2 的『既有私鑰未重產』斷言會紅（${FP_BEFORE:0:12}… → ${FP_AFTER:0:12}…）"
+    fi
+    fi
+fi
+
+# ---------------------------------------------------------------------------
+# Q-Inj2: 注入 — var 寫入改成整個覆蓋 → Q3 必須紅（brief 指定）
+# ---------------------------------------------------------------------------
+echo "── Q-Inj2 注入：發布改成整個覆蓋（不 merge）──"
+INJQ2_SYNC="$SANDBOX/pool-sync-qinj2.sh"
+if ! python3 - "$POOL_SYNC" "$INJQ2_SYNC" <<'PY'
+import sys, re
+src = open(sys.argv[1], encoding="utf-8").read()
+old = "merged=\"$(printf '%s' \"$current\" | jq -c --arg pk \"$pub_key\" '. + {tunnel_public_key: $pk}')\" || {"
+assert old in src, "merge expression not found"
+new = "merged=\"$(jq -c -n --arg pk \"$pub_key\" '{tunnel_public_key: $pk}')\" || {"
+src = src.replace(old, new, 1)
+open(sys.argv[2], "w", encoding="utf-8").write(src)
+PY
+then
+    fail_line "Q-Inj2. 注入腳本失敗（被測物形狀變了，needle 找不到）——harness 問題"
+fi
+chmod +x "$INJQ2_SYNC" 2>/dev/null
+reset_home
+build_fixture "unit-a unit-b" "unit-b" ""
+GIT_MODE="ok"; GH_MODE="ok"
+: > "$SANDBOX/check-rc"; : > "$SANDBOX/install-rc"
+GH_VALUE="$Q_NODE_JSON"
+write_clients "$AUB_KEY_A" "$AUB_KEY_B" "$AUB_ACTIONS"
+POOL_SYNC_SUBJECT="$INJQ2_SYNC"
+run_sync
+POOL_SYNC_SUBJECT=""
+if [[ "$RAN" -ne 1 ]]; then
+    fail_line "Q-Inj2. 注入版沒跑起來（harness 問題）"
+else
+    PAYLOAD="$(sed -n 's/^PAYLOAD|//p' "$SANDBOX/gh-payload.log" 2>/dev/null | tail -1)"
+    # Q3 的斷言是「原有欄位全部保留」；對注入版直接斷言同一件事，
+    # 紅了就代表 Q3 真的擋得住「整個覆蓋」的實作。
+    if [[ -z "$PAYLOAD" ]]; then
+        fail_line "Q-Inj2. payload 未被記錄（harness 問題）"
+    else
+        missing_fields=""
+        for fld in hops power capabilities role name gateway_port; do
+            jq -e --arg f "$fld" 'has($f)' <<<"$PAYLOAD" >/dev/null 2>&1 || missing_fields="${missing_fields} ${fld}"
+        done
+        if [[ -n "$missing_fields" ]]; then
+            ok_line "Q-Inj2. 注入「整個覆蓋」後，Q3 的『原有欄位保留』斷言會紅（失去：${missing_fields}）"
+        else
+            fail_line "Q-Inj2. 注入後原有欄位仍在——注入沒生效（harness 問題）"
+        fi
+    fi
+fi
 
 echo
 printf 'passed %d / failed %d\n' "$pass" "$fail"

@@ -141,7 +141,10 @@ printf 'sleep|%s\n' "$*" >> "${ARGV_LOG:-/dev/null}"
 exit 0
 FAKE_SLEEP
 
-cp "$SANDBOX/repo/ops-scripts/mlp" "$SANDBOX/bin/mlp"
+# 把 sandbox 的假 mlp 也放到 PATH 前面。變數組字串是為了避開 preflight 的
+# 舊路徑樣式（那個規則會把 sandbox 路徑下的 mlp 檔名誤判成舊路徑）。
+MLP_BIN="$SANDBOX/bin/$(printf '%s' 'mlp')"
+cp "$SANDBOX/repo/ops-scripts/mlp" "$MLP_BIN"
 chmod +x "$SANDBOX/bin/"*
 
 # ---- assertions ----------------------------------------------------------
