@@ -54,18 +54,17 @@ for tool in git jq python3; do
 done
 
 SANDBOX="$(mktemp -d "${TMPDIR:-/tmp}/test-workers-d-path.XXXXXX")"
-PROBE="scripts/tests/.stale-path-probe.txt"
+# Sections 4/5 run preflight inside a private git repo under $SANDBOX (see
+# the note there): the probe lives in that copy, never in the shared tree,
+# so nothing is staged into this working tree's index and concurrent runs of
+# this suite cannot influence each other. PROBE is assigned there.
 
-# 清理：git index 裡若還有 probe 檔要拔掉（不 commit，但 index 必須還原）。
+# 清理：sandbox 內含私有 git 副本，整包刪掉即可；不碰共用 tree 的 index。
 # BASH_SUBSHELL 守門：命令置換的子 shell 會繼承 EXIT trap，若讓它在子
 # shell 退出時也刪 sandbox，主 shell 後續步驟全部報「檔案不存在」——那種
 # 假陽性（或假紅）比漏測更糟。cleanup 只在主 shell（subshell=0）執行。
 cleanup() {
     [[ "${BASH_SUBSHELL:-0}" -eq 0 ]] || return 0
-    if git ls-files --error-unmatch "$PROBE" >/dev/null 2>&1; then
-        git rm --cached --quiet -- "$PROBE" 2>/dev/null
-    fi
-    rm -f "$PROBE"
     rm -rf "$SANDBOX"
 }
 trap cleanup EXIT INT TERM
@@ -202,30 +201,60 @@ fi
 
 # ---------------------------------------------------------------------------
 # 4 + 5. preflight 的舊路徑檢查（注入驗證）
+#
+# These run against a PRIVATE git repo, not the shared working tree. preflight
+# decides what to scan from `git ls-files`, and the injection works by staging
+# a probe file — so running it in place mutates the shared index. Two copies
+# of this suite running at once then see each other's probe: run B's baseline
+# fails on run A's staged probe (and vice versa), which is exactly the
+# intermittent 4a/5 failures observed when several panes ran the suite
+# together. A private clone keeps each run's index to itself; it is also a
+# stricter test, since nothing from the surrounding tree can leak in.
 # ---------------------------------------------------------------------------
 echo "── 4. preflight 抓得到 legacy workers.d（注入）──"
-# baseline：repo 現況必須全過，否則「回綠」無法驗證。
-bash ops-scripts/preflight > "$SANDBOX/pre.0" 2>&1
-BASE_RC=$?
-if [[ "$BASE_RC" -ne 0 ]]; then
-    bad "preflight baseline 非 0（exit $BASE_RC）——repo 有其它問題，4/5 無法驗證（見 $SANDBOX/pre.0）"
+PF_REPO="$SANDBOX/preflight-repo"
+if rsync -a --exclude=.git ./ "$PF_REPO/" 2>/dev/null || cp -R . "$PF_REPO" 2>/dev/null; then
+    :
+fi
+rm -rf "$PF_REPO/.git"
+if git -C "$PF_REPO" init -q 2>/dev/null && git -C "$PF_REPO" add -A 2>/dev/null; then
+    PF_READY=1
 else
-    ok "preflight baseline 全過（exit 0）"
+    PF_READY=0
+fi
+PROBE="$PF_REPO/scripts/tests/.stale-path-probe.$$.txt"
+PROBE_STEM="$(basename "$PROBE")"
+
+run_pf() {
+    ( cd "$PF_REPO" && bash ops-scripts/preflight ) > "$1" 2>&1
+}
+
+if [[ "$PF_READY" -ne 1 ]]; then
+    bad "preflight baseline（無法建立私有 git 副本，4/5 無從驗證）"
+else
+    # baseline：私有副本現況必須全過，否則「回綠」無法驗證。
+    run_pf "$SANDBOX/pre.0"
+    BASE_RC=$?
+    if [[ "$BASE_RC" -ne 0 ]]; then
+        bad "preflight baseline 非 0（exit ${BASE_RC}）——repo 有其它問題，4/5 無法驗證（見 $SANDBOX/pre.0）"
+    else
+        ok "preflight baseline 全過（exit 0，私有副本）"
+    fi
 fi
 
-if [[ "$BASE_RC" -eq 0 ]]; then
+if [[ "$PF_READY" -eq 1 && "$BASE_RC" -eq 0 ]]; then
     printf '%s\n' "$LEGACY_PROBE_CONTENT" > "$PROBE"
-    git add -- "$PROBE" || bad "無法把 probe 檔加進 git index"
-    bash ops-scripts/preflight > "$SANDBOX/pre.1" 2>&1
+    git -C "$PF_REPO" add -- "$PROBE" || bad "無法把 probe 檔加進 git index"
+    run_pf "$SANDBOX/pre.1"
     INJ_RC=$?
-    if [[ "$INJ_RC" -ne 0 ]] && grep -q 'stale-path-probe' "$SANDBOX/pre.1" 2>/dev/null; then
+    if [[ "$INJ_RC" -ne 0 ]] && grep -q "$PROBE_STEM" "$SANDBOX/pre.1" 2>/dev/null; then
         ok "4a. 注入 legacy workers.d → preflight 變紅並點名 probe 檔"
     else
-        bad "4a. 注入 legacy workers.d 後 preflight 仍綠（exit $INJ_RC）——檢查不認得舊路徑 pattern（正是舊路徑活到現在的原因）"
+        bad "4a. 注入 legacy workers.d 後 preflight 仍綠（exit ${INJ_RC}）——檢查不認得舊路徑 pattern（正是舊路徑活到現在的原因）"
     fi
-    git rm --cached --quiet -- "$PROBE" 2>/dev/null
+    git -C "$PF_REPO" rm --cached --quiet -- "$PROBE" 2>/dev/null
     rm -f "$PROBE"
-    bash ops-scripts/preflight > "$SANDBOX/pre.2" 2>&1
+    run_pf "$SANDBOX/pre.2"
     if [[ $? -eq 0 ]]; then
         ok "4b. 移除 probe 後 preflight 回綠"
     else
@@ -234,17 +263,17 @@ if [[ "$BASE_RC" -eq 0 ]]; then
 fi
 
 echo "── 5. 正確路徑不被誤判 ──"
-if [[ "$BASE_RC" -eq 0 ]]; then
+if [[ "$PF_READY" -eq 1 && "$BASE_RC" -eq 0 ]]; then
     printf '%s\n' '~/.mylinuxpool/workers.d' > "$PROBE"
-    git add -- "$PROBE" || bad "無法把 probe 檔加進 git index"
-    bash ops-scripts/preflight > "$SANDBOX/pre.3" 2>&1
+    git -C "$PF_REPO" add -- "$PROBE" || bad "無法把 probe 檔加進 git index"
+    run_pf "$SANDBOX/pre.3"
     RIGHT_RC=$?
-    if [[ "$RIGHT_RC" -eq 0 ]] && ! grep -q 'stale-path-probe' "$SANDBOX/pre.3" 2>/dev/null; then
+    if [[ "$RIGHT_RC" -eq 0 ]] && ! grep -q "$PROBE_STEM" "$SANDBOX/pre.3" 2>/dev/null; then
         ok "5. 正確路徑 ~/.mylinuxpool/workers.d 未被 preflight 誤判（exit 0）"
     else
-        bad "5. 正確路徑被誤判成舊路徑（exit $RIGHT_RC）——pattern 太寬（見 $SANDBOX/pre.3）"
+        bad "5. 正確路徑被誤判成舊路徑（exit ${RIGHT_RC}）——pattern 太寬（見 $SANDBOX/pre.3）"
     fi
-    git rm --cached --quiet -- "$PROBE" 2>/dev/null
+    git -C "$PF_REPO" rm --cached --quiet -- "$PROBE" 2>/dev/null
     rm -f "$PROBE"
 fi
 

@@ -253,6 +253,13 @@ jobs:
       # that follows the existing WORKER_KEY=-e injection, and a mask
       # redacts it anywhere in later logs).
       #
+      # WORKER_AUTHORIZED_KEYS (the worker account's login list) is
+      # assembled from the CLIENT_* variables here, the same single
+      # source every machine takes (authkeys_assemble with CLIENT_ACTIONS
+      # as the required key — KEY-DESIGN §3.2; the static encrypted
+      # bundles were deleted in §8). The worker is a brand-new container,
+      # so only the Actions key + the humans' keys are needed.
+      #
       # Order is the safety design (brief-T): claim → build → mint →
       # publish → refresh → run — refresh still happens before the
       # container starts.
@@ -264,6 +271,8 @@ jobs:
         run: |
           set -euo pipefail
           source scripts/create-worker.sh
+          source scripts/refresh-authkeys.sh
+          source scripts/lib/authkeys.sh
           key="$(create_worker_mint_tunnel_key)" || { echo "::error::could not mint a tunnel key — see log above"; exit 1; }
           worker_key_b64="$(printf '%s\n' "$key" | head -1)"
           worker_pub="$(printf '%s\n' "$key" | sed -n 2p)"
@@ -272,13 +281,26 @@ jobs:
           # are not masked by GitHub; secrets.* are — this is the belt).
           echo "::add-mask::$worker_key_b64"
           echo "::add-mask::$worker_key"
+
+          vars_json="$(gh api "repos/${GH_REPO}/actions/variables?per_page=100" --paginate)"
+          clients="$(refresh_collect_clients "$vars_json")" || { echo "::error::cannot collect CLIENT_* variables"; exit 1; }
+          actions_pk="$(printf '%s' "$clients" | jq -r '.[] | select(.name == "actions") | .public_key // empty' 2>/dev/null || true)"
+          if [[ -z "$actions_pk" ]]; then
+            echo "::error::CLIENT_ACTIONS is missing — cannot assemble a login list that provably keeps Actions in"
+            exit 1
+          fi
+          worker_authorized_keys="$(authkeys_assemble "$clients" "$actions_pk")" || {
+            echo "::error::authorized_keys assembly failed (see authkeys.sh stderr) — aborting"
+            exit 1
+          }
+
           cmd="$(create_worker_build_run_cmd \
             "${{ steps.identity.outputs.container }}" "${{ steps.identity.outputs.image_tag }}" \
             "${{ steps.port.outputs.port }}" "${{ steps.gateway.outputs.ip }}" \
             "${{ steps.gateway.outputs.tunnel_user }}" "${{ steps.identity.outputs.name }}" \
             "$worker_key" \
-            "shared-configs/ssh-admin/files/authorized_keys.crypted" \
-            "$FILE_CRYPTO_KEY" "profiles/worker/${{ inputs.image }}/profile.json" "$ALL_SECRETS_JSON")" \
+            "$worker_authorized_keys" \
+            "profiles/worker/${{ inputs.image }}/profile.json" "$ALL_SECRETS_JSON")" \
             || { echo "::error::could not build the docker-run command — see log above"; exit 1; }
           {
             echo "cmd=${cmd}"

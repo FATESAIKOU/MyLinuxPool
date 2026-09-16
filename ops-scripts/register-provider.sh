@@ -194,7 +194,7 @@ install_user_gh() {
 
 # ---- step 1: preflight -----------------------------------------------------
 step1_preflight() {
-    log INFO "step 1/8: preflight checks"
+    log INFO "step 1/9: preflight checks"
 
     command -v bash >/dev/null 2>&1 || { log ERROR "bash not found"; exit 1; }
 
@@ -293,7 +293,7 @@ step1_preflight_no_sudo() {
 # all, so we drop the token in a file for pool-resolve to pick up later
 # and export it for the rest of this run.
 step2_store_token() {
-    log INFO "step 2/8: store gh token + git credential helper"
+    log INFO "step 2/9: store gh token + git credential helper"
 
     mkdir -p "$STATE_DIR"
 
@@ -354,10 +354,10 @@ step2_store_token() {
 # present, pull" branch is gone because there is nothing to pull: the
 # clone dies with the trap at the end of this run.
 step3_fetch_runtime() {
-    log INFO "step 3/8: fetch runtime (shallow clone into temp ${REPO_DIR}, install profile-declared units)"
+    log INFO "step 3/9: fetch runtime (shallow clone into temp ${REPO_DIR}, install profile-declared units)"
 
     # BIN_DIR is what pool-runtime's own install.sh derives as
-    # <home>/.mylinuxpool/bin — kept as our own constant too since step8
+    # <home>/.mylinuxpool/bin — kept as our own constant too since step9
     # invokes pool-resolve directly.
     mkdir -p "$STATE_DIR"
 
@@ -402,7 +402,7 @@ step3_fetch_runtime() {
 
 # ---- step 4: local identity --------------------------------------------------
 step4_config() {
-    log INFO "step 4/8: write local identity config"
+    log INFO "step 4/9: write local identity config"
     mkdir -p "$STATE_DIR"
     printf 'NODE_NAME=%s\n' "$NAME" > "${STATE_DIR}/config"
     log INFO "wrote NODE_NAME=${NAME} to ${STATE_DIR}/config"
@@ -410,7 +410,7 @@ step4_config() {
 
 # ---- step 5: register NODE_<NAME> var (deep-merge, never clobber) ----------
 step5_register_var() {
-    log INFO "step 5/8: register ${VAR_NAME} (merge with existing if present)"
+    log INFO "step 5/9: register ${VAR_NAME} (merge with existing if present)"
 
     # `gh variable get` doesn't exist on gh 2.45.0 (fh-l's apt version) —
     # `gh api` has always existed and is equivalent.
@@ -474,7 +474,7 @@ step5_register_var() {
 # no TTY to prompt on) simply has a profile that asks for none, so this
 # step is a correct, declared no-op there rather than a special case.
 step6_sudoers() {
-    log INFO "step 6/8: sudoers rules (declared in ${PROFILE_JSON})"
+    log INFO "step 6/9: sudoers rules (declared in ${PROFILE_JSON})"
 
     local rules
     rules="$(jq -r '.sudoers_rules[]?' "$PROFILE_JSON")"
@@ -567,7 +567,7 @@ enable_linger() {
 }
 
 step7_systemd() {
-    log INFO "step 7/8: enable profile-declared systemd --user services + linger"
+    log INFO "step 7/9: enable profile-declared systemd --user services + linger"
 
     # Whichever unit was installed in step 3 already placed each service's
     # unit file under ~/.config/systemd/user/ — nothing to copy here,
@@ -610,9 +610,53 @@ step7_systemd() {
     fi
 }
 
-# ---- step 8: verify from the Gateway side ------------------------------------
-step8_verify() {
-    log INFO "step 8/8: verifying tunnel from the gateway side"
+# ---- step 8: write this machine's authorized_keys from CLIENT_* ----------
+# KEY-DESIGN §8 removed ssh-admin (the old static-bundle unit); the login
+# list now comes from the CLIENT_* variables alone. A FRESH provider must
+# get Actions' public key onto this machine BEFORE the tunnel verify runs
+# — otherwise Actions cannot reach it through the Gateway and registration
+# fails, waiting up to 30 minutes for the first pool-sync tick.
+#
+# The assembly + install is ONE shared implementation,
+# refresh_sync_local_authorized_keys (scripts/refresh-authkeys.sh) — the
+# same function pool-sync calls every 30 minutes, so there is never a
+# second copy of this rule that could drift out of sync with its guards
+# (RUNBOOK §7.12). Unlike pool-sync, this step is FATAL on failure: a
+# provider whose login list cannot be assembled is a provider Actions
+# cannot get into, and silently skipping would register it anyway.
+step8_authorized_keys() {
+    log INFO "step 8/9: assemble and write this machine's authorized_keys from CLIENT_*"
+
+    # refresh-authkeys.sh / authkeys.sh are business logic in the temp
+    # clone step 3 fetched; they must be present or the registration
+    # cannot proceed.
+    if [[ ! -f "${REPO_DIR}/scripts/refresh-authkeys.sh" \
+          || ! -f "${REPO_DIR}/scripts/lib/authkeys.sh" ]]; then
+        log ERROR "scripts/refresh-authkeys.sh or scripts/lib/authkeys.sh missing in the fetched repo — cannot assemble authorized_keys"
+        exit 1
+    fi
+    # shellcheck source=/dev/null
+    source "${REPO_DIR}/scripts/refresh-authkeys.sh"
+    # shellcheck source=/dev/null
+    source "${REPO_DIR}/scripts/lib/authkeys.sh"
+
+    local vars_json
+    vars_json="$(gh api "repos/${REPO}/actions/variables?per_page=100" --paginate 2>/dev/null || true)"
+    if [[ -z "$vars_json" ]]; then
+        log ERROR "cannot read GitHub variables — a provider without a login list is a provider Actions cannot reach; aborting"
+        exit 1
+    fi
+
+    refresh_sync_local_authorized_keys "$vars_json" "${SSH_DIR}/authorized_keys" || {
+        log ERROR "could not assemble/install authorized_keys — aborting (a provider Actions cannot get into is not a valid outcome)"
+        exit 1
+    }
+    log INFO "this machine's authorized_keys now matches the CLIENT_* declarations"
+}
+
+# ---- step 9: verify from the Gateway side ------------------------------------
+step9_verify() {
+    log INFO "step 9/9: verifying tunnel from the gateway side"
 
     local gw_json gw_ip gw_user
     gw_json="$("${BIN_DIR}/pool-resolve" gateway)" || {
@@ -645,13 +689,13 @@ step8_verify() {
     log INFO "verified: gateway sees an SSH banner on 127.0.0.1:${GATEWAY_PORT}"
 }
 
-# ---- step 8.5: enable pool-sync.timer ----------------------------------------
-# Deliberately AFTER step8_verify: enabling with --now fires the sync
+# ---- step 9.5: enable pool-sync.timer ----------------------------------------
+# Deliberately AFTER step9_verify: enabling with --now fires the sync
 # immediately, and a first sync that detects drift would restart
-# pool-tunnel while step 8 is still verifying it. With the post-install
+# pool-tunnel while step 9 is still verifying it. With the post-install
 # patching gone (see step 7's note) the first sync has nothing to drift on,
 # but ordering verify → enable keeps the race impossible regardless.
-step85_enable_pool_sync() {
+step95_enable_pool_sync() {
     local services
     services="$(jq -r '.systemd_user_services[]?' "$PROFILE_JSON")"
 
@@ -678,8 +722,9 @@ main() {
     step5_register_var
     step6_sudoers
     step7_systemd
-    step8_verify
-    step85_enable_pool_sync
+    step8_authorized_keys
+    step9_verify
+    step95_enable_pool_sync
     log INFO "registration complete for node '${NAME}' (gateway_port=${GATEWAY_PORT})"
 }
 

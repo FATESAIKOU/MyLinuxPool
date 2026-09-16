@@ -123,6 +123,75 @@ refresh_collect_tunnel_keys() {
     return 0
 }
 
+# refresh_sync_local_authorized_keys <variables_json> [target_path]
+#   Assembles the LOGIN authorized_keys for a machine from the CLIENT_*
+#   variables (authkeys_assemble with CLIENT_ACTIONS as the required key)
+#   and installs it at <target_path> (default $HOME/.ssh/authorized_keys).
+#   A FULL REPLACE — never a union: revocation must propagate (removing the
+#   var removes the key from every machine, KEY-DESIGN §3.2).
+#
+#   This is the ONE implementation of "converge a machine's login list from
+#   the variables" — pool-sync and register-provider both call it, so there
+#   is never a second copy that could drift out of sync with its guards
+#   (RUNBOOK §7.12: one rule, two implementations, one without guards).
+#
+#   Exit 0  = the file now matches (written, or already byte-identical).
+#   Non-zero = nothing was written; stderr names the reason (unparseable
+#   variables, invalid public_key, missing CLIENT_ACTIONS, empty result).
+#   The caller decides what non-zero means: pool-sync logs WARN and keeps
+#   running (N6 — GitHub being down must not become a provider fault);
+#   register-provider ABORTS, because a provider whose login list cannot
+#   be assembled is a provider Actions cannot get into.
+#   Requires log() (both callers define it) and refresh_collect_clients +
+#   authkeys_assemble (both source this file and scripts/lib/authkeys.sh).
+refresh_sync_local_authorized_keys() {
+    local vars_json="${1:-}" target="${2:-${HOME}/.ssh/authorized_keys}"
+    local clients actions_pk login tmp n
+
+    clients="$(refresh_collect_clients "$vars_json")" || {
+        log ERROR "cannot collect CLIENT_* variables — ${target} left untouched"
+        return 1
+    }
+
+    # required_pubkey is CLIENT_ACTIONS — the self-lockout guard only works
+    # if we actually have that key to require. A missing CLIENT_ACTIONS is
+    # a data-state problem, not a program error: WARN here, non-zero return,
+    # and let the CALLER decide how fatal that is (pool-sync keeps running,
+    # register-provider aborts).
+    actions_pk="$(printf '%s' "$clients" | jq -r '.[] | select(.name == "actions") | .public_key // empty' 2>/dev/null || true)"
+    if [[ -z "$actions_pk" ]]; then
+        log WARN "no CLIENT_ACTIONS public key found — cannot guarantee Actions stays in; ${target} left untouched"
+        return 1
+    fi
+
+    login="$(authkeys_assemble "$clients" "$actions_pk")" || {
+        log ERROR "authorized_keys assembly failed — ${target} left untouched"
+        return 1
+    }
+    if [[ -z "$login" ]]; then
+        log ERROR "assembled authorized_keys is empty — refusing to write"
+        return 1
+    fi
+
+    if [[ -f "$target" ]] && cmp -s <(printf '%s\n' "$login") "$target"; then
+        log INFO "authorized_keys already matches CLIENT_* declarations"
+        return 0
+    fi
+
+    mkdir -p "$(dirname "$target")"
+    tmp="$(mktemp "$(dirname "$target")/.ak.XXXXXX")"
+    printf '%s\n' "$login" > "$tmp"
+    chmod 600 "$tmp"
+    if mv -f "$tmp" "$target" 2>/dev/null; then
+        n="$(printf '%s\n' "$login" | wc -l | tr -d ' ')"
+        log INFO "converged ${target} from CLIENT_* (${n} key(s))"
+        return 0
+    fi
+    rm -f "$tmp"
+    log ERROR "could not install ${target}"
+    return 1
+}
+
 # refresh_build_install_cmd <remote_path> <content> [--sudo]
 #   Builds the shell command string to hand to pool-ssh (which runs it on
 #   the Gateway). Atomic install: write a temp file in the same directory,

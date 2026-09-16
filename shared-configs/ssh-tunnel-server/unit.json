@@ -1,7 +1,0 @@
-{
-  "name": "ssh-tunnel-server",
-  "description": "sshproxy 帳號的 authorized_keys（被撥入的一方：Gateway）",
-  "needs_key": true,
-  "needs_root": false,
-  "provides": []
-}

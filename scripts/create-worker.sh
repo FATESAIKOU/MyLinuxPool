@@ -227,42 +227,36 @@ create_worker_build_claim_cmd() {
 }
 
 # create_worker_build_run_cmd <container> <image_tag> <port> <gw_host> \
-#     <tunnel_user> <node_name> <worker_key> <authorized_keys_crypted> \
-#     <file_crypto_key> <profile_json> <all_secrets_json>
+#     <tunnel_user> <node_name> <worker_key> <authorized_keys_content> \
+#     <profile_json> <all_secrets_json>
 #   Prints the assembled `docker run ...` command line to stdout.
 #
 #   Everything that touches a secret VALUE happens in here — worker_key,
-#   the decrypted authorized_keys bundle, and every profile-declared
-#   secret from all_secrets_json — precisely so no already-%q-quoted
-#   secret ever has to cross a step-output boundary: a %q-quoted value
-#   handed across `${{ steps.X.outputs.Y }}` gets re-interpreted as
-#   literal shell source by whatever step reads it (GH Actions substitutes
-#   that text before bash parses it), which would mangle anything
-#   containing real escapes (a multi-line key, say) and can corrupt
-#   $GITHUB_OUTPUT itself. Only the caller's OWN step may call this
-#   function — its stdout must never be echoed back through a second
-#   step boundary un-consumed.
+#   and every profile-declared secret from all_secrets_json — precisely
+#   so no already-%q-quoted secret ever has to cross a step-output
+#   boundary: a %q-quoted value handed across `${{ steps.X.outputs.Y }}`
+#   gets re-interpreted as literal shell source by whatever step reads it
+#   (GH Actions substitutes that text before bash parses it), which would
+#   mangle anything containing real escapes (a multi-line key, say) and
+#   can corrupt $GITHUB_OUTPUT itself. Only the caller's OWN step may
+#   call this function — its stdout must never be echoed back through a
+#   second step boundary un-consumed.
 #
-#   WORKER_AUTHORIZED_KEYS is the SAME bundle used to log into the
-#   Gateway (personal keys + SSH_KEY_ACTIONS' public half), never
-#   something derived from the tunnel identity — sshproxy is the tunnel
-#   identity, not an interactive-login one (2026-09-14 incident: workers
-#   came up with only that key authorized, so the tunnel worked but
-#   nobody could actually log in).
+#   WORKER_AUTHORIZED_KEYS is the assembled login list for the worker's
+#   `worker` account (the same list every machine takes from CLIENT_* via
+#   authkeys_assemble — KEY-DESIGN §3.2, no static encrypted bundles since
+#   §8). It is the interactive-login list, never something derived from
+#   the tunnel identity — sshproxy is the tunnel identity, not an
+#   interactive-login one (2026-09-14 incident: workers came up with only
+#   that key authorized, so the tunnel worked but nobody could actually
+#   log in).
 create_worker_build_run_cmd() {
     local container="$1" image_tag="$2" port="$3" gw_host="$4"
     local tunnel_user="$5" node_name="$6" worker_key="$7"
-    local authorized_keys_crypted="$8" file_crypto_key="$9" profile_json="${10}" all_secrets_json="${11}"
+    local authorized_keys_content="$8" profile_json="${9}" all_secrets_json="${10}"
 
-    if [[ ! -f "$authorized_keys_crypted" ]]; then
-        log ERROR "${authorized_keys_crypted} not found"
-        return 1
-    fi
-
-    local authorized_keys_content
-    authorized_keys_content="$("${SCRIPT_DIR}/lib/crypto.sh" decrypt "$file_crypto_key" < "$authorized_keys_crypted")"
     if [[ -z "$authorized_keys_content" ]]; then
-        log ERROR "decrypting ${authorized_keys_crypted} produced no content — wrong FILE_CRYPTO_KEY?"
+        log ERROR "WORKER_AUTHORIZED_KEYS is empty — refusing to start a worker nobody can log into"
         return 1
     fi
 

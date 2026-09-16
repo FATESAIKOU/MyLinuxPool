@@ -65,26 +65,22 @@ rotate_assemble_login_keys() {
     authkeys_assemble "$clients_json" "$actions_pubkey"
 }
 
-# rotate_assemble_sshproxy_keys <shared_pubkey> <tunnel_keys>
-#   Assembles the sshproxy (tunnel) list: the SHARED legacy public key
-#   (MIGRATION.md §2 — add-before-remove, it stays until KEY-DESIGN §8)
-#   UNION every provider/worker tunnel_public_key. Prints one key per
-#   line. The shared key MUST be present in the result — it is what every
-#   current provider dials in with; a list without it would lock the whole
-#   fleet out of a fresh Gateway. Non-zero, no output when it is missing
-#   or the input is empty.
+# rotate_assemble_sshproxy_keys <tunnel_keys>
+#   Assembles the sshproxy (tunnel) list from every machine's own
+#   tunnel_public_key (KEY-DESIGN §3.2: no shared legacy key since §8).
+#   Prints one key per line, sorted, de-duplicated.
+#   The safety guard is: an EMPTY result must abort (non-zero, no
+#   output) — an empty sshproxy list means no provider or worker can
+#   dial in, which is the same lockout the migration-era shared-key
+#   guard existed to prevent. A list with content but no shared key is
+#   no longer a failure: the shared key is gone by design.
 rotate_assemble_sshproxy_keys() {
-    local shared_pubkey="$1" tunnel_keys="$2"
+    local tunnel_keys="${1:-}"
     local all
-    all="$(printf '%s\n%s\n' "$shared_pubkey" "$tunnel_keys" \
+    all="$(printf '%s\n' "$tunnel_keys" \
         | sed '/^[[:space:]]*$/d' | sort -u)"
-    # The shared key is a REQUIRED input, not something the union happens
-    # to contain: during the migration every current provider dials in
-    # with it, so a list without it locks the whole fleet out of a fresh
-    # Gateway. Guard its presence explicitly — an empty shared key (e.g.
-    # decryption failed) must abort, not silently produce a list.
-    if [[ -z "$shared_pubkey" ]] || ! printf '%s\n' "$all" | grep -qF "$shared_pubkey"; then
-        log ERROR "sshproxy list would miss the shared tunnel key — refusing (MIGRATION add-before-remove)"
+    if [[ -z "$all" ]]; then
+        log ERROR "sshproxy list is empty — refusing (no provider/worker could dial in)"
         return 1
     fi
     printf '%s\n' "$all"

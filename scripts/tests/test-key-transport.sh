@@ -129,7 +129,19 @@ if [[ "${1:-}" == "repo" && "${2:-}" == "clone" ]]; then
     git clone --branch "$branch" "https://github.com/${repo}" "$dest"
     exit $?
 fi
-if [[ "${1:-}" == "api" ]]; then echo "{}"; exit 0; fi
+# api: serve a valid variables payload WITH the CLIENT_* entries
+# registration needs. Registration sources the shared scripts and assembles
+# authorized_keys from CLIENT_* before finishing; a body without them makes
+# it abort at that step (task U follow-up), which would hide the install
+# loop this section measures. The keys are fake but well-formed, and this
+# suite is about argv/stdin transport, not key assembly.
+if [[ "${1:-}" == "api" ]]; then
+    printf '%s\n' '{"total_count":2,"variables":[
+      {"name":"CLIENT_FATESAIKOU_MAC","value":"{\"name\":\"fatesaikou-mac\",\"public_key\":\"ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIKTTRANSPORTMAC mac@test\",\"added_at\":\"2026-09-16T12:00:00Z\"}"},
+      {"name":"CLIENT_ACTIONS","value":"{\"name\":\"actions\",\"public_key\":\"ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIKTTRANSPORTACT actions@test\",\"added_at\":\"2026-09-16T12:00:00Z\"}"}
+    ]}'
+    exit 0
+fi
 if [[ "${1:-}" == "variable" ]]; then cat >/dev/null; exit 0; fi
 exit 0
 FAKE_GH
@@ -380,7 +392,7 @@ fi
 emit "── 3) register-provider.sh unit install loop ──"
 REG_SRC="ops-scripts/register-provider.sh"
 TPL="$SANDBOX/register-template"
-mkdir -p "$TPL/profiles/provider/no-sudo" "$TPL/shared-configs"
+mkdir -p "$TPL/profiles/provider/no-sudo" "$TPL/shared-configs" "$TPL/scripts/lib"
 printf '%s\n' '{"shared_config":["pool-runtime","unit-alpha","unit-beta"],"sudoers_rules":[],"systemd_user_services":[],"linger":false}' \
     > "$TPL/profiles/provider/no-sudo/profile.json"
 for u in pool-runtime unit-alpha unit-beta; do
@@ -388,6 +400,13 @@ for u in pool-runtime unit-alpha unit-beta; do
     cp "$SANDBOX/fake-install.sh" "$TPL/shared-configs/$u/install.sh"
     chmod +x "$TPL/shared-configs/$u/install.sh"
 done
+# Registration now assembles authorized_keys from CLIENT_* via the shared
+# scripts, so the fake clone must carry them or the run aborts before the
+# install loop this section measures (task U follow-up).
+if [[ -f scripts/refresh-authkeys.sh && -f scripts/lib/authkeys.sh ]]; then
+    cp scripts/refresh-authkeys.sh "$TPL/scripts/refresh-authkeys.sh"
+    cp scripts/lib/authkeys.sh "$TPL/scripts/lib/authkeys.sh"
+fi
 
 REG_TRUSTED=0
 if [[ -f "$REG_SRC" ]]; then REG_TRUSTED=1; fi

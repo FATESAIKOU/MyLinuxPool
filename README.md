@@ -68,13 +68,12 @@
 | 身分 | 誰用 | 走哪 |
 |---|---|---|
 | `SSH_KEY_ACTIONS` | GitHub Actions、管理員 | 由上往下進入所有機器 |
-| 隧道身分（`ssh-tunnel-client/files/id_rsa.crypted`） | provider / worker | 由下往上掛反向隧道 |
+| 隧道身分（各機自己的 `~/.ssh/id_tunnel`） | provider / worker | 由下往上掛反向隧道 |
 
-**不變式**：由 `shared-configs/ssh-tunnel-client/files/id_rsa.crypted` 用
-`ssh-keygen -y` 推導出的公鑰，必須出現在
-`shared-configs/ssh-tunnel-server/files/authorized_keys.crypted` 裡
-（公鑰不再另存一份，是私鑰的函數——N7）。兩者脫鉤時，所有 provider 會
-一起 `Permission denied (publickey)`。
+**不變式**：每台機器用自己的 `id_tunnel`（KEY-DESIGN §3.2/§8，共用私鑰已刪除）；
+公鑰存在該機的 `NODE_<NAME>.tunnel_public_key` 或 `POOL_WORKERS[].tunnel_public_key`，
+Gateway 的 sshproxy 清單由 refresh/rotate 從這些 var 組裝。不再有任何靜態
+`authorized_keys.crypted`。
 
 ## 隧道：`pool-tunnel`，不是 autossh
 
@@ -110,7 +109,7 @@ shared-configs/rclone/
 ```json
 {
   "name": "default", "role": "provider",
-  "shared_config": ["pool-runtime", "ssh-tunnel-client", "gh"],
+  "shared_config": ["pool-runtime", "gh"],
   "systemd_user_services": ["pool-tunnel.service", "pool-sync.timer"],
   "linger": true,
   "sudoers_rules": ["ALL=(root) NOPASSWD: /usr/bin/systemctl poweroff, /usr/sbin/ethtool"]
@@ -152,8 +151,9 @@ provider 只放**衍生物**。宣告在 GitHub 有一份，機器上不留第�
 它**不記版本戳記**。判斷漂移靠的是 unit 自己的內容比對，不是 commit SHA，
 所以連被手動改過的 `bin/` 也會被修回來——而且 provider 上一個新檔案都不會多。
 
-需要 `FILE_CRYPTO_KEY` 的 unit（`ssh-tunnel-client`）一律跳過：provider 邊緣
-刻意不放解密金鑰，那些只在註冊時處理。
+需要 `FILE_CRYPTO_KEY` 的 unit（`rclone`/`dotfiles`/`standalonescripts`）一律
+跳過：provider 邊緣刻意不放解密金鑰，那些只在註冊時處理（`ssh-tunnel-client`
+已在 KEY-DESIGN §8 刪除，不再有需要它的 provider unit）。
 
 盤查下來，provider 上**推導不出來的資訊只剩 59 bytes**——
 `config` 裡的 `NODE_NAME` 和 `gh_token`。
@@ -270,8 +270,10 @@ ops-scripts/mlp status
 
 **只有一項失去就救不回來**：
 
-- `FILE_CRYPTO_KEY` — 解開 9 個 `.crypted` 檔的對稱金鑰。GitHub secret 是
-  唯寫的，讀不回來。失去它系統還活著，但你再也無法註冊新機器或檢視機密。
+- `FILE_CRYPTO_KEY` — 解開 `.crypted` 檔的對稱金鑰（現在只剩
+  `rclone`/`dotfiles`/`standalonescripts` 在用——KEY-DESIGN §8 之後不再是
+  「掌握全叢集 ssh 存取」的金鑰）。GitHub secret 是唯寫的，讀不回來。
+  失去它系統還活著，但你無法再註冊新機器或檢視那些機密。
 
 `GH_POOL_TOKEN`、`LINODE_TOKEN` 都能重新產生，所以 `SECRETS.md` 只記重發
 程序、不記值——現值仍活在 GitHub secret 與機器上的本機副本裡。多記一份值
@@ -279,9 +281,9 @@ ops-scripts/mlp status
 密碼管理器，不在這裡留第二份。
 
 GitHub secret 只有四個：`FILE_CRYPTO_KEY`、`SSH_KEY_ACTIONS`、
-`GH_POOL_TOKEN`、`LINODE_TOKEN`。隧道身分不在其中——同一把私鑰已經以
-`shared-configs/ssh-tunnel-client/files/id_rsa.crypted` 隨 repo 分發，
-再存一份 secret 只是製造兩份要手動同步的東西。
+`GH_POOL_TOKEN`、`LINODE_TOKEN`。隧道身分不在其中——每台機器用自己的
+`~/.ssh/id_tunnel`（KEY-DESIGN §3.2，共用私鑰已刪除），沒有需要分發的
+共用私鑰。
 
 本機 repo 根目錄現在只剩 `crypto_key` 一個明文機密（`pw`、`fhproxy_pw`、
 `gw_pw`、`gh_token` 都已抹除）。
@@ -346,13 +348,14 @@ echo -n "$FILE_CRYPTO_KEY" | \
 
 ## 換 `FILE_CRYPTO_KEY`
 
-1. 用舊金鑰把 9 個 `.crypted` 全部解開。
+1. 用舊金鑰把 `.crypted` 全部解開（現在只剩 `rclone`/`dotfiles`/
+   `standalonescripts` 三支 unit 在用）。
 2. 產新金鑰，全部重新加密。
 3. `gh secret set FILE_CRYPTO_KEY`，更新 `SECRETS.md`。
-4. **兩台 provider 各重跑一次 `register-provider.sh`**（它們本機存了副本）。
+4. 需要 `FILE_CRYPTO_KEY` 的機器（Gateway）重跑一次 provision/repair。
 
-`ssh-tunnel-client` 的公鑰與 `ssh-tunnel-server` 的 `authorized_keys`
-必須同步更新，否則所有隧道一起斷。
+沒有「同步更新隧道公鑰」這一步了——隧道身分是各機自己的 `id_tunnel`
+（KEY-DESIGN §8），與 `FILE_CRYPTO_KEY` 無關。
 
 ## 換 `GH_POOL_TOKEN`
 

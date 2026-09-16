@@ -170,14 +170,16 @@ provision。用途有三處：`register-client` 之後、`register-provider` 之
 ## 7. 這個設計會讓什麼消失
 
 - `shared-configs/ssh-tunnel-client/`（整個 unit——它只存在於分發那把共用私鑰）
-- `shared-configs/ssh-tunnel-server/files/authorized_keys.crypted`
-- `shared-configs/ssh-admin/files/authorized_keys.crypted`
-- `shared-configs/ssh-admin/files/id_rsa.crypted`（已退役，順手刪）
-- `ssh-tunnel-server/install.sh` 裡那條「私鑰推導的公鑰必須在清單裡」的不變式
-  ——沒有共用私鑰之後就不存在這個對應關係
+- `shared-configs/ssh-tunnel-server/files/authorized_keys.crypted` ✅ 已刪（2026-09-16，task U）
+- `shared-configs/ssh-admin/files/authorized_keys.crypted` ✅ 已刪（task U）
+- `shared-configs/ssh-admin/files/id_rsa.crypted` ✅ 已刪（task U）
+- `ssh-tunnel-server/install.sh` 裡那條「私鑰推導的公鑰必須在清單裡」的不變式 ✅ 已刪
+- `shared-configs/ssh-admin/`（整個 unit，靜態清單的載體）✅ 已刪（task U）
 
-**`FILE_CRYPTO_KEY` 的守備範圍也跟著縮小**：剩下 `rclone`、`dotfiles`、
-`standalonescripts`。它不再是「掌握全叢集 ssh 存取」的金鑰。
+**`FILE_CRYPTO_KEY` 的守備範圍已縮小（task U 落地）**：只剩 `rclone`、
+`dotfiles`、`standalonescripts` 三個 unit 在用。它不再是「掌握全叢集 ssh
+存取」的金鑰——登入清單由 `CLIENT_*` 組裝、隧道身分是各機自己的
+`id_tunnel`，兩者都不需要它。
 
 ## 8. 取捨與未解
 

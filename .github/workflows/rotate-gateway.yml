@@ -59,20 +59,13 @@ jobs:
         with:
           token: ${{ secrets.LINODE_TOKEN }}
 
-      - name: Start ssh-agent, load Actions key + decrypted tunnel key
+      - name: Start ssh-agent, load Actions key
         id: agent
         shell: bash
         env:
           # SSH_KEY_ACTIONS is Actions' one identity across the whole
-          # cluster (management access to Gateway and every provider) —
-          # not to be confused with the tunnel identity below, which
-          # providers/workers use to reverse-tunnel in.
+          # cluster (management access to Gateway and every provider).
           SSH_KEY_ACTIONS: ${{ secrets.SSH_KEY_ACTIONS }}
-          # The tunnel identity is not a secret of its own: it already
-          # ships in the repo as ssh-tunnel-client/files/id_rsa.crypted,
-          # and Actions holds the key that opens it. One fewer secret to
-          # keep in sync with the .crypted file it duplicated.
-          FILE_CRYPTO_KEY: ${{ secrets.FILE_CRYPTO_KEY }}
         run: |
           set -euo pipefail
           eval "$(ssh-agent -s)" >/dev/null
@@ -80,16 +73,13 @@ jobs:
           echo "SSH_AGENT_PID=${SSH_AGENT_PID}" >> "$GITHUB_ENV"
 
           ssh-add - <<< "$SSH_KEY_ACTIONS"
-          scripts/lib/crypto.sh decrypt "$FILE_CRYPTO_KEY" \
-            < shared-configs/ssh-tunnel-client/files/id_rsa.crypted | ssh-add -
 
-          # Keys never touch disk: derive each public half straight out of
+          # Keys never touch disk: derive the public half straight out of
           # the agent instead of writing the private key to a file for
-          # `ssh-keygen -y`. Order matches the two ssh-add calls above.
+          # `ssh-keygen -y`.
           mapfile -t pubkeys < <(ssh-add -L)
           {
             echo "fatesaikou_pub=${pubkeys[0]}"
-            echo "sshproxy_pub=${pubkeys[1]}"
           } >> "$GITHUB_OUTPUT"
 
       - name: Read current Gateway state
@@ -111,11 +101,6 @@ jobs:
         shell: bash
         env:
           FATESAIKOU_PUBKEY: ${{ steps.agent.outputs.fatesaikou_pub }}
-          SSHPROXY_PUBKEY: ${{ steps.agent.outputs.sshproxy_pub }}
-          # The shared tunnel key is still inside ssh-tunnel-server's
-          # encrypted file during the migration (MIGRATION.md §2) — the
-          # same FILE_CRYPTO_KEY the agent step above uses.
-          FILE_CRYPTO_KEY: ${{ secrets.FILE_CRYPTO_KEY }}
           # Optional. Set it and every rotated Gateway keeps the same root
           # password, so the LISH console rescue documented in SECRETS.md
           # stays valid instead of expiring with each rotate. Unset, rotate
@@ -133,8 +118,8 @@ jobs:
           # per-machine tunnel keys missing and the current providers
           # unable to dial in.
           #   login: CLIENT_* via authkeys_assemble (required = Actions)
-          #   sshproxy: the SHARED legacy key (from the encrypted file,
-          #     MIGRATION add-before-remove) ∪ all tunnel_public_key
+          #   sshproxy: all tunnel_public_key (NODE_* providers +
+          #     POOL_WORKERS workers) — no shared key since KEY-DESIGN §8
           vars_json="$(gh api "repos/${GH_REPO}/actions/variables?per_page=100" --paginate)"
           workers_json="$(gh api "repos/${GH_REPO}/actions/variables/POOL_WORKERS" --jq .value 2>/dev/null || echo '[]')"
 
@@ -149,20 +134,9 @@ jobs:
             exit 1
           }
 
-          # The shared tunnel key is still the fleet's dial-in identity
-          # during the migration (MIGRATION.md §2); decrypt it from the
-          # encrypted file exactly like the tunnel identity is decrypted
-          # elsewhere.
-          shared_tunnel_key="$(scripts/lib/crypto.sh decrypt "$FILE_CRYPTO_KEY" \
-              < shared-configs/ssh-tunnel-server/files/authorized_keys.crypted 2>/dev/null \
-              | sed '/^[[:space:]]*$/d' | head -1 || true)"
-          if [[ -z "$shared_tunnel_key" ]]; then
-            echo "::error::could not decrypt the shared tunnel key — refusing to build a Gateway the fleet cannot reach"
-            exit 1
-          fi
           tunnel_keys="$(refresh_collect_tunnel_keys "$vars_json" "$workers_json")"
-          sshproxy_keys="$(rotate_assemble_sshproxy_keys "$shared_tunnel_key" "$tunnel_keys")" || {
-            echo "::error::sshproxy list assembly failed — aborting (migration add-before-remove guard)"
+          sshproxy_keys="$(rotate_assemble_sshproxy_keys "$tunnel_keys")" || {
+            echo "::error::sshproxy list assembly failed — aborting (empty-list guard)"
             exit 1
           }
 

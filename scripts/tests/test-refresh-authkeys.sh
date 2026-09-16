@@ -254,12 +254,12 @@ else
     if [[ "$C1" == "$C2" ]]; then
         ok "9. 同樣輸入 → 位元組相同（冪等）"
     else
-        bad "9. 兩次輸出不同（$C1 vs $C2）"
+        bad "9. 兩次輸出不同（$C1 vs ${C2}）"
     fi
 
     # 7c/7d: 輸出必須是「恰好一行」的 base64——$GITHUB_OUTPUT 的 key=value
     # 不吃多行，而 Linux base64 每 76 字元折行；只有把 base64 壓成單行，
-    # 指令字串才能安全地放進 $GITHUB_OUTPUT。用一個很長的內容（20 把
+    # 指令字串才能安全地放進 ${GITHUB_OUTPUT}。用一個很長的內容（20 把
     # 公鑰）測——短內容不會折行，測不出這個 bug。
     LONG_CONTENT=""
     for k in $(seq 1 20); do
@@ -359,50 +359,72 @@ fi
 # refresh-authorized-keys.yml 把 Gateway 的 sshproxy authorized_keys 整份
 # 覆蓋成只有一把新的各機鑰，把共用公鑰刷掉了。當時只有 fh-l 有自產鑰，
 # fh-proxy 唯一能用的就是共用那把、而且它沒有任何遠端退路——差一次隧道
-# 重啟就永久失聯。根因：rotate_assemble_sshproxy_keys 有「共用鑰必須在
-# 結果裡」的防線，但 refresh 那條路走的是另一套邏輯，沒有。
-# 修法是兩條路共用同一個函式（rotate_assemble_sshproxy_keys）；下面用
-# 事故情境直接測那支共用函式——它必須包含共用鑰、即使已有各機鑰存在。
-# 這幾條會擋住一個已經真的發生過的失聯事故，不得刪。
+# 重啟就永久失聯。根因：refresh 那條路走的組裝邏輯沒有防線，任何非預期
+# 的結果都會被照寫。
+#
+# Task U 拆掉了共用鑰（KEY-DESIGN §8），所以「共用鑰必須在」這條防線沒有
+# 對象了。事故的**教訓**沒有消失：覆蓋 sshproxy 清單前必須有硬性防線。
+# 取代它的是「結果為空 → 中止」——空清單代表沒有任何機器撥得進來，正是
+# 這個事故的終極形態（全部鎖在外面）。這幾條會擋住一個已經真的發生過的
+# 失聯事故，不得刪，只改語意。
 # ---------------------------------------------------------------------------
-R_SHARED="ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFIXTURESHARED legacy-shared"
 R_FHL="ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFIXTURERFHL fh-l"
 R_FHPROXY="ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFIXTURERFHPROXY fh-proxy"
 
 # refresh 路的 tunnel_keys = refresh_collect_tunnel_keys 的輸出（各機新鑰）
 TUNNEL_KEYS="$R_FHL"$'\n'"$R_FHPROXY"
 
-echo "── R1-R2. 事故迴歸：refresh 的 sshproxy 清單必定含共用公鑰 ──"
+echo "── R1-R2. 事故迴歸：refresh 的 sshproxy 清單＝各機鑰完整集合 ──"
 if ! declare -F rotate_assemble_sshproxy_keys >/dev/null 2>&1; then
     bad "R1-R2. rotate_assemble_sshproxy_keys 未定義（scripts/rotate-gateway.sh 尚未落地）"
 else
-    OUT="$(rotate_assemble_sshproxy_keys "$R_SHARED" "$TUNNEL_KEYS" </dev/null 2>/dev/null)"; RC=$?
-    if [[ $RC -eq 0 ]] && printf '%s\n' "$OUT" | grep -qF "$R_SHARED"; then
-        ok "R1. 已有各機鑰時清單仍含共用公鑰（事故情境防線）"
-    else
-        bad "R1. 共用公鑰不在清單裡（rc=$RC, out=[${OUT:0:200}]）——事故重演：fh-proxy 會被鎖在外面"
-    fi
-    if printf '%s\n' "$OUT" | grep -qF "$R_SHARED" && printf '%s\n' "$OUT" | grep -qF "$R_FHL" \
+    OUT="$(rotate_assemble_sshproxy_keys "$TUNNEL_KEYS" </dev/null 2>/dev/null)"; RC=$?
+    # R1 的原始語意（「清單必須含各機鑰，不能只剩一把」）在 Task U 後
+    # 變成完整集合檢查：事故當下 fh-proxy 沒有任何自產鑰，現在它有了，
+    # 這條確認它的鑰真的進了清單——漏掉它就是同一種失聯。
+    if [[ $RC -eq 0 ]] && printf '%s\n' "$OUT" | grep -qF "$R_FHL" \
        && printf '%s\n' "$OUT" | grep -qF "$R_FHPROXY"; then
-        ok "R2. 共用鑰 + 各機鑰同時在（事故當下：只有 fh-l 有鑰、fh-proxy 靠共用）"
+        ok "R1. 各機鑰完整進清單（事故情境：少一把就是一台機器失聯）"
     else
-        bad "R2. 清單缺共用或各機鑰（out=[${OUT:0:200}]）——事故重演：fh-proxy 唯一能用的共用鑰被刷掉"
+        bad "R1. 清單缺各機鑰（rc=$RC, out=[${OUT:0:200}]）——事故重演：被漏掉的那台會鎖在外面"
+    fi
+    # R2 的原始語意（「共用與各機並存」）沒有對象了；對應的新不變式是
+    # 清單不得憑空多出任何東西——只放進去的那些鑰，逐行都是輸入的子集。
+    R2_OK=1
+    while IFS= read -r line; do
+        [[ -n "$line" ]] || continue
+        case "$line" in
+            "$R_FHL"|"$R_FHPROXY") ;;
+            *) R2_OK=0 ;;
+        esac
+    done <<< "$OUT"
+    if [[ $RC -eq 0 && "$R2_OK" -eq 1 ]]; then
+        ok "R2. 清單恰好是輸入的集合（沒有多餘或來源不明的鑰）"
+    else
+        bad "R2. 清單含輸入以外的行（rc=$RC, out=[${OUT:0:200}]）"
     fi
 fi
 
-echo "── R3. 共用公鑰取不到（解密失敗）→ 中止、不寫入 ──"
+echo "── R3. 結果為空 → 中止、不寫入（事故的終極形態）──"
 if ! declare -F rotate_assemble_sshproxy_keys >/dev/null 2>&1; then
     bad "R3. rotate_assemble_sshproxy_keys 未定義"
 else
-    OUT="$(rotate_assemble_sshproxy_keys "" "$TUNNEL_KEYS" </dev/null 2>/dev/null)"; RC=$?
-    if [[ $RC -ne 0 && -z "$OUT" ]]; then
-        ok "R3. 共用公鑰取不到 → 中止、非 0、不輸出（絕不寫出沒有共用鑰的清單）"
+    # 前置：新型介面在正常輸入下要能成功，否則空清單斷言會因為舊的兩參數
+    # guard 而假通過。必須在 subshell 裡呼叫：舊介面會讓 `$2` unbound，
+    # set -u 下直接呼叫會把整支測試殺掉。
+    if [[ -z "$(rotate_assemble_sshproxy_keys "$TUNNEL_KEYS" 2>/dev/null)" ]]; then
+        bad "R3. 前置不成立：單一參數無法組出清單，空清單防線無從驗證"
     else
-        bad "R3. 共用公鑰取不到卻 rc=$RC、out=[${OUT:0:200}]——正是事故的寫入行為"
+        OUT="$(rotate_assemble_sshproxy_keys "" </dev/null 2>/dev/null)"; RC=$?
+        if [[ $RC -ne 0 && -z "$OUT" ]]; then
+            ok "R3. 空清單 → 中止、非 0、不輸出（絕不寫出沒有機器的清單）"
+        else
+            bad "R3. 空清單卻 rc=${RC}、out=[${OUT:0:200}]——正是事故的寫入行為"
+        fi
     fi
 fi
 
-echo "── R4. 注入：拿掉共用鑰 union（模擬事故當下行為）──"
+echo "── R4. 注入：拿掉空清單防線（模擬事故當下「沒有防線直接寫」）──"
 if ! declare -F rotate_assemble_sshproxy_keys >/dev/null 2>&1; then
     bad "R4. rotate_assemble_sshproxy_keys 未定義，無從注入"
 else
@@ -410,27 +432,29 @@ else
     python3 - "scripts/rotate-gateway.sh" "$INJ_R" <<'PY'
 import re, sys
 src = open(sys.argv[1], encoding="utf-8").read()
-# 模擬事故當下的 refresh 路：union 只含各機鑰（共用鑰不併入），
-# 且沒有「共用鑰必須在結果裡」的防線（事故就是這樣把共用鑰刷掉的）。
-src = src.replace(
-    'all="$(printf \'%s\\n%s\\n\' "$shared_pubkey" "$tunnel_keys" \\',
-    'all="$(printf \'%s\\n\' "$tunnel_keys" \\')
-# 防線一起拿掉：guard 改 if false（等同事故路的「沒有防線直接寫」）
-pat = re.compile(r'if \[\[ -z "\$shared_pubkey" \]\][^\n]*\n(?:[^\n]*\n)*?^\s*fi\n', re.M)
-src = pat.sub('if false; then\n    :\nfi\n', src)
-open(sys.argv[2], "w", encoding="utf-8").write(src)
+# 模擬事故當下：沒有「結果為空必須中止」的防線，空輸入就照樣輸出
+# （空的清單被寫進 Gateway 的 authorized_keys → 全部鎖在外面）。
+pat = re.compile(
+    r'if \[\[[^\n]*(?:-z "\$all"|-z "\$tunnel_keys"|empty)[^\n]*\]\][^\n]*\n(?:[^\n]*\n)*?^\s*fi\n',
+    re.M)
+new_src, n = pat.subn('if false; then\n    :\nfi\n', src)
+if n == 0:
+    sys.exit(1)
+open(sys.argv[2], "w", encoding="utf-8").write(new_src)
 PY
-    INJ_OUT="$(bash -c "
+    if [[ ! -s "$INJ_R" ]]; then
+        bad "R4. 找不到空清單 guard 可中性化（needle 落空）——harness 問題"
+    else
+        INJ_OUT="$(bash -c "
 set -uo pipefail
 source '$INJ_R'
-rotate_assemble_sshproxy_keys \"\$1\" \"\$2\"
-" _ "$R_SHARED" "$TUNNEL_KEYS" </dev/null 2>/dev/null)"; RC=$?
-    if printf '%s\n' "$INJ_OUT" | grep -qF "$R_SHARED"; then
-        bad "R4. 注入後共用鑰仍在——注入沒生效（harness 問題）"
-    elif printf '%s\n' "$INJ_OUT" | grep -qF "$R_FHL"; then
-        printf '  inj ok    %s\n' "注入後（union 只含各機鑰）共用鑰被刷掉——R1/R2 條會紅（事故行為被重現並擋住）"
-    else
-        bad "R4. 注入後無輸出——注入沒生效（harness 問題）"
+rotate_assemble_sshproxy_keys \"\$1\"
+" _ "" </dev/null 2>/dev/null)"; RC=$?
+        if [[ $RC -eq 0 ]]; then
+            printf '  inj ok    %s\n' "注入後（拿掉空清單防線）空輸入仍 rc=0——R3 條會紅（事故行為被重現並擋住）"
+        else
+            bad "R4. 注入後仍非 0（rc=${RC}）——注入沒生效（harness 問題）"
+        fi
     fi
 fi
 

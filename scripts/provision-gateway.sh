@@ -149,16 +149,10 @@ step2_fail2ban_ignoreip() {
 # "installed elsewhere, disconnected from the files" problem LAYOUT.md's
 # rationale describes.
 #
-# sshproxy gets `ssh-tunnel-server` — the "gets dialed into" half of the
-# sshproxy identity (authorized_keys), never `ssh-tunnel-client`'s private
-# key (that's for the machines that DIAL OUT: providers/workers). Its
-# install.sh is idempotent and skips writing if the file already exists —
-# cloud-init already rendered sshproxy's authorized_keys fresh this rotate
-# (SSHPROXY_PUBKEY, from the live secret), so in practice this call mostly
-# just re-runs the spec §4 invariant check (this bundle's id_rsa.pub vs.
-# its own authorized_keys) rather than overwriting anything cloud-init
-# already got right; it's still the thing that would actually install the
-# file on a path that doesn't go through cloud-init (spec §4).
+# No sshproxy unit any more: KEY-DESIGN §8 deleted the static encrypted
+# bundles (ssh-tunnel-server) — sshproxy's authorized_keys is assembled
+# from the repo variables and installed by refresh/rotate, never by a
+# unit.
 step3_install_shared_config() {
     log INFO "step 3/6: install shared_config units"
 
@@ -174,7 +168,7 @@ step3_install_shared_config() {
 
     local unit home target_user install
 
-    for unit in pool-runtime ssh-admin rclone standalonescripts dotfiles gh; do
+    for unit in pool-runtime rclone standalonescripts dotfiles gh; do
         home="/home/fatesaikou"
         target_user="fatesaikou"
         install="${SHARED_CONFIG_DIR}/${unit}/install.sh"
@@ -187,16 +181,6 @@ step3_install_shared_config() {
         # to every user via ps (RUNBOOK.md §9).
         printf '%s' "$FILE_CRYPTO_KEY" | "$install" --home "$home" --user "$target_user"
     done
-
-    home="/home/sshproxy"
-    target_user="sshproxy"
-    install="${SHARED_CONFIG_DIR}/ssh-tunnel-server/install.sh"
-    if [[ ! -x "$install" ]]; then
-        log ERROR "${install} missing or not executable"
-        exit 1
-    fi
-    log INFO "installing unit 'ssh-tunnel-server' for ${target_user}"
-    printf '%s' "$FILE_CRYPTO_KEY" | "$install" --home "$home" --user "$target_user"
 }
 
 # ---- step 4: remaining runtime packages --------------------------------------

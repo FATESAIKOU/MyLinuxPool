@@ -19,9 +19,10 @@ name: Refresh Authorized Keys
 # Gateway's sshproxy authorized_keys was overwritten with just fh-l's key
 # and the SHARED key (the only key fh-proxy had) was wiped. fh-proxy has
 # no remote fallback; a tunnel restart would have lost it permanently.
-# That function carries the MIGRATION.md §2 guard — the shared key must be
-# in the result or it refuses — so this path is safe only BECAUSE it goes
-# through it. Do not fork the assembly logic here again.
+# That function carries the empty-result guard (KEY-DESIGN §8: the shared
+# key is gone; an empty list means nobody can dial in) — so this path is
+# safe only BECAUSE it goes through it. Do not fork the assembly logic
+# here again.
 
 on:
   workflow_dispatch:
@@ -36,9 +37,6 @@ env:
   # (docs/ARCHITECTURE.md §3) — pool-ssh's agent only ever needs this
   # single key regardless of which chain it resolves.
   SSH_KEY_ACTIONS: ${{ secrets.SSH_KEY_ACTIONS }}
-  # Used to decrypt the shared tunnel key (MIGRATION.md §2: it stays in
-  # the fleet's sshproxy list until KEY-DESIGN §8).
-  FILE_CRYPTO_KEY: ${{ secrets.FILE_CRYPTO_KEY }}
 
 jobs:
   refresh:
@@ -85,30 +83,21 @@ jobs:
           echo "assembled ${login_count} login key(s) from CLIENT_*"
 
           # ---- tunnel list ------------------------------------------------
-          # The sshproxy list = the SHARED key (decrypted from
-          # ssh-tunnel-server's encrypted file — it is every provider's
-          # dial-in identity during the migration) UNION all per-machine
-          # tunnel_public_key. Assembled by rotate_assemble_sshproxy_keys,
-          # the SAME function rotate uses: it aborts when the shared key
-          # would be missing from the result (MIGRATION.md §2). With the
-          # shared key always in, the list is never empty — there is no
-          # "skip" branch anymore.
+          # The sshproxy list = every machine's own tunnel_public_key
+          # (NODE_* providers + POOL_WORKERS workers). Assembled by
+          # rotate_assemble_sshproxy_keys, the SAME function rotate uses:
+          # it aborts when the result would be EMPTY (KEY-DESIGN §8 —
+          # no shared key any more; an empty list means nobody can dial
+          # in). With per-machine keys present, the list is never empty.
           tunnel="$(refresh_collect_tunnel_keys "$vars_json" "$workers_json")"
-          shared_tunnel_key="$(scripts/lib/crypto.sh decrypt "$FILE_CRYPTO_KEY" \
-              < shared-configs/ssh-tunnel-server/files/authorized_keys.crypted 2>/dev/null \
-              | sed '/^[[:space:]]*$/d' | head -1 || true)"
-          if [[ -z "$shared_tunnel_key" ]]; then
-            echo "::error::could not decrypt the shared tunnel key — refusing to overwrite the sshproxy list (a list without it locks every provider out)"
-            exit 1
-          fi
-          sshproxy="$(rotate_assemble_sshproxy_keys "$shared_tunnel_key" "$tunnel")" || {
-            echo "::error::sshproxy list assembly failed — refusing to touch the Gateway (MIGRATION add-before-remove guard)"
+          sshproxy="$(rotate_assemble_sshproxy_keys "$tunnel")" || {
+            echo "::error::sshproxy list assembly failed — refusing to touch the Gateway (empty-list guard)"
             exit 1
           }
           tunnel_count="$(printf '%s\n' "$sshproxy" | wc -l | tr -d ' ')"
           echo "tunnel_count=${tunnel_count}" >> "$GITHUB_OUTPUT"
           echo "tunnel_cmd=$(refresh_build_install_cmd /home/sshproxy/.ssh/authorized_keys "$sshproxy" --sudo)" >> "$GITHUB_OUTPUT"
-          echo "assembled ${tunnel_count} sshproxy key(s): shared ∪ NODE_*/POOL_WORKERS tunnel keys"
+          echo "assembled ${tunnel_count} sshproxy key(s) from NODE_*/POOL_WORKERS tunnel keys"
 
       - name: Install login authorized_keys on the Gateway
         uses: ./.github/actions/pool-ssh

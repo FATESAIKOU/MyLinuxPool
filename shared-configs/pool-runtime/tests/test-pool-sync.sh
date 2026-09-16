@@ -804,7 +804,7 @@ if [[ "$RAN" -ne 1 ]]; then
 elif [[ "$MTIME_BEFORE" == "$MTIME_AFTER" ]]; then
     ok_line "A3. 內容已正確 → 沒有重寫（mtime 不變）"
 else
-    fail_line "A3. 內容已正確卻重寫（mtime $MTIME_BEFORE → $MTIME_AFTER）——每輪都動檔案 = 永遠在漂移"
+    fail_line "A3. 內容已正確卻重寫（mtime $MTIME_BEFORE → ${MTIME_AFTER}）——每輪都動檔案 = 永遠在漂移"
 fi
 
 echo "── A4 自鎖防線：無 Actions → 不寫、原檔不變 ──"
@@ -923,23 +923,19 @@ GIT_MODE="ok"; GH_MODE="ok"
 : > "$SANDBOX/check-rc"; : > "$SANDBOX/install-rc"
 GH_VALUE='{"name":"testnode","role":"provider","registered_with":"register-provider.sh"}'
 write_clients "$AUB_KEY_A" "$AUB_KEY_B" "$AUB_ACTIONS"
-# 注入版 pool-sync：把 authorized_keys 寫入改成「不清空、只附加」的
-# 聯集版本（等價於拿掉完全取代）。實作是原子寫入：`mv -f "$tmp"
-# "$target"` 換成 `cat "$tmp" >> "$target"`——目標不被覆蓋、舊鑰留下。
-INJ_SYNC="$SANDBOX/pool-sync-inj.sh"
-python3 - "$POOL_SYNC" "$INJ_SYNC" <<'PY'
+# 注入版：把 authorized_keys 寫入改成「不清空、只附加」的聯集版本（等價
+# 於拿掉完全取代）。收斂邏輯在 fixture 的 refresh-authkeys.sh 裡（pool-sync
+# 呼叫 refresh_sync_local_authorized_keys），所以注入目標是那個 fixture
+# 副本——實作是原子寫入：`mv -f "$tmp" "$target"` 換成 `cat "$tmp" >>
+# "$target"`，目標不被覆蓋、舊鑰留下。
+python3 - "$SANDBOX/fixture/scripts/refresh-authkeys.sh" <<'PY'
 import re
 import sys
 src = open(sys.argv[1], encoding="utf-8").read()
 src = re.sub(r'mv -f "\$tmp" "\$target"',
              r'cat "$tmp" >> "$target"', src)
-open(sys.argv[2], "w", encoding="utf-8").write(src)
+open(sys.argv[1], "w", encoding="utf-8").write(src)
 PY
-# 注入版是 python 寫出的 644 檔，run_sync 直接執行它——不可執行會
-# Permission denied（rc=126），讓 A9 假通過（檔案狀態恰好符合）而
-# A10 判「注入沒生效」。補執行位元。
-chmod +x "$INJ_SYNC"
-POOL_SYNC_SUBJECT="$INJ_SYNC"
 run_sync
 if [[ "$RAN" -ne 1 ]]; then
     fail_line "A9. 注入版沒跑起來（注入 harness 問題）"
@@ -948,7 +944,6 @@ elif [[ -f "$AUTHKEYS_FILE" ]] && grep -qF "$AUB_STALE" "$AUTHKEYS_FILE"; then
 else
     fail_line "A9. 注入後舊鑰仍被移除——注入沒生效（harness 問題）"
 fi
-POOL_SYNC_SUBJECT=""
 
 # ---------------------------------------------------------------------------
 # A10: 注入 — 拿掉自鎖防線 → A4 必須紅
@@ -965,28 +960,27 @@ FAKE_CLIENT_VARS="$(jq -c -n \
     --arg ka "$AUB_KEY_A" --arg kb "$AUB_KEY_B" \
     '{CLIENT_FATESAIKOU_MAC:{name:"fatesaikou-mac",public_key:$ka,added_at:"2026-09-16T12:00:00Z"},
       CLIENT_OTHER_USER:{name:"other-user",public_key:$kb,added_at:"2026-09-16T12:00:00Z"}}')"
-# 注入：把「CLIENT_ACTIONS 檢查失敗就中止」的 guard 中性化。
-INJ2_SYNC="$SANDBOX/pool-sync-inj2.sh"
-python3 - "$POOL_SYNC" "$INJ2_SYNC" <<'PY'
+# 注入：把「CLIENT_ACTIONS 檢查失敗就中止」的 guard 中性化。guard 在
+# fixture 的 refresh-authkeys.sh（refresh_sync_local_authorized_keys）——
+# 自鎖防線有兩層：該函式的 CLIENT_ACTIONS 檢查（上面）與
+# authkeys_assemble 的 required 檢查（CONTRACT §2 第 5 條）。guard 被
+# 移除後 actions_pk 為空，空 required 會讓 assemble 自己拒絕——所以要
+# 重現「防線全失」還得把 required 換成清單裡存在的任一把，否則注入版
+# 仍不寫、A4 永遠紅不了。
+python3 - "$SANDBOX/fixture/scripts/refresh-authkeys.sh" <<'PY'
 import re
 import sys
 src = open(sys.argv[1], encoding="utf-8").read()
-# 中性化：任何「若缺 CLIENT_ACTIONS 就 return/exit 非 0」的形狀
-# 需要 re.S：body 跨多行，re.M 下 `.` 不匹配換行會讓整個 pattern 落空。
-# [ \t]* 而非 \s*：\s 含換行，會把 body 一起吞掉導致負向前瞻誤判。
-src = re.sub(r'if[^\n]*CLIENT_ACTIONS[^\n]*;\s*then\s*\n((?:(?!\n[ \t]*fi).)*)\n[ \t]*fi',
+# 中性化：任何「若缺 CLIENT_ACTIONS 就 return 非 0」的形狀。guard 是
+# `if [[ -z "$actions_pk" ]]; then ... return 1`（actions_pk 來自
+# CLIENT_ACTIONS 查詢），用 re.S 讓 `.` 跨多行、[ \t]* 避免吞 body。
+src = re.sub(r'if[^\n]*actions_pk[^\n]*;\s*then\s*\n((?:(?!\n[ \t]*fi).)*)\n[ \t]*fi',
              lambda m: 'if false; then\n%s\nfi' % m.group(1), src, flags=re.M | re.S)
-# 自鎖防線有兩層：pool-sync 的 guard（上面）與 authkeys_assemble 的
-# required 檢查（CONTRACT §2 第 5 條）。guard 被移除後 actions_pk 為空，
-# 空 required 會讓 assemble 自己拒絕——所以要重現「防線全失」還得把
-# required 換成清單裡存在的任一把，否則注入版仍不寫、A4 永遠紅不了。
 src = re.sub(r'authkeys_assemble "\$clients" "\$actions_pk"',
              'authkeys_assemble "$clients" "$(printf \'%s\' "$clients" | jq -r \'.[0].public_key // empty\' 2>/dev/null || true)"',
              src)
-open(sys.argv[2], "w", encoding="utf-8").write(src)
+open(sys.argv[1], "w", encoding="utf-8").write(src)
 PY
-chmod +x "$INJ2_SYNC"
-POOL_SYNC_SUBJECT="$INJ2_SYNC"
 run_sync
 if [[ "$RAN" -ne 1 ]]; then
     fail_line "A10. 注入版沒跑起來（注入 harness 問題）"
@@ -995,7 +989,6 @@ elif [[ -f "$AUTHKEYS_FILE" ]] && grep -qF "$AUB_KEY_B" "$AUTHKEYS_FILE"; then
 else
     fail_line "A10. 注入後仍沒寫入——注入沒生效（harness 問題）"
 fi
-POOL_SYNC_SUBJECT=""
 
 # ===========================================================================
 # Q1–Q7: provider 自產隧道金鑰（MIGRATION.md §3 / KEY-DESIGN §3.3、§9.4）。
@@ -1035,7 +1028,7 @@ if [[ "$RAN" -ne 1 ]]; then
 elif [[ -f "$TUNNEL_KEY_FILE" && -f "$TUNNEL_PUB_FILE" ]]; then
     ok_line "Q1. id_tunnel 與 id_tunnel.pub 都被產生"
 else
-    fail_line "Q1. id_tunnel 未被產生（$TUNNEL_KEY_FILE）"
+    fail_line "Q1. id_tunnel 未被產生（${TUNNEL_KEY_FILE}）"
 fi
 if [[ "$RAN" -eq 1 && -f "$TUNNEL_KEY_FILE" ]]; then
     perm="$(tunnel_key_perm)"
@@ -1206,9 +1199,11 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# Q8–Q10: pool-tunnel 同時提供兩把身分（MIGRATION.md §1 的安全網）。
-# 直接觀察它組出來的 ssh 命令列：id_tunnel 必須在 id_pool 之前，缺失的
-# 檔案要跳過而不是讓它失敗。
+# Q8–Q10: pool-tunnel 的隧道身分（task U 之後：只有 id_tunnel）。
+# MIGRATION.md 的遷移期安全網是「兩把都提供、id_tunnel 在前、id_pool 退
+# 路」；KEY-DESIGN §8 拿掉共用鑰之後，id_pool 退路也一併移除——留著它會
+# 讓一台機器在 id_tunnel 壞掉時悄悄用退役的共用身分連上。下面用假 ssh
+# 直接觀察命令列。
 # ---------------------------------------------------------------------------
 POOL_TUNNEL_SH="${UNIT_ROOT}/files/pool-tunnel"
 FAKE_SSH_BIN="$SANDBOX/fakebin/ssh"
@@ -1254,73 +1249,75 @@ ssh_identity_args() {
     grep -oE '\-i [^ ]+' "$SANDBOX/ssh.log" 2>/dev/null | sed 's/^-i //' | head -4
 }
 
-echo "── Q8 兩把都在 → -i id_tunnel 在前、-i id_pool 在後 ──"
+echo "── Q8 只有 id_tunnel → 只帶那一把（遷移已完成，不再有 id_pool 退路）──"
 QT="$SANDBOX/home-tunnel"
 mkdir -p "$QT/.ssh" "$QT/.mylinuxpool"
 printf 'NODE_NAME=testnode\n' > "$QT/.mylinuxpool/config"
 printf 'ghp_FAKE_TOKEN_abc123\n' > "$QT/.mylinuxpool/gh_token"
 ssh-keygen -t ed25519 -N '' -C 'tunnel-key-q8' -f "$QT/.ssh/id_tunnel" -q </dev/null >/dev/null 2>&1
-ssh-keygen -t ed25519 -N '' -C 'pool-key-q8' -f "$QT/.ssh/id_pool" -q </dev/null >/dev/null 2>&1
 run_tunnel "$QT"
 if [[ ! -f "$POOL_TUNNEL_SH" ]]; then
-    fail_line "Q8. id_tunnel 在 id_pool 之前（${POOL_TUNNEL_SH} 不存在）"
+    fail_line "Q8. 只帶 id_tunnel（${POOL_TUNNEL_SH} 不存在）"
 elif [[ ! -s "$SANDBOX/ssh.log" ]]; then
-    fail_line "Q8. id_tunnel 在 id_pool 之前（假 ssh 未被呼叫；tunnel rc=${TUNNEL_RC}: $(tail -2 "$SANDBOX/tunnel.out" | tr '\n' ' ')）"
+    fail_line "Q8. 只帶 id_tunnel（假 ssh 未被呼叫；tunnel rc=${TUNNEL_RC}: $(tail -2 "$SANDBOX/tunnel.out" | tr '\n' ' ')）"
 else
     IDS="$(ssh_identity_args | tr '\n' ' ')"
-    FIRST_ID="$(ssh_identity_args | head -1)"
-    SECOND_ID="$(ssh_identity_args | sed -n '2p')"
-    if [[ "$FIRST_ID" == *"/.ssh/id_tunnel" && "$SECOND_ID" == *"/.ssh/id_pool" ]]; then
-        ok_line "Q8. ssh 命令列同時帶兩把，且 id_tunnel 在前（${IDS}）"
+    if [[ "$IDS" == *"/.ssh/id_tunnel"* && "$IDS" != *"id_pool"* ]]; then
+        ok_line "Q8. 命令列只帶 -i id_tunnel（${IDS}）"
     else
-        fail_line "Q8. -i 的順序/內容不對（實際：${IDS:-<無>}）"
+        fail_line "Q8. 命令列的 -i 不是只有 id_tunnel（實際：${IDS:-<無>}）"
     fi
     if grep -q 'IdentitiesOnly=yes' "$SANDBOX/ssh.log" 2>/dev/null; then
-        ok_line "Q8. 有帶 IdentitiesOnly=yes（ssh 只試這兩把）"
+        ok_line "Q8. 有帶 IdentitiesOnly=yes（ssh 只試這一把）"
     else
         fail_line "Q8. 少了 IdentitiesOnly=yes"
     fi
 fi
 
-echo "── Q9 只有 id_pool → 只帶那一把，不失敗 ──"
+echo "── Q9 即使 id_pool 還在磁碟上，也不得被使用（退役身分）──"
 QT2="$SANDBOX/home-tunnel-pool"
 mkdir -p "$QT2/.ssh" "$QT2/.mylinuxpool"
 printf 'NODE_NAME=testnode\n' > "$QT2/.mylinuxpool/config"
 printf 'ghp_FAKE_TOKEN_abc123\n' > "$QT2/.mylinuxpool/gh_token"
-ssh-keygen -t ed25519 -N '' -C 'pool-only-q9' -f "$QT2/.ssh/id_pool" -q </dev/null >/dev/null 2>&1
+# 刻意同時放兩把：遷移期會帶兩把；退役後留著的 id_pool 必須被忽略，
+# 否則一台有殘留共用鑰的機器會悄悄用舊身分連上。
+ssh-keygen -t ed25519 -N '' -C 'tunnel-both-q9' -f "$QT2/.ssh/id_tunnel" -q </dev/null >/dev/null 2>&1
+ssh-keygen -t ed25519 -N '' -C 'pool-leftover-q9' -f "$QT2/.ssh/id_pool" -q </dev/null >/dev/null 2>&1
 run_tunnel "$QT2"
 if [[ ! -f "$POOL_TUNNEL_SH" ]]; then
-    fail_line "Q9. 只有 id_pool 時只帶那一把（被測物不存在）"
+    fail_line "Q9. id_pool 在磁碟上也不被使用（被測物不存在）"
 elif [[ "$TUNNEL_RC" -ne 0 ]]; then
-    fail_line "Q9. 只有 id_pool 不可失敗（rc=${TUNNEL_RC}: $(tail -2 "$SANDBOX/tunnel.out" | tr '\n' ' ')）"
+    fail_line "Q9. 有 id_tunnel 時不可失敗（rc=${TUNNEL_RC}: $(tail -2 "$SANDBOX/tunnel.out" | tr '\n' ' ')）"
 else
-    ok_line "Q9. 只有 id_pool 時 pool-tunnel 仍成功（rc=0）"
+    ok_line "Q9. 兩把都在磁碟上時 pool-tunnel 仍成功（rc=0）"
     IDS="$(ssh_identity_args | tr '\n' ' ')"
-    if [[ "$IDS" == *"/.ssh/id_pool"* && "$IDS" != *"id_tunnel"* ]]; then
-        ok_line "Q9. 命令列只帶 -i id_pool（${IDS}）"
+    if [[ "$IDS" == *"/.ssh/id_tunnel"* && "$IDS" != *"id_pool"* ]]; then
+        ok_line "Q9. 命令列只帶 -i id_tunnel，殘留的 id_pool 被忽略（${IDS}）"
     else
-        fail_line "Q9. 命令列的 -i 不對（實際：${IDS:-<無>}）"
+        fail_line "Q9. 命令列仍帶了 id_pool（實際：${IDS:-<無>}）——退役的共用身分不得再被使用"
     fi
 fi
 
-echo "── Q10 只有 id_tunnel → 同理 ──"
+echo "── Q10 完全沒有 id_tunnel → 失敗（不得退回 id_pool）──"
 QT3="$SANDBOX/home-tunnel-new"
 mkdir -p "$QT3/.ssh" "$QT3/.mylinuxpool"
 printf 'NODE_NAME=testnode\n' > "$QT3/.mylinuxpool/config"
 printf 'ghp_FAKE_TOKEN_abc123\n' > "$QT3/.mylinuxpool/gh_token"
-ssh-keygen -t ed25519 -N '' -C 'tunnel-only-q10' -f "$QT3/.ssh/id_tunnel" -q </dev/null >/dev/null 2>&1
+ssh-keygen -t ed25519 -N '' -C 'pool-only-q10' -f "$QT3/.ssh/id_pool" -q </dev/null >/dev/null 2>&1
 run_tunnel "$QT3"
 if [[ ! -f "$POOL_TUNNEL_SH" ]]; then
-    fail_line "Q10. 只有 id_tunnel 時只帶那一把（被測物不存在）"
-elif [[ "$TUNNEL_RC" -ne 0 ]]; then
-    fail_line "Q10. 只有 id_tunnel 不可失敗（rc=${TUNNEL_RC}: $(tail -2 "$SANDBOX/tunnel.out" | tr '\n' ' ')）"
-else
-    ok_line "Q10. 只有 id_tunnel 時 pool-tunnel 仍成功（rc=0）"
+    fail_line "Q10. 沒有 id_tunnel 時失敗（被測物不存在）"
+elif [[ "$TUNNEL_RC" -eq 0 ]]; then
+    # 只有 id_pool 卻成功＝還留著舊退路，這正是 task U 要拿掉的。
     IDS="$(ssh_identity_args | tr '\n' ' ')"
-    if [[ "$IDS" == *"/.ssh/id_tunnel"* && "$IDS" != *"id_pool"* ]]; then
-        ok_line "Q10. 命令列只帶 -i id_tunnel（${IDS}）"
+    fail_line "Q10. 只有 id_pool 竟仍成功（${IDS:-<無>}）——id_pool 退路未移除"
+else
+    ok_line "Q10. 沒有 id_tunnel 時失敗（rc=${TUNNEL_RC}），未退回 id_pool"
+    IDS="$(ssh_identity_args | tr '\n' ' ')"
+    if [[ "$IDS" != *"id_pool"* ]]; then
+        ok_line "Q10. 命令列未帶 id_pool（${IDS:-<無>}）"
     else
-        fail_line "Q10. 命令列的 -i 不對（實際：${IDS:-<無>}）"
+        fail_line "Q10. 命令列仍帶了 id_pool（實際：${IDS}）"
     fi
 fi
 

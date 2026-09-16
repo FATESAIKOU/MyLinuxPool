@@ -1,36 +1,37 @@
 #!/usr/bin/env bash
 # test-rotate-authkeys.sh — direct function tests for the rotate-side
-# authorized_keys assembly + cloud-config rendering (task S; MIGRATION.md,
+# authorized_keys assembly + cloud-config rendering (task S / task U;
 # docs/KEY-DESIGN.md).
 #
-# The migration (MIGRATION.md) is add-before-remove with a machine-enforced
-# safety net: during the migration the Gateway's sshproxy list must contain
-# the SHARED legacy key UNION every provider/worker tunnel_public_key — the
-# shared key being ABSENT is a hard abort (removing it first would cut every
-# current provider with no remote rescue path). The fatesaikou login list
-# must contain CLIENT_ACTIONS or the whole thing aborts. The rendered
-# cloud-config must be valid YAML with ssh_authorized_keys as an ARRAY of
-# multiple entries (not one blob).
+# Task U completed the migration: the shared legacy tunnel key and the
+# static authorized_keys bundles are gone (KEY-DESIGN §7). The sshproxy
+# list is now built from the per-machine tunnel_public_key values alone —
+# there is no shared key to union in. The safety property that replaced
+# the old "shared key must be present" guard is: **an empty result must
+# abort**, because an empty sshproxy list means no provider can dial in.
+# The fatesaikou login list must still contain CLIENT_ACTIONS or the whole
+# thing aborts. The rendered cloud-config must be valid YAML with
+# ssh_authorized_keys as an ARRAY of multiple entries (not one blob).
 #
 # Real signatures (scripts/rotate-gateway.sh, sourced — it sets SCRIPT_DIR
 # itself):
 #   rotate_assemble_login_keys <clients_json> <actions_pubkey>
 #       fatesaikou login list (authkeys_assemble inside). Missing Actions
 #       key -> non-zero, no output.
-#   rotate_assemble_sshproxy_keys <shared_pubkey> <tunnel_keys>
-#       sshproxy list = shared ∪ tunnel_keys (one per line). Shared key not
-#       in the result -> non-zero, no output.
+#   rotate_assemble_sshproxy_keys <tunnel_keys>
+#       sshproxy list = every machine's tunnel_public_key, one per line.
+#       Empty result -> non-zero, no output.
 #   rotate_render_cloud_config <template> <fatesaikou_pubkeys>
 #       <sshproxy_pubkeys>
 # The NODE_* role==provider filter lives in
 # refresh_collect_tunnel_keys (scripts/refresh-authkeys.sh) and is tested
 # here directly too (assertion 4).
 #
-# Assertions: 1-3 sshproxy union via rotate_assemble_sshproxy_keys,
-# 4 provider-only filter via refresh_collect_tunnel_keys, 5 shared-key
+# Assertions: 1-3 sshproxy assembly via rotate_assemble_sshproxy_keys,
+# 4 provider-only filter via refresh_collect_tunnel_keys, 5 empty-result
 # guard, 6 CLIENT_ACTIONS guard via rotate_assemble_login_keys,
 # 7 rendered YAML valid + array shape, 8 idempotence. Injections:
-# shared-key guard removed -> 5 red; multi-key squeezed into ONE string ->
+# empty-result guard removed -> 5 red; multi-key squeezed into ONE string ->
 # 7 red.
 #
 # bash 3.2 compatible on purpose (macOS ships 3.2).
@@ -52,6 +53,9 @@ SANDBOX="$(mktemp -d "${TMPDIR:-/tmp}/test-rotate-authkeys.XXXXXX")"
 trap 'rm -rf "$SANDBOX"' EXIT INT TERM
 
 # ---- fixtures ---------------------------------------------------------------
+# Task U: no shared legacy key any more — the list is the machines' own
+# tunnel_public_key values. SHARED_KEY is kept only as a "must never appear"
+# control below, to prove the assembly is not still unioning something in.
 SHARED_KEY="ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFIXTURESHARED legacy-shared"
 PROV1_KEY="ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFIXTUREPROV1 fh-l"
 PROV2_KEY="ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFIXTUREPROV2 fh-proxy"
@@ -121,25 +125,38 @@ pass=0; fail=0
 ok()  { printf '  ok    %s\n' "$1"; pass=$((pass + 1)); }
 bad() { printf '  FAIL  %s\n' "$1"; fail=$((fail + 1)); }
 
-echo "── 1-3. rotate_assemble_sshproxy_keys（共用 ∪ tunnel）──"
+echo "── 1-3. rotate_assemble_sshproxy_keys（各機 tunnel_public_key）──"
 if ! declare -F rotate_assemble_sshproxy_keys >/dev/null 2>&1; then
     bad "1-3. rotate_assemble_sshproxy_keys 未定義（scripts/rotate-gateway.sh 尚未落地）"
 else
-    OUT="$(rotate_assemble_sshproxy_keys "$SHARED_KEY" "$TUNNEL_KEYS" </dev/null 2>/dev/null)"; RC=$?
+    # Task U signature: one argument (the collected tunnel keys). The
+    # migration-era two-argument form took the shared key first; if that is
+    # still what is installed, passing a single arg makes the shared-key
+    # guard fire and every assertion here goes red — which is the intended
+    # signal that the implementation has not been migrated yet.
+    OUT="$(rotate_assemble_sshproxy_keys "$TUNNEL_KEYS" </dev/null 2>/dev/null)"; RC=$?
+    if [[ $RC -eq 0 ]] && printf '%s\n' "$OUT" | grep -qF "$PROV1_KEY" \
+       && printf '%s\n' "$OUT" | grep -qF "$PROV2_KEY"; then
+        ok "1. sshproxy 清單含所有 provider 的 tunnel_public_key"
+    else
+        bad "1. provider 公鑰不在清單裡（rc=$RC, out=[${OUT:0:200}]）"
+    fi
+    if [[ $RC -eq 0 ]] && printf '%s\n' "$OUT" | grep -qF "$WORKER_KEY"; then
+        ok "2. 含 POOL_WORKERS 的 tunnel_public_key"
+    else
+        bad "2. worker 公鑰缺失（rc=$RC, out=[${OUT:0:200}]）"
+    fi
+    # Task U: the shared/legacy key is gone from the design entirely. It must
+    # not appear even though it was never passed in — a union implementation
+    # that still decrypts and prepends it would put it here. Gate on the
+    # successful single-argument assembly above: with the old signature the
+    # output is empty, so "no shared key" would be true for the wrong reason.
     if [[ $RC -eq 0 ]] && printf '%s\n' "$OUT" | grep -qF "$SHARED_KEY"; then
-        ok "1. sshproxy 清單含共用公鑰（遷移期 add-before-remove 必要）"
+        bad "3. 清單仍含已退役的共用公鑰——KEY-DESIGN §8 未完成（out=[${OUT:0:200}]）"
+    elif [[ $RC -ne 0 ]]; then
+        bad "3. 無法判定（新的單一參數介面組不出清單，rc=${RC}）"
     else
-        bad "1. 共用公鑰不在清單裡（rc=$RC, out=[${OUT:0:200}]）"
-    fi
-    if printf '%s\n' "$OUT" | grep -qF "$PROV1_KEY" && printf '%s\n' "$OUT" | grep -qF "$PROV2_KEY"; then
-        ok "2. 含所有 provider 的 tunnel_public_key"
-    else
-        bad "2. provider 公鑰缺失（out=[${OUT:0:200}]）"
-    fi
-    if printf '%s\n' "$OUT" | grep -qF "$WORKER_KEY"; then
-        ok "3. 含 POOL_WORKERS 的 tunnel_public_key"
-    else
-        bad "3. worker 公鑰缺失（out=[${OUT:0:200}]）"
+        ok "3. 不再含已退役的共用公鑰（遷移完成後不該有來源）"
     fi
 fi
 
@@ -157,15 +174,31 @@ else
     fi
 fi
 
-echo "── 5. 共用公鑰缺席 → 中止 ──"
+echo "── 5. 結果為空 → 中止（取代遷移期的「共用鑰必須在」防線）──"
 if ! declare -F rotate_assemble_sshproxy_keys >/dev/null 2>&1; then
     bad "5. rotate_assemble_sshproxy_keys 未定義"
 else
-    OUT="$(rotate_assemble_sshproxy_keys "" "$TUNNEL_KEYS" </dev/null 2>/dev/null)"; RC=$?
-    if [[ $RC -ne 0 && -z "$OUT" ]]; then
-        ok "5. 共用公鑰缺席 → 中止、非 0、不輸出"
+    # Precondition: assertions 5a/5b are only meaningful under the Task U
+    # signature. With the old two-argument form, an empty FIRST argument
+    # trips the shared-key guard — the function returns non-zero for the
+    # wrong reason, and 5a/5b would "pass" without the empty-result guard
+    # existing at all. The real new-contract precondition is that a
+    # non-empty tunnel list assembles fine with ONE argument.
+    if ! rotate_assemble_sshproxy_keys "$TUNNEL_KEYS" >/dev/null 2>&1; then
+        bad "5. 前置不成立：單一參數（新的介面）無法組出清單，空清單防線無從驗證"
     else
-        bad "5. 共用公鑰缺席卻 rc=$RC、out=[${OUT:0:200}]（少了它現役 provider 全斷——必須硬性中止）"
+        OUT="$(rotate_assemble_sshproxy_keys "" </dev/null 2>/dev/null)"; RC=$?
+        if [[ $RC -ne 0 && -z "$OUT" ]]; then
+            ok "5a. 空輸入 → 中止、非 0、不輸出"
+        else
+            bad "5a. 空輸入卻 rc=${RC}、out=[${OUT:0:200}]（空清單＝沒有機器撥得進來，必須硬性中止）"
+        fi
+        OUT="$(rotate_assemble_sshproxy_keys "$(printf '\n\n')" </dev/null 2>/dev/null)"; RC=$?
+        if [[ $RC -ne 0 && -z "$OUT" ]]; then
+            ok "5b. 只有空白的輸入 → 中止、非 0、不輸出"
+        else
+            bad "5b. 空白輸入卻 rc=${RC}、out=[${OUT:0:200}]"
+        fi
     fi
 fi
 
@@ -183,7 +216,7 @@ else
     if [[ $RC -ne 0 && -z "$OUT" ]]; then
         ok "6b. 缺 CLIENT_ACTIONS → 中止、非 0、不輸出"
     else
-        bad "6b. 缺 CLIENT_ACTIONS 卻 rc=$RC、out=[${OUT:0:200}]"
+        bad "6b. 缺 CLIENT_ACTIONS 卻 rc=${RC}、out=[${OUT:0:200}]"
     fi
 fi
 
@@ -192,7 +225,7 @@ if ! declare -F rotate_render_cloud_config >/dev/null 2>&1; then
     bad "7. rotate_render_cloud_config 未定義"
 else
     FATESAIKOU_LIST="      - $CLIENT_A"$'\n'"      - $CLIENT_ACTIONS"
-    SSHPROXY_LIST="      - $SHARED_KEY"$'\n'"      - $PROV1_KEY"$'\n'"      - $PROV2_KEY"
+    SSHPROXY_LIST="      - $PROV1_KEY"$'\n'"      - $PROV2_KEY"$'\n'"      - $WORKER_KEY"
     RENDERED="$SANDBOX/rendered.yaml"
     rotate_render_cloud_config "$TEMPLATE" "$FATESAIKOU_LIST" "$SSHPROXY_LIST" > "$RENDERED" 2>/dev/null
     if python3 -c "import yaml,sys; yaml.safe_load(open(sys.argv[1]))" "$RENDERED" 2>/dev/null; then
@@ -227,14 +260,14 @@ else
     if [[ "$C1" == "$C2" ]]; then
         ok "8. 兩次渲染位元組相同"
     else
-        bad "8. 兩次渲染不同（$C1 vs $C2）"
+        bad "8. 兩次渲染不同（$C1 vs ${C2}）"
     fi
 fi
 
 # ---------------------------------------------------------------------------
-# 注入 1：拿掉共用公鑰檢查 → 第 5 條必須紅
+# 注入 1：拿掉空清單防線 → 第 5 條必須紅
 # ---------------------------------------------------------------------------
-echo "── 注入 1：拿掉共用公鑰檢查 ──"
+echo "── 注入 1：拿掉空清單防線 ──"
 if ! declare -F rotate_assemble_sshproxy_keys >/dev/null 2>&1; then
     bad "注入 1. rotate_assemble_sshproxy_keys 未定義，無從注入"
 else
@@ -242,21 +275,30 @@ else
     python3 - "$ROTATE" "$INJ1" <<'PY'
 import re, sys
 src = open(sys.argv[1], encoding="utf-8").read()
-# 中性化共用鑰防線：把「共用鑰為空或缺席 → return 1」的 if 區塊
-# 換成 if false（guard 永遠不執行）。
-pat = re.compile(r'if \[\[ -z "\$shared_pubkey" \]\][^\n]*\n(?:[^\n]*\n)*?^\s*fi\n', re.M)
-src = pat.sub('if false; then\n    :\nfi\n', src)
-open(sys.argv[2], "w", encoding="utf-8").write(src)
+# 中性化空清單防線：把「結果為空 → return 1」的 if 區塊換成 if false
+# （guard 永遠不執行）。形狀可能是 -z "$all"、-z "$tunnel_keys" 或對
+# 輸出行數的檢查，所以用較寬的比對：guard 區塊內提到 empty / -z 的那個 if。
+pat = re.compile(
+    r'if \[\[[^\n]*(?:-z "\$all"|-z "\$tunnel_keys"|empty)[^\n]*\]\][^\n]*\n(?:[^\n]*\n)*?^\s*fi\n',
+    re.M)
+new_src, n = pat.subn('if false; then\n    :\nfi\n', src)
+if n == 0:
+    sys.exit(1)
+open(sys.argv[2], "w", encoding="utf-8").write(new_src)
 PY
-    INJ_OUT="$(bash -c "
+    if [[ ! -s "$INJ1" ]]; then
+        bad "注入 1. 找不到空清單 guard 可中性化（needle 落空）——harness 問題"
+    else
+        INJ_OUT="$(bash -c "
 set -uo pipefail
 source '$INJ1'
-rotate_assemble_sshproxy_keys \"\$1\" \"\$2\"
-" _ "" "$TUNNEL_KEYS" </dev/null 2>/dev/null)"; RC=$?
-    if [[ $RC -eq 0 && -n "$INJ_OUT" ]]; then
-        printf '  inj ok    %s\n' "注入後（拿掉共用鑰檢查）空共用鑰仍輸出清單——第 5 條會紅"
-    else
-        bad "注入 1. 注入後仍失敗/無輸出——注入沒生效（harness 問題）"
+rotate_assemble_sshproxy_keys \"\$1\"
+" _ "" </dev/null 2>/dev/null)"; RC=$?
+        if [[ $RC -eq 0 ]]; then
+            printf '  inj ok    %s\n' "注入後（拿掉空清單防線）空輸入仍 rc=0——第 5 條會紅"
+        else
+            bad "注入 1. 注入後仍非 0（rc=${RC}）——注入沒生效（harness 問題）"
+        fi
     fi
 fi
 
@@ -267,7 +309,7 @@ echo "── 注入 2：ssh_authorized_keys 塞成單一字串 ──"
 if ! declare -F rotate_render_cloud_config >/dev/null 2>&1; then
     bad "注入 2. rotate_render_cloud_config 未定義，無從注入"
 else
-    ONE_LINE_SSHPROXY="      - $(printf '%s %s' "$SHARED_KEY" "$PROV1_KEY")"
+    ONE_LINE_SSHPROXY="      - $(printf '%s %s' "$PROV1_KEY" "$PROV2_KEY")"
     BAD_RENDERED="$SANDBOX/rendered-bad.yaml"
     rotate_render_cloud_config "$TEMPLATE" "$FATESAIKOU_LIST" "$ONE_LINE_SSHPROXY" > "$BAD_RENDERED" 2>/dev/null
     if python3 - "$BAD_RENDERED" <<'PY'
