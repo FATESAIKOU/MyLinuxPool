@@ -32,15 +32,20 @@ _ledger_normalize() {
     printf '%s\n' "${out:-[]}"
 }
 
-# ledger_add <workers_json> <port> <provider> <image> <container> <created_at>
+# ledger_add <workers_json> <port> <provider> <image> <container> <created_at> [<tunnel_public_key>]
 #   Replaces the entry for <port>, or appends one; prints the array sorted
 #   by port. The port is the unique key (STATE_CONTRACT §1).
+#   The last argument is OPTIONAL: when given, the entry gains a
+#   `tunnel_public_key` field (the worker's own per-machine tunnel key,
+#   KEY-DESIGN §3.2); when omitted the record is exactly the five fields
+#   as before — the two outputs are byte-identical for existing callers.
 #   ALWAYS prints an array — including when the ledger was empty, where
 #   the old code printed a bare record and polluted the master with a
 #   non-array value (STATE_CONTRACT §1; 2026-09-15 incident).
 ledger_add() {
     local workers_json="${1:-}" port="${2:-}"
     local provider="${3:-}" image="${4:-}" container="${5:-}" created_at="${6:-}"
+    local tunnel_public_key="${7:-}"
 
     if [[ ! "$port" =~ ^[0-9]+$ ]]; then
         printf 'ledger_add: port must be numeric, got %q\n' "$port" >&2
@@ -53,9 +58,11 @@ ledger_add() {
         --arg image "$image" \
         --arg container "$container" \
         --arg created_at "$created_at" \
+        --arg tpk "$tunnel_public_key" \
         '([.[] | objects | select(.port != $port)]
           + [{port: $port, provider: $provider, image: $image,
-              container: $container, created_at: $created_at}])
+              container: $container, created_at: $created_at}
+             + (if $tpk != "" then {tunnel_public_key: $tpk} else {} end)])
          | sort_by(.port)'
 }
 

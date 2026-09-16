@@ -40,6 +40,36 @@ create_worker_compute_identity() {
     printf 'container=mlp-%s\n' "$name"
 }
 
+# create_worker_mint_tunnel_key
+#   Generates a fresh ed25519 key pair for a worker (KEY-DESIGN §3.3:
+#   workers get a NEW key on every create — the container dies with it,
+#   no key reuse). Runs on the Actions runner, never on a provider.
+#
+#   Output, exactly two lines on stdout:
+#     line 1: the PRIVATE key, base64-encoded
+#     line 2: the PUBLIC key, one full line (type, blob, optional
+#             comment — callers may overwrite the comment)
+#
+#   The key material is generated in a temp dir that is removed on every
+#   exit path; the private key only ever leaves as base64 on stdout — it
+#   is never written to a persistent file and never logged. Base64 is
+#   used (rather than raw key bytes) so the caller can carry it through
+#   a single step-output boundary without mangling newlines.
+create_worker_mint_tunnel_key() {
+    local tmp rc
+    tmp="$(mktemp -d "${TMPDIR:-/tmp}/mlp-worker-key.XXXXXX")" || return 1
+    if ! ssh-keygen -t ed25519 -N "" -f "$tmp/id" >/dev/null 2>&1; then
+        rm -rf "$tmp"
+        log ERROR "ssh-keygen failed — cannot mint a worker tunnel key"
+        return 1
+    fi
+    base64 < "$tmp/id"
+    rc=$?
+    cat "${tmp}/id.pub" || rc=1
+    rm -rf "$tmp"
+    return "$rc"
+}
+
 # create_worker_missing_secrets <profile_json> <all_secrets_json>
 #   Prints the name of every profile-declared secret NOT present in
 #   all_secrets_json, one per line. No values are ever printed — only

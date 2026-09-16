@@ -238,19 +238,94 @@ jobs:
       # "Validate profile-declared secrets exist" above for why. Only this
       # step ever reads the decrypted tunnel key / $FILE_CRYPTO_KEY / the
       # function's own %q-quoted output.
+      #
+      # A FRESH tunnel key is minted for this worker first (KEY-DESIGN
+      # §3.3: every create gets a new pair), its public half goes into the
+      # POOL_WORKERS entry, and the Gateway authorizes it BEFORE the
+      # container starts — a worker whose key is not yet authorized cannot
+      # connect at all. Order is the safety design (brief-T): claim →
+      # build → mint → publish → refresh → run. The private key travels
+      # base64 through this one step boundary and is decoded here, never
+      # written to a file and never logged.
+      - name: Mint a worker tunnel key
+        id: mint
+        shell: bash
+        run: |
+          set -euo pipefail
+          source scripts/create-worker.sh
+          key="$(create_worker_mint_tunnel_key)" || { echo "::error::could not mint a tunnel key — see log above"; exit 1; }
+          {
+            echo "private_key_b64=$(printf '%s\n' "$key" | head -1)"
+            echo "public_key=$(printf '%s\n' "$key" | sed -n 2p)"
+          } >> "$GITHUB_OUTPUT"
+
+      # The Gateway placeholder is a cache; POOL_WORKERS is the master
+      # (docs/STATE_CONTRACT.md §1). Writing it here — WITH the new
+      # worker's tunnel public key — is what lets a rotate restore the
+      # ledger from the repo, and is what the refresh below assembles
+      # from.
+      - name: Record the worker in POOL_WORKERS
+        shell: bash
+        run: |
+          set -euo pipefail
+          source scripts/lib/ledger.sh
+          cur="$(gh api "repos/${GH_REPO}/actions/variables/POOL_WORKERS" --jq .value 2>/dev/null || true)"
+          new="$(ledger_add "$cur" \
+                   "${{ steps.port.outputs.port }}" \
+                   "${{ inputs.provider }}" \
+                   "${{ inputs.image }}" \
+                   "${{ steps.identity.outputs.container }}" \
+                   "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+                   "${{ steps.mint.outputs.public_key }}")"
+          printf '%s' "$new" | gh variable set POOL_WORKERS --repo "$GH_REPO"
+          echo "POOL_WORKERS now holds $(printf '%s' "$new" | jq 'length') worker(s)"
+
+      # The Gateway must authorize this worker's tunnel key BEFORE the
+      # container starts (brief-T §流程順序). A dispatch or run failure
+      # here fails the whole create — the failure handler below rolls the
+      # ledger entry back out.
+      - name: Refresh the Gateway authorized keys
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! gh workflow run refresh-authorized-keys.yml --repo "$GH_REPO"; then
+            echo "::error::could not dispatch refresh-authorized-keys.yml — the worker's key would never be authorized"
+            exit 1
+          fi
+          # Dispatching is not the same as done: wait for the refresh to
+          # actually finish and succeed.
+          run_id=""
+          for _ in $(seq 1 30); do
+            sleep 5
+            run_id="$(gh run list --workflow=refresh-authorized-keys.yml --repo "$GH_REPO" --limit 1 --json databaseId,status --jq '.[0] | select(.status != "queued") | .databaseId' 2>/dev/null || true)"
+            [[ -n "$run_id" ]] && break
+          done
+          if [[ -z "$run_id" ]]; then
+            echo "::error::refresh workflow did not start within the wait window"
+            exit 1
+          fi
+          conclusion="$(gh run view "$run_id" --repo "$GH_REPO" --json conclusion --jq '.conclusion' 2>/dev/null || true)"
+          if [[ "$conclusion" != "success" ]]; then
+            echo "::error::refresh workflow ${run_id} finished with conclusion '${conclusion:-<unknown>}' — the worker's key may not be authorized"
+            exit 1
+          fi
+          echo "refresh workflow ${run_id} succeeded"
+
       - name: Build docker-run command
         id: run_cmd
         shell: bash
         env:
           FILE_CRYPTO_KEY: ${{ secrets.FILE_CRYPTO_KEY }}
+          WORKER_KEY_B64: ${{ steps.mint.outputs.private_key_b64 }}
         run: |
           set -euo pipefail
           source scripts/create-worker.sh
+          worker_key="$(printf '%s' "$WORKER_KEY_B64" | base64 -d)"
           cmd="$(create_worker_build_run_cmd \
             "${{ steps.identity.outputs.container }}" "${{ steps.identity.outputs.image_tag }}" \
             "${{ steps.port.outputs.port }}" "${{ steps.gateway.outputs.ip }}" \
             "${{ steps.gateway.outputs.tunnel_user }}" "${{ steps.identity.outputs.name }}" \
-            "$(scripts/lib/crypto.sh decrypt "$FILE_CRYPTO_KEY" < shared-configs/ssh-tunnel-client/files/id_rsa.crypted)" \
+            "$worker_key" \
             "shared-configs/ssh-admin/files/authorized_keys.crypted" \
             "$FILE_CRYPTO_KEY" "profiles/worker/${{ inputs.image }}/profile.json" "$ALL_SECRETS_JSON")" \
             || { echo "::error::could not build the docker-run command — see log above"; exit 1; }
@@ -277,25 +352,6 @@ jobs:
             f=~/.mylinuxpool/workers.d/${{ steps.port.outputs.port }}.json &&
             jq --arg c '${{ steps.identity.outputs.container }}' '.container = $c' "$f" > "$f.tmp" &&
             mv "$f.tmp" "$f"
-
-      # The Gateway placeholder is a cache; POOL_WORKERS is the master
-      # (docs/STATE_CONTRACT.md §1). Writing it here is what lets a rotate
-      # restore the ledger from the repo instead of copying it off a
-      # machine that may be unreachable.
-      - name: Record the worker in POOL_WORKERS
-        shell: bash
-        run: |
-          set -euo pipefail
-          source scripts/lib/ledger.sh
-          cur="$(gh api "repos/${GH_REPO}/actions/variables/POOL_WORKERS" --jq .value 2>/dev/null || true)"
-          new="$(ledger_add "$cur" \
-                   "${{ steps.port.outputs.port }}" \
-                   "${{ inputs.provider }}" \
-                   "${{ inputs.image }}" \
-                   "${{ steps.identity.outputs.container }}" \
-                   "$(date -u +%Y-%m-%dT%H:%M:%SZ)")"
-          printf '%s' "$new" | gh variable set POOL_WORKERS --repo "$GH_REPO"
-          echo "POOL_WORKERS now holds $(printf '%s' "$new" | jq 'length') worker(s)"
 
       - name: Push the state cache
         uses: ./.github/actions/push-state

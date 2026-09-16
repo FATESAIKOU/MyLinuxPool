@@ -107,6 +107,37 @@ jobs:
           printf '%s' "$new" | gh variable set POOL_WORKERS --repo "$GH_REPO"
           echo "POOL_WORKERS now holds $(printf '%s' "$new" | jq 'length') worker(s)"
 
+      # The worker's tunnel public key was authorized on the Gateway when
+      # it was created; deleting the ledger entry alone leaves the key
+      # authorized forever (KEY-DESIGN §3.2: delete is revocation). Push a
+      # refresh to pull the key OFF the Gateway. A failed dispatch or a
+      # failed run FAILS the workflow — a leftover authorized key is a
+      # security issue, not something to swallow.
+      - name: Refresh the Gateway authorized keys
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! gh workflow run refresh-authorized-keys.yml --repo "$GH_REPO"; then
+            echo "::error::could not dispatch refresh-authorized-keys.yml — the deleted worker's key may still be authorized"
+            exit 1
+          fi
+          run_id=""
+          for _ in $(seq 1 30); do
+            sleep 5
+            run_id="$(gh run list --workflow=refresh-authorized-keys.yml --repo "$GH_REPO" --limit 1 --json databaseId,status --jq '.[0] | select(.status != "queued") | .databaseId' 2>/dev/null || true)"
+            [[ -n "$run_id" ]] && break
+          done
+          if [[ -z "$run_id" ]]; then
+            echo "::error::refresh workflow did not start within the wait window"
+            exit 1
+          fi
+          conclusion="$(gh run view "$run_id" --repo "$GH_REPO" --json conclusion --jq '.conclusion' 2>/dev/null || true)"
+          if [[ "$conclusion" != "success" ]]; then
+            echo "::error::refresh workflow ${run_id} finished with conclusion '${conclusion:-<unknown>}' — the deleted worker's key may still be authorized"
+            exit 1
+          fi
+          echo "refresh workflow ${run_id} succeeded"
+
       - name: Resolve Gateway for the push
         id: gw
         shell: bash
