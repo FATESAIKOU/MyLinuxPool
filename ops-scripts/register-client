@@ -13,10 +13,18 @@
 
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
+
 REPO="${POOL_REPO:-FATESAIKOU/MyLinuxPool}"
 SSH_DIR="${HOME}/.ssh"
 DEFAULT_KEY_PATH="${SSH_DIR}/id_mlp"
 REFRESH_WORKFLOW="refresh-authorized-keys.yml"
+
+# The refresh-wait logic is the SINGLE shared implementation in
+# scripts/lib/refresh-wait.sh (RUNBOOK §7.12, fourth incident — a second
+# copy of the wait loop here reported "<unknown>" for a successful refresh).
+# shellcheck source=../scripts/lib/refresh-wait.sh
+source "${SCRIPT_DIR}/../scripts/lib/refresh-wait.sh"
 
 log() {
     local level="$1"; shift
@@ -40,34 +48,24 @@ EOF
 }
 
 # trigger_refresh — fire the authorized-keys refresh workflow and wait for
-# its outcome. Failure to trigger is a WARN, not fatal: registration is
-# already written to the var and the next manual/periodic refresh would
-# pick it up; the run's own outcome, when reachable, is reported.
+# its outcome via the SINGLE shared implementation
+# dispatch_refresh_and_wait (scripts/lib/refresh-wait.sh — RUNBOOK §7.12,
+# fourth incident: register-client had its own copy of the wait loop with
+# the old `status != "queued"` bug and reported "<unknown>" for a refresh
+# that had actually succeeded). Failure to trigger is a WARN, not fatal:
+# registration is already written to the var and the next
+# manual/periodic refresh would pick it up; the run's own outcome, when
+# reachable, is reported.
 trigger_refresh() {
     log INFO "triggering ${REFRESH_WORKFLOW}"
-    if gh workflow run "$REFRESH_WORKFLOW" --repo "$REPO"; then
-        local run_id="" i
-        for (( i = 0; i < 30; i++ )); do
-            sleep 5
-            run_id="$(gh run list --workflow="$REFRESH_WORKFLOW" --repo "$REPO" --limit 1 --json databaseId,status --jq '.[0] | select(.status != "queued") | .databaseId' 2>/dev/null || true)"
-            if [[ -n "$run_id" ]]; then
-                break
-            fi
-        done
-        if [[ -z "$run_id" ]]; then
-            log WARN "refresh workflow did not start within the wait window — check it manually"
-            return 0
-        fi
-        local conclusion
-        conclusion="$(gh run view "$run_id" --repo "$REPO" --json conclusion --jq '.conclusion' 2>/dev/null || true)"
-        if [[ "$conclusion" == "success" ]]; then
-            log INFO "refresh workflow ${run_id} finished: success"
-        else
-            log ERROR "refresh workflow ${run_id} finished: ${conclusion:-<unknown>} — check the run log"
-        fi
-    else
-        log WARN "could not trigger ${REFRESH_WORKFLOW} — run it manually from the Actions tab"
-    fi
+    # dispatch_refresh_and_wait reads GH_REPO from the environment (the
+    # workflows get it from their env:); this script uses REPO — hand it
+    # over so the shared waiter targets the same repository.
+    GH_REPO="$REPO" dispatch_refresh_and_wait 300 || {
+        log WARN "refresh workflow did not complete successfully (see above) — check it manually from the Actions tab"
+        return 0
+    }
+    return 0
 }
 
 NAME=""

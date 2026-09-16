@@ -98,10 +98,33 @@ fi
 if [[ "${1:-}" == "variable" && "${2:-}" == "delete" ]]; then
     printf 'vardelete|%s|%s\n' "$*" "$f" >> "${ARGV_LOG}"
 fi
+# Apply --jq the way real gh does. register-client now waits through the
+# SHARED dispatch_refresh_and_wait (scripts/lib/refresh-wait.sh), which
+# filters `gh run list` / `gh run view` output itself — a fake that ignores
+# --jq never completes, and the run would look like a timeout instead of the
+# dispatch this section is asserting.
+_jq_filter=""; _prev=""
+for _a in "$@"; do
+    [[ "$_prev" == "--jq" ]] && _jq_filter="$_a"
+    _prev="$_a"
+done
+_fake_emit() {
+    if [[ -n "$_jq_filter" ]]; then
+        printf '%s' "$1" | jq -r "$_jq_filter"
+    else
+        printf '%s\n' "$1"
+    fi
+}
 case "${1:-}" in
     api) echo '{}' ;;
     workflow) printf 'dispatch|%s\n' "$*" >> "${ARGV_LOG}" ;;
-    run) echo '[{"databaseId":1,"status":"completed","conclusion":"success"}]' ;;
+    run)
+        case "${2:-}" in
+            list) _fake_emit '[{"databaseId":1,"status":"completed","conclusion":"success"}]' ;;
+            view) _fake_emit '{"databaseId":1,"status":"completed","conclusion":"success"}' ;;
+            *) _fake_emit '{}' ;;
+        esac
+        ;;
 esac
 exit 0
 FAKE_GH

@@ -117,75 +117,25 @@ create_worker_mint_tunnel_key() {
     return 0
 }
 
+# dispatch_refresh_and_wait lives in scripts/lib/refresh-wait.sh — the
+# SINGLE implementation of "dispatch refresh-authorized-keys.yml and wait
+# for it to actually complete" (RUNBOOK §7.12, fourth incident: the same
+# wait logic existed in create-worker.sh and register-client, only one of
+# them fixed). create_worker_dispatch_refresh_and_wait below is kept as a
+# thin alias so existing callers/tests keep working.
+# shellcheck source=lib/refresh-wait.sh
+source "${SCRIPT_DIR}/lib/refresh-wait.sh"
+
 # create_worker_dispatch_refresh_and_wait [<timeout_seconds>]
+#   Thin alias of dispatch_refresh_and_wait (scripts/lib/refresh-wait.sh).
 #   Dispatches refresh-authorized-keys.yml and waits until the run is
 #   ACTUALLY completed. Returns 0 iff the run finished with conclusion ==
 #   "success"; non-zero on dispatch failure, timeout, or a non-success
 #   conclusion — with timeout and failure messages distinguishable.
-#
-#   The poll waits for status == "completed" before ever reading the
-#   conclusion. Breaking out on `status != "queued"` (the old bug) exits
-#   the moment the run goes in_progress, and an in_progress run has no
-#   conclusion yet — an empty value then got reported as '<unknown>' and
-#   FAILED a refresh that had actually succeeded (real run 35047640983).
 #   GH_REPO comes from the calling workflow's env (docs/LAYOUT.md §3:
 #   the workflow is the thin caller).
 create_worker_dispatch_refresh_and_wait() {
-    local timeout_seconds="${1:-300}"
-    # Overridable so tests can run a queued→in_progress→completed sequence
-    # in seconds instead of the production default's ~10s+; the default
-    # keeps production behaviour unchanged.
-    local poll_interval="${POOL_REFRESH_POLL_INTERVAL:-5}"
-    local repo="${GH_REPO:-}"
-    local workflow="refresh-authorized-keys.yml"
-    local deadline start now
-
-    if [[ -z "$repo" ]]; then
-        log ERROR "GH_REPO is not set — cannot dispatch ${workflow}"
-        return 1
-    fi
-
-    start="$(date +%s)"
-    deadline=$((start + timeout_seconds))
-
-    if ! gh workflow run "$workflow" --repo "$repo" >/dev/null 2>&1; then
-        log ERROR "could not dispatch ${workflow} (${repo})"
-        return 1
-    fi
-
-    local run_id="" row status conclusion
-    while :; do
-        now="$(date +%s)"
-        if (( now >= deadline )); then
-            log ERROR "timed out after ${timeout_seconds}s waiting for ${workflow} to finish (still not completed)"
-            return 1
-        fi
-        row="$(gh run list --workflow="$workflow" --repo "$repo" --limit 1 \
-            --json databaseId,status --jq '.[0] | "\(.databaseId) \(.status)"' 2>/dev/null || true)"
-        if [[ -z "$row" ]]; then
-            # The dispatch was accepted but the run is not listed yet.
-            sleep "$poll_interval"
-            continue
-        fi
-        run_id="${row%% *}"
-        status="${row#* }"
-        if [[ "$status" == "completed" ]]; then
-            break
-        fi
-        sleep "$poll_interval"
-    done
-
-    # `gh run view --json conclusion` returns an OBJECT in real gh; some
-    # gh versions / test fakes return an ARRAY of the same record. Tolerate
-    # both shapes so a conclusion read is never a null-by-mismatch.
-    conclusion="$(gh run view "$run_id" --repo "$repo" --json conclusion --jq \
-        'if type == "array" then .[0].conclusion else .conclusion end' 2>/dev/null || true)"
-    if [[ "$conclusion" != "success" ]]; then
-        log ERROR "refresh workflow ${run_id} finished with conclusion '${conclusion:-<unknown>}'"
-        return 1
-    fi
-    log INFO "refresh workflow ${run_id} succeeded"
-    return 0
+    dispatch_refresh_and_wait "$@"
 }
 
 # create_worker_missing_secrets <profile_json> <all_secrets_json>

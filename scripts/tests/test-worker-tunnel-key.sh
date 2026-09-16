@@ -18,11 +18,18 @@
 # dropping the ledger entry. Ordering is checked by parsing the YAML step
 # list, never by grepping line numbers.
 #
-# Task T2 addition: create_worker_dispatch_refresh_and_wait must wait for
+# Task T2 addition: dispatch_refresh_and_wait must wait for
 # status == "completed" before reading .conclusion. The 2026-09-16 run
 # broke because the poll treated "left queued" as "finished": an
 # in_progress run has no conclusion, so a successful refresh was read as
 # <unknown> and the create was rolled back for nothing.
+#
+# The same bug then appeared a SECOND time, in register-client's own private
+# copy of the wait logic (2026-09-17: `mlp register client --remove` reported
+# <unknown> for a refresh that succeeded). The function now lives in exactly
+# ONE place, shared by create-worker and register-client, and this suite
+# asserts that uniqueness — a second implementation is what caused both
+# incidents (RUNBOOK §7.12).
 #
 # Injection demo at the end: the same order checker is run against a copy
 # with the two steps swapped, and must go red; and (task T2) the refresh
@@ -944,7 +951,7 @@ YML
 fi
 
 # ===========================================================================
-# Task T2: create_worker_dispatch_refresh_and_wait — wait for the refresh to
+# Task T2: dispatch_refresh_and_wait — wait for the refresh to
 # actually COMPLETE before trusting its conclusion.
 #
 # The 2026-09-16 real run failed here: the poll left the loop as soon as the
@@ -952,7 +959,158 @@ fi
 # `.conclusion` and reported `<unknown>` for a refresh that in fact
 # succeeded. Case R1 below is that exact sequence.
 # ===========================================================================
-echo "create_worker_dispatch_refresh_and_wait:"
+# Where does the shared waiter live? The brief allows either a new
+# scripts/lib/refresh-wait.sh or the existing scripts/refresh-authkeys.sh,
+# so discover the single definition instead of hard-coding a path. Discovery
+# failing is itself a FAIL (the function must exist somewhere).
+# log.sh provides the log() the waiter calls; sourcing it here means the
+# discovered file does not have to bring its own.
+LOG_LIB="scripts/lib/log.sh"
+MISSING_WAITER=0
+WAIT_DEFS="$(grep -rlE '^(dispatch_refresh_and_wait|dispatch_refresh_and_wait)\(\)[[:space:]]*\{'     scripts/ ops-scripts/ 2>/dev/null | grep -v '/tests/' | sort -u || true)"
+WAIT_DEF_COUNT="$(printf '%s\n' "$WAIT_DEFS" | grep -c . || true)"
+WAIT_FILE="$(printf '%s\n' "$WAIT_DEFS" | head -1)"
+
+echo "dispatch_refresh_and_wait:"
+echo "  定義點：$(printf '%s' "${WAIT_DEFS:-<none>}" | tr '\n' ' ')"
+
+# S: exactly ONE definition, shared by both callers. The second incident —
+# register-client's private copy of the same poll — is what this prevents.
+echo "S. 等待函式只有一處定義（共用來源）:"
+if [[ "$WAIT_DEF_COUNT" -eq 1 ]]; then
+    ok "S1. exactly one definition of the waiter (${WAIT_DEFS})"
+else
+    bad "S1. expected exactly one definition, found ${WAIT_DEF_COUNT}: $(printf '%s' "${WAIT_DEFS:-<none>}" | tr '\n' ' ')"
+fi
+for consumer in "scripts/create-worker.sh" "ops-scripts/register-client"; do
+    if [[ ! -f "$consumer" ]]; then
+        bad "S2. ${consumer} missing"
+        continue
+    fi
+    if grep -q 'dispatch_refresh_and_wait' "$consumer" 2>/dev/null; then
+        ok "S2. ${consumer} references the shared waiter"
+    else
+        bad "S2. ${consumer} never references the shared waiter"
+        continue
+    fi
+    # A function of its own is only acceptable as a one-line alias; anything
+    # that re-implements the poll (its own gh polling or completion test) is
+    # the second implementation both incidents came from.
+    if grep -qE '^[a-z_]*dispatch_refresh_and_wait\(\)' "$consumer" 2>/dev/null; then
+        body="$(awk '/^[a-z_]*dispatch_refresh_and_wait\(\)/{f=1} f{print} f&&/^\}/{exit}' "$consumer" 2>/dev/null)"
+        if printf '%s' "$body" | grep -qE 'gh (run|workflow)|status.*completed|status != "queued"'; then
+            bad "S2. ${consumer} re-implements the waiter body — second implementation (RUNBOOK §7.12)"
+        else
+            ok "S2. ${consumer} defines only a thin alias, not a second implementation"
+        fi
+    fi
+    if grep -qE 'source .*refresh-(wait|authkeys)\.sh' "$consumer" 2>/dev/null; then
+        ok "S2. ${consumer} sources the shared file"
+    else
+        bad "S2. ${consumer} does not source the shared file — it cannot be calling the shared function"
+    fi
+done
+# The historical bug shape must not survive in non-test code.
+if grep -rn 'select(.status != "queued")' scripts/ ops-scripts/ 2>/dev/null | grep -v '/tests/' | grep -q .; then
+    bad "S3. a file still polls on 'status != queued' (the bug shape): $(grep -rn 'select(.status != "queued")' scripts/ ops-scripts/ 2>/dev/null | grep -v '/tests/' | head -1)"
+else
+    ok "S3. no 'status != queued' poll remains in non-test code"
+fi
+
+# S4: register-client runs on an operator/provider machine, and must resolve
+# the shared file from its OWN location. "Does it still run after being
+# copied" is not enough: a hard-coded absolute path to the real repo works on
+# this machine too. So the relocated tree carries a SENTINEL refresh-wait.sh
+# that records when it is sourced — only a self-derived path reaches it.
+echo "S4. register-client 由自身位置推導共用檔路徑（sentinel 判別）:"
+RELOC="$SANDBOX/relocated"
+rm -rf "$RELOC"
+mkdir -p "$RELOC/ops-scripts" "$RELOC/scripts/lib"
+cp "ops-scripts/register-client" "$RELOC/ops-scripts/register-client" 2>/dev/null
+cp scripts/lib/log.sh "$RELOC/scripts/lib/log.sh" 2>/dev/null
+SENTINEL="$SANDBOX/sentinel.hit"
+: > "$SENTINEL"
+cat > "$RELOC/scripts/lib/refresh-wait.sh" <<SENTINEL_SH
+# Test sentinel standing in for the real shared file: records that THIS copy
+# was sourced, then provides a harmless stub.
+printf '%s' "hit" >> "${SENTINEL}"
+dispatch_refresh_and_wait() { return 0; }
+SENTINEL_SH
+chmod +x "$RELOC/ops-scripts/register-client"
+
+if [[ ! -f "$RELOC/ops-scripts/register-client" ]]; then
+    bad "S4. 無法建立搬移後的副本（harness 問題）"
+else
+    # --help stops before any network use; the source line runs regardless.
+    SENTINEL="$SENTINEL" HOME="$SANDBOX/home" PATH="$SANDBOX/fakebin:$PATH" \
+        $TIMEOUT bash "$RELOC/ops-scripts/register-client" --help \
+        </dev/null >"$SANDBOX/s4.out" 2>&1
+    if [[ -s "$SENTINEL" ]]; then
+        ok "S4. 搬移後 source 到的是自身旁邊的共用檔（路徑由 SCRIPT_DIR 推導）"
+    else
+        bad "S4. 搬移後沒 source 到自身旁邊的共用檔——路徑不是由自身位置推導（$(head -c 160 "$SANDBOX/s4.out")）"
+    fi
+fi
+
+# S5: the extraction must not silently break a caller's dispatch. The shared
+# waiter reads GH_REPO; register-client defines REPO (POOL_REPO). If the two
+# never meet, register-client reaches the waiter and the waiter immediately
+# errors "GH_REPO is not set" WITHOUT ever calling `gh workflow run` — so no
+# refresh happens at all, and the caller's WARN makes it look intended.
+# Behavioral check: run register-client with a fake gh and require that a
+# `workflow run` reached gh.
+echo "S5. register-client 真的派發 refresh（共用函式拿得到 repo）:"
+if [[ ! -f "ops-scripts/register-client" ]]; then
+    bad "S5. register-client 不存在"
+else
+    S5BIN="$SANDBOX/s5bin"
+    rm -rf "$S5BIN"; mkdir -p "$S5BIN" "$SANDBOX/s5-home" "$SANDBOX/s5-stdin" "$SANDBOX/s5-tmp"
+    : > "$SANDBOX/s5-argv.log"
+    # Fake gh: records calls; answers the var write and (if reached) the
+    # run list/view the waiter uses. --jq is applied like real gh.
+    cat > "$S5BIN/gh" <<'S5GH'
+#!/usr/bin/env bash
+printf 'gh|%s\n' "$*" >> "${S5_ARGV_LOG:?}"
+if [[ ! -t 0 ]]; then cat >/dev/null; fi
+_f=""; _p=""
+for _a in "$@"; do [[ "$_p" == "--jq" ]] && _f="$_a"; _p="$_a"; done
+case "${1:-}" in
+    api) printf '%s\n' '{}' ;;
+    variable) : ;;
+    workflow) : ;;
+    run)
+        _j='{"databaseId":1,"status":"completed","conclusion":"success"}'
+        if [[ "${2:-}" == "list" ]]; then _j="[$_j]"; fi
+        if [[ -n "$_f" ]]; then printf '%s' "$_j" | jq -r "$_f"; else printf '%s\n' "$_j"; fi ;;
+esac
+exit 0
+S5GH
+    chmod +x "$S5BIN/gh"
+    for tool in whoami hostname uname id sleep; do
+        printf '#!/usr/bin/env bash\ncase "${1:-}" in -n|-un) printf "TestHost";; *) printf "501";; esac\n' > "$S5BIN/$tool"
+        chmod +x "$S5BIN/$tool"
+    done
+    S5_TREE="$SANDBOX/s5-repo"
+    rm -rf "$S5_TREE"
+    mkdir -p "$S5_TREE"
+    if command -v rsync >/dev/null 2>&1; then
+        rsync -a --exclude '.git' ./ "$S5_TREE/" 2>/dev/null
+    else
+        cp -R . "$S5_TREE/" 2>/dev/null
+    fi
+    HOME="$SANDBOX/s5-home" TMPDIR="$SANDBOX/s5-tmp" \
+    PATH="$S5BIN:$PATH" USER=TestUser GH_TOKEN=fake \
+    S5_ARGV_LOG="$SANDBOX/s5-argv.log" STDIN_DIR="$SANDBOX/s5-stdin" \
+    $TIMEOUT bash "$S5_TREE/ops-scripts/register-client" --name s5client \
+        </dev/null >"$SANDBOX/s5.out" 2>&1
+    if grep -q 'workflow run' "$SANDBOX/s5-argv.log" 2>/dev/null; then
+        ok "S5. register-client 的呼叫真的觸發了 gh workflow run"
+    else
+        s5_reason="$(grep -E 'ERROR|WARN' "$SANDBOX/s5.out" 2>/dev/null | head -1)"
+        bad "S5. register-client 沒有觸發任何 workflow run——共用函式拿不到 repo（${s5_reason:0:140}）"
+    fi
+fi
+
 
 GHFAKE_LOG="$SANDBOX/gh.log"
 : > "$GHFAKE_LOG"
@@ -975,11 +1133,14 @@ run_refresh_wait() {
     rm -rf "$T2_STATE"; mkdir -p "$T2_STATE"
     printf '0' > "$T2_STATE/next.idx"
     T2_RC=0; T2_OUT=""; T2_ERR=""
-    if ! declare -F create_worker_dispatch_refresh_and_wait >/dev/null 2>&1; then
+    local wait_file="${WAIT_FILE:-${WAIT_DEFS%%$'\n'*}}"
+    if [[ -z "$wait_file" || ! -f "$wait_file" ]]; then
         T2_RC=127
-        T2_ERR="<undefined function: create_worker_dispatch_refresh_and_wait>"
+        T2_ERR="<no file defining dispatch_refresh_and_wait found>"
+        MISSING_WAITER=1
         return 127
     fi
+    MISSING_WAITER=0
     local -a args=()
     [[ -n "$timeout_arg" ]] && args=("$timeout_arg")
     HOME="$SANDBOX/home" TMPDIR="$SANDBOX/tmp" \
@@ -991,11 +1152,19 @@ run_refresh_wait() {
     FAKE_GH_DISPATCH_MODE="$dispatch" FAKE_GH_WATCH_SECS="$watch" \
     FAKE_GH_RUN_ID=35047640983 \
     $TIMEOUT bash -c '
-        source "$1" >/dev/null 2>&1
-        create_worker_dispatch_refresh_and_wait ${2:+"$2"}
-    ' _ "$CREATE_WORKER_SH" "${timeout_arg:-}" \
+        source "$1" >/dev/null 2>&1 || true
+        source "$2" >/dev/null 2>&1
+        if ! declare -F dispatch_refresh_and_wait >/dev/null 2>&1; then
+            printf "%s" "<undefined function: dispatch_refresh_and_wait>" >&2
+            exit 127
+        fi
+        dispatch_refresh_and_wait ${3:+"$3"}
+    ' _ "$LOG_LIB" "$wait_file" "${timeout_arg:-}" \
         </dev/null > "$SANDBOX/t2.out" 2> "$SANDBOX/t2.err"
     T2_RC=$?
+    if [[ "$T2_RC" -eq 127 && "$(cat "$SANDBOX/t2.err" 2>/dev/null)" == *"undefined function"* ]]; then
+        MISSING_WAITER=1
+    fi
     T2_OUT="$(cat "$SANDBOX/t2.out")"
     T2_ERR="$(cat "$SANDBOX/t2.err")"
     return "$T2_RC"
@@ -1014,7 +1183,7 @@ t2_fail() {
 # R1: queued -> in_progress -> completed/success must return 0. The
 # in_progress observation must NOT be treated as "finished".
 run_refresh_wait "queued,in_progress,completed" success ok 30 30 0 || true
-if ! declare -F create_worker_dispatch_refresh_and_wait >/dev/null 2>&1; then
+if [[ "${MISSING_WAITER:-1}" -eq 1 ]]; then
     t2_fail "R1. queued→in_progress→completed/success 回 0" "函式不存在"
 else
     if [[ "$T2_RC" -eq 0 ]]; then
@@ -1028,7 +1197,7 @@ fi
 # R1b: an early exit on in_progress leaves no conclusion — the fake reports
 # the empty value the real gh reported, so this also documents the bug shape.
 run_refresh_wait "in_progress,completed" success ok 30 30 0 || true
-if ! declare -F create_worker_dispatch_refresh_and_wait >/dev/null 2>&1; then
+if [[ "${MISSING_WAITER:-1}" -eq 1 ]]; then
     t2_fail "R1b. 首見即 in_progress 仍等到 completed" "函式不存在"
 elif [[ "$T2_RC" -eq 0 ]]; then
     ok "R1b. 首見即 in_progress 仍等到 completed（回 0）"
@@ -1038,7 +1207,7 @@ fi
 
 # R2: completed/failure → non-zero.
 run_refresh_wait "queued,completed" failure ok 30 30 0 || true
-if ! declare -F create_worker_dispatch_refresh_and_wait >/dev/null 2>&1; then
+if [[ "${MISSING_WAITER:-1}" -eq 1 ]]; then
     t2_fail "R2. completed/failure 回非 0" "函式不存在"
 elif [[ "$T2_RC" -ne 0 ]]; then
     ok "R2. completed/failure 回非 0"
@@ -1052,7 +1221,7 @@ fi
 # timeout is 1 second with a status sequence that never reaches completed.
 run_refresh_wait "queued,in_progress,in_progress,in_progress" success ok 30 1 1 || true
 T2_MSG="$(printf '%s %s' "$T2_OUT" "$T2_ERR" | tr '\n' ' ')"
-if ! declare -F create_worker_dispatch_refresh_and_wait >/dev/null 2>&1; then
+if [[ "${MISSING_WAITER:-1}" -eq 1 ]]; then
     t2_fail "R3. 逾時回非 0" "函式不存在"
     t2_fail "R3. 逾時訊息看得出是逾時" "函式不存在"
 else
@@ -1086,7 +1255,7 @@ fi
 # R4: dispatch itself fails → non-zero, and no waiting happens (no run
 # list/view/watch call may follow).
 : > "$GHFAKE_LOG"; run_refresh_wait "queued,completed" success fail 30 30 0 || true
-if ! declare -F create_worker_dispatch_refresh_and_wait >/dev/null 2>&1; then
+if [[ "${MISSING_WAITER:-1}" -eq 1 ]]; then
     t2_fail "R4. 派發失敗回非 0" "函式不存在"
     t2_fail "R4. 派發失敗不進入等待" "函式不存在"
 else
@@ -1119,27 +1288,27 @@ for i, s in enumerate(steps):
     blob = json.dumps(s, default=str)
     if "refresh-authorized-keys" in blob:
         body = s.get("run", "") or ""
-        has_call = "create_worker_dispatch_refresh_and_wait" in body
+        has_call = "dispatch_refresh_and_wait" in body
         has_own_poll = "run list" in body or "run view" in body
         print(json.dumps({"index": i, "has_call": has_call, "has_own_poll": has_own_poll}))
         break
 PY
 )"
     if [[ -z "$wf_call" ]]; then
-        t2_fail "R5. workflow 那步改呼叫 create_worker_dispatch_refresh_and_wait" "找不到 refresh 步驟"
+        t2_fail "R5. workflow 那步改呼叫 dispatch_refresh_and_wait" "找不到 refresh 步驟"
     elif jq -e '.has_call == true' >/dev/null 2>&1 <<<"$wf_call"; then
-        ok "R5. workflow 那步有呼叫 create_worker_dispatch_refresh_and_wait"
+        ok "R5. workflow 那步有呼叫 dispatch_refresh_and_wait"
         if jq -e '.has_own_poll == false' >/dev/null 2>&1 <<<"$wf_call"; then
             ok "R5b. workflow 不再自己輪詢（沒有 run list/view）"
         else
             t2_fail "R5b. workflow 不再自己輪詢" "步驟內仍有 run list/view"
         fi
     else
-        t2_fail "R5. workflow 那步改呼叫 create_worker_dispatch_refresh_and_wait" \
+        t2_fail "R5. workflow 那步改呼叫 dispatch_refresh_and_wait" \
             "步驟 $(jq -r '.index' <<<"$wf_call") 沒有呼叫它"
     fi
 else
-    t2_fail "R5. workflow 那步改呼叫 create_worker_dispatch_refresh_and_wait" "workflow 不存在或 YAML 不可用"
+    t2_fail "R5. workflow 那步改呼叫 dispatch_refresh_and_wait" "workflow 不存在或 YAML 不可用"
     t2_fail "R5b. workflow 不再自己輪詢" "workflow 不存在或 YAML 不可用"
 fi
 
@@ -1149,28 +1318,45 @@ fi
 # copy, so it exercises whatever the implementer actually wrote.
 # ---------------------------------------------------------------------------
 echo "injection (refresh waiter):"
-T2_INJ="$SANDBOX/create-worker-inj.sh"
+# Mutate the SHARED file's completion condition back to the historical
+# `status != "queued"` shape and show R1 reddens. Two mutation styles so the
+# injection does not depend on how the implementer spelled the comparison.
+T2_INJ="$SANDBOX/refresh-wait-inj.sh"
+INJ_SRC_FILE=""
+if [[ -n "${WAIT_DEFS:-}" ]]; then
+    INJ_SRC_FILE="$(printf '%s\n' "$WAIT_DEFS" | head -1)"
+fi
 T2_INJ_OK=0
-if [[ -f "$CREATE_WORKER_SH" ]]; then
-    python3 - "$CREATE_WORKER_SH" "$T2_INJ" <<'PY'
+if [[ -n "$INJ_SRC_FILE" && -f "$INJ_SRC_FILE" ]]; then
+    python3 - "$INJ_SRC_FILE" "$T2_INJ" <<'PY'
 import re, sys
+
 src = open(sys.argv[1], encoding="utf-8").read()
-# Find the function and neuter "completed" checks inside it: any comparison
-# against completed becomes the historical != queued shape. Then, if that
-# leaves no in_progress exclusion at all, insert the buggy filter directly.
-m = re.search(r'create_worker_dispatch_refresh_and_wait\s*\(\)\s*\{', src)
+m = re.search(r'^[a-z_]*dispatch_refresh_and_wait\s*\(\)\s*\{', src, re.M)
 if not m:
     sys.exit(1)
-# body: to the first line that is exactly "}" at column 0 after the start
+
 rest = src[m.end():]
 endm = re.search(r'\n\}', rest)
 body = rest[:endm.start()] if endm else rest
+
+# Style 1: the condition compares against "completed" -> flip it so the
+# loop leaves as soon as the run is not queued (the historical bug).
 mutated = re.sub(r'"completed"', '"in_progress"', body)
 mutated = re.sub(r"'completed'", "'in_progress'", mutated)
+
+# Style 2: no "completed" literal — force the buggy filter explicitly by
+# breaking out on anything that is not queued.
+if mutated == body:
+    mutated = re.sub(
+        r'if \[\[ "\$status" == "[^"]*" \]\]; then(\s*\n\s*break)',
+        'if [[ "$status" != "queued" ]]; then\1',
+        mutated, count=1)
+
 out = src[:m.end()] + mutated + rest[endm.start():] if endm else src[:m.end()] + mutated
 open(sys.argv[2], "w", encoding="utf-8").write(out)
 PY
-    if [[ -s "$T2_INJ" ]] && ! cmp -s "$CREATE_WORKER_SH" "$T2_INJ"; then
+    if [[ -s "$T2_INJ" ]] && ! cmp -s "$INJ_SRC_FILE" "$T2_INJ" && bash -n "$T2_INJ" 2>/dev/null; then
         T2_INJ_OK=1
     fi
 fi
@@ -1190,8 +1376,9 @@ if [[ "$T2_INJ_OK" -eq 1 ]]; then
     FAKE_GH_DISPATCH_MODE=ok FAKE_GH_WATCH_SECS=30 FAKE_GH_RUN_ID=35047640983 \
     timeout 30 bash -c '
         source "$1" >/dev/null 2>&1
-        create_worker_dispatch_refresh_and_wait 10
-    ' _ "$T2_INJ" </dev/null > "$SANDBOX/inj.out" 2>&1
+        source "$2" >/dev/null 2>&1
+        dispatch_refresh_and_wait 10
+    ' _ "$LOG_LIB" "$T2_INJ" </dev/null > "$SANDBOX/inj.out" 2>&1
     INJ_RC=$?
     INJ_MSG="$(tr '\n' ' ' < "$SANDBOX/inj.out")"
     # The mutant must fail for the RIGHT reason: an early exit on in_progress
@@ -1212,7 +1399,7 @@ else
     # same scenario through a reference implementation (correct) and through
     # the historical buggy shape, proving R1's check discriminates.
     cat > "$SANDBOX/ref-correct.sh" <<'REF'
-create_worker_dispatch_refresh_and_wait() {
+dispatch_refresh_and_wait() {
     local timeout_secs="${1:-5}"
     local poll_interval="${POOL_REFRESH_POLL_INTERVAL:-1}"
     gh workflow run refresh-authorized-keys.yml --repo r >/dev/null 2>&1 || return 1
@@ -1238,7 +1425,7 @@ create_worker_dispatch_refresh_and_wait() {
 }
 REF
     cat > "$SANDBOX/ref-buggy.sh" <<'REF'
-create_worker_dispatch_refresh_and_wait() {
+dispatch_refresh_and_wait() {
     local timeout_secs="${1:-5}"
     local poll_interval="${POOL_REFRESH_POLL_INTERVAL:-1}"
     gh workflow run refresh-authorized-keys.yml --repo r >/dev/null 2>&1 || return 1
@@ -1267,7 +1454,7 @@ REF
         FAKE_GH_LOG="$GHFAKE_LOG" FAKE_GH_STATE_DIR="$T2_STATE" \
         FAKE_GH_STATUS_SEQ="queued,in_progress,completed" FAKE_GH_CONCLUSION=success \
         FAKE_GH_WATCH_SECS=30 FAKE_GH_RUN_ID=35047640983 \
-        timeout 30 bash -c 'source "$1" >/dev/null 2>&1; create_worker_dispatch_refresh_and_wait 3' \
+        timeout 30 bash -c 'source "$1" >/dev/null 2>&1; dispatch_refresh_and_wait 3' \
             _ "$impl" </dev/null > "$SANDBOX/probe.out" 2>&1
         return $?
     }

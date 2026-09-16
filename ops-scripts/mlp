@@ -162,9 +162,45 @@ resolve_gateway() {
 
 open_gateway_master() {
     CTL_DIR="$(mktemp -d "${TMPDIR:-/tmp}/mlp.XXXXXX")" || return 1
+    # client_identity_path — the key this client authenticates with.
+#   ONE definition, used both by mlp's own ssh calls and by the ssh_config
+#   it writes. id_mlp is what `mlp register client` creates and publishes;
+#   ssh's built-in candidates (id_rsa, id_ed25519, ...) do NOT include it,
+#   so every ssh invocation must pass -i explicitly or it silently falls
+#   back to a key the pool may have stopped authorising — which is exactly
+#   how `mlp` started failing with Permission denied while a direct
+#   `ssh -i ~/.ssh/id_mlp` still worked.
+client_identity_path() {
+    # Sourced, never restated: tunnel-identity.sh is the one place that
+    # says which file holds which key (RUNBOOK §7.12 — a rule with two
+    # implementations is a rule that drifts). Prefer the copy installed on
+    # this machine, fall back to the repo's.
+    local ti
+    for ti in "${HOME}/.mylinuxpool/bin/tunnel-identity.sh" \
+              "${SCRIPT_DIR}/../shared-configs/pool-runtime/files/tunnel-identity.sh"; do
+        if [[ -f "$ti" ]]; then
+            # shellcheck source=/dev/null
+            . "$ti"
+            break
+        fi
+    done
+    [[ -n "${CLIENT_KEY:-}" ]] || return 1
+    echo "$CLIENT_KEY"
+}
+
+# client_identity_opts — the -i/-o pair for ssh, empty when no key is found
+#   (ssh then falls back to its own defaults, and says so itself).
+client_identity_opts() {
+    local key
+    key="$(client_identity_path)" || return 0
+    printf '%s' "-i ${key} -o IdentitiesOnly=yes"
+}
+
     CTL="${CTL_DIR}/ctl-gateway"
     local err rc
+    local ident; read -r -a ident <<< "$(client_identity_opts)"
     err="$(ssh -M -S "$CTL" -o ControlPersist=60 -o ConnectTimeout=8 \
+        "${ident[@]}" \
         -o UserKnownHostsFile="$GW_KNOWN_HOSTS" -o StrictHostKeyChecking=accept-new -o BatchMode=yes \
         -N -f "${GW_USER}@${GW_IP}" < /dev/null 2>&1)"
     rc=$?
@@ -205,7 +241,9 @@ cmd_trust_gateway() {
     ssh-keygen -R "$GW_IP" -f "$GW_KNOWN_HOSTS" >/dev/null 2>&1
     echo "cleared any old host key entry for ${GW_IP} in ${GW_KNOWN_HOSTS}"
 
+    local ident2; read -r -a ident2 <<< "$(client_identity_opts)"
     if ssh -o UserKnownHostsFile="$GW_KNOWN_HOSTS" -o StrictHostKeyChecking=accept-new \
+           "${ident2[@]}" \
            -o ConnectTimeout=8 -o BatchMode=yes "${GW_USER}@${GW_IP}" true < /dev/null 2>/dev/null; then
         printf '%strusted Gateway host key for %s%s → %s\n' "$C_GREEN" "$GW_IP" "$C_RESET" "$GW_KNOWN_HOSTS"
     else
@@ -1051,7 +1089,7 @@ Host mlp-gateway
     User ${GW_USER}
     Port 22
 HEADER
-    [[ -f "${HOME}/.ssh/id_rsa" ]] && echo "    IdentityFile ~/.ssh/id_rsa"
+    client_identity_line
     cat <<HEADER
     UserKnownHostsFile ${GW_KNOWN_HOSTS}
     StrictHostKeyChecking yes
@@ -1069,7 +1107,7 @@ HEADER
         echo "    HostName 127.0.0.1"
         echo "    Port ${port}"
         echo "    User ${user}"
-        [[ -f "${HOME}/.ssh/id_rsa" ]] && echo "    IdentityFile ~/.ssh/id_rsa"
+        client_identity_line
         echo "    ProxyJump mlp-gateway"
         echo "    UserKnownHostsFile /dev/null"
         echo "    StrictHostKeyChecking no"
@@ -1088,6 +1126,18 @@ ssh_config_collisions() {
         [[ -n "$n" ]] || continue
         grep -qE "^Host( .*)? ${n}( |$)|^Host ${n}( |$)" "$user_cfg" && echo "$n"
     done
+}
+
+# client_identity_line — print the IdentityFile line for this client.
+#   Prefers ~/.ssh/id_mlp, which is what `mlp register client` creates and
+#   publishes as CLIENT_<NAME>. Falls back to ~/.ssh/id_rsa for a machine
+#   that predates that flow. Hardcoding id_rsa is how a client keeps using
+#   a key the pool is about to stop authorising.
+client_identity_line() {
+    local k
+    local key
+    key="$(client_identity_path)" || return 0
+    echo "    IdentityFile ${key/#${HOME}/~}"
 }
 
 cmd_ssh_config() {

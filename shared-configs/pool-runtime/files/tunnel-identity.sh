@@ -20,3 +20,26 @@
 # §8 (MIGRATION completed — providers proved they connect with id_tunnel
 # alone before the shared key was removed).
 TUNNEL_KEY="${HOME}/.ssh/id_tunnel"
+
+# CLIENT_KEY — the key an OPERATOR machine authenticates with as the admin
+#   user. `mlp register client` creates ~/.ssh/id_mlp and publishes it as
+#   CLIENT_<NAME>; id_rsa is the fallback for a client registered before
+#   that flow existed.
+#
+#   ssh's built-in candidates (id_rsa, id_ed25519, ...) do NOT include
+#   id_mlp, so anything connecting as the admin user must pass -i
+#   explicitly. Leaving that to ssh's defaults is how `mlp` and
+#   `pool-status` both started reporting Permission denied while a direct
+#   `ssh -i ~/.ssh/id_mlp` worked fine — the fifth and sixth time one rule
+#   had several implementations (RUNBOOK §7.12).
+#
+#   Empty when neither exists: a provider or worker has no client identity,
+#   and callers fall back to their own behaviour.
+CLIENT_KEY=""
+for _mlp_client_key in "${HOME}/.ssh/id_mlp" "${HOME}/.ssh/id_rsa"; do
+    if [[ -f "$_mlp_client_key" ]]; then
+        CLIENT_KEY="$_mlp_client_key"
+        break
+    fi
+done
+unset _mlp_client_key

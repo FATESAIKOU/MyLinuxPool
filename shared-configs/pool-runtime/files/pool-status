@@ -251,11 +251,16 @@ if [[ -n "$GW_IP" ]]; then
         # provider that has no management access to the Gateway. TUNNEL_KEY
         # is the single source (tunnel-identity.sh) — the same key
         # pool-tunnel and the rotate probe use (RUNBOOK §7.12).
-        ssh_err="$(tmo 12 ssh "${SSH_OPTS[@]}" "${GW_USER}@${GW_IP}" true 2>&1)"
+        # CLIENT_KEY comes from tunnel-identity.sh, the same single source
+        # that defines TUNNEL_KEY. Without -i, ssh never tries id_mlp.
+        admin_ident=()
+        [[ -n "${CLIENT_KEY:-}" ]] && admin_ident=(-i "$CLIENT_KEY" -o IdentitiesOnly=yes)
+        ssh_err="$(tmo 12 ssh "${SSH_OPTS[@]}" ${admin_ident[@]+"${admin_ident[@]}"} \
+            "${GW_USER}@${GW_IP}" true 2>&1)"
         ssh_rc=$?
         if [[ $ssh_rc -eq 0 ]]; then
             GW_LOGIN_USER="$GW_USER"
-            GW_SSH_EXTRA=()
+            GW_SSH_EXTRA=(${admin_ident[@]+"${admin_ident[@]}"})
             GW_LOGIN_OK=1
         elif [[ -f "$TUNNEL_KEY" && -n "$GW_TUNNEL_USER" ]]; then
             ssh_err="$(tmo 12 ssh "${SSH_OPTS[@]}" -i "$TUNNEL_KEY" -o IdentitiesOnly=yes \
