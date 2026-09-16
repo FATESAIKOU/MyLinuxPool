@@ -1,0 +1,186 @@
+#!/usr/bin/env bash
+# ops-scripts/register-client — docs/KEY-DESIGN.md §4, task N.
+#
+# Registers a human client's login public key with the pool: writes it to
+# a CLIENT_<NAME> repo variable, triggers the authorized-keys refresh
+# workflow, and writes the local ssh_config so plain `ssh fh-l` works.
+# The private key NEVER leaves this machine — only the public half goes
+# into GitHub, and never into a log.
+#
+# No FILE_CRYPTO_KEY anywhere: the public key goes into a repo variable,
+# not into the .crypted authorized_keys bundle. If you find yourself
+# reaching for that key, you are doing it wrong.
+
+set -euo pipefail
+
+REPO="${POOL_REPO:-FATESAIKOU/MyLinuxPool}"
+SSH_DIR="${HOME}/.ssh"
+DEFAULT_KEY_PATH="${SSH_DIR}/id_mlp"
+REFRESH_WORKFLOW="refresh-authorized-keys.yml"
+
+log() {
+    local level="$1"; shift
+    local ts
+    ts="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    if [[ "$level" == "INFO" ]]; then
+        printf '[%s] %s %s\n' "$ts" "$level" "$*"
+    else
+        printf '[%s] %s %s\n' "$ts" "$level" "$*" >&2
+    fi
+}
+
+usage() {
+    cat >&2 <<'EOF'
+usage: register-client [--name <name>] [--key <private-key-path>] [--remove] [--no-refresh]
+  --name        client name, lowercase [a-z0-9-]; default <user>-<short-hostname>
+  --key         path of the private key; default ~/.ssh/id_mlp (created if absent)
+  --remove      delete the CLIENT_<NAME> var instead of writing it
+  --no-refresh  skip triggering the refresh workflow (tests, batch use)
+EOF
+}
+
+# trigger_refresh — fire the authorized-keys refresh workflow and wait for
+# its outcome. Failure to trigger is a WARN, not fatal: registration is
+# already written to the var and the next manual/periodic refresh would
+# pick it up; the run's own outcome, when reachable, is reported.
+trigger_refresh() {
+    log INFO "triggering ${REFRESH_WORKFLOW}"
+    if gh workflow run "$REFRESH_WORKFLOW" --repo "$REPO"; then
+        local run_id="" i
+        for (( i = 0; i < 30; i++ )); do
+            sleep 5
+            run_id="$(gh run list --workflow="$REFRESH_WORKFLOW" --repo "$REPO" --limit 1 --json databaseId,status --jq '.[0] | select(.status != "queued") | .databaseId' 2>/dev/null || true)"
+            if [[ -n "$run_id" ]]; then
+                break
+            fi
+        done
+        if [[ -z "$run_id" ]]; then
+            log WARN "refresh workflow did not start within the wait window — check it manually"
+            return 0
+        fi
+        local conclusion
+        conclusion="$(gh run view "$run_id" --repo "$REPO" --json conclusion --jq '.conclusion' 2>/dev/null || true)"
+        if [[ "$conclusion" == "success" ]]; then
+            log INFO "refresh workflow ${run_id} finished: success"
+        else
+            log ERROR "refresh workflow ${run_id} finished: ${conclusion:-<unknown>} — check the run log"
+        fi
+    else
+        log WARN "could not trigger ${REFRESH_WORKFLOW} — run it manually from the Actions tab"
+    fi
+}
+
+NAME=""
+KEY_PATH=""
+REMOVE=0
+NO_REFRESH=0
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --name) [[ $# -ge 2 ]] || { usage; exit 2; }; NAME="$2"; shift 2 ;;
+        --key) [[ $# -ge 2 ]] || { usage; exit 2; }; KEY_PATH="$2"; shift 2 ;;
+        --remove) REMOVE=1; shift ;;
+        --no-refresh) NO_REFRESH=1; shift ;;
+        -h|--help) usage; exit 0 ;;
+        *) log ERROR "unknown argument: $1"; usage; exit 2 ;;
+    esac
+done
+
+# gh token comes from the environment (GH_TOKEN) or gh's own login state —
+# never as a command-line argument, which would show up in ps.
+if ! command -v gh >/dev/null 2>&1; then
+    log ERROR "gh not found on PATH"
+    exit 1
+fi
+
+# ---- name ----------------------------------------------------------------
+if [[ -z "$NAME" ]]; then
+    NAME="${USER:-$(whoami)}-$(hostname -s)"
+fi
+# lowercase; anything outside [a-z0-9-] becomes '-'
+NAME="$(printf '%s' "$NAME" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9-]/-/g')"
+if [[ -z "$NAME" ]]; then
+    log ERROR "client name is empty after normalisation"
+    exit 2
+fi
+
+# CLIENT_<NAME>, same convention as NODE_*: uppercase, '-' -> '_'
+VAR_NAME="CLIENT_$(printf '%s' "$NAME" | tr 'a-z' 'A-Z' | tr '-' '_')"
+
+# ---- --remove ------------------------------------------------------------
+if [[ "$REMOVE" -eq 1 ]]; then
+    # Hard refusal: removing CLIENT_ACTIONS would let Actions lock itself
+    # out of every machine (authkeys_assemble would also refuse, but the
+    # tool must block it first, with the reason spelled out).
+    if [[ "$VAR_NAME" == "CLIENT_ACTIONS" ]]; then
+        log ERROR "refusing to remove ${VAR_NAME}: that is the Actions identity itself — deleting it would lock Actions out of the pool"
+        exit 3
+    fi
+    printf 'removing %s (client %s)\n' "$VAR_NAME" "$NAME"
+    if gh variable delete "$VAR_NAME" --repo "$REPO" 2>/dev/null; then
+        log INFO "deleted ${VAR_NAME}"
+    else
+        # gh variable delete is not on old gh (2.45.0) — fall back to the
+        # api endpoint that has existed forever.
+        gh api -X DELETE "repos/${REPO}/actions/variables/${VAR_NAME}" >/dev/null
+        log INFO "deleted ${VAR_NAME} (via api)"
+    fi
+    if [[ "$NO_REFRESH" -eq 0 ]]; then
+        trigger_refresh
+    fi
+    exit 0
+fi
+
+# ---- key ------------------------------------------------------------------
+if [[ -z "$KEY_PATH" ]]; then
+    KEY_PATH="$DEFAULT_KEY_PATH"
+fi
+if [[ ! -f "$KEY_PATH" ]]; then
+    mkdir -p "$(dirname "$KEY_PATH")"
+    chmod 700 "$(dirname "$KEY_PATH")"
+    log INFO "no key at ${KEY_PATH} — generating an ed25519 pair (passphrase is your choice; leave empty for none)"
+    ssh-keygen -t ed25519 -N "" -C "$NAME" -f "$KEY_PATH"
+    log INFO "generated ${KEY_PATH} (public half: ${KEY_PATH}.pub)"
+else
+    log INFO "using existing key at ${KEY_PATH}"
+fi
+chmod 600 "$KEY_PATH"
+
+PUBKEY="$(cat "${KEY_PATH}.pub")"
+PUBKEY="$(printf '%s' "$PUBKEY" | tr -d '\r\n')"
+
+# ---- write the var --------------------------------------------------------
+# The value goes to gh on stdin — never as --body on the command line.
+# public_key is not a secret, but keeping it out of argv is the same
+# discipline we apply to everything else.
+JSON="$(jq -n \
+    --arg name "$NAME" \
+    --arg public_key "$PUBKEY" \
+    --arg added_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+    '{name: $name, public_key: $public_key, added_at: $added_at}')"
+printf '%s' "$JSON" | gh variable set "$VAR_NAME" --repo "$REPO"
+log INFO "wrote ${VAR_NAME} (client ${NAME})"
+
+# ---- refresh ----------------------------------------------------------------
+if [[ "$NO_REFRESH" -eq 0 ]]; then
+    trigger_refresh
+fi
+
+# ---- client ssh_config ------------------------------------------------------
+# Best-effort: `mlp ssh-config --write` needs the Gateway reachable; if it
+# fails, the registration itself is still done and the user can run it
+# later. mlp is normally co-located in ops-scripts/; fall back to PATH so
+# a custom install or a test stub can supply it.
+MLP="$(dirname "${BASH_SOURCE[0]}")/mlp"
+[[ -x "$MLP" ]] || MLP="$(command -v mlp 2>/dev/null || true)"
+if [[ -n "$MLP" ]]; then
+    if "$MLP" ssh-config --write; then
+        log INFO "wrote ~/.mylinuxpool/ssh_config — plain 'ssh <host>' should work"
+    else
+        log WARN "could not write the ssh_config (is the Gateway reachable?) — run 'mlp ssh-config --write' later"
+    fi
+else
+    log WARN "ops-scripts/mlp not found — skipping ssh_config (run 'mlp ssh-config --write' when available)"
+fi
+
+log INFO "done: client '${NAME}' registered. Providers/workers pick the new key up on their next self-heal cycle."

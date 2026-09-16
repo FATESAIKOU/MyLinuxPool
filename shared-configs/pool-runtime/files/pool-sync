@@ -174,6 +174,97 @@ main() {
         fi
     done
 
+    # --- converge this machine's authorized_keys from CLIENT_* ---------
+    # (KEY-DESIGN §3.4: the provider's login list converges itself on
+    # every tick — no repair-provider run, no FILE_CRYPTO_KEY needed, the
+    # gh_token can read the variables this machine already holds.)
+    #
+    # This coexists with ssh-admin for now: ssh-admin writes the same
+    # list at registration time (it is needs_key, so pool-sync skips it)
+    # and pool-sync rewrites it every 30 minutes. They cannot fight as
+    # long as both assemble the same content — CLIENT_* was seeded from
+    # ssh-admin's list. The coexistence is temporary; KEY-DESIGN §7
+    # deletes ssh-admin's static encrypted list.
+    #
+    # This is a FULL REPLACE, deliberately NOT the union ssh-admin's
+    # install uses. The point is revocation: with a union, a
+    # `register-client --remove` would delete the var but the key would
+    # stay on every provider forever. Replacing means removing the var
+    # removes the key.
+    #
+    # Guards, all mandatory (brief-O):
+    #   - authkeys_assemble non-zero  -> do NOT write, log ERROR, but keep
+    #     going (other convergence work still runs)
+    #   - assembled list empty        -> do NOT write
+    #   - GitHub unreachable          -> do NOT write, log WARN, exit 0
+    #     (N6: GitHub being down must never become a provider fault)
+    sync_authorized_keys() {
+        local vars_json clients actions_pk login target tmp
+
+        vars_json="$(GH_TOKEN="$(cat "$GH_TOKEN_FILE")" \
+            gh api "repos/${REPO}/actions/variables?per_page=100" --paginate 2>/dev/null || true)"
+        if [[ -z "$vars_json" ]]; then
+            log WARN "cannot read GitHub variables — leaving ${HOME}/.ssh/authorized_keys untouched (N6)"
+            return 0
+        fi
+
+        # Source the functions from the fresh clone fetched above —
+        # always the latest declarations, never a stale copy. A missing
+        # scripts/ (e.g. an old repo branch) is a WARN, not a failure.
+        if [[ ! -f "${TMP_DIR}/repo/scripts/refresh-authkeys.sh" \
+              || ! -f "${TMP_DIR}/repo/scripts/lib/authkeys.sh" ]]; then
+            log WARN "scripts/refresh-authkeys.sh or scripts/lib/authkeys.sh missing in the fetched repo — skipping authorized_keys convergence"
+            return 0
+        fi
+        # shellcheck source=/dev/null
+        source "${TMP_DIR}/repo/scripts/refresh-authkeys.sh"
+        # shellcheck source=/dev/null
+        source "${TMP_DIR}/repo/scripts/lib/authkeys.sh"
+
+        clients="$(refresh_collect_clients "$vars_json")" || {
+            log WARN "cannot collect CLIENT_* variables — leaving ${HOME}/.ssh/authorized_keys untouched (N6)"
+            return 0
+        }
+
+        # required_pubkey is CLIENT_ACTIONS — the self-lockout guard only
+        # works if we actually have that key to require.
+        actions_pk="$(printf '%s' "$clients" | jq -r '.[] | select(.name == "actions") | .public_key // empty' 2>/dev/null || true)"
+        if [[ -z "$(printf '%s' "$clients" | jq -r --arg n "CLIENT_ACTIONS" '.[] | select(.name == "actions") | .public_key // empty' 2>/dev/null || true)" ]]; then
+            log WARN "no CLIENT_ACTIONS public key found — cannot guarantee Actions stays in; leaving authorized_keys untouched"
+            return 0
+        fi
+
+        login="$(authkeys_assemble "$clients" "$actions_pk")" || {
+            log ERROR "authorized_keys assembly failed — leaving ${HOME}/.ssh/authorized_keys untouched"
+            return 0
+        }
+        if [[ -z "$login" ]]; then
+            log ERROR "assembled authorized_keys is empty — refusing to write"
+            return 0
+        fi
+
+        target="${HOME}/.ssh/authorized_keys"
+        if [[ -f "$target" ]] && cmp -s <(printf '%s\n' "$login") "$target"; then
+            log INFO "authorized_keys already matches CLIENT_* declarations"
+            return 0
+        fi
+
+        mkdir -p "${HOME}/.ssh"
+        tmp="$(mktemp "${TMP_DIR}/ak.XXXXXX")"
+        printf '%s\n' "$login" > "$tmp"
+        chmod 600 "$tmp"
+        if mv -f "$tmp" "$target" 2>/dev/null; then
+            local n
+            n="$(printf '%s\n' "$login" | wc -l | tr -d ' ')"
+            log INFO "converged ${target} from CLIENT_* (${n} key(s))"
+        else
+            rm -f "$tmp"
+            log ERROR "could not install ${target}"
+        fi
+    }
+
+    sync_authorized_keys
+
     # --- restart the tunnel only when something actually changed -------
     # pool-tunnel holds every worker's reverse tunnel; an unnecessary
     # restart drops all of them for nothing (spec §3.5: restarts are

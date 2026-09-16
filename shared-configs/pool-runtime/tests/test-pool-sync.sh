@@ -87,6 +87,33 @@ if [[ "${FAKE_GH_MODE:-ok}" == "missing" ]]; then
     echo "gh: HTTP 404: Not Found (variable)" >&2
     exit 1
 fi
+is_list=0
+for a in "$@"; do
+    case "$a" in
+        *actions/variables?per_page=100*|*variables?per_page=100*) is_list=1 ;;
+    esac
+done
+if [[ "$is_list" -eq 1 ]]; then
+    # 列舉請求：NODE_TESTNODE（既有）+ 所有 FAKE_CLIENT_VARS 的 CLIENT_*
+    list="$(jq -c -n --arg n "NODE_TESTNODE" --arg v "${FAKE_GH_VALUE}" \
+        '{variables:[{name:$n,value:$v}]}')"
+    if [[ -n "${FAKE_CLIENT_VARS:-}" ]]; then
+        list="$(printf '%s' "$list" | jq -c --argjson cv "${FAKE_CLIENT_VARS}" \
+            '.variables += [ $cv | to_entries[] | {name:.key, value:(.value|tostring)} ]')"
+    fi
+    filter=""
+    prev=""
+    for a in "$@"; do
+        [[ "$prev" == "--jq" ]] && filter="$a"
+        prev="$a"
+    done
+    if [[ -n "$filter" ]]; then
+        printf '%s' "$list" | jq -r "$filter"
+    else
+        printf '%s\n' "$list"
+    fi
+    exit 0
+fi
 name=""
 filter=""
 prev=""
@@ -101,7 +128,14 @@ for a in "$@"; do
     prev="$a"
 done
 if [[ -n "$name" ]]; then
-    obj="$(jq -c -n --arg n "$name" --arg v "${FAKE_GH_VALUE}" '{name:$n,value:$v}')"
+    if [[ "$name" == CLIENT_* && -n "${FAKE_CLIENT_VARS:-}" ]]; then
+        # CLIENT_* 取值：FAKE_CLIENT_VARS 是 name→value 物件（KEY-DESIGN
+        # §3.2 的 CLIENT_<NAME> 形狀），gh api 回 value 字串。
+        obj="$(printf '%s' "$FAKE_CLIENT_VARS" | jq -c --arg n "$name" \
+            '{"name":$n, "value": (.[$n] // empty | tostring)}')"
+    else
+        obj="$(jq -c -n --arg n "$name" --arg v "${FAKE_GH_VALUE}" '{name:$n,value:$v}')"
+    fi
 else
     obj="$(jq -c -n --arg n "NODE_TESTNODE" --arg v "${FAKE_GH_VALUE}" '{variables:[{name:$n,value:$v}]}')"
 fi
@@ -255,11 +289,25 @@ build_fixture() {
         cp "$SANDBOX/fake-install.sh" "$SANDBOX/fixture/shared-configs/$u/install.sh"
         chmod +x "$SANDBOX/fixture/shared-configs/$u/install.sh"
     done
+    # pool-sync 組 authorized_keys 時要 source 的 authkeys.sh：把 repo 現況
+    # 放進 fixture 的 scripts/lib/（實作落地後才用得到）。
+    if [[ -f scripts/lib/authkeys.sh ]]; then
+        mkdir -p "$SANDBOX/fixture/scripts/lib"
+        cp scripts/lib/authkeys.sh "$SANDBOX/fixture/scripts/lib/authkeys.sh"
+    fi
+    # refresh-authkeys.sh 也一樣：brief-O 要求 pool-sync source 它（含
+    # refresh_collect_clients），fixture 缺它會讓 authorized_keys 收斂
+    # 直接跳過（A1 起全紅）。
+    if [[ -f scripts/refresh-authkeys.sh ]]; then
+        mkdir -p "$SANDBOX/fixture/scripts"
+        cp scripts/refresh-authkeys.sh "$SANDBOX/fixture/scripts/refresh-authkeys.sh"
+    fi
 }
 
 GIT_MODE="ok"
 GH_MODE="ok"
 GH_VALUE='{"name":"testnode","role":"provider","registered_with":"register-provider.sh"}'
+FAKE_CLIENT_VARS=""
 
 run_sync() {
     : > "$SANDBOX/install.log"; : > "$SANDBOX/systemctl.log"
@@ -272,6 +320,9 @@ run_sync() {
         : > "$SANDBOX/out"
     else
         RAN=1
+        # POOL_SYNC_SUBJECT 注入點：測試可把被測物換成一個修改版（例如
+        # 拿掉自鎖防線、或改成聯集語意的版本）——注入段落用。
+        local subject="${POOL_SYNC_SUBJECT:-$POOL_SYNC}"
         HOME="$SANDBOX/home" TMPDIR="$SANDBOX/tmpdir" \
         PATH="$SANDBOX/fakebin:$PATH" \
         POOL_REPO="testowner/testrepo" POOL_BRANCH="master" \
@@ -286,7 +337,8 @@ run_sync() {
         FAKE_GIT_MODE="$GIT_MODE" \
         FAKE_GH_MODE="$GH_MODE" \
         FAKE_GH_VALUE="$GH_VALUE" \
-        $TIMEOUT "$POOL_SYNC" > "$SANDBOX/out" 2> "$SANDBOX/err" </dev/null
+        FAKE_CLIENT_VARS="${FAKE_CLIENT_VARS:-}" \
+        $TIMEOUT "$subject" > "$SANDBOX/out" 2> "$SANDBOX/err" </dev/null
         SYNC_RC=$?
     fi
     cat "$SANDBOX/out" "$SANDBOX/err" > "$SANDBOX/combined"
@@ -650,6 +702,282 @@ GH_VALUE='{"name":"testnode","role":"provider","registered_with":"register-provi
 run_sync
 check_rc 0 "無舊 repo → exit 0"
 grep_no "$SANDBOX/combined" 'ERROR' "無舊 repo → 沒有錯誤訊息"
+
+# ---------------------------------------------------------------------------
+# A1–A8: pool-sync 收斂本機 authorized_keys（KEY-DESIGN §3.4 / task O）。
+# pool-sync 從 CLIENT_* var 組出登入清單、完全取代 ~/.ssh/authorized_keys
+# （與 ssh-admin 的聯集語意刻意不同——撤銷要生效）。自鎖防線：清單必須
+# 含 Actions 那把，否則不寫、原檔不變。gh 取不到 → 不寫、原檔不變、exit 0。
+# 被測物尚未含此段時（impl 未落地）這些案例會 FAIL——不得 skip。
+# ---------------------------------------------------------------------------
+AUTHKEYS_FILE="$SANDBOX/home/.ssh/authorized_keys"
+AUB_KEY_A="ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFIXTUREKEYA fatesaikou-mac"
+AUB_KEY_B="ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFIXTUREKEYB other-user"
+AUB_ACTIONS="ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFIXTUREACTIONS actions"
+AUB_STALE="ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFIXTURESTALE stale-user"
+
+# write_clients <key-a> <key-b> <actions> <...> — name → value 的
+# FAKE_CLIENT_VARS（gh 假貨依此回 CLIENT_* 的值）。
+write_clients() {
+    FAKE_CLIENT_VARS="$(jq -c -n \
+        --arg ka "$1" --arg kb "$2" --arg ac "$3" \
+        '{CLIENT_FATESAIKOU_MAC:{name:"fatesaikou-mac",public_key:$ka,added_at:"2026-09-16T12:00:00Z"},
+          CLIENT_OTHER_USER:{name:"other-user",public_key:$kb,added_at:"2026-09-16T12:00:00Z"},
+          CLIENT_ACTIONS:{name:"actions",public_key:$ac,added_at:"2026-09-16T12:00:00Z"}}')"
+}
+write_no_clients() {
+    FAKE_CLIENT_VARS='{}'
+}
+
+echo "── A1 兩個 CLIENT_* → authorized_keys 寫成那兩把 ──"
+reset_home
+build_fixture "unit-a unit-b" "unit-b" ""
+GIT_MODE="ok"; GH_MODE="ok"
+: > "$SANDBOX/check-rc"; : > "$SANDBOX/install-rc"
+GH_VALUE='{"name":"testnode","role":"provider","registered_with":"register-provider.sh"}'
+write_clients "$AUB_KEY_A" "$AUB_KEY_B" "$AUB_ACTIONS"
+run_sync
+if [[ "$RAN" -ne 1 ]]; then
+    fail_line "A1. authorized_keys 被寫成那兩把（被測物沒有真的執行，無從證明）"
+elif [[ -f "$AUTHKEYS_FILE" ]] \
+     && grep -qF "$AUB_KEY_A" "$AUTHKEYS_FILE" \
+     && grep -qF "$AUB_KEY_B" "$AUTHKEYS_FILE"; then
+    ok_line "A1. authorized_keys 含那兩把使用者公鑰"
+else
+    fail_line "A1. authorized_keys 缺公鑰（$(head -c 200 "$AUTHKEYS_FILE" 2>/dev/null | tr '\n' ' ')）"
+fi
+
+echo "── A2 完全取代：var 外的舊鑰被移除 ──"
+reset_home
+mkdir -p "$SANDBOX/home/.ssh"
+printf '%s\n' "$AUB_STALE" > "$AUTHKEYS_FILE"
+build_fixture "unit-a unit-b" "unit-b" ""
+GIT_MODE="ok"; GH_MODE="ok"
+: > "$SANDBOX/check-rc"; : > "$SANDBOX/install-rc"
+GH_VALUE='{"name":"testnode","role":"provider","registered_with":"register-provider.sh"}'
+write_clients "$AUB_KEY_A" "$AUB_KEY_B" "$AUB_ACTIONS"
+run_sync
+if [[ "$RAN" -ne 1 ]]; then
+    fail_line "A2. var 外的舊鑰被移除（被測物沒有真的執行，無從證明）"
+elif [[ -f "$AUTHKEYS_FILE" ]] && ! grep -qF "$AUB_STALE" "$AUTHKEYS_FILE" \
+     && grep -qF "$AUB_KEY_A" "$AUTHKEYS_FILE"; then
+    ok_line "A2. 舊鑰（var 外）被移除——完全取代語意生效"
+else
+    fail_line "A2. 舊鑰仍在或新鑰沒寫（$(head -c 200 "$AUTHKEYS_FILE" 2>/dev/null | tr '\n' ' ')）"
+fi
+
+echo "── A3 內容已正確 → 不重寫 ──"
+reset_home
+mkdir -p "$SANDBOX/home/.ssh"
+# 預寫的順序必須跟 authkeys_assemble 的契約輸出一致（依金鑰材料排序：
+# FIXTUREACTIONS < FIXTUREKEYA < FIXTUREKEYB）——契約第 4 條，byte-stable。
+printf '%s\n%s\n%s\n' "$AUB_ACTIONS" "$AUB_KEY_A" "$AUB_KEY_B" > "$AUTHKEYS_FILE"
+build_fixture "unit-a unit-b" "unit-b" ""
+GIT_MODE="ok"; GH_MODE="ok"
+: > "$SANDBOX/check-rc"; : > "$SANDBOX/install-rc"
+GH_VALUE='{"name":"testnode","role":"provider","registered_with":"register-provider.sh"}'
+write_clients "$AUB_KEY_A" "$AUB_KEY_B" "$AUB_ACTIONS"
+MTIME_BEFORE="$(stat -f %m "$AUTHKEYS_FILE" 2>/dev/null || stat -c %Y "$AUTHKEYS_FILE" 2>/dev/null)"
+sleep 1
+run_sync
+MTIME_AFTER="$(stat -f %m "$AUTHKEYS_FILE" 2>/dev/null || stat -c %Y "$AUTHKEYS_FILE" 2>/dev/null)"
+if [[ "$RAN" -ne 1 ]]; then
+    fail_line "A3. 內容正確 → 不重寫（被測物沒有真的執行，無從證明）"
+elif [[ "$MTIME_BEFORE" == "$MTIME_AFTER" ]]; then
+    ok_line "A3. 內容已正確 → 沒有重寫（mtime 不變）"
+else
+    fail_line "A3. 內容已正確卻重寫（mtime $MTIME_BEFORE → $MTIME_AFTER）——每輪都動檔案 = 永遠在漂移"
+fi
+
+echo "── A4 自鎖防線：無 Actions → 不寫、原檔不變 ──"
+reset_home
+mkdir -p "$SANDBOX/home/.ssh"
+printf '%s\n' "$AUB_KEY_A" > "$AUTHKEYS_FILE"
+build_fixture "unit-a unit-b" "unit-b" ""
+GIT_MODE="ok"; GH_MODE="ok"
+: > "$SANDBOX/check-rc"; : > "$SANDBOX/install-rc"
+GH_VALUE='{"name":"testnode","role":"provider","registered_with":"register-provider.sh"}'
+# CLIENT_* 裡沒有 CLIENT_ACTIONS
+FAKE_CLIENT_VARS="$(jq -c -n \
+    --arg ka "$AUB_KEY_A" --arg kb "$AUB_KEY_B" \
+    '{CLIENT_FATESAIKOU_MAC:{name:"fatesaikou-mac",public_key:$ka,added_at:"2026-09-16T12:00:00Z"},
+      CLIENT_OTHER_USER:{name:"other-user",public_key:$kb,added_at:"2026-09-16T12:00:00Z"}}')"
+run_sync
+if [[ "$RAN" -ne 1 ]]; then
+    fail_line "A4. 無 Actions → 不寫、原檔不變（被測物沒有真的執行，無從證明）"
+else
+    if [[ -f "$AUTHKEYS_FILE" ]] && grep -qF "$AUB_KEY_A" "$AUTHKEYS_FILE" \
+       && ! grep -qF "$AUB_KEY_B" "$AUTHKEYS_FILE"; then
+        ok_line "A4a. 無 Actions → 原檔維持不變（沒被清空、沒被寫）"
+    else
+        fail_line "A4a. 原檔被動了（$(head -c 200 "$AUTHKEYS_FILE" 2>/dev/null | tr '\n' ' ')）"
+    fi
+    if grep -q 'CLIENT_ACTIONS\|Actions' "$SANDBOX/combined" 2>/dev/null; then
+        ok_line "A4b. 無 Actions → log 有說明（CLIENT_ACTIONS）"
+    else
+        fail_line "A4b. 無 Actions → log 沒有說明"
+    fi
+fi
+
+echo "── A5 組出來是空的 → 不寫、原檔不變 ──"
+reset_home
+mkdir -p "$SANDBOX/home/.ssh"
+printf '%s\n' "$AUB_KEY_A" > "$AUTHKEYS_FILE"
+build_fixture "unit-a unit-b" "unit-b" ""
+GIT_MODE="ok"; GH_MODE="ok"
+: > "$SANDBOX/check-rc"; : > "$SANDBOX/install-rc"
+GH_VALUE='{"name":"testnode","role":"provider","registered_with":"register-provider.sh"}'
+write_no_clients
+run_sync
+if [[ "$RAN" -ne 1 ]]; then
+    fail_line "A5. 空清單 → 不寫、原檔不變（被測物沒有真的執行，無從證明）"
+elif [[ -f "$AUTHKEYS_FILE" ]] && grep -qF "$AUB_KEY_A" "$AUTHKEYS_FILE"; then
+    ok_line "A5. 組出空清單 → 不寫、原檔不變"
+else
+    fail_line "A5. 空清單卻動了原檔（$(head -c 200 "$AUTHKEYS_FILE" 2>/dev/null | tr '\n' ' ')）"
+fi
+
+echo "── A6 gh 取不到 → 不寫、原檔不變、exit 0 ──"
+reset_home
+mkdir -p "$SANDBOX/home/.ssh"
+printf '%s\n' "$AUB_KEY_A" > "$AUTHKEYS_FILE"
+build_fixture "unit-a unit-b" "unit-b" ""
+GIT_MODE="ok"; GH_MODE="missing"
+: > "$SANDBOX/check-rc"; : > "$SANDBOX/install-rc"
+GH_VALUE='{"name":"testnode","role":"provider","registered_with":"register-provider.sh"}'
+write_clients "$AUB_KEY_A" "$AUB_KEY_B" "$AUB_ACTIONS"
+run_sync
+check_rc 0 "gh 取不到 → exit 0（N6：不變 provider 故障）"
+if [[ "$RAN" -ne 1 ]]; then
+    fail_line "A6. gh 取不到 → 原檔不變（被測物沒有真的執行，無從證明）"
+elif [[ -f "$AUTHKEYS_FILE" ]] && grep -qF "$AUB_KEY_A" "$AUTHKEYS_FILE" \
+     && ! grep -qF "$AUB_KEY_B" "$AUTHKEYS_FILE"; then
+    ok_line "A6. gh 取不到 → 原檔不變"
+else
+    fail_line "A6. gh 取不到卻動了原檔（$(head -c 200 "$AUTHKEYS_FILE" 2>/dev/null | tr '\n' ' ')）"
+fi
+
+echo "── A7 收斂失敗時，其他 unit 照常收斂 ──"
+reset_home
+mkdir -p "$SANDBOX/home/.ssh"
+printf '%s\n' "$AUB_STALE" > "$AUTHKEYS_FILE"
+build_fixture "unit-a unit-b" "unit-b" ""
+GIT_MODE="ok"; GH_MODE="ok"
+printf 'unit-b 1\n' > "$SANDBOX/check-rc"
+: > "$SANDBOX/install-rc"
+GH_VALUE='{"name":"testnode","role":"provider","registered_with":"register-provider.sh"}'
+FAKE_CLIENT_VARS="$(jq -c -n --arg ka "$AUB_KEY_A" \
+    '{CLIENT_FATESAIKOU_MAC:{name:"fatesaikou-mac",public_key:$ka,added_at:"2026-09-16T12:00:00Z"}}')"
+run_sync
+check_rc 0 "收斂失敗情境 → exit 0"
+if [[ "$(unit_calls unit-b no)" -ge 1 ]]; then
+    ok_line "A7. authorized_keys 收斂失敗時，其他 unit 仍照常收斂"
+else
+    fail_line "A7. 其他 unit 沒被收斂（unit-b 呼叫次數：$(unit_calls unit-b no)）"
+fi
+
+echo "── A8 寫入是原子的（暫存 + mv，非直接覆蓋）──"
+reset_home
+build_fixture "unit-a unit-b" "unit-b" ""
+GIT_MODE="ok"; GH_MODE="ok"
+: > "$SANDBOX/check-rc"; : > "$SANDBOX/install-rc"
+GH_VALUE='{"name":"testnode","role":"provider","registered_with":"register-provider.sh"}'
+write_clients "$AUB_KEY_A" "$AUB_KEY_B" "$AUB_ACTIONS"
+run_sync
+if [[ "$RAN" -ne 1 ]]; then
+    fail_line "A8. 寫入是原子的（被測物沒有真的執行，無從證明）"
+elif grep -q 'authorized_keys' "$SANDBOX/combined" 2>/dev/null \
+     && ! grep -qE '>\s*\$HOME/.ssh/authorized_keys|>\s*'"$AUTHKEYS_FILE" "$SANDBOX/combined" 2>/dev/null; then
+    ok_line "A8. authorized_keys 收斂未見直接覆蓋目標的形狀（log 無 > 目標）"
+else
+    fail_line "A8. 看不到原子寫入的證據，或出現直接覆蓋（log: $(head -c 300 "$SANDBOX/combined" | tr '\n' ' ')）"
+fi
+
+# ---------------------------------------------------------------------------
+# A9: 注入 — 把「完全取代」改回聯集 → A2 必須紅
+# ---------------------------------------------------------------------------
+echo "── A9 注入：完全取代改回聯集 ──"
+reset_home
+mkdir -p "$SANDBOX/home/.ssh"
+printf '%s\n' "$AUB_STALE" > "$AUTHKEYS_FILE"
+build_fixture "unit-a unit-b" "unit-b" ""
+GIT_MODE="ok"; GH_MODE="ok"
+: > "$SANDBOX/check-rc"; : > "$SANDBOX/install-rc"
+GH_VALUE='{"name":"testnode","role":"provider","registered_with":"register-provider.sh"}'
+write_clients "$AUB_KEY_A" "$AUB_KEY_B" "$AUB_ACTIONS"
+# 注入版 pool-sync：把 authorized_keys 寫入改成「不清空、只附加」的
+# 聯集版本（等價於拿掉完全取代）。實作是原子寫入：`mv -f "$tmp"
+# "$target"` 換成 `cat "$tmp" >> "$target"`——目標不被覆蓋、舊鑰留下。
+INJ_SYNC="$SANDBOX/pool-sync-inj.sh"
+python3 - "$POOL_SYNC" "$INJ_SYNC" <<'PY'
+import re
+import sys
+src = open(sys.argv[1], encoding="utf-8").read()
+src = re.sub(r'mv -f "\$tmp" "\$target"',
+             r'cat "$tmp" >> "$target"', src)
+open(sys.argv[2], "w", encoding="utf-8").write(src)
+PY
+# 注入版是 python 寫出的 644 檔，run_sync 直接執行它——不可執行會
+# Permission denied（rc=126），讓 A9 假通過（檔案狀態恰好符合）而
+# A10 判「注入沒生效」。補執行位元。
+chmod +x "$INJ_SYNC"
+POOL_SYNC_SUBJECT="$INJ_SYNC"
+run_sync
+if [[ "$RAN" -ne 1 ]]; then
+    fail_line "A9. 注入版沒跑起來（注入 harness 問題）"
+elif [[ -f "$AUTHKEYS_FILE" ]] && grep -qF "$AUB_STALE" "$AUTHKEYS_FILE"; then
+    printf '  inj ok    %s\n' "注入後（聯集語意）舊鑰仍在——A2 條會紅（完全取代被拿掉）"
+else
+    fail_line "A9. 注入後舊鑰仍被移除——注入沒生效（harness 問題）"
+fi
+POOL_SYNC_SUBJECT=""
+
+# ---------------------------------------------------------------------------
+# A10: 注入 — 拿掉自鎖防線 → A4 必須紅
+# ---------------------------------------------------------------------------
+echo "── A10 注入：拿掉自鎖防線 ──"
+reset_home
+mkdir -p "$SANDBOX/home/.ssh"
+printf '%s\n' "$AUB_KEY_A" > "$AUTHKEYS_FILE"
+build_fixture "unit-a unit-b" "unit-b" ""
+GIT_MODE="ok"; GH_MODE="ok"
+: > "$SANDBOX/check-rc"; : > "$SANDBOX/install-rc"
+GH_VALUE='{"name":"testnode","role":"provider","registered_with":"register-provider.sh"}'
+FAKE_CLIENT_VARS="$(jq -c -n \
+    --arg ka "$AUB_KEY_A" --arg kb "$AUB_KEY_B" \
+    '{CLIENT_FATESAIKOU_MAC:{name:"fatesaikou-mac",public_key:$ka,added_at:"2026-09-16T12:00:00Z"},
+      CLIENT_OTHER_USER:{name:"other-user",public_key:$kb,added_at:"2026-09-16T12:00:00Z"}}')"
+# 注入：把「CLIENT_ACTIONS 檢查失敗就中止」的 guard 中性化。
+INJ2_SYNC="$SANDBOX/pool-sync-inj2.sh"
+python3 - "$POOL_SYNC" "$INJ2_SYNC" <<'PY'
+import re
+import sys
+src = open(sys.argv[1], encoding="utf-8").read()
+# 中性化：任何「若缺 CLIENT_ACTIONS 就 return/exit 非 0」的形狀
+# 需要 re.S：body 跨多行，re.M 下 `.` 不匹配換行會讓整個 pattern 落空。
+# [ \t]* 而非 \s*：\s 含換行，會把 body 一起吞掉導致負向前瞻誤判。
+src = re.sub(r'if[^\n]*CLIENT_ACTIONS[^\n]*;\s*then\s*\n((?:(?!\n[ \t]*fi).)*)\n[ \t]*fi',
+             lambda m: 'if false; then\n%s\nfi' % m.group(1), src, flags=re.M | re.S)
+# 自鎖防線有兩層：pool-sync 的 guard（上面）與 authkeys_assemble 的
+# required 檢查（CONTRACT §2 第 5 條）。guard 被移除後 actions_pk 為空，
+# 空 required 會讓 assemble 自己拒絕——所以要重現「防線全失」還得把
+# required 換成清單裡存在的任一把，否則注入版仍不寫、A4 永遠紅不了。
+src = re.sub(r'authkeys_assemble "\$clients" "\$actions_pk"',
+             'authkeys_assemble "$clients" "$(printf \'%s\' "$clients" | jq -r \'.[0].public_key // empty\' 2>/dev/null || true)"',
+             src)
+open(sys.argv[2], "w", encoding="utf-8").write(src)
+PY
+chmod +x "$INJ2_SYNC"
+POOL_SYNC_SUBJECT="$INJ2_SYNC"
+run_sync
+if [[ "$RAN" -ne 1 ]]; then
+    fail_line "A10. 注入版沒跑起來（注入 harness 問題）"
+elif [[ -f "$AUTHKEYS_FILE" ]] && grep -qF "$AUB_KEY_B" "$AUTHKEYS_FILE"; then
+    printf '  inj ok    %s\n' "注入後（拿掉自鎖防線）無 Actions 仍寫入了 user B——A4 條會紅"
+else
+    fail_line "A10. 注入後仍沒寫入——注入沒生效（harness 問題）"
+fi
+POOL_SYNC_SUBJECT=""
 
 echo
 printf 'passed %d / failed %d\n' "$pass" "$fail"
