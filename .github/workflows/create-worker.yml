@@ -169,7 +169,13 @@ jobs:
           source scripts/create-worker.sh
           cmd="$(create_worker_build_claim_cmd "${{ steps.gateway.outputs.port_lo }}" "${{ steps.gateway.outputs.port_hi }}" \
             "${{ inputs.provider }}" "${{ inputs.image }}")"
-          echo "cmd=${cmd}" >> "$GITHUB_OUTPUT"
+          # Built here, next to the run command it pairs with, so both
+          # agree on the container name without the workflow restating it.
+          read_pubkey_cmd="$(create_worker_read_pubkey_cmd "${{ steps.identity.outputs.container }}")"
+          {
+            echo "cmd=${cmd}"
+            echo "read_pubkey_cmd=${read_pubkey_cmd}"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Claim a worker port on the Gateway
         id: claim
@@ -250,7 +256,7 @@ jobs:
       # not a secret, and the POOL_WORKERS record / refresh below need
       # it. The private half is additionally ::add-mask::-ed as a
       # belt-and-suspenders (it may appear inside the docker-run command
-      # that follows the existing WORKER_KEY=-e injection, and a mask
+      # that follows the same -e injection pattern, and a mask
       # redacts it anywhere in later logs).
       #
       # WORKER_AUTHORIZED_KEYS (the worker account's login list) is
@@ -263,24 +269,19 @@ jobs:
       # Order is the safety design (brief-T): claim → build → mint →
       # publish → refresh → run — refresh still happens before the
       # container starts.
-      - name: Build docker-run command (and mint the worker tunnel key)
+      # No key is minted here any more. The worker mints its own inside
+      # the container (profiles/worker/*/entrypoint.sh), so no private key
+      # is ever produced on the runner, put in a step output, or written
+      # onto a docker-run command line — only the public half comes back,
+      # two steps below.
+      - name: Build docker-run command
         id: run_cmd
         shell: bash
-        env:
-          FILE_CRYPTO_KEY: ${{ secrets.FILE_CRYPTO_KEY }}
         run: |
           set -euo pipefail
           source scripts/create-worker.sh
           source scripts/refresh-authkeys.sh
           source scripts/lib/authkeys.sh
-          key="$(create_worker_mint_tunnel_key)" || { echo "::error::could not mint a tunnel key — see log above"; exit 1; }
-          worker_key_b64="$(printf '%s\n' "$key" | head -1)"
-          worker_pub="$(printf '%s\n' "$key" | sed -n 2p)"
-          worker_key="$(printf '%s' "$worker_key_b64" | base64 -d)"
-          # Mask the private key in every subsequent log line (step outputs
-          # are not masked by GitHub; secrets.* are — this is the belt).
-          echo "::add-mask::$worker_key_b64"
-          echo "::add-mask::$worker_key"
 
           vars_json="$(gh api "repos/${GH_REPO}/actions/variables?per_page=100" --paginate)"
           clients="$(refresh_collect_clients "$vars_json")" || { echo "::error::cannot collect CLIENT_* variables"; exit 1; }
@@ -298,14 +299,49 @@ jobs:
             "${{ steps.identity.outputs.container }}" "${{ steps.identity.outputs.image_tag }}" \
             "${{ steps.port.outputs.port }}" "${{ steps.gateway.outputs.ip }}" \
             "${{ steps.gateway.outputs.tunnel_user }}" "${{ steps.identity.outputs.name }}" \
-            "$worker_key" \
             "$worker_authorized_keys" \
             "profiles/worker/${{ inputs.image }}/profile.json" "$ALL_SECRETS_JSON")" \
             || { echo "::error::could not build the docker-run command — see log above"; exit 1; }
-          {
-            echo "cmd=${cmd}"
-            echo "public_key=${worker_pub}"
-          } >> "$GITHUB_OUTPUT"
+          echo "cmd=${cmd}" >> "$GITHUB_OUTPUT"
+
+      # Nothing is authorized yet and that is fine: pool-tunnel inside the
+      # container retries every 2 seconds, so it connects the moment the
+      # refresh below lands. The old order (authorize, then start) was only
+      # possible while the runner minted the key — it cannot know a key the
+      # container has not generated yet.
+      - name: Run worker container on provider
+        id: run
+        uses: ./.github/actions/pool-ssh
+        with:
+          node: ${{ inputs.provider }}
+          command: ${{ steps.run_cmd.outputs.cmd }}
+
+      # The ONLY thing that crosses back from the container, and it is
+      # public. Waits for the key: the container mints it during startup,
+      # so reading immediately after `docker run -d` races it.
+      - name: Collect the worker's tunnel public key
+        id: pubkey
+        uses: ./.github/actions/pool-ssh
+        with:
+          node: ${{ inputs.provider }}
+          command: ${{ steps.run_cmd.outputs.read_pubkey_cmd }}
+
+      - name: Check the collected key really is a public key
+        id: checked_pubkey
+        shell: bash
+        env:
+          # Through env, never interpolated into the script body: a step
+          # output is remote-produced text and has no business being
+          # spliced into shell source.
+          RAW_PUBKEY: ${{ steps.pubkey.outputs.stdout }}
+        run: |
+          set -euo pipefail
+          pk="$(printf '%s' "$RAW_PUBKEY" | tr -d '\r' | grep -m1 '^ssh-' || true)"
+          if [[ -z "$pk" ]]; then
+            echo "::error::the worker did not return a usable tunnel public key"
+            exit 1
+          fi
+          echo "public_key=${pk}" >> "$GITHUB_OUTPUT"
 
       # The Gateway placeholder is a cache; POOL_WORKERS is the master
       # (docs/STATE_CONTRACT.md §1). Writing it here — WITH the new
@@ -324,14 +360,15 @@ jobs:
                    "${{ inputs.image }}" \
                    "${{ steps.identity.outputs.container }}" \
                    "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-                   "${{ steps.run_cmd.outputs.public_key }}")"
+                   "${{ steps.checked_pubkey.outputs.public_key }}")"
           printf '%s' "$new" | gh variable set POOL_WORKERS --repo "$GH_REPO"
           echo "POOL_WORKERS now holds $(printf '%s' "$new" | jq 'length') worker(s)"
 
-      # The Gateway must authorize this worker's tunnel key BEFORE the
-      # container starts (brief-T §流程順序). A dispatch or run failure
-      # here fails the whole create — the failure handler below rolls the
-      # ledger entry back out. Logic lives in
+      # This is what finally lets the worker's tunnel in: it has been
+      # retrying since the container started, with a key the Gateway did
+      # not know. A dispatch or run failure here fails the whole create —
+      # the failure handler below rolls the ledger entry back out and
+      # removes the container. Logic lives in
       # create_worker_dispatch_refresh_and_wait (thin caller, LAYOUT §3).
       - name: Refresh the Gateway authorized keys
         shell: bash
@@ -341,13 +378,6 @@ jobs:
           # dispatches refresh-authorized-keys.yml and waits for it to complete
           create_worker_dispatch_refresh_and_wait 300 \
             || { echo "::error::could not refresh the Gateway authorized keys — see log above"; exit 1; }
-
-      - name: Run worker container on provider
-        id: run
-        uses: ./.github/actions/pool-ssh
-        with:
-          node: ${{ inputs.provider }}
-          command: ${{ steps.run_cmd.outputs.cmd }}
 
       # pool-port-alloc --claim never learns the container's name (it runs
       # before docker build/run even happen) — record it into the

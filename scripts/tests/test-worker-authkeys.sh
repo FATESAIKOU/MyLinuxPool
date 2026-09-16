@@ -61,7 +61,7 @@ CMD="$(
     source "$CREATE" 2>/dev/null
     create_worker_build_run_cmd \
         mlp-fh-l-default-1 mylinuxpool-worker-default 2300 203.0.113.9 \
-        sshproxy fh-l "PRIVATE-KEY-MATERIAL" "$AK_LIST" "$PROFILE" '{}' 2>/dev/null
+        sshproxy fh-l "$AK_LIST" "$PROFILE" '{}' 2>/dev/null
 )"
 if [[ -z "$CMD" ]]; then
     bad "harness: create_worker_build_run_cmd 產不出指令，後面的斷言都跑不了"
@@ -173,7 +173,7 @@ else
 fi
 
 inj2="$SANDBOX/create-worker-inj.sh"
-sed 's|cmd+=" -e WORKER_KEY=${worker_key_q}"|cmd+=" -e WORKER_KEY=${worker_key_q} -e WORKER_AUTHORIZED_KEYS=x"|' \
+sed 's|cmd+=" -e POOL_NODE_NAME=${node_name_q}"|cmd+=" -e POOL_NODE_NAME=${node_name_q} -e WORKER_AUTHORIZED_KEYS=x"|' \
     "$CREATE" > "$inj2"
 if ! grep -q 'WORKER_AUTHORIZED_KEYS=x' "$inj2"; then
     inj_bad "10. 注入沒生效（needle 落空）——harness 問題"
@@ -182,7 +182,7 @@ else
         set -uo pipefail
         source "$inj2" 2>/dev/null
         create_worker_build_run_cmd mlp-x mylinuxpool-worker-default 2300 203.0.113.9 \
-            sshproxy fh-l "K" "$AK_LIST" "$PROFILE" '{}' 2>/dev/null
+            sshproxy fh-l "$AK_LIST" "$PROFILE" '{}' 2>/dev/null
     )"
     if grep -q -- '-e WORKER_AUTHORIZED_KEYS' <<<"$CMD2"; then
         inj_ok "10. 把靜態清單加回去後第 2 條會紅"

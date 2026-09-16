@@ -48,73 +48,29 @@ create_worker_compute_identity() {
     printf 'container=mlp-%s\n' "$name"
 }
 
-# create_worker_mint_tunnel_key
-#   Generates a fresh ed25519 key pair for a worker (KEY-DESIGN §3.3:
-#   workers get a NEW key on every create — the container dies with it,
-#   no key reuse). Runs on the Actions runner, never on a provider.
+# create_worker_read_pubkey_cmd <container> [tries]
+#   Builds the command that reads the worker's OWN tunnel public key back
+#   off the provider. The worker mints its key inside the container
+#   (profiles/worker/*/entrypoint.sh) so the private half never travels —
+#   this is the only thing that crosses back, and it is public.
 #
-#   Output, exactly two lines on stdout:
-#     line 1: the PRIVATE key, base64-encoded, ONE line
-#     line 2: the PUBLIC key, one full line (type, blob, optional
-#             comment — callers may overwrite the comment)
+#   Waits rather than reading once: the key is minted during container
+#   startup, so a read issued immediately after `docker run -d` races it.
 #
-#   The key material is generated in a temp dir that is removed on every
-#   exit path; the private key only ever leaves as base64 on stdout — it
-#   is never written to a persistent file and never logged. Base64 is
-#   used (rather than raw key bytes) so the caller can carry it through
-#   a single step-output boundary without mangling newlines.
-#
-#   THE BASE64 MUST BE A SINGLE LINE, AND THIS IS A SECURITY ISSUE, NOT
-#   COSMETIC: GNU coreutils base64 wraps output at 76 columns, so on Linux
-#   (the Actions runner) the private key's base64 spans several lines and
-#   "line 2" is a private-key fragment, not the public key. macOS base64
-#   does NOT wrap, so tests running on macOS never see the difference —
-#   this is the second time this exact Linux/macOS wrap difference has
-#   caused a real incident (same shape as refresh_build_install_cmd's
-#   `| base64 | tr -d '\n'` fix days ago). We do NOT use -w0: it is GNU
-#   coreutils-only and macOS base64 does not accept it. Instead the output
-#   is tr'd flat and a self-check asserts line 2 is a real public key
-#   BEFORE anything leaves the function — a "private key published as a
-#   public key" error must be caught here, not by a careful caller.
-create_worker_mint_tunnel_key() {
-    local tmp rc line1 line2
-    tmp="$(mktemp -d "${TMPDIR:-/tmp}/mlp-worker-key.XXXXXX")" || return 1
-    if ! ssh-keygen -t ed25519 -N "" -f "$tmp/id" >/dev/null 2>&1; then
-        rm -rf "$tmp"
-        log ERROR "ssh-keygen failed — cannot mint a worker tunnel key"
-        return 1
-    fi
-
-    # tr -d '\n' then a newline: guarantees exactly one line on Linux
-    # (which wraps) and macOS (which does not) alike.
-    line1="$(base64 < "$tmp/id" | tr -d '\n')"
-    rc=$?
-    line2="$(cat "${tmp}/id.pub" 2>/dev/null)"
-    rc=$((rc || $?))
-    rm -rf "$tmp"
-
-    # Self-check: the private-key line MUST be a single line, and line 2
-    # MUST be a public key line, never a private-key fragment. The
-    # wrapped-base64 failure mode puts a PRIVATE-key fragment on stdout's
-    # line 2 while the `line2` variable (read from id.pub directly) still
-    # looks fine — so check the base64 line for embedded newlines too,
-    # not just line2's shape. Any violation aborts before a caller can
-    # publish a fragment.
-    if [[ $rc -ne 0 || -z "$line1" || -z "$line2" ]]; then
-        log ERROR "could not read the minted key material — nothing was output"
-        return 1
-    fi
-    if [[ "$line1" == *$'\n'* ]]; then
-        log ERROR "minted output self-check failed: the private-key line is wrapped (Linux base64 folds at 76 cols) — line 2 would be a private-key fragment; aborting"
-        return 1
-    fi
-    if ! [[ "$line2" =~ ^ssh-[a-z0-9-]+[[:space:]]+[A-Za-z0-9+/=]+ ]]; then
-        log ERROR "minted output self-check failed: line 2 is not a public key (a private-key fragment must never be published) — aborting"
-        return 1
-    fi
-
-    printf '%s\n%s\n' "$line1" "$line2"
-    return 0
+#   The path is NOT written here. tunnel-identity.sh inside the container
+#   is the one definition of which file holds the tunnel key, and this
+#   sources it exactly like pool-tunnel does (RUNBOOK §7.12). HOME is set
+#   explicitly because `docker exec` does not reliably inherit the target
+#   user's home, and tunnel-identity.sh builds its paths from it.
+create_worker_read_pubkey_cmd() {
+    local container="$1" tries="${2:-30}"
+    local container_q; container_q="$(printf '%q' "$container")"
+    printf '%s' "for i in \$(seq 1 ${tries}); do \
+k=\"\$(docker exec -e HOME=/home/worker -u worker ${container_q} \
+bash -c '. /usr/local/bin/tunnel-identity.sh; cat \"\${TUNNEL_KEY}.pub\"' 2>/dev/null || true)\"; \
+case \"\$k\" in ssh-*) printf '%s\\n' \"\$k\"; exit 0;; esac; \
+sleep 1; done; \
+echo 'worker never produced a tunnel public key' >&2; exit 1"
 }
 
 # dispatch_refresh_and_wait lives in scripts/lib/refresh-wait.sh — the
@@ -177,7 +133,7 @@ create_worker_build_claim_cmd() {
 }
 
 # create_worker_build_run_cmd <container> <image_tag> <port> <gw_host> \
-#     <tunnel_user> <node_name> <worker_key> <authorized_keys_content> \
+#     <tunnel_user> <node_name> <authorized_keys_content> \
 #     <profile_json> <all_secrets_json>
 #   Prints the assembled `docker run ...` command line to stdout.
 #
@@ -202,22 +158,21 @@ create_worker_build_claim_cmd() {
 #   log in).
 create_worker_build_run_cmd() {
     local container="$1" image_tag="$2" port="$3" gw_host="$4"
-    local tunnel_user="$5" node_name="$6" worker_key="$7"
-    local authorized_keys_content="$8" profile_json="${9}" all_secrets_json="${10}"
+    local tunnel_user="$5" node_name="$6"
+    local authorized_keys_content="$7" profile_json="$8" all_secrets_json="$9"
 
     if [[ -z "$authorized_keys_content" ]]; then
         log ERROR "the assembled client list is empty — refusing to start a worker nobody can log into"
         return 1
     fi
 
-    local container_q image_q port_q host_q tunnel_user_q node_name_q worker_key_q
+    local container_q image_q port_q host_q tunnel_user_q node_name_q
     container_q="$(printf '%q' "$container")"
     image_q="$(printf '%q' "$image_tag")"
     port_q="$(printf '%q' "$port")"
     host_q="$(printf '%q' "$gw_host")"
     tunnel_user_q="$(printf '%q' "$tunnel_user")"
     node_name_q="$(printf '%q' "$node_name")"
-    worker_key_q="$(printf '%q' "$worker_key")"
 
     # The client list travels as base64: `base64` on a Linux runner wraps
     # at 76 columns and `-w0` is GNU-only, so the newlines come off with
@@ -257,7 +212,10 @@ create_worker_build_run_cmd() {
     cmd+=" -e POOL_GATEWAY_FILE=/run/mlp-gateway/gateway.json"
     cmd+=" -e POOL_GATEWAY_PORT=${port_q} -e POOL_GATEWAY_HOST=${host_q} -e POOL_GATEWAY_USER=${tunnel_user_q}"
     cmd+=" -e POOL_NODE_NAME=${node_name_q}"
-    cmd+=" -e WORKER_KEY=${worker_key_q}"
+    # No key of any kind on this command line. The container mints its
+    # own tunnel identity at startup and only its public half ever leaves
+    # (create_worker_read_pubkey_cmd) — so nothing here shows up in the
+    # provider's `ps`, in `docker inspect`, or in a workflow log.
 
     local container_var secret_name val literal_val
     while IFS=$'\t' read -r container_var secret_name; do

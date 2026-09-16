@@ -8,11 +8,12 @@
 # provider does — not a duplicated copy — which needs a build context wide
 # enough to reach shared-configs/.
 #
-# No secret ever gets baked in here (spec §7). WORKER_KEY,
-# POOL_GATEWAY_PORT, POOL_NODE_NAME and GH_TOKEN / GH_WORKER_TOKEN all
-# arrive at `docker run` time via -e / mounts — see entrypoint.sh. The
-# list of who may log in arrives as a read-only mount, not an env var, so
-# that it can keep changing after the container has started.
+# No secret ever gets baked in here (spec §7), and none arrives at run
+# time either: the tunnel private key is MINTED BY THIS CONTAINER at
+# startup and never leaves it. POOL_GATEWAY_PORT, POOL_NODE_NAME and
+# GH_TOKEN / GH_WORKER_TOKEN arrive via `docker run -e`; the list of who
+# may log in arrives as a read-only mount, not an env var, so that it can
+# keep changing after the container has started.
 
 FROM ubuntu:24.04
 

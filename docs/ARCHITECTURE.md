@@ -265,7 +265,9 @@ Provider 每 30 秒輪詢，實際斷線時間 ≈ 一個輪詢週期 + 一次 s
 1. 解析 provider var → 組出跳板鏈
 2. 在 Gateway 上 `flock` 序列化，掃 2300–2399 找空位，寫 `~/pool/workers.d/<port>.json` 佔位
 3. 在 provider 上 `docker build workers/<image>`
-4. `docker run`，執行時注入 `WORKER_KEY`／`GATEWAY_*`／`ASSIGNED_PORT`／`GH_WORKER_TOKEN`（**不進 image**）
+4. `docker run`（**不帶任何金鑰**），執行時注入 `GATEWAY_*`／`ASSIGNED_PORT`／`GH_WORKER_TOKEN`（**不進 image**）；
+   容器啟動時自己產隧道金鑰，create-worker 只用 `docker exec` 讀回公鑰寫進 `POOL_WORKERS`，
+   再 refresh Gateway——私鑰從不離開容器
 5. container entrypoint：起 sshd ＋ 起 pool-tunnel
 6. 從 Gateway 驗證：埠在聽 ＋ 回得出 SSH banner
 7. 輸出連線指令

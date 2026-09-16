@@ -6,9 +6,8 @@
 # `worker` user.
 #
 # Everything here arrives via `docker run -e` / mounts, never baked into
-# the image (spec §7):
-#   WORKER_KEY             private key for pool-tunnel's reverse tunnel,
-#                          written to ~worker/.ssh/id_pool (600)
+# the image (spec §7). The tunnel private key is NOT in that list: this
+# container mints its own (see below) so the private half never travels.
 #   /run/mlp-clients       (read-only mount) the provider's assembled
 #                          client list; sshd reads it through
 #                          AuthorizedKeysCommand on every login
@@ -37,12 +36,29 @@ chmod 700 "${WORKER_HOME}/.ssh"
 # moved to id_tunnel (KEY-DESIGN §8).
 HOME="$WORKER_HOME" . /usr/local/bin/tunnel-identity.sh
 
-if [[ -n "${WORKER_KEY:-}" ]]; then
-    printf '%s\n' "$WORKER_KEY" > "$TUNNEL_KEY"
-    chmod 600 "$TUNNEL_KEY"
-else
-    echo "WARNING: WORKER_KEY not set — pool-tunnel has no key to reverse-tunnel with" >&2
+# The tunnel key is MINTED HERE, in the container that will use it, and
+# never leaves it — the same invariant every provider already follows
+# (KEY-DESIGN §3.2). Before this it was minted by the create-worker
+# workflow and handed over as `docker run -e WORKER_KEY=<private key>`,
+# which put the private half in the provider's process listing, in
+# `docker inspect` for the life of the container, and on the wire.
+#
+# Only the PUBLIC half leaves: create-worker reads ${TUNNEL_KEY}.pub back
+# with `docker exec` and records it in POOL_WORKERS, which is what the
+# Gateway refresh then authorizes. The tunnel therefore fails for the few
+# seconds between this container starting and that refresh landing —
+# pool-tunnel retries every 2s, so it connects as soon as the key is
+# authorized, and `docker logs` shows the retries plainly.
+#
+# Only when absent: a restart (--restart unless-stopped) must keep the
+# identity the Gateway has already authorized, or the worker would lock
+# itself out of its own tunnel on every reboot of the provider.
+if [[ ! -f "$TUNNEL_KEY" ]]; then
+    ssh-keygen -t ed25519 -N "" -C "${POOL_NODE_NAME:-worker}" -f "$TUNNEL_KEY" >/dev/null \
+        || { echo "FATAL: could not mint the worker tunnel key" >&2; exit 1; }
 fi
+chmod 600 "$TUNNEL_KEY"
+chmod 644 "${TUNNEL_KEY}.pub"
 
 # Who may log in is NOT written here any more. sshd asks
 # /usr/local/bin/worker-authkeys, which reads the provider's read-only

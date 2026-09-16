@@ -303,422 +303,149 @@ b64decode() {
 }
 
 # ---------------------------------------------------------------------------
-# 1–3) create_worker_mint_tunnel_key
-# ---------------------------------------------------------------------------
-echo "create_worker_mint_tunnel_key:"
-
-MINT1_OUT=""; MINT1_RC=0; MINT1_ERR=""
-MINT2_OUT=""; MINT2_RC=0
-run_mint() {
-    local n="$1"
-    : > "$SANDBOX/ssh-keygen.log"; : > "$SANDBOX/mktemp.log"
-    rm -rf "$SANDBOX/mint-home" "$SANDBOX/tmp/mint"; mkdir -p "$SANDBOX/mint-home" "$SANDBOX/tmp/mint"
-    if ! declare -F create_worker_mint_tunnel_key >/dev/null 2>&1; then
-        printf 'mint_out_%s="<undefined function: create_worker_mint_tunnel_key>"\n' "$n" > "$SANDBOX/mint.$n.env"
-        return 127
-    fi
-    HOME="$SANDBOX/mint-home" TMPDIR="$SANDBOX/tmp" \
-    PATH="$SANDBOX/fakebin:$PATH" \
-    REAL_MKTEMP="$REAL_MKTEMP" REAL_SSH_KEYGEN="$REAL_SSH_KEYGEN" \
-    REAL_BASE64="$REAL_BASE64" \
-    FAKE_MKTEMP_DIR="$SANDBOX/tmp/mint" FAKE_MKTEMP_LOG="$SANDBOX/mktemp.log" \
-    FAKE_SSH_KEYGEN_LOG="$SANDBOX/ssh-keygen.log" \
-    $TIMEOUT bash -c 'source "$1" >/dev/null 2>&1; create_worker_mint_tunnel_key' _ "$CREATE_WORKER_SH" \
-        </dev/null > "$SANDBOX/mint.$n.out" 2> "$SANDBOX/mint.$n.err"
-    return $?
-}
-
-MINT1_RC=0; run_mint 1 || MINT1_RC=$?
-MINT2_RC=0; run_mint 2 || MINT2_RC=$?
-
-LINE1="$(sed -n '1p' "$SANDBOX/mint.1.out" 2>/dev/null)"
-LINE2="$(sed -n '2p' "$SANDBOX/mint.1.out" 2>/dev/null)"
-N_LINES="$(grep -c . "$SANDBOX/mint.1.out" 2>/dev/null || true)"
-
-if ! declare -F create_worker_mint_tunnel_key >/dev/null 2>&1; then
-    bad "1. mint 輸出兩行（函式不存在）"
-    bad "1. 第 1 行是私鑰的 base64（函式不存在）"
-    bad "1. 第 2 行是合法公鑰（authkeys_valid_pubkey）（函式不存在）"
-    bad "2. 連續兩次產生不同金鑰（函式不存在）"
-    bad "3. 私鑰不出現在 stderr 或子行程 argv（函式不存在）"
-    bad "3. 產完沒有留下暫存檔（函式不存在）"
-else
-    if [[ "$MINT1_RC" -eq 0 && "$N_LINES" -eq 2 ]]; then
-        ok "1. mint 輸出恰兩行（rc=0）"
-    else
-        bad "1. mint 輸出恰兩行（rc=${MINT1_RC}, 非空行數=${N_LINES}; stderr: $(head -c 160 "$SANDBOX/mint.1.err" 2>/dev/null | tr '\n' ' '))"
-    fi
-
-    # Line 1: base64 that decodes to a private key (the interface says so).
-    if [[ -n "$LINE1" ]] && [[ "$LINE1" =~ ^[A-Za-z0-9+/=]+$ ]]; then
-        DECODED="$(printf '%s' "$LINE1" | b64decode)"
-        if [[ "$DECODED" == *"PRIVATE KEY"* ]]; then
-            ok "1. 第 1 行 base64 解出私鑰（含 PRIVATE KEY armor）"
-        else
-            bad "1. 第 1 行 base64 解出的內容不像私鑰"
-        fi
-    else
-        bad "1. 第 1 行不是非空 base64（got: ${LINE1:0:40}）"
-    fi
-
-    # Line 2: a valid public key line (contract: authkeys_valid_pubkey).
-    if ! declare -F authkeys_valid_pubkey >/dev/null 2>&1; then
-        bad "1. 第 2 行是合法公鑰（authkeys_valid_pubkey）（authkeys.sh 不存在）"
-    elif authkeys_valid_pubkey "$LINE2" >/dev/null 2>&1; then
-        ok "1. 第 2 行通過 authkeys_valid_pubkey"
-    else
-        bad "1. 第 2 行不是合法公鑰（got: ${LINE2:0:60}）"
-    fi
-    if [[ -n "$LINE2" && "$LINE1" != "$LINE2" ]]; then
-        ok "1. 兩行內容不同（私鑰行不是公鑰行的複製）"
-    else
-        bad "1. 兩行相同或第 2 行為空"
-    fi
-
-    # 2) Two calls must yield different keys.
-    M2_OK=0
-    if [[ "$MINT2_RC" -eq 0 ]]; then
-        L1B="$(sed -n '1p' "$SANDBOX/mint.2.out" 2>/dev/null)"
-        L2B="$(sed -n '2p' "$SANDBOX/mint.2.out" 2>/dev/null)"
-        if [[ -n "$LINE2" && -n "$L2B" && "$LINE2" != "$L2B" && -n "$LINE1" && "$LINE1" != "$L1B" ]]; then
-            M2_OK=1
-        fi
-    fi
-    if [[ "$M2_OK" -eq 1 ]]; then
-        ok "2. 連續兩次產生不同的金鑰（公鑰與私鑰都不同）"
-    else
-        bad "2. 連續兩次的金鑰相同或第二次失敗（rc2=${MINT2_RC}）"
-    fi
-
-    # 3a) Private key must not surface in stderr or child argv.
-    LEAK=""
-    for f in "$SANDBOX/mint.1.err" "$SANDBOX/ssh-keygen.log"; do
-        if grep -qF 'OPENSSH PRIVATE KEY' "$f" 2>/dev/null; then LEAK="$LEAK ${f##*/}(armor)"; fi
-        if [[ -n "$LINE1" ]] && grep -qF "$LINE1" "$f" 2>/dev/null; then LEAK="$LEAK ${f##*/}(b64)"; fi
-    done
-    if ! grep -q . "$SANDBOX/ssh-keygen.log" 2>/dev/null; then
-        bad "3. 私鑰不出現在 stderr 或子行程 argv（前提失敗：ssh-keygen 未被呼叫，無從證明）"
-    elif [[ -z "$LEAK" ]]; then
-        ok "3. 私鑰不出現在 stderr 與 ssh-keygen argv"
-    else
-        bad "3. 私鑰出現在：${LEAK}"
-    fi
-
-    # 3b) Temp files: every path the intercepted mktemp handed out must be
-    # gone, and nothing may remain in HOME/TMPDIR.
-    LEFT=""
-    while IFS= read -r p; do
-        [[ -n "$p" ]] || continue
-        [[ -e "$p" ]] && LEFT="$LEFT $p"
-    done < "$SANDBOX/mktemp.log"
-    if ! grep -q . "$SANDBOX/mktemp.log" 2>/dev/null; then
-        # No temp path handed out: fall back to sweeping the observed dirs.
-        LEFT="$(find "$SANDBOX/mint-home" "$SANDBOX/tmp/mint" -mindepth 1 2>/dev/null | tr '\n' ' ')"
-    fi
-    if [[ -z "$LEFT" ]]; then
-        ok "3. 產完沒有留下暫存檔（mktemp 發出的路徑與觀察目錄皆已清空）"
-    else
-        bad "3. 暫存檔未刪除：${LEFT}"
-    fi
-
-    # 3c) No private key file may be left anywhere the harness can see.
-    KEYFILE="$(find "$SANDBOX/mint-home" "$SANDBOX/tmp" -type f 2>/dev/null | head -1)"
-    if [[ -z "$KEYFILE" ]]; then
-        ok "3. 觀察範圍內沒有留下的金鑰檔（HOME/TMPDIR 皆空）"
-    else
-        bad "3. 留下檔案：${KEYFILE}"
-    fi
-fi
-
-# ===========================================================================
-# W1–W4: the GNU-wrap platform. macOS base64 never wraps, so "line 2 is the
-# public key" passed here while the real Linux runner emitted the private
-# key's second chunk on line 2 — and that chunk was published as the worker's
-# tunnel key. Every mint below runs with the wrapping fake base64 on PATH
-# (same PATH ordering as production), so this case is platform-faithful.
+# 1–3) The private key is never produced on the runner any more.
 #
-# The assertions are the same three the contract needs, plus the structural
-# reason the bug was silent: `-` is not in base64's alphabet, so a line that
-# starts with "ssh-" cannot be a private-key chunk.
-# ===========================================================================
-echo "GNU base64（每 76 字元折行）下的 mint:"
-W1_RC=0
-run_mint_wrapped() {
-    local n="$1"
-    : > "$SANDBOX/ssh-keygen.log"; : > "$SANDBOX/mktemp.log"
-    rm -rf "$SANDBOX/mint-home" "$SANDBOX/tmp/mint"; mkdir -p "$SANDBOX/mint-home" "$SANDBOX/tmp/mint"
-    if ! declare -F create_worker_mint_tunnel_key >/dev/null 2>&1; then
-        return 127
-    fi
-    HOME="$SANDBOX/mint-home" TMPDIR="$SANDBOX/tmp" \
-    PATH="$SANDBOX/fakebin:$PATH" \
-    REAL_MKTEMP="$REAL_MKTEMP" REAL_SSH_KEYGEN="$REAL_SSH_KEYGEN" \
-    REAL_BASE64="$REAL_BASE64" \
-    FAKE_MKTEMP_DIR="$SANDBOX/tmp/mint" FAKE_MKTEMP_LOG="$SANDBOX/mktemp.log" \
-    FAKE_SSH_KEYGEN_LOG="$SANDBOX/ssh-keygen.log" \
-    FAKE_KEYGEN_BOGUS_PUB="${FAKE_KEYGEN_BOGUS_PUB:-}" \
-    $TIMEOUT bash -c 'source "$1" >/dev/null 2>&1; create_worker_mint_tunnel_key' _ "$CREATE_WORKER_SH" \
-        </dev/null > "$SANDBOX/wrapped.$n.out" 2> "$SANDBOX/wrapped.$n.err"
-    return $?
-}
+# It used to be: create_worker_mint_tunnel_key ran ssh-keygen ON THE RUNNER,
+# base64'd the private half through a step output, and handed it to the
+# provider as `docker run -e WORKER_KEY=<private key>` — visible in the
+# provider's process listing, in `docker inspect` for the life of the
+# container, and one masking slip away from a workflow log (RUNBOOK §7.13,
+# where exactly that leak happened). The worker now mints its own key
+# inside the container and only the public half ever comes back.
+# ---------------------------------------------------------------------------
+echo "no private key on the runner:"
 
-if ! declare -F create_worker_mint_tunnel_key >/dev/null 2>&1; then
-    bad "W1. 折行環境下仍恰兩行（函式不存在）"
-    bad "W1b. 第 1 行能單獨解出私鑰（函式不存在）"
-    bad "W2. 第 2 行以 ssh- 開頭（函式不存在）"
-    bad "W3. 第 2 行通過 authkeys_valid_pubkey（函式不存在）"
-    bad "W4. 第 2 行不含私鑰材料（函式不存在）"
+if declare -F create_worker_mint_tunnel_key >/dev/null 2>&1; then
+    bad "1. create_worker_mint_tunnel_key 還在——只要它存在，就還有一條在 runner 上產生私鑰的路徑"
 else
-    run_mint_wrapped 1 || W1_RC=$?
-    W_LINE1="$(sed -n '1p' "$SANDBOX/wrapped.1.out" 2>/dev/null)"
-    W_LINE2="$(sed -n '2p' "$SANDBOX/wrapped.1.out" 2>/dev/null)"
-    W_NLINES="$(grep -c . "$SANDBOX/wrapped.1.out" 2>/dev/null || true)"
+    ok "1. create_worker_mint_tunnel_key 已移除（runner 不再產生私鑰）"
+fi
 
-    # Sanity: the fake really did wrap, or this whole section proves nothing.
-    RAW_B64_LINES="$(head -c 200 /dev/urandom | "$REAL_BASE64" | fold -w 76 | grep -c .)"
-    if [[ "$RAW_B64_LINES" -ge 3 && "$W_LINE1" != *"PRIVATE KEY"* ]]; then
-        :
-    fi
-
-    if [[ "$W1_RC" -eq 0 && "$W_NLINES" -eq 2 ]]; then
-        ok "W1. 折行環境下輸出恰兩行（rc=0）"
+AK_FIXTURE='ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFIXTUREACTIONS actions'
+PROFILE_FIXTURE="$SANDBOX/profile.json"
+printf '%s\n' '{"secrets":[],"env":[]}' > "$PROFILE_FIXTURE"
+RUN_CMD_OUT="$(
+    set -uo pipefail
+    source "$CREATE_WORKER_SH" 2>/dev/null
+    create_worker_build_run_cmd mlp-fh-l-default-1 img 2300 203.0.113.9 \
+        sshproxy fh-l "$AK_FIXTURE" "$PROFILE_FIXTURE" '{}' 2>/dev/null
+)"
+if [[ -z "$RUN_CMD_OUT" ]]; then
+    bad "2. create_worker_build_run_cmd 產不出指令（簽章可能已改）"
+    bad "3. docker run 指令不含任何私鑰痕跡（前一條失敗，無從檢查）"
+else
+    if grep -q -- '-e WORKER_KEY' <<<"$RUN_CMD_OUT"; then
+        bad "2. docker run 仍帶 -e WORKER_KEY——私鑰會出現在 provider 的 ps 與 docker inspect"
     else
-        bad "W1. 折行環境下輸出恰兩行（rc=${W1_RC}, 非空行數=${W_NLINES}; 第 2 行=[${W_LINE2:0:50}]）"
+        ok "2. docker run 不再帶 -e WORKER_KEY"
     fi
-
-    # Line 1 must be the COMPLETE base64 of the private key. Under GNU
-    # wrapping without the fix, line 1 is only the first 76 characters and
-    # decodes to a fragment with no armor — this is the assertion that
-    # catches the bug at its source.
-    if [[ -n "$W_LINE1" ]] && [[ "$W_LINE1" =~ ^[A-Za-z0-9+/=]+$ ]]; then
-        W_DEC1="$(printf '%s' "$W_LINE1" | b64decode)"
-        if [[ "$W_DEC1" == *"PRIVATE KEY"* ]]; then
-            ok "W1b. 第 1 行單獨就能解出私鑰（未被折行截斷）"
-        else
-            bad "W1b. 第 1 行解不出私鑰——base64 被折行截斷了（第 1 行長度 ${#W_LINE1}）"
-        fi
+    if grep -qE 'PRIVATE KEY|BEGIN OPENSSH' <<<"$RUN_CMD_OUT"; then
+        bad "3. docker run 指令裡出現私鑰材料"
     else
-        bad "W1b. 第 1 行不是純 base64（長度 ${#W_LINE1}）"
-    fi
-
-    if [[ "$W_LINE2" == ssh-* ]]; then
-        ok "W2. 第 2 行以 ssh- 開頭"
-    else
-        bad "W2. 第 2 行不以 ssh- 開頭（got: ${W_LINE2:0:60}）——這就是私鑰被當公鑰發布的形狀"
-    fi
-
-    if ! declare -F authkeys_valid_pubkey >/dev/null 2>&1; then
-        bad "W3. 第 2 行通過 authkeys_valid_pubkey（authkeys.sh 不存在）"
-    elif authkeys_valid_pubkey "$W_LINE2" >/dev/null 2>&1; then
-        ok "W3. 第 2 行通過 authkeys_valid_pubkey"
-    else
-        bad "W3. 第 2 行不是合法公鑰（got: ${W_LINE2:0:60}）"
-    fi
-
-    # W4: no private-key material on line 2. `-` is not in base64's
-    # alphabet, so any private-key chunk is structurally excluded once the
-    # ssh- prefix holds; this also rejects a pure base64 chunk explicitly.
-    W4_OK=1
-    if [[ -z "$W_LINE2" ]]; then
-        W4_OK=0
-    elif [[ "$W_LINE2" =~ ^[A-Za-z0-9+/=]+$ ]]; then
-        W4_OK=0   # a bare base64 chunk: private-key continuation
-    fi
-    if [[ "$W4_OK" -eq 1 && -n "$W_DEC1" ]]; then
-        # The decoded private key, re-encoded, must not overlap with line 2.
-        if [[ "$W_LINE2" != "$W_LINE1" ]] && [[ -n "$W_LINE1" ]]; then
-            if printf '%s' "$W_LINE2" | b64decode 2>/dev/null | grep -q 'PRIVATE KEY'; then
-                W4_OK=0
-            fi
-        fi
-    fi
-    if [[ "$W4_OK" -eq 1 ]]; then
-        ok "W4. 第 2 行不含任何私鑰材料"
-    else
-        bad "W4. 第 2 行是私鑰材料或其片段（got: ${W_LINE2:0:60}）"
+        ok "3. docker run 指令裡沒有任何私鑰材料"
     fi
 fi
 
-# ===========================================================================
-# S1: the function's own self-check. If line 2 does not start with "ssh-",
-# the function must return non-zero rather than publish it — the defence
-# being added alongside the wrap fix. Forced by making ssh-keygen write a
-# non-key file as the public half.
-# ===========================================================================
-echo "mint 自我檢查（第 2 行不是 ssh- 開頭 → 非 0）:"
-if ! declare -F create_worker_mint_tunnel_key >/dev/null 2>&1; then
-    bad "S1. 第 2 行不是公鑰時回非 0（函式不存在）"
+# ---------------------------------------------------------------------------
+# 3b–3d) The container mints its own key — and keeps it across a restart.
+# ---------------------------------------------------------------------------
+echo "entrypoint mints in the container:"
+
+ENTRY="profiles/worker/default/entrypoint.sh"
+if [[ ! -f "$ENTRY" ]]; then
+    bad "3b. entrypoint 不存在"
+    bad "3c. entrypoint 重啟時沿用既有金鑰（前一條失敗）"
+    bad "3d. entrypoint 不再從環境變數寫入私鑰（前一條失敗）"
 else
-    cat > "$SANDBOX/fakebin/ssh-keygen-bogus" <<'FAKE_BOGUS'
+    # 只取「產金鑰」那一段來跑：entrypoint 其餘部分需要 root 與 sshd。
+    MINT_FRAG="$SANDBOX/mint-frag.sh"
+    {
+        echo 'set -uo pipefail'
+        echo 'TUNNEL_KEY="$1"'
+        awk '/^if \[\[ ! -f "\$TUNNEL_KEY" \]\]; then$/,/^chmod 644/' "$ENTRY"
+    } > "$MINT_FRAG"
+
+    if ! grep -q 'ssh-keygen' "$MINT_FRAG"; then
+        bad "3b. 在 entrypoint 裡找不到產金鑰的片段（awk needle 落空）"
+        bad "3c. entrypoint 重啟時沿用既有金鑰（前一條失敗）"
+    else
+        K="$SANDBOX/wk/id_tunnel"; mkdir -p "$SANDBOX/wk"
+        bash "$MINT_FRAG" "$K" >/dev/null 2>&1
+        if [[ -f "$K" && -f "${K}.pub" ]] && grep -q '^ssh-ed25519 ' "${K}.pub"; then
+            ok "3b. 容器缺金鑰時自己產一把 ed25519"
+        else
+            bad "3b. 沒有產出可用的金鑰對"
+        fi
+        FIRST="$(cat "${K}.pub" 2>/dev/null)"
+        bash "$MINT_FRAG" "$K" >/dev/null 2>&1
+        SECOND="$(cat "${K}.pub" 2>/dev/null)"
+        if [[ -n "$FIRST" && "$FIRST" == "$SECOND" ]]; then
+            ok "3c. 已有金鑰時原封不動——重啟不會把自己踢出 Gateway 的授權清單"
+        else
+            bad "3c. 第二次執行換掉了金鑰，重啟後隧道會被拒絕"
+        fi
+    fi
+
+    if grep -q 'WORKER_KEY' "$ENTRY"; then
+        if grep -qE '^\s*(printf|echo).*WORKER_KEY.*>' "$ENTRY"; then
+            bad "3d. entrypoint 仍把 WORKER_KEY 寫成私鑰檔"
+        else
+            ok "3d. entrypoint 只在註解裡提到 WORKER_KEY，不再據以寫檔"
+        fi
+    else
+        ok "3d. entrypoint 完全不碰 WORKER_KEY"
+    fi
+fi
+
+# ---------------------------------------------------------------------------
+# 3e–3g) Reading the public key back: it must wait, and must refuse
+#        anything that is not a public key.
+# ---------------------------------------------------------------------------
+echo "create_worker_read_pubkey_cmd:"
+
+if ! declare -F create_worker_read_pubkey_cmd >/dev/null 2>&1; then
+    bad "3e. create_worker_read_pubkey_cmd 未定義"
+    bad "3f. 讀公鑰會等待容器啟動（前一條失敗）"
+    bad "3g. 只接受 ssh- 開頭的內容（前一條失敗）"
+else
+    ok "3e. create_worker_read_pubkey_cmd 已定義"
+    mkdir -p "$SANDBOX/pkbin"
+    export PK_COUNT="$SANDBOX/pk.count"
+
+    cat > "$SANDBOX/pkbin/docker" <<'FAKEDOCKER'
 #!/usr/bin/env bash
-# Writes a real private key but a bogus .pub, to exercise the self-check.
-# NOTE: no `exec` here — exec would replace this shell, so the .pub
-# overwrite below would never run and the case would silently test nothing.
-args=("$@")
-"$REAL_SSH_KEYGEN" "${args[@]}" >/dev/null 2>&1
-rc=$?
-f=""
-prev=""
-for a in "${args[@]}"; do
-    [[ "$prev" == "-f" ]] && f="$a"
-    prev="$a"
-done
-if [[ -n "$f" ]]; then
-    printf 'not-a-public-key\n' > "${f}.pub"
-fi
-exit $rc
-FAKE_BOGUS
-    chmod +x "$SANDBOX/fakebin/ssh-keygen-bogus"
-    # Put the bogus keygen in front under the name ssh-keygen for one run.
-    S1_RC=0
-    rm -rf "$SANDBOX/s1bin"; mkdir -p "$SANDBOX/s1bin"
-    cp "$SANDBOX/fakebin/ssh-keygen-bogus" "$SANDBOX/s1bin/ssh-keygen"
-    chmod +x "$SANDBOX/s1bin/ssh-keygen"
-    rm -rf "$SANDBOX/s1-home" "$SANDBOX/s1-tmp"; mkdir -p "$SANDBOX/s1-home" "$SANDBOX/s1-tmp"
-    HOME="$SANDBOX/s1-home" TMPDIR="$SANDBOX/s1-tmp" \
-    PATH="$SANDBOX/s1bin:$SANDBOX/fakebin:$PATH" \
-    REAL_MKTEMP="$REAL_MKTEMP" REAL_SSH_KEYGEN="$REAL_SSH_KEYGEN" REAL_BASE64="$REAL_BASE64" \
-    FAKE_MKTEMP_DIR="$SANDBOX/s1-tmp" FAKE_MKTEMP_LOG="$SANDBOX/s1-mktemp.log" \
-    FAKE_SSH_KEYGEN_LOG="$SANDBOX/s1-keygen.log" \
-    $TIMEOUT bash -c 'source "$1" >/dev/null 2>&1; create_worker_mint_tunnel_key' _ "$CREATE_WORKER_SH" \
-        </dev/null > "$SANDBOX/s1.out" 2> "$SANDBOX/s1.err"
-    S1_RC=$?
-    S1_L2="$(sed -n '2p' "$SANDBOX/s1.out" 2>/dev/null)"
-    if [[ "$S1_RC" -ne 0 ]]; then
-        ok "S1. 第 2 行不是公鑰時回非 0（rc=${S1_RC}）"
+n=$(cat "$PK_COUNT" 2>/dev/null || echo 0); n=$((n+1)); echo "$n" > "$PK_COUNT"
+# 前兩次還在啟動中，第三次才吐出公鑰
+[[ $n -lt 3 ]] && exit 1
+echo "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIWORKERSELFMINTED fh-l"
+FAKEDOCKER
+    chmod +x "$SANDBOX/pkbin/docker"
+
+    echo 0 > "$PK_COUNT"
+    PK_CMD="$(create_worker_read_pubkey_cmd mlp-fh-l-default-1 10)"
+    PK_OUT="$(PATH="$SANDBOX/pkbin:$PATH" bash -c "$PK_CMD" 2>/dev/null)"
+    PK_TRIES="$(cat "$PK_COUNT" 2>/dev/null || echo 0)"
+    if [[ "$PK_OUT" == ssh-ed25519\ * && "$PK_TRIES" -ge 3 ]]; then
+        ok "3f. 容器還沒產好就重試，等到了才回傳（試了 ${PK_TRIES} 次）"
     else
-        bad "S1. 第 2 行不是公鑰時仍回 0——自我檢查不存在（輸出第 2 行=[${S1_L2:0:50}]）"
+        bad "3f. 沒有等待就放棄（試了 ${PK_TRIES} 次，回傳 [${PK_OUT}]）"
     fi
-    if [[ "$S1_RC" -ne 0 ]] && [[ "$S1_L2" != ssh-* ]]; then
-        ok "S1b. 自我檢查失敗時不把非公鑰行留在 stdout"
-    elif [[ "$S1_RC" -ne 0 ]]; then
-        bad "S1b. 回非 0 但仍印了非公鑰的第 2 行=[${S1_L2:0:50}]"
+
+    # 永遠吐非公鑰的內容：必須以非 0 結束，而不是把垃圾當成公鑰發布
+    cat > "$SANDBOX/pkbin/docker" <<'FAKEDOCKER2'
+#!/usr/bin/env bash
+echo "-----BEGIN OPENSSH PRIVATE KEY-----"
+FAKEDOCKER2
+    chmod +x "$SANDBOX/pkbin/docker"
+    PK_CMD2="$(create_worker_read_pubkey_cmd mlp-fh-l-default-1 2)"
+    PK_OUT2="$(PATH="$SANDBOX/pkbin:$PATH" bash -c "$PK_CMD2" 2>/dev/null)"; PK_RC2=$?
+    if [[ $PK_RC2 -ne 0 && -z "$PK_OUT2" ]]; then
+        ok "3g. 回來的東西不是公鑰時以非 0 結束，不會把它當公鑰發布"
     else
-        bad "S1b. 自我檢查不存在，無從判斷 stdout（前提不成立）"
+        bad "3g. 把非公鑰的內容放行了（rc=${PK_RC2}, out=[${PK_OUT2}]）"
     fi
 fi
 
-# ---------------------------------------------------------------------------
-# W-Inj: remove the single-line flattening from a copy of the function and
-# show W1/W1b/W2 redden. macOS's base64 does not wrap, so the injection must
-# reproduce GNU wrapping explicitly (fold -w 76) — exactly the trick
-# test-refresh-authkeys.sh used for the same class of bug.
-# ---------------------------------------------------------------------------
-echo "注入（折行平台）:"
-if [[ -f "$CREATE_WORKER_SH" ]] && grep -qE 'base64 < "\$tmp/id"' "$CREATE_WORKER_SH"; then
-    INJ_W="$SANDBOX/create-worker-wrap-inj.sh"
-    if ! python3 - "$CREATE_WORKER_SH" "$INJ_W" <<'PY'
-import re, sys
-src = open(sys.argv[1], encoding="utf-8").read()
-# Strip ONLY the flattening pipe from the base64 line, leaving the rest of
-# the assignment (the closing `)"`, the `line1=` prefix) untouched. Matching
-# the whole line and rebuilding it is what mangled the function before.
-m = re.search(r'base64 < "\$tmp/id"\s*\|\s*tr -d .\\n.', src)
-if not m:
-    sys.exit(1)   # no flattening pipe: either already fixed or not this shape
-src = src[:m.start()] + 'base64 < "$tmp/id"' + src[m.end():]
-open(sys.argv[2], "w", encoding="utf-8").write(src)
-PY
-    then
-        bad "W-Inj. 注入腳本失敗（找不到 base64 的單行化管線）——harness 問題"
-    fi
-    chmod +x "$INJ_W" 2>/dev/null
-    if [[ -s "$INJ_W" ]] && ! cmp -s "$CREATE_WORKER_SH" "$INJ_W"; then
-        INJ_W_RC=0
-        rm -rf "$SANDBOX/wi-home" "$SANDBOX/wi-tmp"; mkdir -p "$SANDBOX/wi-home" "$SANDBOX/wi-tmp"
-        HOME="$SANDBOX/wi-home" TMPDIR="$SANDBOX/wi-tmp" \
-        PATH="$SANDBOX/fakebin:$PATH" \
-        REAL_MKTEMP="$REAL_MKTEMP" REAL_SSH_KEYGEN="$REAL_SSH_KEYGEN" REAL_BASE64="$REAL_BASE64" \
-        FAKE_MKTEMP_DIR="$SANDBOX/wi-tmp" FAKE_MKTEMP_LOG="$SANDBOX/wi-mktemp.log" \
-        FAKE_SSH_KEYGEN_LOG="$SANDBOX/wi-keygen.log" \
-        timeout 30 bash -c 'source "$1" >/dev/null 2>&1; create_worker_mint_tunnel_key' _ "$INJ_W" \
-            </dev/null > "$SANDBOX/wi.out" 2>&1
-        INJ_W_RC=$?
-        INJ_W_N="$(grep -c . "$SANDBOX/wi.out" 2>/dev/null || true)"
-        INJ_W_L2="$(sed -n '2p' "$SANDBOX/wi.out" 2>/dev/null)"
-        INJ_W_MSG="$(tr '\n' ' ' < "$SANDBOX/wi.out")"
-        if [[ "$INJ_W_N" -gt 2 ]]; then
-            inj_ok "拿掉單行化後（GNU 折行）輸出變成 ${INJ_W_N} 行、第 2 行=[${INJ_W_L2:0:40}]——W1/W1b/W2 會紅"
-        elif [[ "$INJ_W_RC" -ne 0 ]] && printf '%s' "$INJ_W_MSG" | grep -Eqi 'self-check|wrapped|private-key fragment'; then
-            inj_ok "拿掉單行化後被函式自己的自我檢查擋下（rc=${INJ_W_RC}；${INJ_W_MSG:0:110}）——W1/W1b/W2 會紅"
-        elif [[ "$INJ_W_RC" -ne 0 ]]; then
-            inj_bad "注入後回非 0，但不是折行/自我檢查的症狀（rc=${INJ_W_RC}；訊息：${INJ_W_MSG:0:140}）——證明不了 W 群"
-        else
-            inj_bad "注入後仍恰兩行且回 0——W 群擋不住這個 bug"
-        fi
-    else
-        inj_bad "注入腳本沒改到檔案（needle 找不到）——harness 問題"
-    fi
-else
-    inj_bad "找不到 base64 呼叫（實作尚未落地或形狀改變）——注入無從執行"
-fi
-
-# W-Inj2: the stronger injection — strip the flattening AND both self-checks,
-# so the raw 2026-09-16 shape reaches stdout (line 2 = private-key fragment).
-# This proves W1/W1b/W2 catch the underlying bug even if the guard is gone;
-# W-Inj1 alone only shows the guard firing.
-if [[ -f "$CREATE_WORKER_SH" ]] && grep -qE 'base64 < "\$tmp/id"' "$CREATE_WORKER_SH"; then
-    INJ_W2="$SANDBOX/create-worker-wrap-inj2.sh"
-    if ! python3 - "$CREATE_WORKER_SH" "$INJ_W2" <<'PY'
-import re, sys
-src = open(sys.argv[1], encoding="utf-8").read()
-m = re.search(r'base64 < "\$tmp/id"\s*\|\s*tr -d .\\n.', src)
-if not m:
-    sys.exit(1)
-src = src[:m.start()] + 'base64 < "$tmp/id"' + src[m.end():]
-# Neutralise the self-check block. Match on the guard's distinctive payload
-# rather than the whole expression: shell quoting in the source (`*$'\n'*`)
-# is awkward to reproduce in a regex and silently failed before. Each guard
-# is located by a substring that only appears in it, then its condition is
-# replaced with `false`.
-guards = [
-    ('if [[ "$line1"', 'if [[ "$line1"', 'if false; then'),
-    ('if ! [[ "$line2"', 'if ! [[ "$line2"', 'if false; then'),
-]
-n = 0
-for start_marker, _unused, repl in guards:
-    i = src.find(start_marker)
-    if i == -1:
-        continue
-    # Replace from the `if` keyword through the `; then` that ends the condition.
-    j = src.find('; then', i)
-    if j == -1:
-        continue
-    src = src[:i] + repl + src[j + len('; then'):]
-    n += 1
-if n < 2:
-    sys.exit(1)
-open(sys.argv[2], "w", encoding="utf-8").write(src)
-PY
-    then
-        bad "W-Inj2. 注入腳本失敗——harness 問題"
-    fi
-    chmod +x "$INJ_W2" 2>/dev/null
-    if [[ -s "$INJ_W2" ]] && [[ "$(grep -c 'if false; then' "$INJ_W2")" -ge 2 ]]; then
-        rm -rf "$SANDBOX/wi2-home" "$SANDBOX/wi2-tmp"; mkdir -p "$SANDBOX/wi2-home" "$SANDBOX/wi2-tmp"
-        HOME="$SANDBOX/wi2-home" TMPDIR="$SANDBOX/wi2-tmp" \
-        PATH="$SANDBOX/fakebin:$PATH" \
-        REAL_MKTEMP="$REAL_MKTEMP" REAL_SSH_KEYGEN="$REAL_SSH_KEYGEN" REAL_BASE64="$REAL_BASE64" \
-        FAKE_MKTEMP_DIR="$SANDBOX/wi2-tmp" FAKE_MKTEMP_LOG="$SANDBOX/wi2-mktemp.log" \
-        FAKE_SSH_KEYGEN_LOG="$SANDBOX/wi2-keygen.log" \
-        timeout 30 bash -c 'source "$1" >/dev/null 2>&1; create_worker_mint_tunnel_key' _ "$INJ_W2" \
-            </dev/null > "$SANDBOX/wi2.out" 2>&1
-        INJ_W2_RC=$?
-        INJ_W2_N="$(grep -c . "$SANDBOX/wi2.out" 2>/dev/null || true)"
-        INJ_W2_L2="$(sed -n '2p' "$SANDBOX/wi2.out" 2>/dev/null)"
-        # The bug shape: more than two lines, and line 2 is a base64 chunk
-        # (private-key fragment) rather than an ssh- line.
-        if [[ "$INJ_W2_N" -gt 2 ]] && [[ "$INJ_W2_L2" =~ ^[A-Za-z0-9+/=]+$ ]]; then
-            inj_ok "移除單行化與兩道自我檢查後，第 2 行變成私鑰片段（base64、非 ssh-）——W1b/W2/W4 會紅"
-        elif [[ "$INJ_W2_N" -gt 2 ]]; then
-            inj_ok "移除單行化與自我檢查後輸出 ${INJ_W2_N} 行——W1/W1b/W2 會紅"
-        else
-            inj_bad "移除防線後仍未重現折行（行數=${INJ_W2_N}, 第2行=[${INJ_W2_L2:0:40}]）——W 群證明力不足"
-        fi
-    else
-        inj_bad "W-Inj2 注入沒生效（防線沒被中性化）——harness 問題"
-    fi
-fi
 
 # ---------------------------------------------------------------------------
 # 4–5) ledger_add's optional 7th argument
@@ -790,6 +517,7 @@ out = {
     # command text as a fallback if the id is ever renamed.
     "docker": [i for i, s in enumerate(steps)
                if s.get("id") == "run" or "docker run" in blob(s)],
+    "pubkey": [i for i, s in enumerate(steps) if s.get("id") == "pubkey"],
     "ledger_remove": [i for i, s in enumerate(steps)
                       if "ledger_remove" in blob(s)
                       or "POOL_WORKERS" in (s.get("name") or "")],
@@ -805,7 +533,17 @@ PY
 
     wf_json() { python3 "$SANDBOX/wf-order.py" "$1" 2>/dev/null; }
 
-    # order_create <wf> — refresh must come before docker run.
+    # order_create <wf> — run, THEN collect the public key, THEN refresh.
+    #
+    # This order is the inverse of the original brief, and deliberately so.
+    # While the runner minted the key it could authorize it before starting
+    # anything; now the key does not exist until the container has started,
+    # so the only possible order is: start it, ask it for its public key,
+    # record that, then authorize. The gap is safe because pool-tunnel
+    # retries every 2s — it connects the moment the refresh lands. What
+    # would NOT be safe is refreshing before collecting, which would
+    # authorize a stale list and leave this worker permanently locked out
+    # of its own tunnel.
     ORDER_REASON=""
     order_create() {
         local j="$1"
@@ -813,16 +551,19 @@ PY
         if [[ -z "$j" ]] || ! jq -e . >/dev/null 2>&1 <<<"$j"; then
             ORDER_REASON="YAML 解析失敗"; return 1
         fi
-        local nr nd
+        local nr nd np
         nr="$(jq '.refresh | length' <<<"$j")"
         nd="$(jq '.docker | length' <<<"$j")"
+        np="$(jq '.pubkey | length' <<<"$j")"
         [[ "$nr" -ge 1 ]] || { ORDER_REASON="找不到派發 refresh 的步驟"; return 1; }
         [[ "$nd" -ge 1 ]] || { ORDER_REASON="找不到 docker run 的步驟（id: run）"; return 1; }
-        local rmin dmin
+        [[ "$np" -ge 1 ]] || { ORDER_REASON="找不到收取 worker 公鑰的步驟（id: pubkey）"; return 1; }
+        local rmin dmin pmin
         rmin="$(jq '[.refresh[]] | min' <<<"$j")"
         dmin="$(jq '[.docker[]] | min' <<<"$j")"
-        if [[ "$rmin" -lt "$dmin" ]]; then return 0; fi
-        ORDER_REASON="refresh 在第 ${rmin} 步、docker run 在第 ${dmin} 步——refresh 必須在前"
+        pmin="$(jq '[.pubkey[]] | min' <<<"$j")"
+        if [[ "$dmin" -lt "$pmin" && "$pmin" -lt "$rmin" ]]; then return 0; fi
+        ORDER_REASON="docker run 在第 ${dmin} 步、收公鑰在第 ${pmin} 步、refresh 在第 ${rmin} 步——必須是這個順序"
         return 1
     }
 
@@ -830,7 +571,7 @@ PY
     if [[ ! -f "$CREATE_WF" ]]; then
         bad "6. create-worker.yml 順序（workflow 不存在）"
     elif order_create "$CJ"; then
-        ok "6. create-worker.yml：派發 refresh 的步驟在 docker run 之前"
+        ok "6. create-worker.yml：docker run → 收公鑰 → refresh，順序正確"
     else
         bad "6. create-worker.yml 順序：${ORDER_REASON}"
     fi

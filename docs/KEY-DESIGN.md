@@ -120,7 +120,9 @@ provider 與 worker 會在下一輪自癒時自己拿到，不需要這支腳本
 
 ### `create-worker` / `delete-worker`（改）
 
-- create：產生一對金鑰，私鑰經 `WORKER_KEY` 注入（現行機制不變），
+- create：容器啟動時**自己**產一對金鑰（2026-09-16 起；原本由 Actions 產、
+  經 `docker run -e WORKER_KEY=` 注入，私鑰因此出現在 provider 的 `ps`、
+  `docker inspect` 與網路上）。私鑰不離開容器，
   公鑰寫進 `POOL_WORKERS` 條目；**先刷新 Gateway 授權，再啟動容器**
 - delete：刪掉 `POOL_WORKERS` 條目即撤銷，再刷新 Gateway 授權
 
