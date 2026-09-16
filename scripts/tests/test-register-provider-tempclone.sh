@@ -169,7 +169,10 @@ if [[ "${1:-}" == "api" ]]; then
     if [[ -n "$url" ]]; then
         single="${url##*/}"; single="${single%%\?*}"
     fi
-    if [[ -n "$single" ]]; then
+    if [[ -n "$single" && -n "${FAKE_VAR_WRITES:-}" && -f "${FAKE_VAR_WRITES}/${single}.json" ]]; then
+        body="$(jq -c -n --arg n "$single" --rawfile v "${FAKE_VAR_WRITES}/${single}.json" \
+                  "{name: \$n, value: \$v}")"
+    elif [[ -n "$single" ]]; then
         body="$(printf "%s" "$FAKE_VARS_JSON" | jq -c --arg n "$single" \
             "(.variables // []) | map(select(.name == \$n)) | if length > 0 then .[0] else null end" 2>/dev/null)"
         [[ "$body" == "null" || -z "$body" ]] && { echo "gh: HTTP 404: Not Found (${single})" >&2; exit 1; }
@@ -189,7 +192,38 @@ if [[ "${1:-}" == "api" ]]; then
     exit 0
 fi
 if [[ "${1:-}" == "variable" || "${1:-}" == "variables" ]]; then
-    cat >/dev/null
+    # Remember the write: step 5 creates NODE_<NAME> and step 6.5 reads it
+    # straight back to merge tunnel_public_key in. A stub that discarded
+    # writes made that real ordering look broken.
+    if [[ "${2:-}" == "set" && -n "${3:-}" && -n "${FAKE_VAR_WRITES:-}" ]]; then
+        mkdir -p "$FAKE_VAR_WRITES"
+        cat > "${FAKE_VAR_WRITES}/${3}.json"
+    else
+        cat >/dev/null
+    fi
+    exit 0
+fi
+# step 6.5 dispatches refresh-authorized-keys.yml and WAITS for it. Serve an
+# already-completed successful run so the wait returns at once -- the wait
+# logic itself is covered by test-worker-tunnel-key.sh; what matters here is
+# that registration gets past it. --jq is applied the same way the api branch
+# does it, so the caller s own filter is what runs.
+if [[ "${1:-}" == "run" ]]; then
+    filter=""; prev=""
+    for a in "$@"; do
+        [[ "$prev" == "--jq" ]] && filter="$a"
+        prev="$a"
+    done
+    if [[ "${2:-}" == "list" ]]; then
+        body="[{\"databaseId\":1,\"status\":\"completed\"}]"
+    else
+        body="{\"conclusion\":\"success\"}"
+    fi
+    if [[ -n "$filter" ]]; then
+        printf "%s" "$body" | jq -r "$filter"
+    else
+        printf "%s\n" "$body"
+    fi
     exit 0
 fi
 exit 0'
@@ -231,6 +265,23 @@ if [[ -f "$SHARED_COLLECT_FILE" && -f "$SHARED_AUTHKEYS_FILE" ]]; then
     cp "$SHARED_COLLECT_FILE" "$SANDBOX/template/scripts/refresh-authkeys.sh"
     cp "$SHARED_AUTHKEYS_FILE" "$SANDBOX/template/scripts/lib/authkeys.sh"
 fi
+# Same reason for step 6.5: minting and publishing this machine's tunnel
+# identity is a SHARED implementation (scripts/lib/tunnel-key.sh) read from
+# the fresh clone, and waiting for the Gateway refresh is another
+# (scripts/lib/refresh-wait.sh). Without them in the template that step dies
+# and every later step -- including the authorized_keys convergence these
+# cases assert on -- never runs.
+for f in scripts/lib/tunnel-key.sh scripts/lib/refresh-wait.sh; do
+    [[ -f "$f" ]] && cp "$f" "$SANDBOX/template/$f"
+done
+# tunnel-identity.sh defines TUNNEL_KEY. tunnel-key.sh prefers the installed
+# copy and falls back to the clone's -- which is this case exactly: a machine
+# being registered for the first time has nothing installed yet.
+if [[ -f "shared-configs/pool-runtime/files/tunnel-identity.sh" ]]; then
+    mkdir -p "$SANDBOX/template/shared-configs/pool-runtime/files"
+    cp "shared-configs/pool-runtime/files/tunnel-identity.sh" \
+       "$SANDBOX/template/shared-configs/pool-runtime/files/tunnel-identity.sh"
+fi
 
 pass=0; fail=0
 ok()  { printf '  ok    %s\n' "$1"; pass=$((pass + 1)); }
@@ -246,6 +297,7 @@ run_register() {
              FILE_CRYPTO_KEY="$CRYPTO_KEY" GH_POOL_TOKEN="$TOKEN" \
              USER="testuser" ARGV_LOG="$ARGV_LOG" \
              FAKE_REPO_TEMPLATE="$SANDBOX/template" \
+             FAKE_VAR_WRITES="${work}/var-writes" \
              FAKE_VARS_JSON="${4:-$FAKE_VARS_JSON}")
     if [[ "${3:-}" == "fail" ]]; then
         envargs+=(FAKE_CLONE_FAIL=1)
@@ -637,6 +689,7 @@ PYEOF
                  FILE_CRYPTO_KEY="$CRYPTO_KEY" GH_POOL_TOKEN="$TOKEN" \
                  USER="testuser" ARGV_LOG="$ARGV_LOG" \
                  FAKE_REPO_TEMPLATE="$SANDBOX/template" \
+                 FAKE_VAR_WRITES="$I_HOME/var-writes" \
                  FAKE_VARS_JSON="$CLIENT_VARS_EMPTY" \
                  /bin/bash "$INJ_REG" --name testnode --gateway-port 2301 --no-sudo \
                  </dev/null >"$SANDBOX/inj9.log" 2>&1
@@ -646,7 +699,7 @@ PYEOF
             elif [[ -e "$I_HOME/.ssh/authorized_keys" ]]; then
                 printf '  inj ok    %s\n' "移除防線後仍非 0，但留下了 authorized_keys——第 9b 條會紅"
             else
-                bad "injection: 移除防線後行為不變（rc=$i9rc，無檔案）——注入沒生效"
+                bad "injection: 移除防線後行為不變（rc=${i9rc}，無檔案）——注入沒生效"
             fi
         fi
     else

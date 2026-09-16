@@ -318,6 +318,12 @@ build_fixture() {
         mkdir -p "$SANDBOX/fixture/scripts"
         cp scripts/refresh-authkeys.sh "$SANDBOX/fixture/scripts/refresh-authkeys.sh"
     fi
+    # tunnel-key.sh：產+發佈隧道金鑰的共用實作。pool-sync 只 source 它，
+    # 自己不再有一份——fixture 缺它會讓整個 Q 群跳過（Q1 起全紅）。
+    if [[ -f scripts/lib/tunnel-key.sh ]]; then
+        mkdir -p "$SANDBOX/fixture/scripts/lib"
+        cp scripts/lib/tunnel-key.sh "$SANDBOX/fixture/scripts/lib/tunnel-key.sh"
+    fi
     # tunnel-identity.sh：pool-sync 從這裡取 TUNNEL_KEY（單一來源）。
     # 注入版的 SCRIPT_DIR 指向 sandbox 自己的目錄——沒有這份副本，
     # source 會失敗、TUNNEL_KEY unbound，讓 Q-Inj1/Q-Inj2 假紅。
@@ -1348,27 +1354,28 @@ run_sync
 if [[ "$RAN" -ne 1 || ! -f "$TUNNEL_KEY_FILE" ]]; then
     fail_line "Q-Inj1. 前提：第一輪應產出 id_tunnel（目前沒有）"
 else
-    INJQ_SYNC="$SANDBOX/pool-sync-qinj1.sh"
-    if ! python3 - "$POOL_SYNC" "$INJQ_SYNC" <<'PY'
-import sys, re
-src = open(sys.argv[1], encoding="utf-8").read()
-old = 'if [[ ! -f "$tunnel_key" ]]; then'
-assert old in src, "ensure_tunnel_key guard not found"
-# 每次都重產：把存在檢查拿掉，並且強制覆寫
-src = src.replace(old, 'if true; then\n            rm -f "$tunnel_key" "$tunnel_key.pub"', 1)
-open(sys.argv[2], "w", encoding="utf-8").write(src)
+    # 注入點是 fixture 的 scripts/lib/tunnel-key.sh，不是 pool-sync：產金鑰
+    # 的規則已經搬進那支共用實作（pool-sync 只 source 它），所以改 pool-sync
+    # 什麼也改不到。必須在 build_fixture 之後動手，否則會被重新複製覆蓋。
+    INJ_OK=1
+    if ! python3 - "$SANDBOX/fixture/scripts/lib/tunnel-key.sh" <<'PY'
+import sys
+p = sys.argv[1]
+src = open(p, encoding="utf-8").read()
+old = 'if [[ ! -f "$TUNNEL_KEY" ]]; then'
+assert old in src, "tunnel_key_mint guard not found"
+src = src.replace(old, 'if true; then\n        rm -f "$TUNNEL_KEY" "$TUNNEL_KEY.pub"', 1)
+open(p, "w", encoding="utf-8").write(src)
 PY
     then
         fail_line "Q-Inj1. 注入腳本失敗（被測物形狀變了，needle 找不到）——harness 問題"
+        INJ_OK=0
     fi
-    chmod +x "$INJQ_SYNC" 2>/dev/null
-    if [[ ! -x "$INJQ_SYNC" ]]; then
-        fail_line "Q-Inj1. 注入版無法執行——注入沒生效（harness 問題）"
+    if [[ "$INJ_OK" -ne 1 ]]; then
+        :
     else
     FP_BEFORE="$(tunnel_fingerprint)"
-    POOL_SYNC_SUBJECT="$INJQ_SYNC"
     run_sync
-    POOL_SYNC_SUBJECT=""
     FP_AFTER="$(tunnel_fingerprint)"
     # 這正是 Q2 的斷言（同一份資料、同一個比較）：現在對注入版直接斷言，
     # 而不是只印一行「會紅」。失敗了就代表測試真的抓得到。
@@ -1388,29 +1395,27 @@ fi
 # Q-Inj2: 注入 — var 寫入改成整個覆蓋 → Q3 必須紅（brief 指定）
 # ---------------------------------------------------------------------------
 echo "── Q-Inj2 注入：發布改成整個覆蓋（不 merge）──"
-INJQ2_SYNC="$SANDBOX/pool-sync-qinj2.sh"
-if ! python3 - "$POOL_SYNC" "$INJQ2_SYNC" <<'PY'
-import sys, re
-src = open(sys.argv[1], encoding="utf-8").read()
-old = "merged=\"$(printf '%s' \"$current\" | jq -c --arg pk \"$pub_key\" '. + {tunnel_public_key: $pk}')\" || {"
-assert old in src, "merge expression not found"
-new = "merged=\"$(jq -c -n --arg pk \"$pub_key\" '{tunnel_public_key: $pk}')\" || {"
-src = src.replace(old, new, 1)
-open(sys.argv[2], "w", encoding="utf-8").write(src)
-PY
-then
-    fail_line "Q-Inj2. 注入腳本失敗（被測物形狀變了，needle 找不到）——harness 問題"
-fi
-chmod +x "$INJQ2_SYNC" 2>/dev/null
 reset_home
 build_fixture "unit-a unit-b" "unit-b" ""
 GIT_MODE="ok"; GH_MODE="ok"
 : > "$SANDBOX/check-rc"; : > "$SANDBOX/install-rc"
 GH_VALUE="$Q_NODE_JSON"
 write_clients "$AUB_KEY_A" "$AUB_KEY_B" "$AUB_ACTIONS"
-POOL_SYNC_SUBJECT="$INJQ2_SYNC"
+# 同樣改 fixture 的共用實作，同樣必須在 build_fixture 之後
+if ! python3 - "$SANDBOX/fixture/scripts/lib/tunnel-key.sh" <<'PY'
+import sys
+p = sys.argv[1]
+src = open(p, encoding="utf-8").read()
+old = "merged=\"$(printf '%s' \"$current\" | jq -c --arg pk \"$pub\" '. + {tunnel_public_key: $pk}')\" || {"
+assert old in src, "merge expression not found"
+new = "merged=\"$(jq -c -n --arg pk \"$pub\" '{tunnel_public_key: $pk}')\" || {"
+src = src.replace(old, new, 1)
+open(p, "w", encoding="utf-8").write(src)
+PY
+then
+    fail_line "Q-Inj2. 注入腳本失敗（被測物形狀變了，needle 找不到）——harness 問題"
+fi
 run_sync
-POOL_SYNC_SUBJECT=""
 if [[ "$RAN" -ne 1 ]]; then
     fail_line "Q-Inj2. 注入版沒跑起來（harness 問題）"
 else

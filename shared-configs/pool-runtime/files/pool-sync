@@ -271,68 +271,38 @@ main() {
     # old key, and the next tick retries. Idempotent by construction:
     # id_tunnel is only generated when absent; the var is only rewritten
     # when its tunnel_public_key is missing or differs.
-    ensure_tunnel_key() {
-        local ssh_dir="${HOME}/.ssh"
-        local tunnel_key="${TUNNEL_KEY}"
-        local pub_key=""
-
-        if [[ ! -f "$tunnel_key" ]]; then
-            mkdir -p "$ssh_dir"
-            chmod 700 "$ssh_dir" 2>/dev/null || true
-            if ! ssh-keygen -t ed25519 -N "" -C "mlp-tunnel-${node_name}" -f "$tunnel_key" >/dev/null 2>&1; then
-                log WARN "could not generate ${tunnel_key} — will retry on the next tick (old key keeps the tunnel up)"
-                return 0
+    # The mint-and-publish rule itself lives in scripts/lib/tunnel-key.sh,
+    # sourced from the clone fetched above — the same sharing pattern as
+    # refresh-authkeys.sh. It used to live only here, which is why
+    # register-provider never had it and registering a NEW provider could
+    # not work at all (RUNBOOK §7.12, seventh incident).
+    #
+    # WARN-only on this side: a running machine must never be broken by a
+    # bad tick, and the next tick retries.
+    if [[ -f "${TMP_DIR}/repo/scripts/lib/tunnel-key.sh" ]]; then
+        # shellcheck source=/dev/null
+        # TUNNEL_KEY_REPO_DIR gives the lib a fallback for
+        # tunnel-identity.sh: it prefers the installed copy, but a machine
+        # syncing for the very first time may not have one yet.
+        TUNNEL_KEY_REPO_DIR="${TMP_DIR}/repo" \
+            source "${TMP_DIR}/repo/scripts/lib/tunnel-key.sh"
+        if GH_TOKEN="$(cat "$GH_TOKEN_FILE")" \
+                tunnel_key_ensure_published "$node_name" "$var_name" "$REPO"; then
+            # The Gateway has to authorize it before it is of any use.
+            # Fire and forget: the tunnel is already up on a key the
+            # Gateway knows, so there is nothing here to wait for.
+            if GH_TOKEN="$(cat "$GH_TOKEN_FILE")" \
+                    gh workflow run refresh-authorized-keys.yml --repo "$REPO" >/dev/null 2>&1; then
+                log INFO "dispatched refresh-authorized-keys.yml"
+            else
+                log WARN "could not dispatch refresh-authorized-keys.yml — the Gateway will pick the key up on the next successful refresh"
             fi
-            chmod 600 "$tunnel_key" 2>/dev/null || true
-            log INFO "generated per-machine tunnel key ${tunnel_key}"
-        fi
-
-        pub_key="$(cat "${tunnel_key}.pub" 2>/dev/null | tr -d '\r\n')"
-        if [[ -z "$pub_key" ]]; then
-            log WARN "cannot read ${tunnel_key}.pub — will retry on the next tick"
-            return 0
-        fi
-
-        # Re-read the node var (fresher than the profile-read above) and
-        # MERGE tunnel_public_key into it — never overwrite hops/power/
-        # capabilities/... (writing the whole var wrong would take the
-        # machine offline).
-        local current merged
-        current="$(GH_TOKEN="$(cat "$GH_TOKEN_FILE")" \
-            gh api "repos/${REPO}/actions/variables/${var_name}" --jq .value 2>/dev/null || true)"
-        if [[ -z "$current" ]] || ! printf '%s' "$current" | jq empty >/dev/null 2>&1; then
-            log WARN "cannot read ${var_name} for the tunnel key publish — will retry on the next tick"
-            return 0
-        fi
-
-        if [[ "$(printf '%s' "$current" | jq -r '.tunnel_public_key // empty')" == "$pub_key" ]]; then
-            log INFO "tunnel_public_key already published for ${var_name}"
-            return 0
-        fi
-
-        merged="$(printf '%s' "$current" | jq -c --arg pk "$pub_key" '. + {tunnel_public_key: $pk}')" || {
-            log WARN "could not merge tunnel_public_key into ${var_name}"
-            return 0
-        }
-        if ! printf '%s' "$merged" | GH_TOKEN="$(cat "$GH_TOKEN_FILE")" \
-                gh variable set "$var_name" --repo "$REPO" >/dev/null 2>&1; then
-            log WARN "could not write tunnel_public_key into ${var_name} — will retry on the next tick"
-            return 0
-        fi
-        log INFO "published tunnel_public_key into ${var_name}"
-
-        # The Gateway must authorize the new key before it is of any use.
-        # A failed dispatch is a WARN — the old shared key keeps the
-        # tunnel up, and a later refresh (or the next publish) covers it.
-        if ! GH_TOKEN="$(cat "$GH_TOKEN_FILE")" \
-                gh workflow run refresh-authorized-keys.yml --repo "$REPO" >/dev/null 2>&1; then
-            log WARN "could not dispatch refresh-authorized-keys.yml — the Gateway will authorize the new key on the next successful refresh"
         else
-            log INFO "dispatched refresh-authorized-keys.yml (Gateway will authorize ${tunnel_key})"
+            log WARN "tunnel key convergence failed (see above) — retrying on the next tick"
         fi
-    }
-
-    ensure_tunnel_key
+    else
+        log WARN "scripts/lib/tunnel-key.sh missing in the fetched repo — skipping tunnel key convergence"
+    fi
 
     # --- restart the tunnel only when something actually changed -------
     # pool-tunnel holds every worker's reverse tunnel; an unnecessary

@@ -201,7 +201,17 @@ fi
 
 # ===========================================================================
 echo "── 3. 每個 source tunnel-identity.sh 的檔案，都把該檔一起佈署 ──"
-for consumer in "$POOL_TUNNEL" "$POOL_STATUS" "$POOL_SYNC" "$ROTATE"; do
+# pool-sync 不再直接用 TUNNEL_KEY——產金鑰的規則搬進了共用的
+# scripts/lib/tunnel-key.sh（RUNBOOK §7.12 第七次：那條規則本來只存在於
+# pool-sync 裡，register-provider 因此完全沒有它）。委派鏈本身要被驗到：
+# pool-sync 必須 source 那支 lib，而那支 lib 必須接上單一來源。
+TUNNEL_KEY_LIB="scripts/lib/tunnel-key.sh"
+if grep -q 'tunnel-key\.sh' "$POOL_SYNC"; then
+    ok "3. pool-sync 透過 tunnel-key.sh 接上（不自己實作）"
+else
+    bad "3. pool-sync 沒有 source tunnel-key.sh"
+fi
+for consumer in "$POOL_TUNNEL" "$POOL_STATUS" "$TUNNEL_KEY_LIB" "$ROTATE"; do
     if [[ ! -f "$consumer" ]]; then
         bad "3. $(basename "$consumer") 不存在"
         continue

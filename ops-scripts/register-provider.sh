@@ -22,7 +22,11 @@ REPO_DIR="$(mktemp -d "${TMPDIR:-/tmp}/mlp-register.XXXXXX" 2>/dev/null)" || {
 trap 'rm -rf "$REPO_DIR"' EXIT INT TERM
 BIN_DIR="${STATE_DIR}/bin"
 SSH_DIR="${HOME}/.ssh"
-PRIVATE_KEY="${SSH_DIR}/id_pool"
+# Which file holds the tunnel key is NOT decided here — tunnel-identity.sh
+# is the one definition (RUNBOOK §7.12). This used to say
+# "${SSH_DIR}/id_pool", the shared key deleted in KEY-DESIGN §8, so step 9
+# verified with a key that no longer existed and always failed.
+# TUNNEL_KEY is resolved in step 6.5, once the repo clone exists.
 GH_TOKEN_FILE="${STATE_DIR}/gh_token"
 
 log() {
@@ -572,6 +576,39 @@ enable_linger() {
     log INFO "enabled linger for ${who}"
 }
 
+# ---- step 6.5: this machine's own tunnel identity ---------------------------
+# Without this, registering a NEW provider cannot work: step 7 starts
+# pool-tunnel, which looks for ~/.ssh/id_tunnel; a brand-new machine has
+# none, so the tunnel never comes up and step 9 fails. The key WAS minted
+# eventually — by pool-sync, whose timer step 9.5 enables — but step 9
+# exits first, so that never happened. (RUNBOOK §7.12, seventh incident:
+# the mint-and-publish rule lived only inside pool-sync.)
+#
+# Deliberately BEFORE step 7 (which starts the tunnel) and before step 9
+# (which verifies it), and the refresh is WAITED ON: the Gateway must
+# already authorize this key when the tunnel dials, or step 9 would be
+# racing a workflow. pool-sync fires the same refresh without waiting,
+# because there the tunnel is already up on a key the Gateway knows.
+step6_5_tunnel_identity() {
+    log INFO "step 6.5/9: mint and publish this machine's tunnel identity"
+
+    # shellcheck source=../scripts/lib/tunnel-key.sh
+    TUNNEL_KEY_REPO_DIR="$REPO_DIR" . "${REPO_DIR}/scripts/lib/tunnel-key.sh"
+    # shellcheck source=../scripts/lib/refresh-wait.sh
+    . "${REPO_DIR}/scripts/lib/refresh-wait.sh"
+
+    tunnel_key_ensure_published "$NAME" "$VAR_NAME" "$REPO" || {
+        log ERROR "could not establish this machine's tunnel identity — aborting"
+        log ERROR "registering without one would leave a machine that can never dial the Gateway"
+        exit 1
+    }
+
+    GH_REPO="$REPO" dispatch_refresh_and_wait 300 || {
+        log ERROR "the Gateway did not accept the new tunnel key (refresh failed) — aborting"
+        exit 1
+    }
+}
+
 step7_systemd() {
     log INFO "step 7/9: enable profile-declared systemd --user services + linger"
 
@@ -675,7 +712,7 @@ step9_verify() {
     local tries=0 max_tries=30 ok=0 banner
     while (( tries < max_tries )); do
         banner="$(ssh -o StrictHostKeyChecking=accept-new -o BatchMode=yes -o ConnectTimeout=5 \
-            -i "$PRIVATE_KEY" "${gw_user}@${gw_ip}" \
+            -i "$TUNNEL_KEY" "${gw_user}@${gw_ip}" \
             "timeout 2 bash -c 'exec 3<>/dev/tcp/127.0.0.1/${GATEWAY_PORT} && head -c 4 <&3' 2>/dev/null" \
             2>/dev/null || true)"
         if [[ "$banner" == SSH-* ]]; then
@@ -727,6 +764,7 @@ main() {
     step4_config
     step5_register_var
     step6_sudoers
+    step6_5_tunnel_identity
     step7_systemd
     step8_authorized_keys
     step9_verify
