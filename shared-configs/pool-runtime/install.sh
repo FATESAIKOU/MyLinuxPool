@@ -70,7 +70,10 @@ UNIT_DIR="${HOME_DIR}/.config/systemd/user"
 # so it MUST ship with them: without it every one of them dies at source
 # time and the machine loses its tunnel (2026-09-16 — the test caught
 # this before it reached a provider, which is the only reason it did not).
-BINARIES="pool-resolve pool-tunnel pool-wol pool-status pool-port-alloc pool-sync tunnel-identity.sh"
+BINARIES="pool-resolve pool-tunnel pool-wol pool-status pool-port-alloc pool-sync"
+# Sourced, not executed — so it ships WITHOUT the executable bit
+# (ops-scripts/preflight: only things nothing sources must be +x).
+LIBS="tunnel-identity.sh"
 UNITS="pool-tunnel.service pool-sync.service pool-sync.timer"
 
 # file_matches <installed-path> <repo-source>
@@ -85,6 +88,11 @@ file_matches() {
 check_installed() {
     local f
     for f in $BINARIES; do
+        file_matches "${BIN_DIR}/${f}" "${FILES_DIR}/${f}" || return 1
+    done
+    # Sourced libraries count too: a missing tunnel-identity.sh kills
+    # pool-tunnel at source time, so --check must call that drift.
+    for f in $LIBS; do
         file_matches "${BIN_DIR}/${f}" "${FILES_DIR}/${f}" || return 1
     done
     for f in $UNITS; do

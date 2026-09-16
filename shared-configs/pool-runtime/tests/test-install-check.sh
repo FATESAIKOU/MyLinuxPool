@@ -21,7 +21,13 @@ INSTALL_SH="${UNIT_ROOT}/install.sh"
 FILES_DIR="${UNIT_ROOT}/files"
 
 # The contract this test pins down: six binaries, three systemd units.
-BINARIES="pool-resolve pool-tunnel pool-wol pool-status pool-port-alloc pool-sync"
+# Derived from install.sh, never restated: a second copy of this list is
+# how a newly shipped file gets asserted against the old set and the gap
+# goes unnoticed (tunnel-identity.sh, 2026-09-16).
+BINARIES="$(sed -n 's/^BINARIES="\(.*\)"$/\1/p' "$INSTALL_SH" | head -1)"
+LIBS="$(sed -n 's/^LIBS="\(.*\)"$/\1/p' "$INSTALL_SH" | head -1)"
+[ -n "$BINARIES" ] || { echo "ERROR: could not read BINARIES from $INSTALL_SH" >&2; exit 1; }
+[ -n "$LIBS" ] || { echo "ERROR: could not read LIBS from $INSTALL_SH" >&2; exit 1; }
 UNITS="pool-tunnel.service pool-sync.service pool-sync.timer"
 
 SANDBOX="$(mktemp -d "${TMPDIR:-/tmp}/test-install-check.XXXXXX")"
@@ -104,7 +110,7 @@ for f in $BINARIES $UNITS; do
     [[ -f "${FILES_DIR}/${f}" ]] || missing="${missing} ${f}"
 done
 if [[ -z "$missing" ]]; then
-    ok_line "files/ 內有 6 支 bin + 3 個 unit 來源檔"
+    ok_line "files/ 內有 7 支 bin + 3 個 unit 來源檔"
 else
     fail_line "files/ 缺少來源檔：${missing}"
 fi
@@ -153,7 +159,20 @@ if fresh_installed_home "$H5"; then
 fi
 
 # ---------------------------------------------------------------------------
-echo "── 6) 安裝內容：6 支 bin + 3 個 unit ──"
+# --check must notice a MISSING sourced library, not just missing binaries:
+# pool-sync decides whether to reinstall from --check's exit code, so a
+# library it ignores is a library that never gets repaired — and without
+# tunnel-identity.sh every pool-* script dies at source time.
+echo "── 5b) --check 抓得到被刪掉的函式庫 ──"
+H5B="$SANDBOX/home-5b"
+if fresh_installed_home "$H5B"; then
+    for f in $LIBS; do
+        rm -f "$H5B/.mylinuxpool/bin/$f"
+    done
+    expect_check_nonzero "$H5B" "刪掉函式庫後 --check 非 0（否則 pool-sync 永遠不會修復它）"
+fi
+
+echo "── 6) 安裝內容：7 支 bin + 3 個 unit ──"
 H6="$SANDBOX/home-6"
 rm -rf "$H6"
 if fresh_installed_home "$H6"; then
@@ -166,9 +185,25 @@ if fresh_installed_home "$H6"; then
             fail_line "bin/${f} 不存在或不可執行"
         fi
     done
+    for f in $LIBS; do
+        if [[ -f "$H6/.mylinuxpool/bin/$f" ]]; then
+            ok_line "bin/${f} 已安裝（被 source，刻意不帶執行位元）"
+        else
+            fail_line "bin/${f} 未安裝——source 它的 pool-tunnel/pool-status/pool-sync 會啟動失敗"
+        fi
+    done
     inst_count="$(ls -A "$H6/.mylinuxpool/bin" 2>/dev/null | wc -l | tr -d ' ')"
-    if [[ "$inst_count" -eq 6 ]]; then ok_line "bin/ 恰好 6 支檔案"
-    else fail_line "bin/ 應該恰好 6 支，實際 ${inst_count} 支"; fi
+    # tunnel-identity.sh is the one definition of the tunnel key path, and
+    # pool-tunnel / pool-status / pool-sync source it. If install.sh stops
+    # shipping it, every one of them dies at source time and the machine
+    # loses its tunnel — name it explicitly rather than trusting the count.
+    if [[ -f "$H6/.mylinuxpool/bin/tunnel-identity.sh" ]]; then
+        ok_line "bin/tunnel-identity.sh 已安裝（pool-tunnel 等會 source 它）"
+    else
+        fail_line "bin/tunnel-identity.sh 未安裝——pool-tunnel/pool-status/pool-sync 會 source 失敗，機器失去隧道"
+    fi
+    if [[ "$inst_count" -eq 7 ]]; then ok_line "bin/ 恰好 7 支檔案"
+    else fail_line "bin/ 應該恰好 7 支，實際 ${inst_count} 支"; fi
 
     m=0
     for f in $UNITS; do
