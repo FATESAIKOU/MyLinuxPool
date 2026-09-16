@@ -62,7 +62,9 @@ jobs:
           }
           login_count="$(printf '%s\n' "$login" | wc -l | tr -d ' ')"
           echo "login_count=${login_count}" >> "$GITHUB_OUTPUT"
-          echo "login_cmd=$(refresh_build_install_cmd /home/fatesaikou/.ssh/authorized_keys "$login" | base64)" >> "$GITHUB_OUTPUT"
+          # refresh_build_install_cmd output is already a single-line
+          # string (base64 without newlines inside) — safe for $GITHUB_OUTPUT.
+          echo "login_cmd=$(refresh_build_install_cmd /home/fatesaikou/.ssh/authorized_keys "$login")" >> "$GITHUB_OUTPUT"
           echo "assembled ${login_count} login key(s) from CLIENT_*"
 
           # ---- tunnel list ------------------------------------------------
@@ -77,7 +79,7 @@ jobs:
           else
             tunnel_count="$(printf '%s\n' "$tunnel" | wc -l | tr -d ' ')"
             echo "tunnel_count=${tunnel_count}" >> "$GITHUB_OUTPUT"
-            echo "tunnel_cmd=$(refresh_build_install_cmd /home/sshproxy/.ssh/authorized_keys "$tunnel" --sudo | base64)" >> "$GITHUB_OUTPUT"
+            echo "tunnel_cmd=$(refresh_build_install_cmd /home/sshproxy/.ssh/authorized_keys "$tunnel" --sudo)" >> "$GITHUB_OUTPUT"
             echo "assembled ${tunnel_count} tunnel key(s) from NODE_* and POOL_WORKERS"
           fi
 
@@ -88,7 +90,7 @@ jobs:
           timeout: "30"
           command: |
             set -euo pipefail
-            eval "$(printf '%s' '${{ steps.assemble.outputs.login_cmd }}' | base64 -d)"
+            printf '%s' '${{ steps.assemble.outputs.login_cmd }}' | base64 -d | bash
 
       - name: Install tunnel authorized_keys on the Gateway (sshproxy)
         if: steps.assemble.outputs.tunnel_count != '0'
@@ -98,4 +100,4 @@ jobs:
           timeout: "30"
           command: |
             set -euo pipefail
-            eval "$(printf '%s' '${{ steps.assemble.outputs.tunnel_cmd }}' | base64 -d)"
+            printf '%s' '${{ steps.assemble.outputs.tunnel_cmd }}' | base64 -d | bash

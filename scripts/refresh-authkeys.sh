@@ -128,10 +128,17 @@ refresh_collect_tunnel_keys() {
 #   the Gateway). Atomic install: write a temp file in the same directory,
 #   chmod 600, chown to the right owner, then mv over the target — a
 #   reader can never see a half-written authorized_keys. Content travels
-#   as base64 (one line, no quoting traps). With --sudo every step goes
-#   through sudo and the owner is root-corrected to the target's parent
-#   user name; without it the file is owned by whoever ssh connects as
-#   (fatesaikou for the login list).
+#   as base64 (no quoting traps). With --sudo every step goes through sudo
+#   and the owner is root-corrected to the target's parent user name;
+#   without it the file is owned by whoever ssh connects as (fatesaikou
+#   for the login list).
+#
+#   OUTPUT IS THE COMMAND STRING, BASE64-ENCODED, AS A SINGLE LINE. The
+#   caller puts it straight into a `key=value` $GITHUB_OUTPUT line, which
+#   rejects multi-line values: the command itself is multi-line, plain
+#   `base64` wraps at 76 chars, and `-w0` is GNU-only (macOS's base64 has
+#   no -w). `| base64 | tr -d '\n'` is portable to both. The consumer
+#   restores it with `base64 -d` and evals the resulting command.
 refresh_build_install_cmd() {
     local remote_path="$1" content="$2" sudo=0
     if [[ "${3:-}" == "--sudo" ]]; then
@@ -139,7 +146,7 @@ refresh_build_install_cmd() {
     fi
 
     local content_b64
-    content_b64="$(printf '%s\n' "$content" | base64)"
+    content_b64="$(printf '%s\n' "$content" | base64 | tr -d '\n')"
 
     # Owner for chown: the target's parent directory name is the account
     # (e.g. /home/sshproxy/... -> sshproxy). Deriving it keeps --sudo
@@ -164,5 +171,7 @@ refresh_build_install_cmd() {
         "${pre:+$pre }chown ${owner}:${owner} \"\$d/authorized_keys\"" \
         "${pre:+$pre }install -d -o ${owner} -g ${owner} \"$(dirname "$remote_path")\"" \
         "${pre:+$pre }mv -f \"\$d/authorized_keys\" \"${remote_path}\"" \
-        "echo \"installed $(basename "$remote_path") (\$(wc -l < \"${remote_path}\") key(s))\""
+        "echo \"installed $(basename "$remote_path") (\$(wc -l < \"${remote_path}\") key(s))\"" \
+        | base64 | tr -d '\n'
+    printf '\n'
 }
