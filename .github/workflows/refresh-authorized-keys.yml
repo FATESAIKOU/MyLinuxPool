@@ -1,0 +1,101 @@
+name: Refresh Authorized Keys
+
+# spec: docs/KEY-DESIGN.md §5 — reassemble the Gateway's two
+# authorized_keys from the repo variables and install them. This is the
+# narrow refresh that register-client / register-provider / create-worker
+# dispatch after changing CLIENT_* / NODE_* / POOL_WORKERS; it only
+# rewrites the two key files, it never provisions.
+#
+# A THIN CALLER (docs/LAYOUT.md §3): all decision-making lives in
+# scripts/refresh-authkeys.sh and scripts/lib/authkeys.sh — this file only
+# fetches variables via gh api, calls the functions, and hands the
+# resulting command string to pool-ssh. The tunnel-list-empty decision is
+# made in the script (it logs the notice and emits tunnel_count=0); the
+# `if:` below is mechanical plumbing, not logic.
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  GH_TOKEN: ${{ secrets.GH_POOL_TOKEN }}
+  GH_REPO: ${{ github.repository }}
+  # Every NODE_* hop's key_secret points at this one Actions identity
+  # (docs/ARCHITECTURE.md §3) — pool-ssh's agent only ever needs this
+  # single key regardless of which chain it resolves.
+  SSH_KEY_ACTIONS: ${{ secrets.SSH_KEY_ACTIONS }}
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Assemble both authorized_keys lists and build install commands
+        id: assemble
+        shell: bash
+        run: |
+          set -euo pipefail
+          source scripts/refresh-authkeys.sh
+          source scripts/lib/authkeys.sh
+
+          vars_json="$(gh api "repos/${GH_REPO}/actions/variables?per_page=100" --paginate)"
+          workers_json="$(gh api "repos/${GH_REPO}/actions/variables/POOL_WORKERS" --jq .value 2>/dev/null || echo '[]')"
+
+          # ---- login list -------------------------------------------------
+          clients="$(refresh_collect_clients "$vars_json")"
+          # §6 self-lockout guard: authkeys_assemble needs the Actions key
+          # as required_pubkey and refuses (non-zero, no output) when it is
+          # missing from the result. A failure here aborts the whole run —
+          # a partial or Actions-less list must never reach the Gateway.
+          actions_pk="$(printf '%s' "$clients" | jq -r '.[] | select(.name == "actions") | .public_key // empty' 2>/dev/null || true)"
+          if [[ -z "$actions_pk" ]]; then
+            echo "::error::no CLIENT_ACTIONS public_key found — cannot assemble a login list that provably keeps Actions in. Refusing to touch the Gateway."
+            exit 1
+          fi
+          login="$(authkeys_assemble "$clients" "$actions_pk")" || {
+            echo "::error::login list assembly failed (see authkeys.sh stderr) — aborting without touching the Gateway"
+            exit 1
+          }
+          login_count="$(printf '%s\n' "$login" | wc -l | tr -d ' ')"
+          echo "login_count=${login_count}" >> "$GITHUB_OUTPUT"
+          echo "login_cmd=$(refresh_build_install_cmd /home/fatesaikou/.ssh/authorized_keys "$login" | base64)" >> "$GITHUB_OUTPUT"
+          echo "assembled ${login_count} login key(s) from CLIENT_*"
+
+          # ---- tunnel list ------------------------------------------------
+          tunnel="$(refresh_collect_tunnel_keys "$vars_json" "$workers_json")"
+          if [[ -z "$tunnel" ]]; then
+            # Empty is expected until KEY-DESIGN items 5/6 land. Writing an
+            # empty file would evict every provider currently dialing in,
+            # so the decision (and the explanation) lives here, in the
+            # script — not in a workflow `if:` expression.
+            echo "::notice::no tunnel_public_key declared yet (NODE_*.tunnel_public_key / POOL_WORKERS[].tunnel_public_key) — skipping the sshproxy authorized_keys write"
+            echo "tunnel_count=0" >> "$GITHUB_OUTPUT"
+          else
+            tunnel_count="$(printf '%s\n' "$tunnel" | wc -l | tr -d ' ')"
+            echo "tunnel_count=${tunnel_count}" >> "$GITHUB_OUTPUT"
+            echo "tunnel_cmd=$(refresh_build_install_cmd /home/sshproxy/.ssh/authorized_keys "$tunnel" --sudo | base64)" >> "$GITHUB_OUTPUT"
+            echo "assembled ${tunnel_count} tunnel key(s) from NODE_* and POOL_WORKERS"
+          fi
+
+      - name: Install login authorized_keys on the Gateway
+        uses: ./.github/actions/pool-ssh
+        with:
+          node: gateway
+          timeout: "30"
+          command: |
+            set -euo pipefail
+            eval "$(printf '%s' '${{ steps.assemble.outputs.login_cmd }}' | base64 -d)"
+
+      - name: Install tunnel authorized_keys on the Gateway (sshproxy)
+        if: steps.assemble.outputs.tunnel_count != '0'
+        uses: ./.github/actions/pool-ssh
+        with:
+          node: gateway
+          timeout: "30"
+          command: |
+            set -euo pipefail
+            eval "$(printf '%s' '${{ steps.assemble.outputs.tunnel_cmd }}' | base64 -d)"
