@@ -63,17 +63,36 @@
 
 金鑰只寫**名稱**（`key_secret`），值放在 GitHub secrets。vars 是公開可讀的。
 
-## 兩把 SSH 身分，不要搞混
+## 三類 SSH 身分，不要搞混
 
-| 身分 | 誰用 | 走哪 |
-|---|---|---|
-| `SSH_KEY_ACTIONS` | GitHub Actions、管理員 | 由上往下進入所有機器 |
-| 隧道身分（各機自己的 `~/.ssh/id_tunnel`） | provider / worker | 由下往上掛反向隧道 |
+| 身分 | 誰持有私鑰 | 方向 | 公鑰記在哪 |
+|---|---|---|---|
+| **隧道身分** `~/.ssh/id_tunnel` | 每台 provider / 每個 worker 各自一把 | 由下往上掛反向隧道，登入 Gateway 的 `sshproxy` | `NODE_<NAME>.tunnel_public_key` / `POOL_WORKERS[].tunnel_public_key` |
+| **client 身分** `~/.ssh/id_mlp` | 每台你會「從那裡連出去」的機器（你的 Mac、筆電…） | 由上往下進入 Gateway / provider / worker 的管理帳號 | `CLIENT_<NAME>` |
+| **Actions 身分** `SSH_KEY_ACTIONS` | 只有 GitHub Actions | 同上，workflow 用 | `CLIENT_ACTIONS` |
 
-**不變式**：每台機器用自己的 `id_tunnel`（KEY-DESIGN §3.2/§8，共用私鑰已刪除）；
-公鑰存在該機的 `NODE_<NAME>.tunnel_public_key` 或 `POOL_WORKERS[].tunnel_public_key`，
-Gateway 的 sshproxy 清單由 refresh/rotate 從這些 var 組裝。不再有任何靜態
-`authorized_keys.crypted`。
+後兩類其實是同一種東西——都是「以管理帳號登入」的公鑰，只是持有者不同，
+所以**走同一套分發**：`authkeys_assemble`（`scripts/lib/authkeys.sh`）把所有
+`CLIENT_*` var 組成 `authorized_keys`，Gateway 由 refresh/rotate 寫入，
+provider 與 worker 由自己的 `pool-sync` 週期性收斂。
+
+**三條不變式**：
+
+1. **私鑰永遠不離開產生它的那台機器**，只有公鑰會旅行。provider 的
+   `id_tunnel` 由自己的 `pool-sync` 產生並只上傳公鑰；client 的 `id_mlp`
+   由 `mlp register client` 在你自己的機器上產生。
+2. **哪個檔案放哪把金鑰只有一處定義**：
+   `shared-configs/pool-runtime/files/tunnel-identity.sh`（`TUNNEL_KEY`
+   與 `CLIENT_KEY`）。`mlp`、`pool-status`、`verify-profile`、
+   `scripts/lib/ssh.sh`、rotate 的隧道探測全部 source 它。這條規則曾經有
+   四份實作、只改了三份，`mlp ssh` 就開始報 Permission denied
+   （RUNBOOK §7.12）。
+3. **`authorized_keys` 是完全取代，不是聯集**。聯集會讓「撤銷」永遠傳不到
+   provider——刪掉的 `CLIENT_*` 在機器上會活到天荒地老。
+
+ssh 內建的候選金鑰（`id_rsa`、`id_ed25519`…）**不包含 `id_mlp`**，所以每一處
+ssh 呼叫都必須自己帶 `-i`。這就是為什麼 `mlp` 與 `verify-profile` 都要去問
+`tunnel-identity.sh`，而不是交給 ssh 自己猜。
 
 ## 隧道：`pool-tunnel`，不是 autossh
 
@@ -167,7 +186,7 @@ provider 邊緣刻意不放解密金鑰；KEY-DESIGN §8 之後也不再有任�
 | `profiles/` | 角色宣告：`gateway/`、`provider/`、`worker/`（含 Dockerfile） |
 | `shared-configs/` | 可分發安裝單位，見 `docs/LAYOUT.md` |
 | `scripts/` | 業務邏輯，**不依賴 GitHub Actions**（沒有 `${{ }}`、`$GITHUB_OUTPUT`），含 `lib/{log,crypto,ssh,profile}.sh` |
-| `ops-scripts/` | 人手動跑的：`mlp`、`register-provider.sh`、`verify-profile`、`preflight` |
+| `ops-scripts/` | 人手動跑的：`mlp`、`register-client`、`register-provider.sh`、`verify-profile`、`preflight` |
 | `.github/` | workflow 與 `pool-ssh` composite action。所有 GitHub 專屬的東西只出現在這裡 |
 | `docs/` | 見文件表 |
 
@@ -190,7 +209,13 @@ ops-scripts/mlp worker new     # 選 provider、選 image，開一個 worker
 ops-scripts/mlp worker rm      # 從清單挑一個刪掉、釋放埠
 ops-scripts/mlp ssh-config     # 匯出 ssh_config，讓 ssh/scp/rsync 直接可用
 ops-scripts/mlp trust-gateway  # 通常不用跑了（每條指令都會自動釘選）
+ops-scripts/mlp register client    # 把「這台機器」註冊成 client（見下面「加一台 client」）
+ops-scripts/mlp register provider  # 把「這台機器」註冊成 provider，在新機器上跑
 ```
+
+`mlp` 自己連線時用的金鑰與它寫出來的 `ssh_config` 是同一把
+（`tunnel-identity.sh` 的 `CLIENT_KEY`，預設 `~/.ssh/id_mlp`）——兩邊各寫一份
+的時候，`mlp ssh` 會在 `ssh` 還能通的情況下報 Permission denied。
 
 ### 用原生 ssh 而不透過 mlp
 
@@ -296,19 +321,47 @@ GitHub secret 只有四個：`FILE_CRYPTO_KEY`、`SSH_KEY_ACTIONS`、
 > 就設 `GATEWAY_ROOT_PASSWORD` secret——rotate 會優先取它
 > （`scripts/rotate-gateway.sh:48`）。這個 secret 目前**還沒設**。
 
+## 加一台 client（你要「從哪裡連」的機器）
+
+在**那台機器上**跑，不是在別處代跑——重點就是私鑰不離開它：
+
+```bash
+mlp register client                       # 名字預設 <user>-<short-hostname>
+mlp register client --name kou-thinkpad   # 自己命名
+mlp register client --remove --name <n>   # 撤銷
+```
+
+它會產生 `~/.ssh/id_mlp`（已存在就沿用）、把公鑰寫進 `CLIENT_<NAME>` var、
+觸發 `refresh-authorized-keys` 並等它跑完。Gateway 立刻生效；provider 與
+worker 在下一輪 `pool-sync`（每 30 分鐘）收斂。
+
+撤銷同理：`--remove` 之後那把金鑰在 Gateway 上立刻失效，provider 上最多
+30 分鐘。`CLIENT_ACTIONS` 拒絕被刪——刪掉就等於把所有 workflow 鎖在門外。
+
+沒有 `mlp` 的機器可以直接跑 `ops-scripts/register-client`（`mlp register client`
+只是轉呼叫它）。
+
 ## 加一台 provider
 
 ```bash
 # 在那台機器上
 git clone <repo> && cd MyLinuxPool
-ops-scripts/register-provider.sh --name <node-name> --gateway-port <port>
+mlp register provider --name <node-name> --gateway-port <port>
 # 沒有 sudo 密碼時（例如 WSL2）：
-ops-scripts/register-provider.sh --name <node-name> --gateway-port <port> --no-sudo
+mlp register provider --name <node-name> --gateway-port <port> --no-sudo
 ```
 
-它會裝 profile 宣告的所有 unit、設好 systemd user service 與 linger、
-把 `NODE_<NAME>` var 寫上 GitHub。`--no-sudo` 全程不碰 root，代價是沒有
-sudoers 規則（所以無法遠端 poweroff）。
+（`mlp register provider` 轉呼叫 `ops-scripts/register-provider.sh`，直接跑
+那支也一樣。）
+
+它會裝 profile 宣告的所有 unit、設好 systemd user service 與 linger、自己
+產一把 `~/.ssh/id_tunnel` 並把公鑰寫進 `NODE_<NAME>.tunnel_public_key`、
+從所有 `CLIENT_*` 組出本機的 `authorized_keys`，然後觸發 refresh 讓 Gateway
+接受這台的隧道。`--no-sudo` 全程不碰 root，代價是沒有 sudoers 規則
+（所以無法遠端 poweroff）。
+
+跑完機器上**不留 repo**（用 `mktemp -d` 的暫時 clone），非衍生狀態只剩
+`NODE_NAME` 與一個 `gh_token`。
 
 ## 加一種 worker image
 
@@ -334,6 +387,9 @@ gh workflow run repair-gateway.yml -f confirm=<現役 Gateway IP>
 ## 改了東西要跑的檢查
 
 ```bash
+find . -name 'test-*.sh' -not -path './.git/*' | sort | xargs -n1 bash
+                                   # 全套單元測試（scripts/tests/ 與
+                                   # shared-configs/pool-runtime/tests/）
 ops-scripts/preflight              # 靜態檢查：Dockerfile COPY 來源、
                                    # profile 宣告的 unit 是否存在、
                                    # needs_key 與 files/*.crypted 是否一致、
@@ -342,7 +398,8 @@ echo -n "$FILE_CRYPTO_KEY" | \
   ops-scripts/verify-profile <node> <role>/<profile>
                                    # 連上真機，跑每個 unit 的
                                    # install.sh --check，回報落差
-                                   # （金鑰走 stdin，不進命令列）
+                                   # （FILE_CRYPTO_KEY 走 stdin，不進命令列；
+                                   #  登入身分取自 tunnel-identity.sh）
 ```
 
 `preflight` 檢查的正是語法檢查抓不到、但會在實機炸掉的那類問題——
