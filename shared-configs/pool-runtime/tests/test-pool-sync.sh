@@ -139,7 +139,7 @@ for a in "$@"; do
         *actions/variables/*) name="${a##*/}"; name="${name%%\?*}" ;;
     esac
     case "$a" in
-        NODE_*) name="$a" ;;
+        NODE_*|POOL_WORKERS) name="$a" ;;
     esac
     prev="$a"
 done
@@ -149,6 +149,13 @@ if [[ -n "$name" ]]; then
         # §3.2 的 CLIENT_<NAME> 形狀），gh api 回 value 字串。
         obj="$(printf '%s' "$FAKE_CLIENT_VARS" | jq -c --arg n "$name" \
             '{"name":$n, "value": (.[$n] // empty | tostring)}')"
+    elif [[ "$name" == "POOL_WORKERS" ]]; then
+        # 掃除殭屍容器時會讀它。FAKE_POOL_WORKERS 未設 = 讀不到（N6 情境）。
+        if [[ -z "${FAKE_POOL_WORKERS:-}" ]]; then
+            echo "gh: HTTP 404: Not Found (POOL_WORKERS)" >&2
+            exit 1
+        fi
+        obj="$(jq -c -n --arg n "$name" --arg v "${FAKE_POOL_WORKERS}" '{name:$n,value:$v}')"
     else
         obj="$(jq -c -n --arg n "$name" --arg v "${FAKE_GH_VALUE}" '{name:$n,value:$v}')"
     fi
@@ -162,6 +169,48 @@ else
 fi
 FAKE_GH
 chmod +x "$SANDBOX/fakebin/gh"
+
+# docker：容器清單與建立時間由 FAKE_DOCKER_PS 驅動（每行 "名字 建立秒數前"），
+# rm 只記錄不真的做事。
+cat > "$SANDBOX/fakebin/docker" <<'FAKE_DOCKER'
+#!/usr/bin/env bash
+case "${1:-}" in
+    ps)
+        # --filter name=^<prefix> 必須照做：被測物就是靠它把範圍限定在自己
+        # 名下的容器，假的若忽略它，S5 就驗不到任何東西。
+        want=""
+        for a in "$@"; do
+            case "$a" in name=^*) want="${a#name=^}" ;; esac
+        done
+        while IFS= read -r line; do
+            [[ -n "$line" ]] || continue
+            set -- $line
+            if [[ -n "$want" ]]; then
+                case "$1" in "$want"*) ;; *) continue ;; esac
+            fi
+            printf '%s\n' "$1"
+        done <<< "${FAKE_DOCKER_PS:-}"
+        exit 0 ;;
+    inspect)
+        target="${!#}"
+        while IFS= read -r line; do
+            [[ -n "$line" ]] || continue
+            set -- $line
+            if [[ "$1" == "$target" ]]; then
+                # 轉成 RFC3339；age 由第二欄（幾秒前）決定
+                date -u -d "@$(( $(date +%s) - $2 ))" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null \
+                  || date -u -r "$(( $(date +%s) - $2 ))" +%Y-%m-%dT%H:%M:%SZ
+                exit 0
+            fi
+        done <<< "${FAKE_DOCKER_PS:-}"
+        exit 1 ;;
+    rm)
+        printf '%s\n' "${!#}" >> "${FAKE_DOCKER_RM_LOG:-/dev/null}"
+        exit 0 ;;
+esac
+exit 0
+FAKE_DOCKER
+chmod +x "$SANDBOX/fakebin/docker"
 
 cat > "$SANDBOX/fakebin/systemctl" <<'FAKE_SYSTEMCTL'
 #!/usr/bin/env bash
@@ -336,11 +385,14 @@ GIT_MODE="ok"
 GH_MODE="ok"
 GH_VALUE='{"name":"testnode","role":"provider","registered_with":"register-provider.sh"}'
 FAKE_CLIENT_VARS=""
+FAKE_POOL_WORKERS=""
+FAKE_DOCKER_PS=""
 
 run_sync() {
     : > "$SANDBOX/install.log"; : > "$SANDBOX/systemctl.log"
     : > "$SANDBOX/git.log"; : > "$SANDBOX/gh.log"
     : > "$SANDBOX/gh-payload.log"; : > "$SANDBOX/ssh.log"
+    : > "$SANDBOX/docker-rm.log"
     rm -rf "$SANDBOX/tmpdir"; mkdir -p "$SANDBOX/tmpdir"
     SYNC_RC=0; RAN=0
     if [[ ! -x "$POOL_SYNC" ]]; then
@@ -368,6 +420,10 @@ run_sync() {
         FAKE_GH_MODE="$GH_MODE" \
         FAKE_GH_VALUE="$GH_VALUE" \
         FAKE_CLIENT_VARS="${FAKE_CLIENT_VARS:-}" \
+        FAKE_POOL_WORKERS="${FAKE_POOL_WORKERS:-}" \
+        FAKE_DOCKER_PS="${FAKE_DOCKER_PS:-}" \
+        FAKE_DOCKER_RM_LOG="$SANDBOX/docker-rm.log" \
+        POOL_SWEEP_MIN_AGE="${POOL_SWEEP_MIN_AGE:-900}" \
         $TIMEOUT "$subject" > "$SANDBOX/out" 2> "$SANDBOX/err" </dev/null
         SYNC_RC=$?
     fi
@@ -1342,6 +1398,101 @@ fi
 # ---------------------------------------------------------------------------
 # Q-Inj: 注入 — 每次都重產金鑰 → Q2 必須紅（brief 指定）
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# S: 殭屍 worker 容器的清掃
+#
+# delete-worker 的 `docker rm -f` 是刻意 best-effort 的：fh-l 平常就是關機
+# 的，刪它的 worker 本來就常常連不上。埠與 ledger 條目照樣釋放，於是容器
+# 留在磁碟上、帶著 --restart unless-stopped，開機就復活，然後拿一把已被撤銷
+# 的金鑰永遠重試。這裡驗的是那個 best-effort 的後半段。
+# ---------------------------------------------------------------------------
+echo "── S 群：清掃 ledger 不再列出的 worker 容器 ──"
+
+SWEEP_LEDGER='[{"port":2302,"provider":"testnode","container":"mlp-testnode-default-keep"}]'
+
+sweep_run() {   # $1 = docker ps 內容, $2 = POOL_WORKERS, $3 = 門檻秒數
+    reset_home
+    build_fixture "unit-a unit-b" "unit-b" ""
+    GIT_MODE="ok"; GH_MODE="ok"
+    : > "$SANDBOX/check-rc"; : > "$SANDBOX/install-rc"
+    GH_VALUE="$Q_NODE_JSON"
+    write_clients "$AUB_KEY_A" "$AUB_KEY_B" "$AUB_ACTIONS"
+    FAKE_DOCKER_PS="$1"
+    FAKE_POOL_WORKERS="$2"
+    POOL_SWEEP_MIN_AGE="${3:-900}"
+    run_sync
+    FAKE_DOCKER_PS=""; FAKE_POOL_WORKERS=""; POOL_SWEEP_MIN_AGE=900
+}
+
+# S1: ledger 沒有、且夠老 -> 移除
+sweep_run "mlp-testnode-default-orphan 5000" "$SWEEP_LEDGER"
+if grep -qx 'mlp-testnode-default-orphan' "$SANDBOX/docker-rm.log" 2>/dev/null; then
+    ok_line "S1. ledger 未列出且夠老的容器被移除"
+else
+    fail_line "S1. 殭屍容器沒被移除（rm log: $(tr '\n' ' ' < "$SANDBOX/docker-rm.log" 2>/dev/null)）"
+fi
+
+# S2: ledger 有列 -> 不准碰
+sweep_run "mlp-testnode-default-keep 5000" "$SWEEP_LEDGER"
+if [[ -s "$SANDBOX/docker-rm.log" ]]; then
+    fail_line "S2. 刪掉了 ledger 明明有列的容器：$(tr '\n' ' ' < "$SANDBOX/docker-rm.log")"
+else
+    ok_line "S2. ledger 有列的容器不被碰"
+fi
+
+# S3: ledger 沒有，但很新 -> 可能正在被建立，不准碰
+# create-worker 是先 docker run、之後才寫 ledger（worker 自己產金鑰，公鑰回
+# 傳後才記得起來），所以這個窗口是真的存在的。
+sweep_run "mlp-testnode-default-newborn 30" "$SWEEP_LEDGER"
+if [[ -s "$SANDBOX/docker-rm.log" ]]; then
+    fail_line "S3. 刪掉了剛建立的容器——會誤殺正在建立中的 worker"
+else
+    ok_line "S3. 太新的容器不被碰（建立中的 worker 不會被誤殺）"
+fi
+
+# S4: 讀不到 POOL_WORKERS -> 什麼都不刪（N6）
+sweep_run "mlp-testnode-default-orphan 5000" ""
+if [[ -s "$SANDBOX/docker-rm.log" ]]; then
+    fail_line "S4. 讀不到 ledger 卻照刪——GitHub 掛掉會變成清空這台機器"
+else
+    ok_line "S4. 讀不到 POOL_WORKERS 時什麼都不刪"
+fi
+
+# S5: 別台機器的容器 -> 不准碰
+sweep_run "mlp-othernode-default-orphan 5000" "$SWEEP_LEDGER"
+if [[ -s "$SANDBOX/docker-rm.log" ]]; then
+    fail_line "S5. 碰了別台機器名下的容器：$(tr '\n' ' ' < "$SANDBOX/docker-rm.log")"
+else
+    ok_line "S5. 只處理自己名下（mlp-<node>-）的容器"
+fi
+
+# S-Inj: 拿掉年齡防線 -> S3 必須紅
+echo "── S-Inj 注入：拿掉年齡防線 ──"
+reset_home
+build_fixture "unit-a unit-b" "unit-b" ""
+GIT_MODE="ok"; GH_MODE="ok"
+: > "$SANDBOX/check-rc"; : > "$SANDBOX/install-rc"
+GH_VALUE="$Q_NODE_JSON"
+write_clients "$AUB_KEY_A" "$AUB_KEY_B" "$AUB_ACTIONS"
+INJS_SYNC="$SANDBOX/pool-sync-sinj.sh"
+if ! sed 's|if (( age < SWEEP_MIN_AGE )); then|if false; then|' "$POOL_SYNC" > "$INJS_SYNC" \
+   || ! grep -q 'if false; then' "$INJS_SYNC"; then
+    fail_line "S-Inj. 注入沒生效（needle 落空）——harness 問題"
+else
+    chmod +x "$INJS_SYNC"
+    FAKE_DOCKER_PS="mlp-testnode-default-newborn 30"
+    FAKE_POOL_WORKERS="$SWEEP_LEDGER"
+    POOL_SYNC_SUBJECT="$INJS_SYNC"
+    run_sync
+    POOL_SYNC_SUBJECT=""
+    FAKE_DOCKER_PS=""; FAKE_POOL_WORKERS=""
+    if grep -qx 'mlp-testnode-default-newborn' "$SANDBOX/docker-rm.log" 2>/dev/null; then
+        ok_line "S-Inj. 拿掉年齡防線後，剛建立的容器就被刪了——S3 擋得住這個 bug"
+    else
+        fail_line "S-Inj. 拿掉防線後仍沒刪——注入沒生效（harness 問題）"
+    fi
+fi
+
 echo "── Q-Inj1 注入：ensure_tunnel_key 每次都重產 ──"
 reset_home
 build_fixture "unit-a unit-b" "unit-b" ""

@@ -78,16 +78,40 @@ jobs:
           delete_worker_find_claim "$CLAIMS_JSON" "$PORT_IN" "$NAME_IN" >> "$GITHUB_OUTPUT" \
             || { echo "::error::no worker port claim found — see log above"; exit 1; }
 
-      # Best-effort: a provider being briefly unreachable shouldn't block
-      # freeing the port below — but the step still shows red so it's not
-      # silently swallowed either.
+      # Best-effort: fh-l is normally powered OFF, so deleting one of its
+      # workers routinely cannot reach the provider, and that must not block
+      # freeing the port below.
+      #
+      # The failure is NOT visible on its own, despite what this comment
+      # used to claim: the REST API reports conclusion "success" for a
+      # continue-on-error step, so `mlp` (and anything else reading the API)
+      # sees a clean green run. Only the raw log carries outcome=failure.
+      # Hence the explicit step below, which exists to be seen.
       - name: Stop and remove the container on the provider
+        id: rm_container
         if: steps.find.outputs.container != ''
         continue-on-error: true
         uses: ./.github/actions/pool-ssh
         with:
           node: ${{ steps.find.outputs.provider }}
           command: docker rm -f ${{ steps.find.outputs.container }}
+
+      # Runs ONLY when the removal failed, so its presence in the step list
+      # is the signal — a skipped step renders as a quiet dash in `mlp`.
+      # The container is not leaked: the provider's own pool-sync sweeps
+      # containers the ledger no longer lists, so this resolves itself the
+      # next time the machine is up.
+      - name: "⚠ provider unreachable — container NOT removed (swept on its next boot)"
+        if: steps.rm_container.outcome == 'failure'
+        shell: bash
+        run: |
+          echo "::warning::could not remove ${{ steps.find.outputs.container }} on ${{ steps.find.outputs.provider }} — the provider is unreachable. The port and ledger entry are released; the provider's pool-sync will remove the container when it next runs."
+          {
+            echo "### Container not removed"
+            echo ""
+            echo "\`${{ steps.find.outputs.container }}\` is still on **${{ steps.find.outputs.provider }}** — the provider was unreachable."
+            echo "Its port and ledger entry have been released. The provider's \`pool-sync\` removes containers that POOL_WORKERS no longer lists, so this clears itself on the next boot."
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Release the port on the Gateway
         uses: ./.github/actions/pool-ssh

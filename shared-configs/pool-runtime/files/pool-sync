@@ -31,6 +31,10 @@ set -uo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
 
 REPO="${POOL_REPO:-FATESAIKOU/MyLinuxPool}"
+# How old a worker container must be before the orphan sweep will touch it.
+# create-worker's whole flow (build, run, collect the key, record it) takes
+# a couple of minutes; 15 gives that plenty of room. Overridable for tests.
+SWEEP_MIN_AGE="${POOL_SWEEP_MIN_AGE:-900}"
 BRANCH="${POOL_BRANCH:-master}"
 STATE_DIR="${HOME}/.mylinuxpool"
 CONFIG_FILE="${STATE_DIR}/config"
@@ -259,6 +263,77 @@ main() {
     }
 
     sync_authorized_keys
+
+    # --- remove worker containers the ledger no longer lists -----------
+    # delete-worker removes the container over ssh, but that step is
+    # best-effort on purpose: fh-l is normally powered OFF, so deleting one
+    # of its workers routinely cannot reach it. The port is freed and the
+    # POOL_WORKERS entry removed anyway, which leaves the container on disk
+    # with --restart unless-stopped — it comes back on the next boot and
+    # retries a tunnel whose key the Gateway no longer authorizes, forever.
+    #
+    # This is the other half of that best-effort: what the ledger does not
+    # list, this machine should not be running.
+    sweep_orphan_workers() {
+        command -v docker >/dev/null 2>&1 || return 0
+
+        local workers_json prefix now container created created_trim created_epoch age
+        workers_json="$(GH_TOKEN="$(cat "$GH_TOKEN_FILE")" \
+            gh api "repos/${REPO}/actions/variables/POOL_WORKERS" --jq .value 2>/dev/null || true)"
+        # N6: GitHub being unreachable must never turn into deleting things.
+        # No data means no sweep, not an empty ledger.
+        if [[ -z "$workers_json" ]] || ! printf '%s' "$workers_json" | jq empty >/dev/null 2>&1; then
+            log WARN "cannot read POOL_WORKERS — skipping the orphan sweep (never delete on missing data)"
+            return 0
+        fi
+
+        # Only this node's own containers, ever.
+        prefix="mlp-${node_name}-"
+        now="$(date +%s)"
+
+        while IFS= read -r container; do
+            [[ -n "$container" ]] || continue
+            if printf '%s' "$workers_json" \
+                | jq -e --arg c "$container" 'any(.[]; .container == $c)' >/dev/null 2>&1; then
+                continue
+            fi
+
+            # Age guard. create-worker starts the container BEFORE recording
+            # it — it has to, because the worker mints its own key and only
+            # then can the ledger entry be written. A young container is
+            # therefore probably one being created right now, not an orphan.
+            # If the age cannot be determined at all, leave it alone.
+            created="$(docker inspect -f '{{.Created}}' "$container" 2>/dev/null)"
+            # RFC3339 -> epoch. GNU `date -d` is what providers have; the
+            # BSD form keeps this parseable on a developer Mac so the age
+            # guard can actually be tested — TZ=UTC because BSD date reads
+            # a bare timestamp as LOCAL time, which made every container
+            # look hours old and defeated the guard entirely.
+            # Unparseable means age 0, i.e. leave it alone — never delete
+            # on a number we could not read.
+            created_epoch=""
+            if [[ -n "$created" ]]; then
+                created_trim="${created%%.*}"; created_trim="${created_trim%Z}"
+                created_epoch="$(date -d "$created" +%s 2>/dev/null \
+                    || TZ=UTC date -j -f '%Y-%m-%dT%H:%M:%S' "$created_trim" +%s 2>/dev/null \
+                    || true)"
+            fi
+            age=0
+            [[ -n "$created_epoch" ]] && age=$(( now - created_epoch ))
+            if (( age < SWEEP_MIN_AGE )); then
+                log INFO "leaving ${container} alone (${age}s old — may still be mid-creation)"
+                continue
+            fi
+
+            if docker rm -f "$container" >/dev/null 2>&1; then
+                log INFO "swept orphan worker container ${container} (POOL_WORKERS does not list it)"
+            else
+                log WARN "could not remove orphan container ${container} — will retry next tick"
+            fi
+        done < <(docker ps -a --filter "name=^${prefix}" --format '{{.Names}}' 2>/dev/null)
+    }
+
+    sweep_orphan_workers
 
     # --- ensure the per-machine tunnel key exists and is published -----
     # KEY-DESIGN §3.2/§3.3 + MIGRATION.md §3: providers generate their own
