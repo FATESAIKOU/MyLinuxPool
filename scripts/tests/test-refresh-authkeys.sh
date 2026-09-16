@@ -221,18 +221,22 @@ echo "── 7-9. refresh_build_install_cmd ──"
 if ! declare -F refresh_build_install_cmd >/dev/null 2>&1; then
     bad "7-9. refresh_build_install_cmd 未定義（scripts/refresh-authkeys.sh 尚未落地）"
 else
+    # 實作輸出整串指令的 base64（單行）；斷言一律先解碼再查形狀。
+    cmd_of() { printf '%s' "$1" | base64 -d 2>/dev/null; }
     OUT="$(refresh_build_install_cmd "/home/fatesaikou/.ssh/authorized_keys" "$PUB_A" </dev/null 2>/dev/null)"; RC=$?
-    if printf '%s' "$OUT" | grep -qE 'mktemp -d|mktemp' && printf '%s' "$OUT" | grep -q 'mv -f' \
-       && ! printf '%s' "$OUT" | grep -qE '>\s*/home/[^ ]*authorized_keys'; then
-        ok "7. 指令有「寫暫存 → chmod → mv」原子形狀，無直接覆蓋"
+    DEC="$(cmd_of "$OUT")"
+    if printf '%s' "$DEC" | grep -qE 'mktemp -d|mktemp' && printf '%s' "$DEC" | grep -q 'mv -f' \
+       && ! printf '%s' "$DEC" | grep -qE '>\s*/home/[^ ]*authorized_keys'; then
+        ok "7. 解碼後指令有「寫暫存 → chmod → mv」原子形狀，無直接覆蓋"
     else
-        bad "7. 指令看不出原子形狀（rc=$RC, out=[${OUT:0:300}]）"
+        bad "7. 解碼後指令看不出原子形狀（rc=$RC, decoded=[${DEC:0:300}]）"
     fi
     OUT2="$(refresh_build_install_cmd "/home/sshproxy/.ssh/authorized_keys" "$TUNNEL_1" --sudo </dev/null 2>/dev/null)"
-    if printf '%s' "$OUT2" | grep -q 'sudo '; then
+    DEC2="$(cmd_of "$OUT2")"
+    if printf '%s' "$DEC2" | grep -q 'sudo '; then
         ok "8. --sudo 時指令帶 sudo"
     else
-        bad "8. --sudo 指令沒有 sudo（out=[${OUT2:0:200}]）"
+        bad "8. --sudo 指令沒有 sudo（decoded=[${DEC2:0:200}]）"
     fi
     C1="$(refresh_build_install_cmd "/home/fatesaikou/.ssh/authorized_keys" "$PUB_A" </dev/null 2>/dev/null | cksum)"
     C2="$(refresh_build_install_cmd "/home/fatesaikou/.ssh/authorized_keys" "$PUB_A" </dev/null 2>/dev/null | cksum)"
@@ -240,6 +244,51 @@ else
         ok "9. 同樣輸入 → 位元組相同（冪等）"
     else
         bad "9. 兩次輸出不同（$C1 vs $C2）"
+    fi
+
+    # 7c/7d: 輸出必須是「恰好一行」的 base64——$GITHUB_OUTPUT 的 key=value
+    # 不吃多行，而 Linux base64 每 76 字元折行；只有把 base64 壓成單行，
+    # 指令字串才能安全地放進 $GITHUB_OUTPUT。用一個很長的內容（20 把
+    # 公鑰）測——短內容不會折行，測不出這個 bug。
+    LONG_CONTENT=""
+    for k in $(seq 1 20); do
+        LONG_CONTENT="${LONG_CONTENT}ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFIXTUREKEY${k} user${k}\n"
+    done
+    OUT="$(refresh_build_install_cmd "/home/fatesaikou/.ssh/authorized_keys" "$LONG_CONTENT" </dev/null 2>/dev/null)"; RC=$?
+    if [[ "$OUT" != *$'\n'* ]]; then
+        ok "7c. 長內容（20 把鑰）→ 輸出恰好一行（base64 單行，key=value 才吃得了）"
+    else
+        bad "7c. 輸出是多行（base64 折行沒被壓平）——放進 \$GITHUB_OUTPUT 的 key=value 會整步失敗"
+    fi
+    DECODED="$(printf '%s' "$OUT" | base64 -d 2>/dev/null)"
+    if printf '%s' "$DECODED" | grep -qE 'mktemp -d|mktemp' \
+       && printf '%s' "$DECODED" | grep -q 'mv -f' \
+       && ! printf '%s' "$DECODED" | grep -qE '>\s*/home/[^ ]*authorized_keys'; then
+        ok "7d. 解碼回來仍是原子安裝指令（寫暫存 → chmod → mv，無直接覆蓋）"
+    else
+        bad "7d. 解碼回來不是原子安裝指令（decoded=[${DECODED:0:300}]）"
+    fi
+
+    # 注入：把單行化移除 → 7c 必須紅。注意本機（macOS）base64 預設
+    # 不折行，拿掉 tr -d 也還是單行，測不出這個 bug——所以注入用
+    # `fold -w 76` 模擬 GNU base64 的 76 字元折行（workflow 跑在 Linux
+    # runner 上），正是實作要壓平的形狀。
+    INJ_REFRESH="$SANDBOX/refresh-inj.sh"
+    python3 - "$REFRESH" "$INJ_REFRESH" <<'PY'
+import sys
+src = open(sys.argv[1], encoding="utf-8").read()
+src = src.replace("| base64 | tr -d '\\n'", "| base64 | fold -w 76")
+open(sys.argv[2], "w", encoding="utf-8").write(src)
+PY
+    INJ_OUT="$(bash -c "
+set -uo pipefail
+source '$INJ_REFRESH'
+refresh_build_install_cmd '/home/fatesaikou/.ssh/authorized_keys' \"\$1\"
+" _ "$LONG_CONTENT" </dev/null 2>/dev/null)"
+    if [[ "$INJ_OUT" == *$'\n'* ]]; then
+        printf '  inj ok    %s\n' "注入後（模擬 GNU 折行的 base64）輸出多行——7c 條會紅"
+    else
+        bad "注入後輸出仍單行——注入沒生效（harness 問題）"
     fi
 fi
 
