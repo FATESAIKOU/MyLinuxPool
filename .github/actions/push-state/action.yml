@@ -12,6 +12,14 @@ inputs:
   gateway-ip:
     description: IP of the Gateway machine to push to
     required: true
+  gateway-port:
+    description: >-
+      The Gateway's SSH port (NODE_GATEWAY.port). Defaults to 22 so a caller
+      that predates the port being movable still works — but a caller that
+      does not pass it will fail the moment the Gateway stops listening on
+      22, which is exactly what happened on 2026-09-20.
+    required: false
+    default: "22"
   gateway-user:
     description: SSH user on the Gateway (must be able to sudo to root)
     required: false
@@ -41,6 +49,7 @@ runs:
       shell: bash
       env:
         PUSH_GATEWAY_IP: ${{ inputs.gateway-ip }}
+        PUSH_GATEWAY_PORT: ${{ inputs.gateway-port }}
         PUSH_GATEWAY_USER: ${{ inputs.gateway-user }}
         PUSH_HOST_KEY: ${{ inputs.host-key }}
         PUSH_SOURCE: ${{ inputs.source }}

@@ -64,6 +64,9 @@ jobs:
             exit 1
           fi
           echo "ip=${ip}" >> "$GITHUB_OUTPUT"
+          # The Gateway's own SSH port. Anything dialling it after this point
+          # must use it, or it breaks the moment 22 stops listening.
+          echo "ssh_port=$(shared-configs/pool-runtime/files/pool-resolve gateway --field .port 2>/dev/null || echo 22)" >> "$GITHUB_OUTPUT"
           echo "generation=${gen}" >> "$GITHUB_OUTPUT"
           echo "host_key=$(shared-configs/pool-runtime/files/pool-resolve gateway --field .host_key 2>/dev/null)" >> "$GITHUB_OUTPUT"
 
@@ -101,6 +104,7 @@ jobs:
         uses: ./.github/actions/push-state
         with:
           gateway-ip: ${{ steps.gw.outputs.ip }}
+          gateway-port: ${{ steps.gw.outputs.ssh_port }}
           host-key: ${{ steps.gw.outputs.host_key }}
           source: repair-gateway#${{ github.run_id }}
 

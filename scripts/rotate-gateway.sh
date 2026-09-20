@@ -380,7 +380,7 @@ rotate_compute_new_gateway_json() {
          | if $host_key == "" then . else . + {host_key: $host_key} end'
 }
 
-# rotate_read_host_key <user> <ip>
+# rotate_read_host_key <user> <ip> [<port>]
 #   Read the new Gateway's own host key over the session we just used to
 #   provision it, and print it as a bare "ssh-ed25519 AAAA..." line.
 #
@@ -392,8 +392,11 @@ rotate_compute_new_gateway_json() {
 #   but refuses changed ones — every provider then refuses to attach.
 #   That is exactly how the 2026-09-14 rotate failed.
 rotate_read_host_key() {
-    local user="$1" ip="$2" key
-    key="$(ssh -o StrictHostKeyChecking=accept-new -o BatchMode=yes -o ConnectTimeout=10 \
+    # Called AFTER provisioning, so the machine may already have moved off
+    # the port a fresh Linode boots with. Defaults to 22 for a caller that
+    # predates the port being movable.
+    local user="$1" ip="$2" port="${3:-22}" key
+    key="$(ssh -o StrictHostKeyChecking=accept-new -o BatchMode=yes -o ConnectTimeout=10 -p "$port" \
              "${user}@${ip}" 'cat /etc/ssh/ssh_host_ed25519_key.pub' 2>/dev/null \
            | awk '{print $1, $2}')"
     if [[ -z "$key" ]]; then
@@ -403,12 +406,14 @@ rotate_read_host_key() {
     printf '%s\n' "$key"
 }
 
-# rotate_wait_for_providers <gw_user> <gw_ip> <deadline_secs> <port...>
+# rotate_wait_for_providers <gw_user> <gw_ip> <gw_port> <deadline_secs> <port...>
 #   Polls each port's SSH banner over the new Gateway's own loopback,
 #   exactly like pool-tunnel's own health check — a bare open port
 #   doesn't prove the tunnel is actually there (spec §3.2).
 rotate_wait_for_providers() {
-    local gw_user="$1" gw_ip="$2" deadline_secs="$3"; shift 3
+    # Runs after the switch, against the machine provisioning already moved
+    # to its final port — not the 22 a fresh Linode boots with.
+    local gw_user="$1" gw_ip="$2" gw_port="$3" deadline_secs="$4"; shift 4
     local ports=("$@")
 
     if (( ${#ports[@]} == 0 )); then
@@ -425,6 +430,7 @@ rotate_wait_for_providers() {
         still_pending=()
         for port in "${pending[@]}"; do
             banner="$(timeout 5 ssh -o StrictHostKeyChecking=accept-new -o ConnectTimeout=3 \
+                -p "${gw_port}" \
                 "${gw_user}@${gw_ip}" "timeout 1 nc 127.0.0.1 ${port} </dev/null | head -c 4" 2>/dev/null || true)"
             [[ "$banner" == SSH-* ]] || still_pending+=("$port")
         done

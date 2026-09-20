@@ -155,6 +155,7 @@ jobs:
           gw_json="$(shared-configs/pool-runtime/files/pool-resolve gateway --refresh)"
           {
             echo "ip=$(jq -r '.ip' <<<"$gw_json")"
+            echo "ssh_port=$(jq -r '.port // 22' <<<"$gw_json")"
             echo "host_key=$(jq -r '.host_key // ""' <<<"$gw_json")"
           } >> "$GITHUB_OUTPUT"
 
@@ -162,6 +163,7 @@ jobs:
         uses: ./.github/actions/push-state
         with:
           gateway-ip: ${{ steps.gw.outputs.ip }}
+          gateway-port: ${{ steps.gw.outputs.ssh_port }}
           host-key: ${{ steps.gw.outputs.host_key }}
           source: delete-worker#${{ github.run_id }}
           # These workflows reach machines through the pool-ssh action,

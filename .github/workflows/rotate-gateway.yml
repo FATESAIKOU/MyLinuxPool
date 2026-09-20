@@ -200,6 +200,23 @@ jobs:
           source scripts/rotate-gateway.sh
           rotate_deploy_repo_bundle fatesaikou "$PREVIEW_IP"
 
+      # Both numbers come from NODE_GATEWAY, the same variable clients read,
+      # so the machine and its clients cannot disagree about the port.
+      #   ssh_port      — the single port clients connect to (.port)
+      #   listen_ports  — what the machine binds; a superset only while a
+      #                   port move is in flight
+      - name: Read the Gateway's SSH port from NODE_GATEWAY
+        id: listen
+        shell: bash
+        run: |
+          set -euo pipefail
+          gw_json="$(gh api "repos/${GH_REPO}/actions/variables/NODE_GATEWAY" --jq .value)"
+          {
+            echo "ssh_port=$(printf '%s' "$gw_json" | jq -r '.port // 22')"
+            echo "listen_ports=$(printf '%s' "$gw_json" \
+              | jq -r '(.ssh_listen_ports // [(.port // 22)]) | map(tostring) | join(" ")')"
+          } >> "$GITHUB_OUTPUT"
+
       - name: Run provision-gateway.sh on preview
         id: provision
         shell: bash
@@ -212,14 +229,12 @@ jobs:
           trusted_ips="$(gh variable get POOL_TRUSTED_IPS --repo "$GH_REPO")"
           # The key never gets logged: no -x, and GitHub Actions masks the
           # exact secret value in any log line regardless.
-          # Same source as repair. Note the preview machine is still being
-          # reached on the port a fresh Linode boots with (22) — provisioning
-          # only changes what it listens on at the end, so the session doing
-          # the change is never the one cut off by it.
-          gw_json="$(gh api "repos/${GH_REPO}/actions/variables/NODE_GATEWAY" --jq .value)"
-          listen_ports="$(printf '%s' "$gw_json" \
-            | jq -r '(.ssh_listen_ports // [(.port // 22)]) | map(tostring) | join(" ")')"
-          rotate_run_provision fatesaikou "$PREVIEW_IP" "$trusted_ips" "$FILE_CRYPTO_KEY" "$listen_ports"
+          # The preview is still reached on the port a fresh Linode boots
+          # with (22); provisioning only changes what it listens on at the
+          # end, so the session making the change is never cut off by it.
+          # Everything AFTER this step must use steps.listen.outputs.ssh_port.
+          rotate_run_provision fatesaikou "$PREVIEW_IP" "$trusted_ips" "$FILE_CRYPTO_KEY" \
+            "${{ steps.listen.outputs.listen_ports }}"
 
       # The check that was missing. A rotate used to switch NODE_GATEWAY
       # and only then discover whether providers could attach; when they
@@ -339,6 +354,9 @@ jobs:
         uses: ./.github/actions/push-state
         with:
           gateway-ip: ${{ steps.create_preview.outputs.preview_ip }}
+          # The preview has already been provisioned by now, so it listens on
+          # NODE_GATEWAY's port, not the 22 a fresh Linode boots with.
+          gateway-port: ${{ steps.listen.outputs.ssh_port }}
           host-key: ${{ steps.hostkey.outputs.key }}
           source: rotate-gateway#${{ github.run_id }}
           ssh-key: ${{ secrets.SSH_KEY_ACTIONS }}
@@ -354,7 +372,10 @@ jobs:
           PREVIEW_IP: ${{ steps.create_preview.outputs.preview_ip }}
         run: |
           set -euo pipefail
+          # Post-provisioning, so the preview listens on NODE_GATEWAY's port
+          # rather than the 22 it booted with.
           ssh -o StrictHostKeyChecking=accept-new -o BatchMode=yes -o ConnectTimeout=10 \
+              -p "${{ steps.listen.outputs.ssh_port }}" \
               "fatesaikou@${PREVIEW_IP}" bash -s <<'REMOTE'
           set -euo pipefail
           mkdir -p ~/.mylinuxpool/workers.d
@@ -403,7 +424,7 @@ jobs:
           fi
           echo "waiting only for the providers that were attached: ${ports[*]}"
 
-          if ! rotate_wait_for_providers fatesaikou "$PREVIEW_IP" 180 "${ports[@]}"; then
+          if ! rotate_wait_for_providers fatesaikou "$PREVIEW_IP" "${{ steps.listen.outputs.ssh_port }}" 180 "${ports[@]}"; then
             echo "::error::providers never came back — see log above"
             exit 1
           fi

@@ -36,6 +36,9 @@ GH_REPO="${GH_REPO:-${GITHUB_REPOSITORY:-}}"
 GH_TOKEN="${GH_TOKEN:-}"
 
 GW_IP="${PUSH_GATEWAY_IP:?PUSH_GATEWAY_IP not set}"
+# Defaults to 22 for a caller that does not set it; every pool caller now
+# passes NODE_GATEWAY.port.
+GW_PORT="${PUSH_GATEWAY_PORT:-22}"
 GW_USER="${PUSH_GATEWAY_USER:-fatesaikou}"
 HOST_KEY="${PUSH_HOST_KEY:-}"
 SOURCE="${PUSH_SOURCE:?PUSH_SOURCE not set}"
@@ -102,7 +105,7 @@ if [[ -z "$GH_TOKEN" ]]; then
 fi
 
 # --- host key handling: pin it when given, otherwise trust-on-first-use ---
-SSH_OPTS=(-o BatchMode=yes -o ConnectTimeout="${SSH_CONNECT_TIMEOUT:-10}")
+SSH_OPTS=(-o BatchMode=yes -o ConnectTimeout="${SSH_CONNECT_TIMEOUT:-10}" -p "$GW_PORT")
 if [[ -n "$HOST_KEY" ]]; then
     KH="$(mktemp)"
     trap 'rm -f "$KH"' EXIT

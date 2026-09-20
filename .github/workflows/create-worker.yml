@@ -154,6 +154,7 @@ jobs:
           gw_json="$(shared-configs/pool-runtime/files/pool-resolve gateway)"
           {
             echo "ip=$(jq -r '.ip' <<<"$gw_json")"
+            echo "ssh_port=$(jq -r '.port // 22' <<<"$gw_json")"
             echo "user=$(jq -r '.user' <<<"$gw_json")"
             echo "tunnel_user=$(jq -r '.tunnel_user' <<<"$gw_json")"
             echo "port_lo=$(jq -r '.ports.worker[0]' <<<"$gw_json")"
@@ -399,6 +400,7 @@ jobs:
         uses: ./.github/actions/push-state
         with:
           gateway-ip: ${{ steps.gateway.outputs.ip }}
+          gateway-port: ${{ steps.gateway.outputs.ssh_port }}
           host-key: ${{ steps.gateway.outputs.host_key }}
           source: create-worker#${{ github.run_id }}
           # These workflows reach machines through the pool-ssh action,
