@@ -46,12 +46,17 @@ printf 'systemctl %s\n' "$*" >> "${SYSTEMCTL_LOG:-/dev/null}"
 [[ "${FAKE_SYSTEMCTL_FAIL:-0}" == "1" && "$1" == "restart" ]] && exit 1
 exit 0
 FAKE
+# FAKE_SS_LISTENING 的每一項是 "<埠>" 或 "<埠>/v6"。後者只產生 IPv6 那一行
+# ——2026-09-20 的事故就是這個狀態：機器上看起來在聽，IPv4 全部被拒。
 cat > "$SANDBOX/bin/ss" <<'FAKE'
 #!/usr/bin/env bash
-want=""
-for a in "$@"; do case "$a" in *:*) want="${a##*:}" ;; esac; done
-for p in ${FAKE_SS_LISTENING:-}; do
-    if [[ "$p" == "$want" ]]; then echo "LISTEN 0 4096 0.0.0.0:${p} 0.0.0.0:*"; exit 0; fi
+for e in ${FAKE_SS_LISTENING:-}; do
+    p="${e%%/*}"
+    case "$e" in
+        */v6) echo "LISTEN 0 4096 [::]:${p} [::]:*" ;;
+        *)    echo "LISTEN 0 4096 0.0.0.0:${p} 0.0.0.0:*"
+              echo "LISTEN 0 4096 [::]:${p} [::]:*" ;;
+    esac
 done
 exit 0
 FAKE
@@ -136,12 +141,20 @@ if run_ports "22 2100" "22 2100"; then
     else
         bad "2. 沒有先清空 ListenStream=，改埠會變成多開一個埠:"$'\n'"$(cat "$SANDBOX/socket.conf")"
     fi
-    n="$(grep -c '^ListenStream=[0-9]' "$SANDBOX/socket.conf")"
-    if [[ "$n" -eq 2 ]] && grep -q '^ListenStream=22$' "$SANDBOX/socket.conf" \
-       && grep -q '^ListenStream=2100$' "$SANDBOX/socket.conf"; then
-        ok "3. 兩個埠都寫進去了（遷移期同時聽舊與新）"
+    # 每個埠都必須明寫 IPv4 與 IPv6 兩行。裸的 ListenStream=<port> 在
+    # BindIPv6Only=ipv6-only 之下只會產生 IPv6 socket，IPv4 全部 refused
+    # ——那正是把正式 Gateway 弄死、且重開機也救不回來的原因。
+    ok3=1
+    for p in 22 2100; do
+        grep -q "^ListenStream=0\.0\.0\.0:${p}\$" "$SANDBOX/socket.conf" || ok3=0
+        grep -q "^ListenStream=\[::\]:${p}\$" "$SANDBOX/socket.conf" || ok3=0
+    done
+    if grep -qE '^ListenStream=[0-9]+$' "$SANDBOX/socket.conf"; then
+        bad "3. 出現裸的 ListenStream=<port>——那只會綁 IPv6，IPv4 會全部被拒"
+    elif [[ "$ok3" -eq 1 ]]; then
+        ok "3. 每個埠都明寫了 0.0.0.0 與 [::] 兩行"
     else
-        bad "3. 埠沒寫全（找到 ${n} 個）:"$'\n'"$(cat "$SANDBOX/socket.conf")"
+        bad "3. 位址族沒寫全:"$'\n'"$(cat "$SANDBOX/socket.conf")"
     fi
 else
     bad "2. 正常情況竟然失敗: ${OUT}"
@@ -177,12 +190,12 @@ echo "=== 6. 防鎖死：重啟後沒在聽就還原 ==="
 # 先建立一個「原本就有」的 drop-in，還原時必須回到它
 printf '[Socket]\nListenStream=\nListenStream=22\n' > "$SANDBOX/socket.conf"
 before="$(cat "$SANDBOX/socket.conf")"
-if run_ports "22 2100" "22"; then     # 2100 沒在聽
-    bad "6. 2100 沒在聽卻回報成功——這正是會把自己鎖在門外的情況"
+if run_ports "22 2100" "22 2100/v6"; then   # 2100 只有 IPv6
+    bad "6. 2100 只綁到 IPv6 卻回報成功——這正是 2026-09-20 鎖死自己的情況"
 else
     after="$(cat "$SANDBOX/socket.conf" 2>/dev/null || echo '<檔案不見了>')"
     if [[ "$after" == "$before" ]]; then
-        ok "6. 埠沒真的在聽時以非 0 結束，且 drop-in 還原成原本的內容"
+        ok "6. 只綁到 IPv6 時以非 0 結束，且 drop-in 還原成原本的內容"
     else
         bad "6. 以非 0 結束但沒有還原:"$'\n'"got:  ${after}"$'\n'"want: ${before}"
     fi
@@ -203,25 +216,30 @@ else
 fi
 
 echo "=== 9-10. 注入 ==="
+# 重現 2026-09-20 的真兇：把兩行位址族換回裸的 ListenStream=<port>。
+# 在 BindIPv6Only=ipv6-only 之下那只會產生 IPv6 socket，IPv4 全部 refused，
+# 而機器上的 `ss` 看起來一切正常——正式 Gateway 就是這樣死的，重開機也沒救。
 inj="$SANDBOX/prov-inj1.sh"
 sandbox_prov "$inj"
 python3 - "$inj" <<'INJ'
 import sys
 p = sys.argv[1]
 s = open(p, encoding='utf-8').read()
-old = 'desired="[Socket]"$\'\\n\'"ListenStream="'
-assert old in s, "empty ListenStream needle not found"
-open(p, 'w', encoding='utf-8').write(s.replace(old, 'desired="[Socket]"', 1))
+old = ('        desired+=$\'\\n\'"ListenStream=0.0.0.0:${p}"\n'
+       '        desired+=$\'\\n\'"ListenStream=[::]:${p}"\n')
+assert old in s, "both-family needle not found"
+new = '        desired+=$\'\\n\'"ListenStream=${p}"\n'
+open(p, 'w', encoding='utf-8').write(s.replace(old, new, 1))
 INJ
 if [[ $? -ne 0 ]]; then
     inj_bad "9. 注入腳本失敗（被測物形狀變了）——harness 問題"
 else
+    command rm -f "$SANDBOX/socket-inj.conf"
     exec_prov "$inj" "$SANDBOX/socket-inj.conf" "22 2100" "22 2100"
-    fs="$(grep -n 'ListenStream' "$SANDBOX/socket-inj.conf" 2>/dev/null | head -1)"
-    if [[ "$fs" == *"ListenStream=2"* ]]; then
-        inj_ok "9. 拿掉空的 ListenStream= 後第 2 條會紅"
+    if grep -qE '^ListenStream=[0-9]+$' "$SANDBOX/socket-inj.conf" 2>/dev/null; then
+        inj_ok "9. 換回裸的 ListenStream=<port> 後第 3 條會紅（重現真正的事故成因）"
     else
-        inj_bad "9. 注入後第一行仍是空的 ListenStream=（注入沒生效）"
+        inj_bad "9. 注入沒生效（檔案裡沒有裸的 ListenStream）"
     fi
 fi
 

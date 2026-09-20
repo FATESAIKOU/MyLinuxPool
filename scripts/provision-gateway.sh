@@ -161,10 +161,21 @@ provision_ssh_listen_ports() {
         exit 1
     fi
 
+    # BOTH address families, explicitly, for every port. This is the bug
+    # that took the Gateway down on 2026-09-20: a bare `ListenStream=22`
+    # looks like "listen on port 22" but Ubuntu's ssh.socket ships
+    # BindIPv6Only=ipv6-only, so a bare port creates ONLY an IPv6 socket.
+    # Every IPv4 client — which is every client, Linode reaches the machine
+    # over IPv4 — then gets Connection refused, while `ss` on the machine
+    # cheerfully shows the port listening and ICMP still answers. That is
+    # exactly why the vendor unit spells out 0.0.0.0:22 AND [::]:22 instead
+    # of writing 22, and why clearing ListenStream= means taking on the
+    # obligation to spell out both halves again.
     local desired
     desired="[Socket]"$'\n'"ListenStream="
     for p in "${ports[@]}"; do
-        desired+=$'\n'"ListenStream=${p}"
+        desired+=$'\n'"ListenStream=0.0.0.0:${p}"
+        desired+=$'\n'"ListenStream=[::]:${p}"
     done
 
     if [[ -f "$SSH_SOCKET_CONF" ]] && [[ "$(cat "$SSH_SOCKET_CONF")" == "$desired" ]]; then
@@ -191,9 +202,15 @@ provision_ssh_listen_ports() {
     # Verify every requested port is actually accepting. A socket unit that
     # starts but binds nothing still counts as "started", and the next
     # thing to notice would be a locked-out operator.
+    # Check the IPv4 socket specifically, not just "something is listening
+    # on this port". The outage was an IPv6-only socket, which a
+    # family-agnostic check reports as perfectly healthy.
     local missing=""
     for p in "${ports[@]}"; do
-        ss -lnt "sport = :${p}" 2>/dev/null | grep -q LISTEN || missing+="${p} "
+        ss -lnt 2>/dev/null | awk -v p=":${p}$" '''$4 ~ /^0\.0\.0\.0:/ && $4 ~ p {found=1} END{exit !found}''' \
+            || missing+="${p}/IPv4 "
+        ss -lnt 2>/dev/null | awk -v p=":${p}$" '''$4 ~ /^\[::\]:/ && $4 ~ p {found=1} END{exit !found}''' \
+            || missing+="${p}/IPv6 "
     done
     if [[ -n "$missing" ]]; then
         log ERROR "ssh.socket restarted but is not listening on: ${missing}— reverting"

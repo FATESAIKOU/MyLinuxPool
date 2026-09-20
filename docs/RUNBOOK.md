@@ -939,11 +939,11 @@ WORKER_KEY_B64: ${{ steps.mint.outputs.private_key_b64 }}
 
 結果是整台機器完全沒有 sshd 在聽，重開機也救不回來，最後只能 rotate 重建。
 
-#### 機制
+#### 真正的成因（2026-09-21 在拋棄式機器上實測確認）
 
 Ubuntu 24.04 的 sshd 由 **`ssh.socket`** 啟動，監聽埠來自它的
 `ListenStream=`，`sshd_config` 的 `Port` 完全無效。所以改法是寫一份
-drop-in：
+drop-in——而當時寫成這樣：
 
 ```
 [Socket]
@@ -951,6 +951,32 @@ ListenStream=
 ListenStream=22
 ListenStream=2100
 ```
+
+**這份設定只會綁 IPv6。** Ubuntu 的 `ssh.socket` 帶著
+`BindIPv6Only=ipv6-only`，所以裸的 `ListenStream=<port>` 產生的是單一個
+IPv6 socket，不會有 IPv4 的。原廠 unit 之所以寫成兩行——
+
+```
+ListenStream=0.0.0.0:22
+ListenStream=[::]:22
+```
+
+——正是為了這件事。一旦 `ListenStream=` 清空，就等於接下「兩個位址族都要
+自己補回來」的義務。
+
+實測證據（拋棄式機器，無任何防火牆）：
+
+```
+BindIPv6Only = ipv6-only
+內部 ::1:22            → SSH-2.0-            ✓
+內部 127.0.0.1:22      → Connection refused  ✗
+內部 172.105.x.x:22    → Connection refused  ✗
+```
+
+Linode 走 IPv4，所以「全世界都連不進來、ping 卻正常、機器上 `ss` 顯示埠
+在聽」。這三個現象放在一起就是 IPv6-only socket 的指紋。
+
+改成兩行之後，22 與 2100 從外面都能真的 ssh 進去，**重開機後仍然存活**。
 
 然後 `systemctl daemon-reload && systemctl restart ssh.socket`。
 
@@ -997,16 +1023,30 @@ Gateway 是唯一入口，而它的救援路徑全部依賴 SSH：
 （`scripts/provision-gateway.sh` 的 `provision_ssh_listen_ports`，
 `scripts/tests/test-gateway-ssh-port.sh` 第 0 條盯著它）。
 
-#### 要再做 2100 的話
+#### 正確做法
 
-不要再用推理決定做法。先開一台**拋棄式** Linode，在真實的
-socket-activated sshd 上把下列問題實測清楚：
+```
+[Socket]
+ListenStream=
+ListenStream=0.0.0.0:22
+ListenStream=[::]:22
+ListenStream=0.0.0.0:2100
+ListenStream=[::]:2100
+```
 
-1. `ssh.socket` 與 `ssh.service` 同時 active 時，restart socket 到底發生什麼
-2. 正確做法是 mask `ssh.service`、還是停掉 socket 改用 `ssh.service` 的 `Port`
-3. 改完**重開機**確認仍然可達（這次就是重開機才發現真的壞了）
+`ssh.socket` 與 `ssh.service` 同時 active 是**正常的**（service 是
+`TriggeredBy=ssh.socket`），當初懷疑的這一點與事故無關。
 
-驗證通過再回到 `provision-gateway.sh`，而且驗證要從機器外面做。
+#### 這次學到最貴的一課
+
+檢查「埠在不在聽」而不分位址族，等於沒檢查。`provision_ssh_listen_ports`
+現在分別確認 `0.0.0.0:<port>` 與 `[::]:<port>` 各自存在，
+`test-gateway-ssh-port.sh` 的假 `ss` 也能表達「只有 IPv6」這個狀態，
+第 6 條就是拿它當輸入；第 9 條注入直接把設定換回裸的
+`ListenStream=<port>`，確認第 3 條會紅。
+
+> 一個「看起來在聽」的 socket 不等於「連得進來」。要驗就從機器外面、用
+> 真正的 ssh 連線驗，而且重開機後再驗一次。
 
 
 ## 8. 改了 provision-gateway.sh 之後
