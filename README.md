@@ -19,7 +19,7 @@
                           │ ssh
                           ▼
         ┌─────────────────────────────────────┐
-        │ GATEWAY (Linode)      [:22 唯一公開埠] │
+        │ GATEWAY (Linode)    [:2100 唯一公開埠] │
         │ 127.0.0.1                            │
         │   :2222  :2226  │  :2300 :2301 …     │
         │   provider 固定段 │  worker 動態段     │
@@ -45,6 +45,24 @@
 
 隧道終結在 Gateway 的 **loopback**，不是 `0.0.0.0`。所以就算 Gateway 被打，
 外面也看不到那些埠——必須先登入 Gateway 才碰得到。
+
+## Gateway 的 SSH 埠：`NODE_GATEWAY.port`
+
+`2100`，不是 22。埠由 `NODE_GATEWAY.port` 這**一個欄位**決定——所有 client
+（`mlp`、`pool-status`、`pool-tunnel`、Actions、外部 client）都從它讀，
+機器自己也由它佈署，所以兩邊不可能對不上。欄位不存在時等於 22。
+
+worker 是例外：它沒有 GitHub 憑證、讀不到 var，所以 provider 把埠一起
+發布在 `~/.mylinuxpool/gateway/gateway.json` 的 `ssh_port` 裡，worker 從那裡讀。
+
+搬離 22 的目的是減少大規模掃描的雜訊（實測過：機器人每兩秒試一次 root，
+2100 上完全沒有這種流量），順帶讓擋 22 的網路也能連。**它不是安全強化**
+——針對性的全埠掃描幾秒就找得到 2100。
+
+要再搬一次：改 `NODE_GATEWAY.port`，並在遷移期間用 `ssh_listen_ports`
+（陣列）讓機器同時聽新舊兩個埠，全部 client 轉移完成後再拿掉舊的。
+過程與踩過的坑見 RUNBOOK §7.14——**`ListenStream=<port>` 裸寫在
+`BindIPv6Only=ipv6-only` 之下只會綁 IPv6，曾經把整台 Gateway 弄到必須重建。**
 
 ## 定址：GitHub repo vars 是唯一真實來源
 
