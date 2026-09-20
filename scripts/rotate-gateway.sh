@@ -312,13 +312,16 @@ ssh -o UserKnownHostsFile=\$KH -o StrictHostKeyChecking=yes"
 }
 
 
-# rotate_deploy_repo_bundle <user> <ip>
+# rotate_deploy_repo_bundle <user> <ip> [<port>]
 #   Ships shared-configs/ + scripts/ (still encrypted, decryption happens
 #   per-unit on the Gateway inside provision-gateway.sh's own unit-install
 #   calls) to the path provision-gateway.sh expects. Run from the repo
 #   root — REPO_ROOT is derived from this file's own location.
 rotate_deploy_repo_bundle() {
     local user="$1" ip="$2"
+    # Which port to REACH the machine on. A fresh Linode boots on 22; a
+    # machine that has already been provisioned may have moved.
+    local port="${3:-22}"
     local repo_root stage
 
     repo_root="$(cd "${SCRIPT_DIR}/.." && pwd)"
@@ -328,12 +331,14 @@ rotate_deploy_repo_bundle() {
     cp -a "${repo_root}/shared-configs" "$stage/"
     cp -a "${repo_root}/scripts" "$stage/"
 
-    scp -o StrictHostKeyChecking=accept-new -r "$stage" "${user}@${ip}:/tmp/mlp-repo"
-    ssh -o StrictHostKeyChecking=accept-new "${user}@${ip}" \
+    # scp spells the port -P, ssh spells it -p. Getting that backwards is
+    # a silent "unknown option" rather than a wrong port, but it still fails.
+    scp -o StrictHostKeyChecking=accept-new -P "$port" -r "$stage" "${user}@${ip}:/tmp/mlp-repo"
+    ssh -o StrictHostKeyChecking=accept-new -p "$port" "${user}@${ip}" \
         'sudo mkdir -p /home/fatesaikou/.mylinuxpool/repo && sudo cp -a /tmp/mlp-repo/. /home/fatesaikou/.mylinuxpool/repo/ && sudo rm -rf /tmp/mlp-repo'
 }
 
-# rotate_run_provision <user> <ip> <trusted_ips> <file_crypto_key> [<listen_ports>]
+# rotate_run_provision <user> <ip> <trusted_ips> <file_crypto_key> [<listen_ports>] [<connect_port>]
 #   Runs provision-gateway.sh on the (preview) Gateway. RUNBOOK.md §9's
 #   correct shape: the script is ALREADY a file on the remote
 #   (/home/fatesaikou/.mylinuxpool/repo/scripts/ — rotate_deploy_repo_bundle
@@ -353,13 +358,18 @@ rotate_run_provision() {
     # from NODE_GATEWAY, the same place clients read the port from, so the
     # two can never disagree.
     local listen_ports="${5:-22}"
+    # Which port to REACH the machine on, as opposed to which ports it
+    # should end up listening on. On a rotate these differ: a fresh Linode
+    # is reached on 22 and told to listen on 2100. On a repair they are the
+    # same, because the machine already moved.
+    local connect_port="${6:-22}"
     local provision_script="/home/fatesaikou/.mylinuxpool/repo/scripts/provision-gateway.sh"
 
     # A fresh Linode boots with sshd on 22, so provisioning always REACHES
     # the machine on 22 (or whatever the caller resolved) and only then
     # changes what it listens on. That ordering is why the port change can
     # never strand the provisioning session that is making it.
-    printf '%s' "$file_crypto_key" | ssh -o StrictHostKeyChecking=accept-new "${user}@${ip}" \
+    printf '%s' "$file_crypto_key" | ssh -o StrictHostKeyChecking=accept-new -p "$connect_port" "${user}@${ip}" \
         "sudo env POOL_TRUSTED_IPS=$(printf '%q' "$trusted_ips") \
               GATEWAY_SSH_LISTEN_PORTS=$(printf '%q' "$listen_ports") \
               bash ${provision_script}"

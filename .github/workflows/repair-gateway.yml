@@ -77,7 +77,8 @@ jobs:
         run: |
           set -euo pipefail
           source scripts/rotate-gateway.sh
-          rotate_deploy_repo_bundle fatesaikou "$GW_IP"
+          # The live Gateway, which has already moved to NODE_GATEWAY.port.
+          rotate_deploy_repo_bundle fatesaikou "$GW_IP" "${{ steps.gw.outputs.ssh_port }}"
 
       - name: Run provision-gateway.sh
         shell: bash
@@ -95,7 +96,8 @@ jobs:
           gw_json="$(gh api "repos/${GH_REPO}/actions/variables/NODE_GATEWAY" --jq .value)"
           listen_ports="$(printf '%s' "$gw_json" \
             | jq -r '(.ssh_listen_ports // [(.port // 22)]) | map(tostring) | join(" ")')"
-          rotate_run_provision fatesaikou "$GW_IP" "$trusted_ips" "$FILE_CRYPTO_KEY" "$listen_ports"
+          rotate_run_provision fatesaikou "$GW_IP" "$trusted_ips" "$FILE_CRYPTO_KEY" \
+            "$listen_ports" "${{ steps.gw.outputs.ssh_port }}"
 
       # The state cache is part of provisioning, not an afterthought: a
       # Gateway without it serves nothing to the nodes that now prefer it.
