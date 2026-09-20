@@ -129,6 +129,25 @@ EOF
 provision_ssh_listen_ports() {
     log INFO "step 1b/6: sshd listen ports (${GATEWAY_SSH_LISTEN_PORTS})"
 
+    # DO NOT TOUCH A WORKING DEFAULT. 2026-09-20: writing this drop-in and
+    # restarting ssh.socket took the live Gateway down completely — the
+    # restart reported success, the immediate `ss` check passed, and two
+    # seconds later nothing was listening on any port. A reboot did not
+    # bring it back, so the drop-in breaks ssh.socket at boot too, and
+    # because Ubuntu's ssh.service depends on the socket in this mode,
+    # there was no sshd at all and no way in (the machine had to be
+    # rebuilt).
+    #
+    # Until that is understood and covered by a test that runs against a
+    # real socket-activated sshd, the default path does NOTHING: a machine
+    # that only needs port 22 is left exactly as the distro shipped it.
+    # The code below runs only when someone explicitly asks for a port set
+    # other than the default and there is a drop-in to converge.
+    if [[ "$GATEWAY_SSH_LISTEN_PORTS" == "22" && ! -f "$SSH_SOCKET_CONF" ]]; then
+        log INFO "step 1b/6: default port 22 and no drop-in installed — leaving ssh.socket untouched"
+        return 0
+    fi
+
     local p ports=()
     for p in $GATEWAY_SSH_LISTEN_PORTS; do
         if ! [[ "$p" =~ ^[0-9]+$ ]] || (( p < 1 || p > 65535 )); then

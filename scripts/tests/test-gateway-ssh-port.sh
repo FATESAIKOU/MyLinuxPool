@@ -97,6 +97,24 @@ run_ports() {   # $1 = 埠清單, $2 = 假裝在聽的埠清單
     exec_prov "$prov" "$SANDBOX/socket.conf" "$1" "$2"
 }
 
+echo "=== 0. 預設情況完全不碰 ssh.socket（最重要的一條）==="
+# 2026-09-20：寫 drop-in 並重啟 ssh.socket 把現役 Gateway 弄到完全沒有 sshd
+# 在聽，重開機也救不回來，最後只能重建。在那個根因被理解並用真實的
+# socket-activated sshd 驗證之前，只需要 22 的機器必須原封不動。
+command rm -f "$SANDBOX/socket.conf" "$SANDBOX/systemctl.log"
+: > "$SANDBOX/systemctl.log"
+if run_ports "22" "22"; then
+    if [[ -f "$SANDBOX/socket.conf" ]]; then
+        bad "0. 預設 22 卻還是寫了 drop-in"
+    elif grep -q 'restart ssh.socket' "$SANDBOX/systemctl.log" 2>/dev/null; then
+        bad "0. 預設 22 卻還是重啟了 ssh.socket——那正是弄死 Gateway 的那個動作"
+    else
+        ok "0. 預設 22 且沒有既有 drop-in 時：不寫檔、不重啟，什麼都不做"
+    fi
+else
+    bad "0. 預設情況竟然失敗: ${OUT}"
+fi
+
 echo "=== 1-3. 寫對地方、寫對內容 ==="
 if grep -q 'SSH_SOCKET_CONF=.*ssh\.socket\.d' "$PROV" && grep -q 'ListenStream' "$PROV"; then
     ok "1a. 設定寫進 ssh.socket 的 drop-in"
