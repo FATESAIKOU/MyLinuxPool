@@ -259,7 +259,7 @@ if [[ -n "$GW_IP" ]]; then
         # that defines TUNNEL_KEY. Without -i, ssh never tries id_mlp.
         admin_ident=()
         [[ -n "${CLIENT_KEY:-}" ]] && admin_ident=(-i "$CLIENT_KEY" -o IdentitiesOnly=yes)
-        ssh_err="$(tmo 12 ssh "${SSH_OPTS[@]}" ${admin_ident[@]+"${admin_ident[@]}"} \
+        ssh_err="$(tmo 12 ssh "${SSH_OPTS[@]}" ${admin_ident[@]+"${admin_ident[@]}"} -p "$GW_PORT" \
             "${GW_USER}@${GW_IP}" true 2>&1)"
         ssh_rc=$?
         if [[ $ssh_rc -eq 0 ]]; then
@@ -267,7 +267,7 @@ if [[ -n "$GW_IP" ]]; then
             GW_SSH_EXTRA=(${admin_ident[@]+"${admin_ident[@]}"})
             GW_LOGIN_OK=1
         elif [[ -f "$TUNNEL_KEY" && -n "$GW_TUNNEL_USER" ]]; then
-            ssh_err="$(tmo 12 ssh "${SSH_OPTS[@]}" -i "$TUNNEL_KEY" -o IdentitiesOnly=yes \
+            ssh_err="$(tmo 12 ssh "${SSH_OPTS[@]}" -i "$TUNNEL_KEY" -o IdentitiesOnly=yes -p "$GW_PORT" \
                 "${GW_TUNNEL_USER}@${GW_IP}" true 2>&1)"
             ssh_rc=$?
             if [[ $ssh_rc -eq 0 ]]; then

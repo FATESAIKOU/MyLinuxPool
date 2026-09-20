@@ -199,7 +199,7 @@ rotate_wait_for_cloud_init() {
     esac
 }
 
-# rotate_live_providers <user> <gateway_ip> <name:port> [<name:port>...]
+# rotate_live_providers <user> <gateway_ip> <host_key> <gw_port> <name:port> ...
 #   Prints the "name port" pairs whose forwarded port answers with a real
 #   SSH banner on the CURRENT Gateway, one per line.
 #
@@ -225,7 +225,9 @@ rotate_wait_for_cloud_init() {
 #   belong to a machine that no longer exists — that is what made every
 #   provider look offline the first time this ran from a laptop.
 rotate_live_providers() {
-    local user="$1" gw_ip="$2" host_key="$3"; shift 3
+    # Probes the OLD, live Gateway — which by definition already listens on
+    # whatever NODE_GATEWAY.port says, not on 22.
+    local user="$1" gw_ip="$2" host_key="$3" gw_port="${4:-22}"; shift 4
     local spec name port banner kh
     local -a hk_opts
 
@@ -244,7 +246,7 @@ rotate_live_providers() {
         name="${spec%%:*}"; port="${spec##*:}"
         [[ -n "$name" && -n "$port" ]] || continue
         banner="$(ssh "${hk_opts[@]}" -o BatchMode=yes \
-                    -o ConnectTimeout=10 "${user}@${gw_ip}" \
+                    -o ConnectTimeout=10 -p "$gw_port" "${user}@${gw_ip}" \
                     "timeout 2 nc 127.0.0.1 ${port} </dev/null | head -c 4" 2>/dev/null)"
         if [[ "$banner" == SSH-* ]]; then
             printf '%s %s\n' "$name" "$port"
@@ -285,6 +287,11 @@ rotate_live_providers() {
 source "$(cd "${SCRIPT_DIR}/../shared-configs/pool-runtime/files" && pwd)/tunnel-identity.sh"
 rotate_build_tunnel_probe_cmd() {
     local new_ip="$1" tunnel_user="$2" probe_port="$3" host_key="${4:-}"
+    # The new Gateway's SSH port. The probe has to dial it exactly like the
+    # real tunnel will — a probe that reached the machine on a port the
+    # providers do not use would pass on a Gateway none of them can reach,
+    # which is the failure it exists to catch.
+    local gw_port="${5:-22}"
     local hostkey_part
     # TUNNEL_KEY has ONE definition (pool-runtime/files/tunnel-identity.sh);
     # the probe must source it ON THE PROVIDER rather than spell the path
@@ -307,7 +314,7 @@ ssh -o UserKnownHostsFile=\$KH -o StrictHostKeyChecking=yes"
     printf '%s\n' "${hostkey_part} -o BatchMode=yes \
 -o ExitOnForwardFailure=yes -o AddressFamily=inet -o ConnectTimeout=10 \
 -i \$TUNNEL_KEY -o IdentitiesOnly=yes \
--R 127.0.0.1:${probe_port}:localhost:22 ${tunnel_user}@${new_ip} \
+-R 127.0.0.1:${probe_port}:localhost:22 -p ${gw_port} ${tunnel_user}@${new_ip} \
 'echo TUNNEL_PROBE_OK'; rc=\$?; rm -f \$KH; exit \$rc"
 }
 

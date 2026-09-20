@@ -420,7 +420,7 @@ jobs:
           trap 'ssh-agent -k >/dev/null 2>&1 || true' EXIT
           ssh-add - <<< "$SSH_KEY_ACTIONS" >/dev/null
 
-          if ! create_worker_verify_reachable "${{ steps.gateway.outputs.user }}" "${{ steps.gateway.outputs.ip }}" "${{ steps.port.outputs.port }}"; then
+          if ! create_worker_verify_reachable "${{ steps.gateway.outputs.user }}" "${{ steps.gateway.outputs.ip }}" "${{ steps.port.outputs.port }}" 30 "${{ steps.gateway.outputs.ssh_port }}"; then
             echo "::error::could not authenticate to the new worker — see log above"
             exit 1
           fi

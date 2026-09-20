@@ -257,7 +257,7 @@ cmd_trust_gateway() {
     echo "cleared any old host key entry for ${GW_IP} in ${GW_KNOWN_HOSTS}"
 
     local ident2; read -r -a ident2 <<< "$(client_identity_opts)"
-    if ssh -o UserKnownHostsFile="$GW_KNOWN_HOSTS" -o StrictHostKeyChecking=accept-new \
+    if ssh -o UserKnownHostsFile="$GW_KNOWN_HOSTS" -o StrictHostKeyChecking=accept-new -p "$GW_PORT" \
            "${ident2[@]}" \
            -o ConnectTimeout=8 -o BatchMode=yes "${GW_USER}@${GW_IP}" true < /dev/null 2>/dev/null; then
         printf '%strusted Gateway host key for %s%s → %s\n' "$C_GREEN" "$GW_IP" "$C_RESET" "$GW_KNOWN_HOSTS"

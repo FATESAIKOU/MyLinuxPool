@@ -57,6 +57,26 @@ ok "$n 個 Dockerfile COPY 來源"
 # GitHub 對「引用不存在的 output」不報錯，只回空字串——2026-09-16 就是這樣
 # 把一條空指令送進 pool-ssh 才炸的（產生 read_pubkey_cmd 的程式碼貼錯步驟，
 # 兩個步驟的結尾剛好一樣）。看不懂寫法的步驟會被略過，見 helper 的說明。
+# 對池裡的機器發 ssh/scp 時必須明確指定埠。2026-09-20 把 Gateway 從 22 搬到
+# 2100 時，這類呼叫一個一個在正式流程上炸出來，總共八處；一次抓完比較好。
+SSH_PORT_CHK="scripts/tests/helpers/ssh-port-audit.py"
+if [ -f "$SSH_PORT_CHK" ] && command -v python3 >/dev/null 2>&1; then
+    if out="$(python3 "$SSH_PORT_CHK" \
+            scripts/rotate-gateway.sh scripts/create-worker.sh \
+            .github/actions/push-state/run.sh \
+            shared-configs/pool-runtime/files/pool-tunnel \
+            shared-configs/pool-runtime/files/pool-status \
+            ops-scripts/mlp ops-scripts/verify-profile scripts/lib/ssh.sh 2>&1)"; then
+        ok "對 Gateway 的 ssh/scp 都指定了埠"
+    else
+        while IFS= read -r line; do
+            [ -n "$line" ] && bad "$line"
+        done <<< "$out"
+    fi
+else
+    bad "找不到 ${SSH_PORT_CHK} 或 python3——無法檢查 ssh 埠"
+fi
+
 WF_OUT_CHK="scripts/tests/helpers/wf-step-outputs.py"
 if [ -f "$WF_OUT_CHK" ] && command -v python3 >/dev/null 2>&1; then
     if out="$(python3 "$WF_OUT_CHK" .github/workflows/*.yml 2>&1)"; then

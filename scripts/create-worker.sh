@@ -245,10 +245,14 @@ create_worker_build_run_cmd() {
 #   caller's ssh-agent already holds whatever identity is needed.
 create_worker_verify_reachable() {
     local gw_user="$1" gw_ip="$2" port="$3" max_tries="${4:-30}"
+    # The Gateway's own SSH port, for the -J hop. Defaults to 22; note that
+    # -J takes the port inside the destination spec (user@host:port), NOT
+    # via -p — -p belongs to the final hop, the worker's loopback port.
+    local gw_port="${5:-22}"
     local i out
     for (( i = 1; i <= max_tries; i++ )); do
         if out="$(ssh -o StrictHostKeyChecking=accept-new -o ConnectTimeout=5 -o BatchMode=yes \
-                -J "${gw_user}@${gw_ip}" -p "$port" worker@127.0.0.1 whoami 2>&1)"; then
+                -J "${gw_user}@${gw_ip}:${gw_port}" -p "$port" worker@127.0.0.1 whoami 2>&1)"; then
             if [[ "$out" == "worker" ]]; then
                 log INFO "authenticated ok (whoami=${out}) after ${i} attempt(s)"
                 return 0
@@ -257,6 +261,6 @@ create_worker_verify_reachable() {
         fi
         sleep 2
     done
-    log ERROR "could not authenticate as worker@127.0.0.1:${port} via ${gw_user}@${gw_ip} after ${max_tries} attempts"
+    log ERROR "could not authenticate as worker@127.0.0.1:${port} via ${gw_user}@${gw_ip}:${gw_port} after ${max_tries} attempts"
     return 1
 }

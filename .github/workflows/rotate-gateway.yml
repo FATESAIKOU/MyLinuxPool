@@ -272,7 +272,7 @@ jobs:
           # Keep only well-formed "<name> <port>" lines. Anything else on
           # stdout is not a provider, and silently treating it as one is how
           # a stray log line became the probe target once already.
-          live="$(rotate_live_providers fatesaikou "$OLD_IP" "$OLD_HOST_KEY" "${specs[@]}" \
+          live="$(rotate_live_providers fatesaikou "$OLD_IP" "$OLD_HOST_KEY" "${{ steps.listen.outputs.ssh_port }}" "${specs[@]}" \
                   | grep -E '^[A-Za-z0-9][A-Za-z0-9._-]* [0-9]+$' || true)"
           ports="$(awk '{print $2}' <<<"$live" | tr '\n' ' ' | sed 's/ $//')"
           node="$(awk 'NR==1{print $1}' <<<"$live")"
@@ -295,7 +295,7 @@ jobs:
           # Read over the session that just provisioned it, then carry it
           # in NODE_GATEWAY so providers verify the machine instead of
           # trusting whatever answers on a recycled address.
-          key="$(rotate_read_host_key fatesaikou "$PREVIEW_IP")"
+          key="$(rotate_read_host_key fatesaikou "$PREVIEW_IP" "${{ steps.listen.outputs.ssh_port }}")"
           echo "key=${key}" >> "$GITHUB_OUTPUT"
           if [[ -z "$key" ]]; then
             echo "::warning::could not read the new Gateway's host key; providers will fall back to trust-on-first-use"
@@ -310,7 +310,7 @@ jobs:
         run: |
           set -euo pipefail
           source scripts/rotate-gateway.sh
-          cmd="$(rotate_build_tunnel_probe_cmd "$PREVIEW_IP" sshproxy 2999 "$HOST_KEY")"
+          cmd="$(rotate_build_tunnel_probe_cmd "$PREVIEW_IP" sshproxy 2999 "$HOST_KEY" "${{ steps.listen.outputs.ssh_port }}")"
           echo "cmd=${cmd}" >> "$GITHUB_OUTPUT"
 
       - name: Run the probe on a provider that is attached
