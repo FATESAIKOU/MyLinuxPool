@@ -932,6 +932,83 @@ WORKER_KEY_B64: ${{ steps.mint.outputs.private_key_b64 }}
 > 對策是在測試裡**模擬另一個平台的行為**（放一個會折行的假 `base64`），
 > 而不是期待哪天在對的平台上跑到。
 
+### 7.14 在 socket 啟動的 sshd 上改監聽埠，把唯一的入口弄死
+
+2026-09-20。目標是讓 Gateway 從 22 搬到 2100（減少掃描雜訊，順帶穿透
+擋 22 的網路）。第一步刻意設計成「同時聽 22 與 2100」，好讓切換可回復。
+
+結果是整台機器完全沒有 sshd 在聽，重開機也救不回來，最後只能 rotate 重建。
+
+#### 機制
+
+Ubuntu 24.04 的 sshd 由 **`ssh.socket`** 啟動，監聽埠來自它的
+`ListenStream=`，`sshd_config` 的 `Port` 完全無效。所以改法是寫一份
+drop-in：
+
+```
+[Socket]
+ListenStream=
+ListenStream=22
+ListenStream=2100
+```
+
+然後 `systemctl daemon-reload && systemctl restart ssh.socket`。
+
+日誌顯示這一步「成功」：
+
+```
+13:56:29 INFO wrote /etc/systemd/system/ssh.socket.d/10-mylinuxpool.conf; listening on 22 2100
+13:56:30 INFO all checks passed: sshd config valid, fail2ban active, ...
+13:56:31 ssh: connect to host 172.105.240.197 port 22: Connection refused
+```
+
+**兩秒。** 而且是 Actions 的下一步就撞上，不是某個 client 的網路問題。
+重開機之後仍然兩個埠都 refused——drop-in 在開機時同樣讓 socket 失敗，而
+`ssh.service` 在這個模式下依賴 socket，於是連 22 都起不來。
+
+#### 為什麼防線沒擋住
+
+當時已經寫了防線：重啟後用 `ss` 確認每個埠都在聽，沒在聽就還原 drop-in
+並以非 0 結束。它回報通過。
+
+**因為檢查得太早。** restart 之後那一瞬間，舊的 listener 可能還在
+（`ssh.socket` 與 `ssh.service` 當時都是 active——這個狀態在稍早的排查
+就親眼看過，卻沒想清楚它代表什麼）。`ss` 看到的 22 是別人持有的，於是
+「驗證通過」，真正的崩潰發生在兩秒後、腳本早就結束了。
+
+> 驗證一個非同步的狀態變更時，「剛才那一刻成立」不等於「穩定下來之後成立」。
+> 這條防線若要有意義，得在重啟後等待並重複檢查，最好是**從外面**另開一條
+> 連線驗證，而不是在機器上問它自己。
+
+#### 為什麼特別致命
+
+Gateway 是唯一入口，而它的救援路徑全部依賴 SSH：
+
+- `repair-gateway` 自己走 SSH
+- `rotate` 產生的 root 密碼當場丟棄，LISH 主控台登不進去（§7.7）
+- provider 與 worker 的隧道也是往它連
+
+所以一旦 sshd 死掉，**沒有任何一條內建路徑能修它**，只能重建。
+
+#### 現在的狀態
+
+預設路徑**完全不碰 `ssh.socket`**：只要 22 且沒有既有 drop-in 就不寫檔、
+不重啟，新機器的佈署與這次改動之前逐位元組相同
+（`scripts/provision-gateway.sh` 的 `provision_ssh_listen_ports`，
+`scripts/tests/test-gateway-ssh-port.sh` 第 0 條盯著它）。
+
+#### 要再做 2100 的話
+
+不要再用推理決定做法。先開一台**拋棄式** Linode，在真實的
+socket-activated sshd 上把下列問題實測清楚：
+
+1. `ssh.socket` 與 `ssh.service` 同時 active 時，restart socket 到底發生什麼
+2. 正確做法是 mask `ssh.service`、還是停掉 socket 改用 `ssh.service` 的 `Port`
+3. 改完**重開機**確認仍然可達（這次就是重開機才發現真的壞了）
+
+驗證通過再回到 `provision-gateway.sh`，而且驗證要從機器外面做。
+
+
 ## 8. 改了 provision-gateway.sh 之後
 
 `scripts/provision-gateway.sh` 的改動**只對下一台 rotate 出來的機器生效**。現行
