@@ -160,6 +160,9 @@ fi
 
 GW_JSON=""
 GW_IP=""
+# NODE_GATEWAY.port is the one definition of the Gateway's SSH port;
+# absent means 22 (every machine before the port moved).
+GW_PORT="22"
 GW_USER=""
 GW_TUNNEL_USER=""
 GW_ERR=""
@@ -182,6 +185,7 @@ else
             report OK "pool-resolve gateway" "成功（GitHub 認證正常）"
         fi
         GW_IP="$(printf '%s' "$GW_JSON" | jq -r '.ip // empty' 2>/dev/null)"
+        GW_PORT="$(printf '%s' "$GW_JSON" | jq -r '.port // 22' 2>/dev/null)"
         GW_USER="$(printf '%s' "$GW_JSON" | jq -r '.user // empty' 2>/dev/null)"
         GW_TUNNEL_USER="$(printf '%s' "$GW_JSON" | jq -r '.tunnel_user // empty' 2>/dev/null)"
 
@@ -220,28 +224,28 @@ GW_PORTS=""
 GW_SS=""
 
 gw_ssh() {
-    tmo 25 ssh "${SSH_OPTS[@]}" ${GW_SSH_EXTRA[@]+"${GW_SSH_EXTRA[@]}"} \
+    tmo 25 ssh "${SSH_OPTS[@]}" ${GW_SSH_EXTRA[@]+"${GW_SSH_EXTRA[@]}"} -p "$GW_PORT" \
         "${GW_LOGIN_USER}@${GW_IP}" "$1" 2>&1
 }
 
 if [[ -n "$GW_IP" ]]; then
-    TCP_CLASS="$(tcp_classify "$GW_IP" 22)"
+    TCP_CLASS="$(tcp_classify "$GW_IP" "$GW_PORT")"
     case "$TCP_CLASS" in
         ok)
-            report OK "Gateway TCP 22" "${GW_IP}:22 可達"
+            report OK "Gateway TCP ${GW_PORT}" "${GW_IP}:${GW_PORT} 可達"
             ;;
         timeout)
-            report FAIL "Gateway TCP 22" "逾時（${GW_IP}:22；可能是網路或防火牆 DROP）"
+            report FAIL "Gateway TCP ${GW_PORT}" "逾時（${GW_IP}:${GW_PORT}；可能是網路或防火牆 DROP）"
             ;;
         refused)
-            report FAIL "Gateway TCP 22" "立即被拒（${GW_IP}:22 Connection refused）"
+            report FAIL "Gateway TCP ${GW_PORT}" "立即被拒（${GW_IP}:${GW_PORT} Connection refused）"
             printf '       hint: 若 ICMP 通但 TCP 立即被拒，優先懷疑 fail2ban，執行 `nft list ruleset | grep -A5 f2b-table` 檢查\n'
             ;;
         dns)
-            report FAIL "Gateway TCP 22" "DNS/解析錯誤（${GW_IP}）"
+            report FAIL "Gateway TCP ${GW_PORT}" "DNS/解析錯誤（${GW_IP}）"
             ;;
         *)
-            report FAIL "Gateway TCP 22" "其他連線錯誤（${GW_IP}:22）"
+            report FAIL "Gateway TCP ${GW_PORT}" "其他連線錯誤（${GW_IP}:${GW_PORT}）"
             ;;
     esac
 

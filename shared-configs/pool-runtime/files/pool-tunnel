@@ -37,6 +37,11 @@ ONCE=0
 # Connection state, populated by resolve_connection_info().
 GW_IP=""
 GW_USER=""
+# The Gateway's SSH port. One definition lives in NODE_GATEWAY.port; a
+# worker cannot read that (it holds no GitHub credential), so the provider
+# republishes it into gateway.json as ssh_port. Absent means 22 everywhere,
+# which is what every machine ran before the port moved.
+GW_SSH_PORT="22"
 GW_GEN=""
 GW_HOST_KEY=""
 MY_PORT=""
@@ -135,8 +140,10 @@ publish_gateway() {
     if [[ -f "$GATEWAY_PUBLISH_FILE" ]]; then
         local current
         current="$(jq -r --arg ip "$GW_IP" --arg user "$GW_USER" \
+            --arg port "${GW_SSH_PORT:-22}" \
             --arg gen "${GW_GEN:-}" --arg hk "${GW_HOST_KEY:-}" \
             'select(.ip == $ip and .tunnel_user == $user
+                    and ((.ssh_port // 22) | tostring) == $port
                     and .generation == $gen and .host_key == $hk)' \
             "$GATEWAY_PUBLISH_FILE" 2>/dev/null)"
         [[ -n "$current" ]] && return 0
@@ -146,8 +153,8 @@ publish_gateway() {
     mkdir -p "$GATEWAY_PUBLISH_DIR" 2>/dev/null || return 0
     chmod 755 "$GATEWAY_PUBLISH_DIR" 2>/dev/null || true
     tmp="$(mktemp "${GATEWAY_PUBLISH_DIR}/.gw.XXXXXX" 2>/dev/null)" || return 0
-    printf '{"ip":"%s","tunnel_user":"%s","generation":"%s","host_key":"%s","published_at":"%s"}\n' \
-        "$GW_IP" "$GW_USER" "$GW_GEN" "$GW_HOST_KEY" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$tmp" 2>/dev/null || {
+    printf '{"ip":"%s","tunnel_user":"%s","ssh_port":%s,"generation":"%s","host_key":"%s","published_at":"%s"}\n' \
+        "$GW_IP" "$GW_USER" "${GW_SSH_PORT:-22}" "$GW_GEN" "$GW_HOST_KEY" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$tmp" 2>/dev/null || {
         rm -f "$tmp"; return 0
     }
     chmod 644 "$tmp" 2>/dev/null || true
@@ -181,14 +188,17 @@ pin_gateway_host_key() {
 # file is missing or unreadable, which the caller retries rather than
 # treats as fatal (the provider may not have written it yet).
 read_published_gateway() {
-    local ip user gen hk
+    local ip user gen hk port
     [[ -r "$GATEWAY_FOLLOW_FILE" ]] || return 1
     ip="$(jq -r '.ip // empty' < "$GATEWAY_FOLLOW_FILE" 2>/dev/null)"
     user="$(jq -r '.tunnel_user // empty' < "$GATEWAY_FOLLOW_FILE" 2>/dev/null)"
     gen="$(jq -r '.generation // empty' < "$GATEWAY_FOLLOW_FILE" 2>/dev/null)"
     hk="$(jq -r '.host_key // empty' < "$GATEWAY_FOLLOW_FILE" 2>/dev/null)"
+    # Written by providers since the port became movable. A file from an
+    # older provider has no ssh_port, and 22 is the right answer for it.
+    port="$(jq -r '.ssh_port // 22' < "$GATEWAY_FOLLOW_FILE" 2>/dev/null)"
     [[ -n "$ip" && -n "$user" ]] || return 1
-    printf '%s\t%s\t%s\t%s\n' "$ip" "$user" "$gen" "$hk"
+    printf '%s\t%s\t%s\t%s\t%s\n' "$ip" "$user" "$gen" "$hk" "${port:-22}"
 }
 
 # install_state_cache <state_json> <dest_path>
@@ -303,7 +313,8 @@ resolve_connection_info() {
             log ERROR "no readable Gateway file at ${GATEWAY_FOLLOW_FILE} after 60s and no POOL_GATEWAY_HOST fallback — is the provider's pool-tunnel running?"
             return 1
         fi
-        IFS=$'\t' read -r GW_IP GW_USER GW_GEN GW_HOST_KEY <<< "$pub"
+        IFS=$'\t' read -r GW_IP GW_USER GW_GEN GW_HOST_KEY GW_SSH_PORT <<< "$pub"
+        GW_SSH_PORT="${GW_SSH_PORT:-22}"
         FOLLOW_GATEWAY=1
         log INFO "following ${GATEWAY_FOLLOW_FILE}: ${GW_USER}@${GW_IP} (generation ${GW_GEN:-unknown})"
         return 0
@@ -352,6 +363,7 @@ resolve_connection_info() {
 
     GW_IP="$(printf '%s' "$gw_json" | jq -r '.ip // empty')"
     GW_USER="$(printf '%s' "$gw_json" | jq -r '.tunnel_user // empty')"
+    GW_SSH_PORT="$(printf '%s' "$gw_json" | jq -r '.port // 22')"
     GW_GEN="$(printf '%s' "$gw_json" | jq -r '.generation // empty')"
     GW_HOST_KEY="$(printf '%s' "$gw_json" | jq -r '.host_key // empty')"
 
@@ -480,6 +492,7 @@ start_master() {
         -o AddressFamily=inet
         "${identity_opts[@]}"
         -N -R "127.0.0.1:${MY_PORT}:localhost:22"
+        -p "${GW_SSH_PORT:-22}"
         "${GW_USER}@${GW_IP}"
     )
 

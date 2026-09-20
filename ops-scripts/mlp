@@ -62,6 +62,9 @@ CTL_DIR=""
 CTL=""
 GW_IP=""
 GW_USER=""
+# The Gateway's SSH port. NODE_GATEWAY.port is the one place that says it;
+# absent means 22, which is what every machine had before the port moved.
+GW_PORT="22"
 GW_HOST_KEY=""
 
 # ---- colors: tput, off outside a real terminal --------------------------
@@ -144,6 +147,7 @@ resolve_gateway() {
     [[ $rc -eq 0 ]] || die "pool-resolve gateway failed (exit ${rc})"
     GW_IP="$(printf '%s' "$json" | jq -r '.ip // empty')"
     GW_USER="$(printf '%s' "$json" | jq -r '.user // empty')"
+    GW_PORT="$(printf '%s' "$json" | jq -r '.port // 22')"
     GW_HOST_KEY="$(printf '%s' "$json" | jq -r '.host_key // empty')"
     [[ -n "$GW_IP" && -n "$GW_USER" ]] || die "NODE_GATEWAY is missing ip/user"
 
@@ -210,7 +214,7 @@ open_gateway_master() {
     CTL="${CTL_DIR}/ctl-gateway"
     local err rc
     local ident; read -r -a ident <<< "$(client_identity_opts)"
-    err="$(ssh -M -S "$CTL" -o ControlPersist=60 -o ConnectTimeout=8 \
+    err="$(ssh -M -S "$CTL" -o ControlPersist=60 -o ConnectTimeout=8 -p "$GW_PORT" \
         ${ident[@]+"${ident[@]}"} \
         -o UserKnownHostsFile="$GW_KNOWN_HOSTS" -o StrictHostKeyChecking=accept-new -o BatchMode=yes \
         -N -f "${GW_USER}@${GW_IP}" < /dev/null 2>&1)"
@@ -424,7 +428,7 @@ cmd_ls() {
     # alignment on those instead of ever being "wide enough".
     local name type provider port user state
     local rows=()
-    rows[0]="$(printf 'gateway\tgateway\t-\t22\tup')"
+    rows[0]="$(printf 'gateway\tgateway\t-\t%s\tup' "$GW_PORT")"
 
     while IFS=$'\t' read -r name type provider port user; do
         [[ -n "$name" ]] || continue
@@ -461,13 +465,13 @@ do_connect() {
     local SSH_BATCH_MODE=no
     case "$type" in
         gateway)
-            ssh_gateway_only "$GW_KNOWN_HOSTS" "$GW_USER" "$GW_IP" 22
+            ssh_gateway_only "$GW_KNOWN_HOSTS" "$GW_USER" "$GW_IP" "$GW_PORT"
             ;;
         provider|worker)
             # See scripts/lib/ssh.sh's trust-model note: the Gateway leg
             # is verified (dedicated known_hosts, via ProxyCommand); the
             # 127.0.0.1:<port> leg is not checked at all, on purpose.
-            ssh_via_gateway "$GW_KNOWN_HOSTS" "$GW_USER" "$GW_IP" 22 "$user" 127.0.0.1 "$port"
+            ssh_via_gateway "$GW_KNOWN_HOSTS" "$GW_USER" "$GW_IP" "$GW_PORT" "$user" 127.0.0.1 "$port"
             ;;
         *)
             die "unknown target type: ${type}"
@@ -483,7 +487,7 @@ connect_by_name() {
     if [[ $rc -eq 0 ]]; then
         role="$(printf '%s' "$json" | jq -r '.role // empty')"
         if [[ "$role" == "gateway" ]]; then
-            do_connect gateway 22 ""
+            do_connect gateway "$GW_PORT" ""
             return $?
         fi
         if [[ "$role" == "provider" ]]; then
@@ -541,7 +545,7 @@ cmd_ssh() {
     local name type provider port user state selected
     selected="$(
         {
-            printf 'gateway\tgateway\t-\t22\t%s\tup\n' "$GW_USER"
+            printf 'gateway\tgateway\t-\t%s\t%s\tup\n' "$GW_PORT" "$GW_USER"
             while IFS=$'\t' read -r name type provider port user; do
                 [[ -n "$name" ]] || continue
                 state="$(gw_probe_port "$port")"
@@ -1098,7 +1102,7 @@ emit_ssh_config() {
 Host mlp-gateway
     HostName ${GW_IP}
     User ${GW_USER}
-    Port 22
+    Port ${GW_PORT}
 HEADER
     client_identity_line
     cat <<HEADER

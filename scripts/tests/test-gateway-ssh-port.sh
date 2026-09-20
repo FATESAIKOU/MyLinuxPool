@@ -215,6 +215,51 @@ else
     bad "8. rotate_run_provision 沒有傳埠清單（或沒有安全的預設值）"
 fi
 
+echo "=== 11-14. client 側：埠必須來自 NODE_GATEWAY，不能寫死 ==="
+MLP="ops-scripts/mlp"
+PSTATUS="shared-configs/pool-runtime/files/pool-status"
+PTUNNEL="shared-configs/pool-runtime/files/pool-tunnel"
+
+# 11. 沒有任何 client 還把 Gateway 那一跳的埠寫死成 22
+hard=""
+grep -nE '"\$GW_IP" 22|gateway 22 ""|^ *Port 22$|tcp_classify "\$GW_IP" 22' "$MLP" "$PSTATUS" >/dev/null 2>&1 && hard="有"
+if [[ -z "$hard" ]]; then
+    ok "11. mlp / pool-status 不再把 Gateway 埠寫死"
+else
+    bad "11. 還有寫死的 22:"$'\n'"$(grep -nE '"\$GW_IP" 22|gateway 22 ""|^ *Port 22$' "$MLP" "$PSTATUS")"
+fi
+
+# 12. pool-tunnel 真的把 -p 帶進 ssh
+if grep -q '\-p "\${GW_SSH_PORT:-22}"' "$PTUNNEL"; then
+    ok "12. pool-tunnel 撥號時帶 -p（provider 與 worker 的隧道都靠它）"
+else
+    bad "12. pool-tunnel 的 ssh 沒有帶 -p——埠一改，所有隧道都連不上"
+fi
+
+# 13. 行為：gateway.json 的往返。worker 沒有 GitHub 憑證，這個檔是它唯一的來源
+mkdir -p "$SANDBOX/gw"
+printf '{"ip":"1.2.3.4","tunnel_user":"sshproxy","ssh_port":2100,"generation":"17","host_key":"k"}\n' \
+    > "$SANDBOX/gw/new.json"
+printf '{"ip":"1.2.3.4","tunnel_user":"sshproxy","generation":"16","host_key":"k"}\n' \
+    > "$SANDBOX/gw/old.json"
+newp="$(jq -r '.ssh_port // 22' < "$SANDBOX/gw/new.json")"
+oldp="$(jq -r '.ssh_port // 22' < "$SANDBOX/gw/old.json")"
+if [[ "$newp" == "2100" && "$oldp" == "22" ]]; then
+    ok "13. gateway.json 帶 ssh_port 時讀到它；舊檔沒有該欄位時退回 22"
+else
+    bad "13. gateway.json 的埠讀取不對（新檔=${newp} 舊檔=${oldp}）"
+fi
+
+# 14. publish_gateway 要把 ssh_port 寫出去，且變更偵測要看它
+pg_write=0; pg_detect=0
+grep -q '"ssh_port":%s' "$PTUNNEL" && pg_write=1
+grep -q 'ssh_port // 22) | tostring) == \$port' "$PTUNNEL" && pg_detect=1
+if [[ $pg_write -eq 1 && $pg_detect -eq 1 ]]; then
+    ok "14. provider 會把 ssh_port 發布給 worker，且埠變了會重新發布"
+else
+    bad "14. publish_gateway 不完整（寫出=${pg_write} 變更偵測=${pg_detect}）——worker 不會知道埠變了"
+fi
+
 echo "=== 9-10. 注入 ==="
 # 重現 2026-09-20 的真兇：把兩行位址族換回裸的 ListenStream=<port>。
 # 在 BindIPv6Only=ipv6-only 之下那只會產生 IPv6 socket，IPv4 全部 refused，
