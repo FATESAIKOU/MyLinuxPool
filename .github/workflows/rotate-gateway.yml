@@ -212,7 +212,14 @@ jobs:
           trusted_ips="$(gh variable get POOL_TRUSTED_IPS --repo "$GH_REPO")"
           # The key never gets logged: no -x, and GitHub Actions masks the
           # exact secret value in any log line regardless.
-          rotate_run_provision fatesaikou "$PREVIEW_IP" "$trusted_ips" "$FILE_CRYPTO_KEY"
+          # Same source as repair. Note the preview machine is still being
+          # reached on the port a fresh Linode boots with (22) — provisioning
+          # only changes what it listens on at the end, so the session doing
+          # the change is never the one cut off by it.
+          gw_json="$(gh api "repos/${GH_REPO}/actions/variables/NODE_GATEWAY" --jq .value)"
+          listen_ports="$(printf '%s' "$gw_json" \
+            | jq -r '(.ssh_listen_ports // [(.port // 22)]) | map(tostring) | join(" ")')"
+          rotate_run_provision fatesaikou "$PREVIEW_IP" "$trusted_ips" "$FILE_CRYPTO_KEY" "$listen_ports"
 
       # The check that was missing. A rotate used to switch NODE_GATEWAY
       # and only then discover whether providers could attach; when they

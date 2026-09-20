@@ -333,7 +333,7 @@ rotate_deploy_repo_bundle() {
         'sudo mkdir -p /home/fatesaikou/.mylinuxpool/repo && sudo cp -a /tmp/mlp-repo/. /home/fatesaikou/.mylinuxpool/repo/ && sudo rm -rf /tmp/mlp-repo'
 }
 
-# rotate_run_provision <user> <ip> <trusted_ips> <file_crypto_key>
+# rotate_run_provision <user> <ip> <trusted_ips> <file_crypto_key> [<listen_ports>]
 #   Runs provision-gateway.sh on the (preview) Gateway. RUNBOOK.md §9's
 #   correct shape: the script is ALREADY a file on the remote
 #   (/home/fatesaikou/.mylinuxpool/repo/scripts/ — rotate_deploy_repo_bundle
@@ -347,10 +347,22 @@ rotate_deploy_repo_bundle() {
 #   step) has the value masked in its own log regardless.
 rotate_run_provision() {
     local user="$1" ip="$2" trusted_ips="$3" file_crypto_key="$4"
+    # Which ports the provisioned sshd should listen on. Defaults to 22, so
+    # a caller that does not know about this still provisions exactly as
+    # before. Note this is deliberately NOT read from the machine: it comes
+    # from NODE_GATEWAY, the same place clients read the port from, so the
+    # two can never disagree.
+    local listen_ports="${5:-22}"
     local provision_script="/home/fatesaikou/.mylinuxpool/repo/scripts/provision-gateway.sh"
 
+    # A fresh Linode boots with sshd on 22, so provisioning always REACHES
+    # the machine on 22 (or whatever the caller resolved) and only then
+    # changes what it listens on. That ordering is why the port change can
+    # never strand the provisioning session that is making it.
     printf '%s' "$file_crypto_key" | ssh -o StrictHostKeyChecking=accept-new "${user}@${ip}" \
-        "sudo env POOL_TRUSTED_IPS=$(printf '%q' "$trusted_ips") bash ${provision_script}"
+        "sudo env POOL_TRUSTED_IPS=$(printf '%q' "$trusted_ips") \
+              GATEWAY_SSH_LISTEN_PORTS=$(printf '%q' "$listen_ports") \
+              bash ${provision_script}"
 }
 
 # rotate_compute_new_gateway_json <old_json> <new_ip> <new_generation> <rotated_at>

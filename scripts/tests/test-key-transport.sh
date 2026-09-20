@@ -169,7 +169,18 @@ if [[ "${1:-}" == "-u" ]]; then echo 0; exit 0; fi
 exec /usr/bin/id "$@" 2>/dev/null || exit 0
 FAKE_ID
 
-for t in sshd systemctl fail2ban-client chown apt-get dpkg loginctl docker flock ss nc curl; do
+# `ss` is special: provisioning verifies each requested port is really
+# listening before it accepts the new socket config. A stub that printed
+# nothing would make that check fail and roll back, which is not what this
+# suite is about (test-gateway-ssh-port.sh covers the check itself).
+cat > "$SANDBOX/bin/ss" <<'FAKE_SS'
+#!/usr/bin/env bash
+printf 'ss|%s\n' "$*" >> "${ARGV_LOG:-/dev/null}"
+printf 'LISTEN 0 4096 0.0.0.0:ssh 0.0.0.0:*\n'
+exit 0
+FAKE_SS
+
+for t in sshd systemctl fail2ban-client chown apt-get dpkg loginctl docker flock nc curl; do
     cat > "$SANDBOX/bin/$t" <<FAKE_TOOL
 #!/usr/bin/env bash
 printf '$t|%s\n' "\$*" >> "\${ARGV_LOG:-/dev/null}"
@@ -340,6 +351,7 @@ if [[ -f "$PROV_SRC" ]]; then
         -e 's|^WORKERS_DIR="/home/fatesaikou/.mylinuxpool/workers.d"$|WORKERS_DIR="${SANDBOX_WORKERS:?}"|' \
         -e 's|^SSHD_CONF="/etc/ssh/sshd_config.d/10-mylinuxpool.conf"$|SSHD_CONF="${SANDBOX_SSHD_CONF:?}"|' \
         -e 's|^FAIL2BAN_CONF="/etc/fail2ban/jail.d/mylinuxpool-ignore.conf"$|FAIL2BAN_CONF="${SANDBOX_FAIL2BAN_CONF:?}"|' \
+        -e 's|^SSH_SOCKET_CONF="/etc/systemd/system/ssh.socket.d/10-mylinuxpool.conf"$|SSH_SOCKET_CONF="${SANDBOX_SSH_SOCKET_CONF:?}"|' \
         -e 's|home="/home/fatesaikou"|home="${SANDBOX_HOME_A:?}"|' \
         -e 's|home="/home/sshproxy"|home="${SANDBOX_HOME_B:?}"|' \
         -e 's|--check --home /home/fatesaikou --user fatesaikou|--check --home "${SANDBOX_HOME_A:?}" --user fatesaikou|' \
@@ -351,7 +363,7 @@ if [[ -f "$PROV_SRC" ]]; then
     while IFS= read -r dl; do
         [[ -n "$dl" ]] || continue
         case "$dl" in
-            *REPO_DIR*|*WORKERS_DIR*|*SSHD_CONF*|*FAIL2BAN_CONF*|*home=*|*--check\ --home*) ;;
+            *REPO_DIR*|*WORKERS_DIR*|*SSHD_CONF*|*SSH_SOCKET_CONF*|*FAIL2BAN_CONF*|*home=*|*--check\ --home*) ;;
             *) untrusted="${untrusted}${dl} " ;;
         esac
     done < <(printf '%s\n' "$diff_out" | grep -E '^[<>]' || true)
@@ -387,6 +399,7 @@ if [[ "$PROV_TRUSTED" -eq 1 ]]; then
         SANDBOX_WORKERS="$SANDBOX/prov-workers" \
         SANDBOX_SSHD_CONF="$SANDBOX/prov-sshd.conf" \
         SANDBOX_FAIL2BAN_CONF="$SANDBOX/prov-fail2ban.conf" \
+        SANDBOX_SSH_SOCKET_CONF="$SANDBOX/prov-ssh-socket.conf" \
         SANDBOX_HOME_A="$SANDBOX/prov-home-a" \
         SANDBOX_HOME_B="$SANDBOX/prov-home-b" \
         ARGV_LOG="$ARGV_LOG" STDIN_DIR="$STDIN_DIR" \

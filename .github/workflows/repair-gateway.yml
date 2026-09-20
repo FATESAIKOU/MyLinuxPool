@@ -85,7 +85,14 @@ jobs:
           set -euo pipefail
           source scripts/rotate-gateway.sh
           trusted_ips="$(gh variable get POOL_TRUSTED_IPS --repo "$GH_REPO")"
-          rotate_run_provision fatesaikou "$GW_IP" "$trusted_ips" "$FILE_CRYPTO_KEY"
+          # Which ports sshd should listen on comes from NODE_GATEWAY, the
+          # same variable clients read the port from, so the machine and its
+          # clients can never disagree. ssh_listen_ports is the migration
+          # superset; without it the machine listens on exactly .port.
+          gw_json="$(gh api "repos/${GH_REPO}/actions/variables/NODE_GATEWAY" --jq .value)"
+          listen_ports="$(printf '%s' "$gw_json" \
+            | jq -r '(.ssh_listen_ports // [(.port // 22)]) | map(tostring) | join(" ")')"
+          rotate_run_provision fatesaikou "$GW_IP" "$trusted_ips" "$FILE_CRYPTO_KEY" "$listen_ports"
 
       # The state cache is part of provisioning, not an afterthought: a
       # Gateway without it serves nothing to the nodes that now prefer it.

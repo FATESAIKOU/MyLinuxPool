@@ -25,7 +25,20 @@ REPO_DIR="/home/fatesaikou/.mylinuxpool/repo"
 SHARED_CONFIG_DIR="${REPO_DIR}/shared-configs"
 WORKERS_DIR="/home/fatesaikou/.mylinuxpool/workers.d"
 SSHD_CONF="/etc/ssh/sshd_config.d/10-mylinuxpool.conf"
+SSH_SOCKET_CONF="/etc/systemd/system/ssh.socket.d/10-mylinuxpool.conf"
 FAIL2BAN_CONF="/etc/fail2ban/jail.d/mylinuxpool-ignore.conf"
+
+# Which TCP ports the Gateway's sshd listens on, space-separated. Injected
+# by the caller from NODE_GATEWAY (.ssh_listen_ports // [.port // 22]);
+# defaults to 22 so an older caller provisions exactly as before.
+#
+# This is a LIST because moving the port is a two-step migration: listen on
+# both the old and the new port, move every client over, then drop the old
+# one. Doing it in one step would cut off this machine's only entrance —
+# including Actions, which is the only way back in (repair-gateway is
+# itself SSH-based, and rotate discards the root password so there is no
+# console rescue).
+GATEWAY_SSH_LISTEN_PORTS="${GATEWAY_SSH_LISTEN_PORTS:-22}"
 
 log() {
     local level="$1"; shift
@@ -104,6 +117,88 @@ EOF
     log INFO "wrote ${SSHD_CONF}"
 }
 
+# ---- step 1b: which ports sshd listens on ------------------------------------
+# On Ubuntu 24.04 sshd is SOCKET-ACTIVATED: ssh.socket owns the listening
+# sockets and `Port` in sshd_config is ignored entirely. Setting Port there
+# and reloading is the classic way to end up with nothing listening on any
+# port at all — on the one machine that is the pool's only entrance.
+#
+# So the ports live in a systemd drop-in. The empty `ListenStream=` first
+# is required: without it the unit's own ListenStream=22 stays in effect
+# and is merely appended to.
+provision_ssh_listen_ports() {
+    log INFO "step 1b/6: sshd listen ports (${GATEWAY_SSH_LISTEN_PORTS})"
+
+    local p ports=()
+    for p in $GATEWAY_SSH_LISTEN_PORTS; do
+        if ! [[ "$p" =~ ^[0-9]+$ ]] || (( p < 1 || p > 65535 )); then
+            log ERROR "invalid ssh listen port '${p}' — refusing to write a socket unit from it"
+            exit 1
+        fi
+        ports+=("$p")
+    done
+    if [[ ${#ports[@]} -eq 0 ]]; then
+        log ERROR "no ssh listen ports given — that would leave the Gateway unreachable"
+        exit 1
+    fi
+
+    local desired
+    desired="[Socket]"$'\n'"ListenStream="
+    for p in "${ports[@]}"; do
+        desired+=$'\n'"ListenStream=${p}"
+    done
+
+    if [[ -f "$SSH_SOCKET_CONF" ]] && [[ "$(cat "$SSH_SOCKET_CONF")" == "$desired" ]]; then
+        log INFO "${SSH_SOCKET_CONF} already up to date, skipping"
+        return 0
+    fi
+
+    # Keep whatever was there, so a failed restart can be undone.
+    local backup=""
+    if [[ -f "$SSH_SOCKET_CONF" ]]; then
+        backup="$(cat "$SSH_SOCKET_CONF")"
+    fi
+
+    mkdir -p "$(dirname "$SSH_SOCKET_CONF")"
+    printf '%s\n' "$desired" > "$SSH_SOCKET_CONF"
+    systemctl daemon-reload
+
+    if ! systemctl restart ssh.socket; then
+        log ERROR "ssh.socket failed to restart — reverting"
+        provision_revert_socket "$backup"
+        exit 1
+    fi
+
+    # Verify every requested port is actually accepting. A socket unit that
+    # starts but binds nothing still counts as "started", and the next
+    # thing to notice would be a locked-out operator.
+    local missing=""
+    for p in "${ports[@]}"; do
+        ss -lnt "sport = :${p}" 2>/dev/null | grep -q LISTEN || missing+="${p} "
+    done
+    if [[ -n "$missing" ]]; then
+        log ERROR "ssh.socket restarted but is not listening on: ${missing}— reverting"
+        provision_revert_socket "$backup"
+        exit 1
+    fi
+
+    log INFO "wrote ${SSH_SOCKET_CONF}; listening on ${GATEWAY_SSH_LISTEN_PORTS}"
+}
+
+# provision_revert_socket <previous-content>
+#   Put the drop-in back the way it was (or remove it) and restart, so a
+#   bad port list cannot leave the machine unreachable.
+provision_revert_socket() {
+    local backup="$1"
+    if [[ -n "$backup" ]]; then
+        printf '%s\n' "$backup" > "$SSH_SOCKET_CONF"
+    else
+        rm -f "$SSH_SOCKET_CONF"
+    fi
+    systemctl daemon-reload
+    systemctl restart ssh.socket || log ERROR "revert also failed to restart ssh.socket — the machine may be unreachable"
+}
+
 # ---- step 2: fail2ban ignoreip -----------------------------------------------
 # DO NOT SKIP OR SIMPLIFY THIS STEP. The 2026-09-13 incident (RUNBOOK.md
 # §7.1) was fail2ban silently banning the home IP for 45 minutes — the
@@ -129,8 +224,17 @@ step2_fail2ban_ignoreip() {
     # provision-gateway.sh has been run against a still-provisioning box before.
     mkdir -p "$(dirname "$FAIL2BAN_CONF")"
 
+    # The jail's `port` has to name every port sshd listens on. fail2ban's
+    # nftables action writes a rule scoped to it (RUNBOOK §7: the live rule
+    # reads `tcp dport 22 ... reject`), so a jail still saying "ssh" would
+    # keep banning on 22 while the attempts arrive on 2100 — bans that look
+    # applied and block nothing.
+    local ports_csv
+    ports_csv="$(printf '%s' "$GATEWAY_SSH_LISTEN_PORTS" | tr -s ' ' ',' | sed 's/^,//; s/,$//')"
+
     local desired
-    desired="$(printf '[DEFAULT]\nignoreip = %s\n' "$POOL_TRUSTED_IPS")"
+    desired="$(printf '[DEFAULT]\nignoreip = %s\n\n[sshd]\nport = %s\n' \
+        "$POOL_TRUSTED_IPS" "$ports_csv")"
 
     if [[ -f "$FAIL2BAN_CONF" ]] && [[ "$(cat "$FAIL2BAN_CONF")" == "$desired" ]]; then
         log INFO "${FAIL2BAN_CONF} already up to date, skipping"
@@ -241,6 +345,9 @@ step6_verify() {
 
 main() {
     step1_sshd_harden
+    # After the hardening (which validates sshd_config) and BEFORE
+    # fail2ban, whose ban rules have to name the same ports.
+    provision_ssh_listen_ports
     step2_fail2ban_ignoreip
     step3_install_shared_config
     step4_install_runtime
