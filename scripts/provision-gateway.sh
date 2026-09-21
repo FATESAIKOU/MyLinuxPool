@@ -92,6 +92,27 @@ KbdInteractiveAuthentication no
 # inside pool-tunnel's own retry backoff.
 ClientAliveInterval 15
 ClientAliveCountMax 3
+
+# ONE host key, and it is the one NODE_GATEWAY publishes.
+#
+# sshd's default is to offer rsa, ecdsa and ed25519, while the variable
+# names a single key — so pinning only worked for a client that happened
+# to negotiate ed25519. A client preferring ECDSA got a key the variable
+# does not mention, and the obvious "fix" for that is to switch host key
+# checking off, which throws away the protection entirely. Pinning matters
+# here specifically because Linode recycles addresses (RUNBOOK §7.8): the
+# IP that answers may be someone else's machine.
+#
+# Naming any HostKey replaces the whole default set, so this one line makes
+# ed25519 the only answer the Gateway can give. rsa and ecdsa keys stay on
+# disk but are never offered; if this config is ever removed, sshd falls
+# back to offering all three — more keys, not fewer, which is the safe
+# direction to fail in.
+#
+# The cost is a policy, not a bug: a client whose platform cannot do
+# Ed25519 has no way in. Ours all can (OpenSSH prefers it), and the one
+# external client was checked before this was turned on.
+HostKey /etc/ssh/ssh_host_ed25519_key
 EOF
 )"
 
