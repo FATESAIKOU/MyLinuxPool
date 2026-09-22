@@ -7,7 +7,25 @@
 #
 # 這支腳本檢查的是「引用的東西真的存在嗎」，不是「語法對嗎」。
 set -uo pipefail
-cd "$(dirname "${BASH_SOURCE[0]:-$0}")/.." || exit 1
+# Resolve this script's REAL location, following symlinks, so it can be
+# linked into a directory on PATH (`ln -s .../ops-scripts/mlp <dir on PATH>`).
+# Both $0 and BASH_SOURCE name the LINK, not the target, so dirname on
+# either lands in the link's directory and every repo-relative path below
+# becomes wrong — the symptom is "scripts/lib/ssh.sh: No such file".
+# `readlink` without -f is used deliberately: -f is GNU-only.
+#
+# This block is duplicated in every ops-script because it has to run
+# BEFORE the script knows where the repo is — there is nothing to source
+# yet. test-script-self-location.sh asserts the copies stay identical.
+_mlp_self="${BASH_SOURCE[0]:-$0}"
+while [ -L "$_mlp_self" ]; do
+    _mlp_dir="$(cd -P "$(dirname "$_mlp_self")" && pwd)"
+    _mlp_self="$(readlink "$_mlp_self")"
+    case "$_mlp_self" in /*) ;; *) _mlp_self="${_mlp_dir}/${_mlp_self}" ;; esac
+done
+SCRIPT_DIR="$(cd -P "$(dirname "$_mlp_self")" && pwd)"
+unset _mlp_self _mlp_dir
+cd "${SCRIPT_DIR}/.." || exit 1
 
 FAIL=0
 ok()   { printf '  \033[32mok\033[0m    %s\n' "$1"; }

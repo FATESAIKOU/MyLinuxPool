@@ -235,6 +235,21 @@ ops-scripts/mlp register provider  # 把「這台機器」註冊成 provider，�
 （`tunnel-identity.sh` 的 `CLIENT_KEY`，預設 `~/.ssh/id_mlp`）——兩邊各寫一份
 的時候，`mlp ssh` 會在 `ssh` 還能通的情況下報 Permission denied。
 
+### 把 `mlp` 放到 PATH 上
+
+直接做符號連結就好，四支 ops-script 都會解析自己的真實位置：
+
+```bash
+ln -s "$PWD/ops-scripts/mlp" ~/.local/bin/mlp      # 或任何 PATH 上的目錄
+```
+
+多層連結、相對路徑的連結都可以。`register-client`、`verify-profile`、
+`preflight` 同理。
+
+> 早期版本用 `dirname "$0"` 推導自身位置，而 `$0` 拿到的是**連結本身**的
+> 路徑，於是所有相對於 repo 的路徑都會錯，症狀是
+> `scripts/lib/ssh.sh: No such file` ——看不出跟符號連結有關。
+
 ### 用原生 ssh 而不透過 mlp
 
 ```bash
