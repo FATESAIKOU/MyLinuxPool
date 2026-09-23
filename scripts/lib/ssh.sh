@@ -54,6 +54,10 @@ ssh_gateway_only() {
 # ssh_via_gateway <known_hosts> <gw_user> <gw_host> <gw_port> <dst_user> <dst_host> <dst_port> [remote_cmd...]
 #   One hop past the Gateway (provider/worker at 127.0.0.1:<port>), mixed
 #   trust as described above. With no remote_cmd, connects interactively.
+#   SSH_EXTRA_OPTS (optional array) — extra client options spliced in just
+#   before -p, e.g. (-L 8080:127.0.0.1:80 -M -S <ctl> -N -f) for an mlp fwd
+#   master. Unset or empty: the argv below is byte-identical to before.
+#   pool-ssh (Actions) never sets it — it only calls ssh_jump_chain anyway.
 ssh_via_gateway() {
     local known_hosts="$1" gw_user="$2" gw_host="$3" gw_port="$4"
     local dst_user="$5" dst_host="$6" dst_port="$7"; shift 7
@@ -67,6 +71,7 @@ ssh_via_gateway() {
         ${ident[@]+"${ident[@]}"} \
         -o ConnectTimeout="${SSH_CONNECT_TIMEOUT:-10}" -o BatchMode="${SSH_BATCH_MODE:-yes}" \
         -o ProxyCommand="ssh ${proxy_ident}-o UserKnownHostsFile=${known_hosts} -o StrictHostKeyChecking=accept-new -o ConnectTimeout=${SSH_CONNECT_TIMEOUT:-10} -p ${gw_port} -W %h:%p ${gw_user}@${gw_host}" \
+        ${SSH_EXTRA_OPTS[@]+"${SSH_EXTRA_OPTS[@]}"} \
         -p "$dst_port" "${dst_user}@${dst_host}" "$@"
 }
 
