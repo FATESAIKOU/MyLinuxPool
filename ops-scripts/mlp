@@ -74,6 +74,7 @@ source "${REPO_ROOT}/scripts/lib/ssh.sh"
 
 MLP_STATE_DIR="${HOME}/.mylinuxpool"
 GW_KNOWN_HOSTS="${MLP_STATE_DIR}/known_hosts"
+FWD_DIR="${MLP_STATE_DIR}/fwd"
 
 CTL_DIR=""
 CTL=""
@@ -119,9 +120,13 @@ usage: mlp [command]
                    will connect FROM.
   register provider  register a NEW machine into the pool. Run it ON
                    that new machine, not here on the Mac.
-  ssh-config       print an ssh_config for the pool (--write to install it)
-  trust-gateway    re-accept the Gateway's host key after a rotate
-  -h, --help       show this help
+   ssh-config       print an ssh_config for the pool (--write to install it)
+   trust-gateway    re-accept the Gateway's host key after a rotate
+   fwd add <node> [entryip:]entryport[:targethost:targetport]
+                    forward a local port to a node (or through it to a third host)
+   fwd ls           list local forwards with live state
+   fwd rm [entryport|bind:entryport]  remove a forward (fzf pick when omitted)
+   -h, --help       show this help
 
 requires: fzf, jq, gh — install missing ones with `brew install <name>`
 EOF
@@ -149,8 +154,14 @@ check_deps() {
 # never open a new connection per node. Same idea as pool-tunnel's own
 # health check riding its ControlMaster instead of a fresh handshake.
 
+# resolve_gateway [nodie] — with "nodie", a failure sets RESOLVE_DETAIL
+#   and returns 1 silently instead of dying, for ViewModel callers (fwd_add)
+#   that must stay output-free and keep their own return codes. A bare call
+#   behaves exactly as before (same globals, same messages, dies).
 resolve_gateway() {
-    local json rc
+    local json rc fatal=1
+    [[ "${1:-}" == "nodie" ]] && fatal=0
+    RESOLVE_DETAIL=""
     # --refresh, not the 30s cache. Every command here means "through the
     # Gateway that is current right now"; served from cache, `ls` spends up
     # to 30 seconds after a rotate probing the previous machine, which is
@@ -161,12 +172,20 @@ resolve_gateway() {
     # current one.
     json="$("$POOL_RESOLVE" gateway --refresh)"
     rc=$?
-    [[ $rc -eq 0 ]] || die "pool-resolve gateway failed (exit ${rc})"
+    if [[ $rc -ne 0 ]]; then
+        RESOLVE_DETAIL="pool-resolve gateway failed (exit ${rc})"
+        [[ $fatal -eq 1 ]] && die "$RESOLVE_DETAIL"
+        return 1
+    fi
     GW_IP="$(printf '%s' "$json" | jq -r '.ip // empty')"
     GW_USER="$(printf '%s' "$json" | jq -r '.user // empty')"
     GW_PORT="$(printf '%s' "$json" | jq -r '.port // 22')"
     GW_HOST_KEY="$(printf '%s' "$json" | jq -r '.host_key // empty')"
-    [[ -n "$GW_IP" && -n "$GW_USER" ]] || die "NODE_GATEWAY is missing ip/user"
+    if [[ -z "$GW_IP" || -z "$GW_USER" ]]; then
+        RESOLVE_DETAIL="NODE_GATEWAY is missing ip/user"
+        [[ $fatal -eq 1 ]] && die "$RESOLVE_DETAIL"
+        return 1
+    fi
 
     # NODE_GATEWAY carries the Gateway's host key, written by the rotate
     # that built the machine and writable only by Actions. Pin to it, so a
@@ -179,6 +198,7 @@ resolve_gateway() {
             printf '%s %s\n' "$GW_IP" "$GW_HOST_KEY" >> "$GW_KNOWN_HOSTS"
         fi
     fi
+    return 0
 }
 
 # client_identity_path — the key this client authenticates with.
@@ -473,8 +493,110 @@ cmd_ls() {
 }
 
 # ---- ssh ------------------------------------------------------------------
+# target_resolve <name> — Model: name -> connection data, nothing shown.
+#   The resolving half of the old connect_by_name, shared by do_connect and
+#   fwd_add so the two paths cannot grow separate copies of it.
+#   Sets TARGET_TYPE/TARGET_USER/TARGET_PORT and returns 0; on failure sets
+#   TARGET_ERR (unreachable|notfound) and returns 1. No output of its own —
+#   callers turn TARGET_ERR into messages. Assumes resolve_gateway already
+#   ran (GW_* set), exactly as connect_by_name did. The worker-ledger master
+#   is opened silent so a dead Gateway stays a return code, not output.
+target_resolve() {
+    local name="$1" json rc role port user workers_json match_port master_err
+    TARGET_TYPE=""
+    TARGET_USER=""
+    TARGET_PORT=""
+    TARGET_ERR=""
+    TARGET_DETAIL=""
+
+    json="$("$POOL_RESOLVE" "$name" 2>/dev/null)"
+    rc=$?
+    if [[ $rc -eq 0 && -n "$json" ]]; then
+        role="$(jq -r '.role // empty' 2>/dev/null <<< "$json")"
+        if [[ "$role" == "gateway" ]]; then
+            TARGET_TYPE="gateway"
+            TARGET_USER="$GW_USER"
+            TARGET_PORT="$GW_PORT"
+            return 0
+        fi
+        if [[ "$role" == "provider" ]]; then
+            port="$(jq -r '.gateway_port // empty' 2>/dev/null <<< "$json")"
+            user="$(jq -r '.user // empty' 2>/dev/null <<< "$json")"
+            if [[ -n "$port" && -n "$user" ]]; then
+                TARGET_TYPE="provider"
+                TARGET_USER="$user"
+                TARGET_PORT="$port"
+                return 0
+            fi
+        fi
+    fi
+
+    # Not a registered node — workers deliberately aren't (spec §10.3), so
+    # try matching by container name or bare port against the Gateway's
+    # own placeholder ledger. The master is opened silent and its chatter
+    # is carried back in TARGET_DETAIL for the caller to show — the old
+    # inline code showed it, and this Model shows nothing itself.
+    master_err="$(mktemp "${TMPDIR:-/tmp}/mlp-target-resolve.XXXXXX" 2>/dev/null)" || master_err=""
+    if [[ -n "$master_err" ]]; then
+        open_gateway_master 2>"$master_err"
+        rc=$?
+        TARGET_DETAIL="$(cat "$master_err" 2>/dev/null)"
+        rm -f "$master_err"
+    else
+        open_gateway_master 2>/dev/null
+        rc=$?
+    fi
+    if [[ $rc -eq 0 ]]; then
+        workers_json="$(gw_run '~/.mylinuxpool/bin/pool-port-alloc --list')"
+        close_gateway_master
+    else
+        TARGET_ERR="unreachable"
+        return 1
+    fi
+    if [[ -z "$workers_json" ]]; then
+        workers_json="[]"
+    fi
+
+    if [[ "$name" =~ ^[0-9]+$ ]]; then
+        match_port="$name"
+    else
+        match_port="$(jq -r --arg n "$name" \
+            '[.[] | select(.container == $n)] | first | .port // empty' 2>/dev/null <<< "$workers_json")"
+    fi
+
+    if [[ -n "$match_port" && "$match_port" != "null" ]]; then
+        TARGET_TYPE="worker"
+        TARGET_USER="worker"
+        TARGET_PORT="$match_port"
+        return 0
+    fi
+
+    TARGET_ERR="notfound"
+    return 1
+}
+
 do_connect() {
-    local type="$1" port="$2" user="$3"
+    local type port user
+    if [[ $# -eq 1 ]]; then
+        # Name form: resolve through the shared Model, then fall through to
+        # the same login below. This is what connect_by_name used to inline.
+        target_resolve "$1" || {
+            case "$TARGET_ERR" in
+                unreachable)
+                    [[ -n "$TARGET_DETAIL" ]] && printf '%s\n' "$TARGET_DETAIL" >&2
+                    die "Gateway unreachable (${GW_USER}@${GW_IP})"
+                    ;;
+                *) die "no such node or worker: $1" ;;
+            esac
+        }
+        type="$TARGET_TYPE"
+        port="$TARGET_PORT"
+        user="$TARGET_USER"
+    else
+        type="$1"
+        port="$2"
+        user="$3"
+    fi
     # This is an interactive login (a human is about to get a shell) —
     # BatchMode must be off here, unlike every other caller of
     # ssh_gateway_only/ssh_via_gateway in this file, or a key needing a
@@ -497,49 +619,7 @@ do_connect() {
 }
 
 connect_by_name() {
-    local name="$1" json rc role port user workers_json match_port
-
-    json="$("$POOL_RESOLVE" "$name" 2>/dev/null)"
-    rc=$?
-    if [[ $rc -eq 0 ]]; then
-        role="$(printf '%s' "$json" | jq -r '.role // empty')"
-        if [[ "$role" == "gateway" ]]; then
-            do_connect gateway "$GW_PORT" ""
-            return $?
-        fi
-        if [[ "$role" == "provider" ]]; then
-            port="$(printf '%s' "$json" | jq -r '.gateway_port // empty')"
-            user="$(printf '%s' "$json" | jq -r '.user // empty')"
-            if [[ -n "$port" && -n "$user" ]]; then
-                do_connect provider "$port" "$user"
-                return $?
-            fi
-        fi
-    fi
-
-    # Not a registered node — workers deliberately aren't (spec §10.3), so
-    # try matching by container name or bare port against the Gateway's
-    # own placeholder ledger.
-    if ! open_gateway_master; then
-        die "Gateway unreachable (${GW_USER}@${GW_IP})"
-    fi
-    workers_json="$(gw_run '~/.mylinuxpool/bin/pool-port-alloc --list')"
-    close_gateway_master
-    [[ -n "$workers_json" ]] || workers_json='[]'
-
-    if [[ "$name" =~ ^[0-9]+$ ]]; then
-        match_port="$name"
-    else
-        match_port="$(printf '%s' "$workers_json" | jq -r --arg n "$name" \
-            '[.[] | select(.container == $n)] | first | .port // empty' 2>/dev/null)"
-    fi
-
-    if [[ -n "$match_port" && "$match_port" != "null" ]]; then
-        do_connect worker "$match_port" worker
-        return $?
-    fi
-
-    die "no such node or worker: ${name}"
+    do_connect "$1"
 }
 
 cmd_ssh() {
@@ -1221,6 +1301,682 @@ cmd_ssh_config() {
 }
 
 
+# ---- fwd (local port forwards) --------------------------------------------
+# Client-side only: zero pool state, the Gateway never hears about these.
+# No config file — the live answer is the socket files under $FWD_DIR plus
+# the process table (ps shows the full -L line). Reboot forgets everything;
+# that is accepted on purpose, no launchd recovery, no auto-retry.
+#
+# MVVM split, hard rule: Model returns data and shows nothing; ViewModel
+# decides and acts but shows nothing and never picks; View shows and picks
+# but never dials. New helpers below honor that: the six data/decision
+# functions contain no output primitive and no picker.
+#
+# ControlPath shape: $FWD_DIR/fwd-<bind>-<entryport> (entryport is unique by
+# construction, so rm addresses by entryport). The node name rides the
+# master command line as a trailing mlp-fwd-node=<node> marker: -N means it
+# is never executed remotely, it only stays visible for fwd_records to read
+# back — the same "no second source of truth" idea as the -L line itself.
+
+# fwd_parse_spec <spec> — ViewModel helper: split an -L-shaped spec.
+#   Sets FWD_SPEC_BIND/ENTRY/THOST/TPORT, 0 on valid, 1 on invalid.
+#   A field of digits only is a port, anything else is an address — that one
+#   rule disambiguates every arity, so a third-party target needs no extra
+#   flag (the target is always resolved on the far side anyway):
+#     8080                 -> bind 127.0.0.1, entry 8080, target node:8080
+#     9090:8080            -> bind 127.0.0.1, entry 9090, target node:8080
+#     0.0.0.0:9090:8080    -> bind 0.0.0.0, entry 9090, target node:8080
+#     8080:192.168.0.50:80 -> bind 127.0.0.1, entry 8080, target 192.168.0.50:80
+fwd_parse_spec() {
+    local spec="$1" parts rest p
+    FWD_SPEC_BIND=""
+    FWD_SPEC_ENTRY=""
+    FWD_SPEC_THOST=""
+    FWD_SPEC_TPORT=""
+    if [[ "$spec" != *:* ]]; then
+        if [[ "$spec" =~ ^[0-9]+$ ]]; then
+            FWD_SPEC_BIND="127.0.0.1"
+            FWD_SPEC_ENTRY="$spec"
+            FWD_SPEC_THOST="127.0.0.1"
+            FWD_SPEC_TPORT="$spec"
+        else
+            return 1
+        fi
+    else
+        parts=()
+        rest="$spec"
+        while [[ "$rest" == *:* ]]; do
+            p="${rest%%:*}"
+            parts+=("$p")
+            rest="${rest#*:}"
+        done
+        parts+=("$rest")
+        if [[ "${#parts[@]}" -eq 2 ]]; then
+            if [[ "${parts[0]}" =~ ^[0-9]+$ && "${parts[1]}" =~ ^[0-9]+$ ]]; then
+                FWD_SPEC_BIND="127.0.0.1"
+                FWD_SPEC_ENTRY="${parts[0]}"
+                FWD_SPEC_THOST="127.0.0.1"
+                FWD_SPEC_TPORT="${parts[1]}"
+            elif [[ ! "${parts[0]}" =~ ^[0-9]+$ && "${parts[1]}" =~ ^[0-9]+$ ]]; then
+                FWD_SPEC_BIND="${parts[0]}"
+                FWD_SPEC_ENTRY="${parts[1]}"
+                FWD_SPEC_THOST="127.0.0.1"
+                FWD_SPEC_TPORT="${parts[1]}"
+            else
+                return 1
+            fi
+        elif [[ "${#parts[@]}" -eq 3 ]]; then
+            if [[ ! "${parts[0]}" =~ ^[0-9]+$ && "${parts[1]}" =~ ^[0-9]+$ && "${parts[2]}" =~ ^[0-9]+$ ]]; then
+                FWD_SPEC_BIND="${parts[0]}"
+                FWD_SPEC_ENTRY="${parts[1]}"
+                FWD_SPEC_THOST="127.0.0.1"
+                FWD_SPEC_TPORT="${parts[2]}"
+            elif [[ "${parts[0]}" =~ ^[0-9]+$ && -n "${parts[1]}" && ! "${parts[1]}" =~ ^[0-9]+$ && "${parts[2]}" =~ ^[0-9]+$ ]]; then
+                FWD_SPEC_BIND="127.0.0.1"
+                FWD_SPEC_ENTRY="${parts[0]}"
+                FWD_SPEC_THOST="${parts[1]}"
+                FWD_SPEC_TPORT="${parts[2]}"
+            else
+                return 1
+            fi
+        elif [[ "${#parts[@]}" -eq 4 ]]; then
+            if [[ ! "${parts[0]}" =~ ^[0-9]+$ && "${parts[1]}" =~ ^[0-9]+$ && -n "${parts[2]}" && ! "${parts[2]}" =~ ^[0-9]+$ && "${parts[3]}" =~ ^[0-9]+$ ]]; then
+                FWD_SPEC_BIND="${parts[0]}"
+                FWD_SPEC_ENTRY="${parts[1]}"
+                FWD_SPEC_THOST="${parts[2]}"
+                FWD_SPEC_TPORT="${parts[3]}"
+            else
+                return 1
+            fi
+        else
+            return 1
+        fi
+    fi
+    if [[ ! "$FWD_SPEC_ENTRY" =~ ^[0-9]+$ || ! "$FWD_SPEC_TPORT" =~ ^[0-9]+$ ]]; then
+        return 1
+    fi
+    if [[ "$FWD_SPEC_ENTRY" -lt 1 || "$FWD_SPEC_ENTRY" -gt 65535 || "$FWD_SPEC_TPORT" -lt 1 || "$FWD_SPEC_TPORT" -gt 65535 ]]; then
+        return 1
+    fi
+    case "$FWD_SPEC_BIND" in ""|*[[:space:]/]*) return 1 ;; esac
+    case "$FWD_SPEC_THOST" in ""|*[[:space:]/]*) return 1 ;; esac
+    return 0
+}
+
+# fwd_split_row <row> — split one TAB row into FWD_C1..FWD_C10.
+#   Shared plumbing for every fwd row reader. Pure expansion on purpose:
+#   TAB counts as IFS whitespace, so an IFS-tab read squeezes runs of TABs
+#   into one and empty middle fields vanish (a stale record's node then eats
+#   the ctl path). Expansion keeps every empty slot exactly where it is.
+#   Records carry 7 fields, status rows 10; unused slots stay empty.
+#   Data only, no output, no picking — safe for both layers.
+fwd_split_row() {
+    local rest="$1"
+    FWD_C1=""; FWD_C2=""; FWD_C3=""; FWD_C4=""; FWD_C5=""
+    FWD_C6=""; FWD_C7=""; FWD_C8=""; FWD_C9=""; FWD_C10=""
+    rest="$1"
+    FWD_C1="${rest%%$'\t'*}"
+    if [[ "$rest" == *$'\t'* ]]; then rest="${rest#*$'\t'}"; else rest=""; fi
+    FWD_C2="${rest%%$'\t'*}"
+    if [[ "$rest" == *$'\t'* ]]; then rest="${rest#*$'\t'}"; else rest=""; fi
+    FWD_C3="${rest%%$'\t'*}"
+    if [[ "$rest" == *$'\t'* ]]; then rest="${rest#*$'\t'}"; else rest=""; fi
+    FWD_C4="${rest%%$'\t'*}"
+    if [[ "$rest" == *$'\t'* ]]; then rest="${rest#*$'\t'}"; else rest=""; fi
+    FWD_C5="${rest%%$'\t'*}"
+    if [[ "$rest" == *$'\t'* ]]; then rest="${rest#*$'\t'}"; else rest=""; fi
+    FWD_C6="${rest%%$'\t'*}"
+    if [[ "$rest" == *$'\t'* ]]; then rest="${rest#*$'\t'}"; else rest=""; fi
+    FWD_C7="${rest%%$'\t'*}"
+    if [[ "$rest" == *$'\t'* ]]; then rest="${rest#*$'\t'}"; else rest=""; fi
+    FWD_C8="${rest%%$'\t'*}"
+    if [[ "$rest" == *$'\t'* ]]; then rest="${rest#*$'\t'}"; else rest=""; fi
+    FWD_C9="${rest%%$'\t'*}"
+    if [[ "$rest" == *$'\t'* ]]; then rest="${rest#*$'\t'}"; else rest=""; fi
+    FWD_C10="$rest"
+    return 0
+}
+
+# fwd_is_wild <bind> — 0 when bind is a wildcard (0.0.0.0, ::, empty).
+#   Only these three count: anything else, even another loopback spelling,
+#   is a specific address and coexists with its siblings on the same port.
+fwd_is_wild() {
+    case "$1" in
+        ""|"0.0.0.0"|"::") return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+# fwd_records — Model: one row per socket file under $FWD_DIR.
+#   Sets FWD_RECORDS, each bind<TAB>entryport<TAB>node<TAB>targethost<TAB>
+#   targetport<TAB>pid<TAB>ctl. No network. A file with no live process is
+#   still listed (pid/node/target blank) so ls can show it down and rm can
+#   clear it — hiding it would be a second source of truth disagreeing.
+fwd_records() {
+    local f base rest bind entry ps_out line pid lspec node thost tport
+    local lbind lentry r1 r2 tmp
+    FWD_RECORDS=()
+    [[ -d "$FWD_DIR" ]] || return 0
+    ps_out="$(ps ax -o pid= -o args= 2>/dev/null)"
+    for f in "$FWD_DIR"/fwd-*; do
+        [[ -e "$f" ]] || continue
+        base="${f##*/}"
+        rest="${base#fwd-}"
+        case "$rest" in
+            *-*) bind="${rest%-*}"; entry="${rest##*-}" ;;
+            *) continue ;;
+        esac
+        [[ -n "$bind" && "$entry" =~ ^[0-9]+$ ]] || continue
+        pid=""
+        node=""
+        thost=""
+        tport=""
+        line=""
+        if [[ -n "$ps_out" ]]; then
+            while IFS= read -r tmp; do
+                case "$tmp" in
+                    *" -S ${f} "*) line="$tmp"; break ;;
+                esac
+            done <<< "$ps_out"
+        fi
+        if [[ -n "$line" ]]; then
+            tmp="${line#"${line%%[! ]*}"}"
+            pid="${tmp%% *}"
+            case "$line" in
+                *" -L "*)
+                    tmp="${line#* -L }"
+                    lspec="${tmp%% *}"
+                    lbind="${lspec%%:*}"
+                    r1="${lspec#*:}"
+                    lentry="${r1%%:*}"
+                    r2="${r1#*:}"
+                    thost="${r2%%:*}"
+                    tport="${r2##*:}"
+                    if [[ "$lbind" == "$bind" && "$lentry" == "$entry" ]]; then
+                        :
+                    else
+                        thost=""
+                        tport=""
+                    fi
+                    ;;
+            esac
+            case "$line" in
+                *"mlp-fwd-node="*)
+                    tmp="${line#*mlp-fwd-node=}"
+                    node="${tmp%% *}"
+                    ;;
+            esac
+        fi
+        FWD_RECORDS+=("${bind}"$'\t'"${entry}"$'\t'"${node}"$'\t'"${thost}"$'\t'"${tport}"$'\t'"${pid}"$'\t'"${f}")
+    done
+    return 0
+}
+
+# fwd_probe <ctl> <targethost> <targetport> — Model: two live segments.
+#   Sets FWD_PROBE_TUNNEL (up|down), FWD_PROBE_TARGET
+#   (open|refused|timeout|unreachable|unknown), FWD_PROBE_RTT (ms) and the
+#   joined FWD_PROBE_RESULT. 0 when the tunnel answered, 1 when it did not.
+#   Tunnel verdict rides the master itself (a remote true through it):
+#   asking the local master process would answer OK with the line dead,
+#   which is the exact failure this repo kept re-hitting, so that call is
+#   never used here. Target verdict is one TCP open attempt run ON the far
+#   side, classified by exit code AND far-side stderr: only an explicit
+#   "Connection refused" proves the packet reached the host (RST came back),
+#   so only that counts as healthy alongside open; anything else non-zero
+#   (no route, host down) is unreachable, while 124 stays timeout — "I do
+#   not know" versus "I know it cannot get there", never merged.
+fwd_probe() {
+    local ctl="$1" thost="$2" tport="$3" rc start_ms now_ms target_err
+    FWD_PROBE_TUNNEL=""
+    FWD_PROBE_TARGET=""
+    FWD_PROBE_RTT=""
+    FWD_PROBE_RESULT=""
+    if command -v python3 >/dev/null 2>&1; then
+        start_ms="$(python3 -c 'import time;print(int(time.time()*1000))' 2>/dev/null)" || start_ms=""
+    else
+        start_ms=""
+    fi
+    if ssh -S "$ctl" -o BatchMode=yes -o ConnectTimeout=5 placeholder true < /dev/null >/dev/null 2>&1; then
+        FWD_PROBE_TUNNEL="up"
+    else
+        FWD_PROBE_TUNNEL="down"
+    fi
+    if command -v python3 >/dev/null 2>&1; then
+        now_ms="$(python3 -c 'import time;print(int(time.time()*1000))' 2>/dev/null)" || now_ms=""
+    else
+        now_ms=""
+    fi
+    if [[ -n "$start_ms" && -n "$now_ms" ]]; then
+        FWD_PROBE_RTT="$(( now_ms - start_ms ))"
+    else
+        FWD_PROBE_RTT="0"
+    fi
+    if [[ "$FWD_PROBE_TUNNEL" != "up" ]]; then
+        FWD_PROBE_TARGET="unknown"
+        FWD_PROBE_RESULT="${FWD_PROBE_TUNNEL}"$'\t'"${FWD_PROBE_TARGET}"$'\t'"${FWD_PROBE_RTT}"
+        return 1
+    fi
+    target_err="$(ssh -S "$ctl" -o BatchMode=yes -o ConnectTimeout=8 placeholder \
+        "timeout 3 bash -c 'exec 3<>/dev/tcp/${thost}/${tport}'" < /dev/null 2>&1 >/dev/null)"
+    rc=$?
+    if [[ "$rc" -eq 0 ]]; then
+        FWD_PROBE_TARGET="open"
+    elif [[ "$rc" -eq 124 ]]; then
+        FWD_PROBE_TARGET="timeout"
+    elif [[ "$target_err" == *"Connection refused"* ]]; then
+        FWD_PROBE_TARGET="refused"
+    else
+        FWD_PROBE_TARGET="unreachable"
+    fi
+    FWD_PROBE_RESULT="${FWD_PROBE_TUNNEL}"$'\t'"${FWD_PROBE_TARGET}"$'\t'"${FWD_PROBE_RTT}"
+    return 0
+}
+
+# fwd_add <node> <spec> — ViewModel: parse, resolve, start master, verify.
+#   Sets FWD_ADD_* on success (CTL/BIND/ENTRY/NODE/THOST/TPORT) and returns
+#   0. On failure sets FWD_ERR (spec|resolve|inuse|start|verify, plus
+#   FWD_START_ERR detail and TARGET_ERR from the resolver) and returns
+#   non-zero. Starts the master through ssh_via_gateway with SSH_EXTRA_OPTS
+#   carrying -L/-M/-S/-N/-f; ExitOnForwardFailure makes a held port fail
+#   here instead of pretending to succeed. A stale socket file for the same
+#   entryport is cleared so add stays retryable; a live one refuses.
+fwd_add() {
+    local node="$1" spec="$2" bind entry thost tport tuser tport_lb ctl lspec
+    local rc start_err ps_now f base rest fbind fentry
+    FWD_ERR=""
+    FWD_START_ERR=""
+    FWD_CLASH=""
+    FWD_ADD_CTL=""
+    FWD_ADD_BIND=""
+    FWD_ADD_ENTRY=""
+    FWD_ADD_NODE=""
+    FWD_ADD_THOST=""
+    FWD_ADD_TPORT=""
+    fwd_parse_spec "$spec" || { FWD_ERR="spec"; return 2; }
+    bind="$FWD_SPEC_BIND"
+    entry="$FWD_SPEC_ENTRY"
+    thost="$FWD_SPEC_THOST"
+    tport="$FWD_SPEC_TPORT"
+    resolve_gateway nodie || { FWD_ERR="resolve"; return 3; }
+    target_resolve "$node" || { FWD_ERR="resolve"; return 3; }
+    tuser="$TARGET_USER"
+    tport_lb="$TARGET_PORT"
+    if [[ ! -d "$FWD_DIR" ]]; then
+        mkdir -p "$FWD_DIR" || { FWD_ERR="start"; return 5; }
+    fi
+    ctl="${FWD_DIR}/fwd-${bind}-${entry}"
+    # Identity is bind:entryport; same-port records collide only on overlap:
+    # an exact duplicate always refuses, a wildcard on either side refuses
+    # (the kernel allows it under SO_REUSEADDR but then silently routes by
+    # specificity — two "up" rows pointing at different destinations), and
+    # two different specific addresses coexist legitimately. Dead files never
+    # collide; same-port ones are cleared so add stays retryable.
+    ps_now="$(ps ax -o pid= -o args= 2>/dev/null)"
+    for f in "$FWD_DIR"/fwd-*; do
+        [[ -e "$f" ]] || continue
+        base="${f##*/}"
+        rest="${base#fwd-}"
+        case "$rest" in
+            *-*) fbind="${rest%-*}"; fentry="${rest##*-}" ;;
+            *) continue ;;
+        esac
+        [[ "$fentry" == "$entry" ]] || continue
+        case "$ps_now" in
+            *" -S ${f} "*) : ;;
+            *) rm -f "$f"; continue ;;
+        esac
+        if [[ "$fbind" == "$bind" ]]; then
+            FWD_ERR="inuse"; FWD_CLASH="${fbind}:${fentry}"; return 4
+        fi
+        if fwd_is_wild "$fbind" || fwd_is_wild "$bind"; then
+            FWD_ERR="inuse"; FWD_CLASH="${fbind}:${fentry}"; return 4
+        fi
+    done
+    lspec="${bind}:${entry}:${thost}:${tport}"
+    SSH_EXTRA_OPTS=(-M -S "$ctl" -N -f -L "$lspec" -o ControlPersist=yes -o ExitOnForwardFailure=yes)
+    start_err="$(ssh_via_gateway "$GW_KNOWN_HOSTS" "$GW_USER" "$GW_IP" "$GW_PORT" "$tuser" 127.0.0.1 "$tport_lb" "mlp-fwd-node=${node}" < /dev/null 2>&1 >/dev/null)"
+    rc=$?
+    unset SSH_EXTRA_OPTS
+    if [[ "$rc" -ne 0 ]]; then
+        rm -f "$ctl"
+        FWD_ERR="start"
+        FWD_START_ERR="$start_err"
+        return 5
+    fi
+    fwd_probe "$ctl" "$thost" "$tport"
+    if [[ "$FWD_PROBE_TUNNEL" != "up" ]]; then
+        ssh -S "$ctl" -O exit placeholder < /dev/null >/dev/null 2>&1 || true
+        rm -f "$ctl"
+        FWD_ERR="verify"
+        return 6
+    fi
+    FWD_ADD_CTL="$ctl"
+    FWD_ADD_BIND="$bind"
+    FWD_ADD_ENTRY="$entry"
+    FWD_ADD_NODE="$node"
+    FWD_ADD_THOST="$thost"
+    FWD_ADD_TPORT="$tport"
+    return 0
+}
+
+# fwd_remove <entryport|bind:entryport> — ViewModel: stop one master, clear
+#   its socket. A bare port must match exactly one file; bind:port pins it
+#   (last colon splits, so IPv6 binds work). Several files on one port
+#   (stale leftovers) refuse with FWD_ERR=ambiguous and the FWD_RM_CANDS
+#   list instead of silently picking one.
+#   Sets FWD_RM_CTL and returns 0; FWD_ERR (spec|notfound|ambiguous) else.
+#   Entry match is exact on the parsed port, never a glob, so port 80 can
+#   never catch 8080.
+fwd_remove() {
+    local arg="$1" entry bind f base rest fbind fentry ctl ncands
+    FWD_ERR=""
+    FWD_RM_CTL=""
+    FWD_RM_CANDS=""
+    case "$arg" in
+        *:*)
+            bind="${arg%:*}"
+            entry="${arg##*:}"
+            ;;
+        *)
+            bind=""
+            entry="$arg"
+            ;;
+    esac
+    [[ "$entry" =~ ^[0-9]+$ ]] || { FWD_ERR="spec"; return 2; }
+    ctl=""
+    ncands=0
+    if [[ -d "$FWD_DIR" ]]; then
+        for f in "$FWD_DIR"/fwd-*; do
+            [[ -e "$f" ]] || continue
+            base="${f##*/}"
+            rest="${base#fwd-}"
+            case "$rest" in
+                *-*) fbind="${rest%-*}"; fentry="${rest##*-}" ;;
+                *) continue ;;
+            esac
+            [[ "$fentry" == "$entry" ]] || continue
+            if [[ -n "$bind" ]]; then
+                [[ "$fbind" == "$bind" ]] || continue
+                ctl="$f"
+                break
+            fi
+            ncands=$((ncands + 1))
+            FWD_RM_CANDS="${FWD_RM_CANDS}${fbind}:${fentry}
+"
+            ctl="$f"
+        done
+    fi
+    if [[ -n "$bind" ]]; then
+        if [[ -z "$ctl" ]]; then
+            FWD_ERR="notfound"
+            return 3
+        fi
+    else
+        case "$ncands" in
+            0) FWD_ERR="notfound"; return 3 ;;
+            1) : ;;
+            *) FWD_ERR="ambiguous"; return 4 ;;
+        esac
+    fi
+    ssh -S "$ctl" -O exit placeholder < /dev/null >/dev/null 2>&1 || true
+    rm -f "$ctl"
+    FWD_RM_CTL="$ctl"
+    return 0
+}
+
+# fwd_status — ViewModel: records joined with a probe each.
+#   Sets FWD_STATUS_ROWS, each a record row plus tunnel<TAB>target<TAB>rtt.
+#   Rows with no target (stale files) skip the dial and read down/unknown.
+fwd_status() {
+    local r bind entry node thost tport pid ctl tunnel target rtt
+    FWD_STATUS_ROWS=()
+    fwd_records
+    if [[ "${#FWD_RECORDS[@]}" -gt 0 ]]; then
+        for r in "${FWD_RECORDS[@]}"; do
+            fwd_split_row "$r"
+            bind="$FWD_C1"; entry="$FWD_C2"; node="$FWD_C3"; thost="$FWD_C4"
+            tport="$FWD_C5"; pid="$FWD_C6"; ctl="$FWD_C7"
+            if [[ -n "$thost" && -n "$tport" ]]; then
+                fwd_probe "$ctl" "$thost" "$tport"
+                tunnel="$FWD_PROBE_TUNNEL"
+                target="$FWD_PROBE_TARGET"
+                rtt="$FWD_PROBE_RTT"
+            else
+                tunnel="down"
+                target="unknown"
+                rtt="0"
+            fi
+            FWD_STATUS_ROWS+=("${bind}"$'\t'"${entry}"$'\t'"${node}"$'\t'"${thost}"$'\t'"${tport}"$'\t'"${pid}"$'\t'"${ctl}"$'\t'"${tunnel}"$'\t'"${target}"$'\t'"${rtt}")
+        done
+    fi
+    return 0
+}
+
+# ---- fwd view -----------------------------------------------------------------
+# View: picking, layout, color. Never dials — every fact comes from the
+# ViewModel above.
+
+fwd_view_add() {
+    local node="${1:-}" spec="${2:-}"
+    if [[ -z "$node" || -z "$spec" ]]; then
+        echo "usage: mlp fwd add <node> [entryip:]entryport[:targethost:targetport]" >&2
+        exit 2
+    fi
+    if fwd_add "$node" "$spec"; then
+        printf '%sforward up:%s %s:%s -> %s (%s:%s)\n' \
+            "$C_GREEN" "$C_RESET" "$FWD_ADD_BIND" "$FWD_ADD_ENTRY" "$FWD_ADD_NODE" "$FWD_ADD_THOST" "$FWD_ADD_TPORT"
+        return 0
+    fi
+    case "$FWD_ERR" in
+        spec)
+            die "bad spec '${spec}' — want [entryip:]entryport[:targethost:targetport] (e.g. 8080, 9090:8080, 8080:192.168.0.50:80)"
+            ;;
+        resolve)
+            if [[ -n "$RESOLVE_DETAIL" ]]; then
+                die "$RESOLVE_DETAIL"
+            fi
+            if [[ "$TARGET_ERR" == "unreachable" ]]; then
+                [[ -n "$TARGET_DETAIL" ]] && printf '%s\n' "$TARGET_DETAIL" >&2
+                die "Gateway unreachable (${GW_USER}@${GW_IP})"
+            fi
+            die "no such node or worker: ${node}"
+            ;;
+        inuse)
+            die "fwd ${FWD_SPEC_BIND}:${FWD_SPEC_ENTRY} overlaps live ${FWD_CLASH} (shared bind:port) — 'mlp fwd ls' to see it, 'mlp fwd rm ${FWD_CLASH}' to clear it"
+            ;;
+        start)
+            [[ -n "$FWD_START_ERR" ]] && printf '%s\n' "$FWD_START_ERR" >&2
+            die "could not start forward to ${node} — is the entryport already held?"
+            ;;
+        verify)
+            die "forward to ${node} started but the tunnel never answered — removed again"
+            ;;
+        *)
+            die "mlp fwd add failed"
+            ;;
+    esac
+}
+
+fwd_view_ls() {
+    local r bind entry node thost tport pid ctl tunnel target rtt target_disp
+    local bind_disp tunnel_disp target_state_disp nodewidth bindwidth targetwidth tstatewidth
+    local bplain tplain tunnel_pad tstate_pad rname
+    fwd_status
+    if [[ "${#FWD_STATUS_ROWS[@]}" -eq 0 ]]; then
+        echo "no forwards — 'mlp fwd add <node> <spec>' to create one"
+        return 0
+    fi
+    # Every data-driven column sizes to its widest plain value (headers are
+    # the floors): TSTATE must fit unreachable (11), BIND an IPv6 bind plus
+    # the LAN "*", TARGET an IPv6/long-DNS host:port. ENTRY/TUNNEL are
+    # provably bounded (5-digit ports; up/down), so they stay fixed.
+    nodewidth=4
+    bindwidth=4
+    targetwidth=6
+    tstatewidth=6
+    for r in "${FWD_STATUS_ROWS[@]}"; do
+        fwd_split_row "$r"
+        bind="$FWD_C1"; entry="$FWD_C2"; node="$FWD_C3"; thost="$FWD_C4"
+        tport="$FWD_C5"; target="$FWD_C9"
+        [[ -n "$node" ]] || node="-"
+        if [[ "${#node}" -gt "$nodewidth" ]]; then
+            nodewidth="${#node}"
+        fi
+        if [[ "$bind" == "127.0.0.1" || "$bind" == "localhost" ]]; then
+            bplain="$bind"
+        else
+            bplain="${bind}*"
+        fi
+        if [[ "${#bplain}" -gt "$bindwidth" ]]; then
+            bindwidth="${#bplain}"
+        fi
+        if [[ -n "$thost" && -n "$tport" ]]; then
+            tplain="${thost}:${tport}"
+        else
+            tplain="-"
+        fi
+        if [[ "${#tplain}" -gt "$targetwidth" ]]; then
+            targetwidth="${#tplain}"
+        fi
+        if [[ "${#target}" -gt "$tstatewidth" ]]; then
+            tstatewidth="${#target}"
+        fi
+    done
+    # Color wraps OUTSIDE the padding: printf counts escape bytes as visible
+    # width, so coloring first breaks TTY alignment while pipes stay clean —
+    # exactly the kind of bug pipe-only verification cannot see.
+    local fmt="%-7s %s %-${nodewidth}s  %-${targetwidth}s %s %s %s\n"
+    printf "${C_BOLD}%-7s %-${bindwidth}s %-${nodewidth}s  %-${targetwidth}s %-7s %-${tstatewidth}s %s${C_RESET}\n" \
+        "ENTRY" "BIND" "NODE" "TARGET" "TUNNEL" "TSTATE" "RTT"
+    for r in "${FWD_STATUS_ROWS[@]}"; do
+        fwd_split_row "$r"
+        bind="$FWD_C1"; entry="$FWD_C2"; node="$FWD_C3"; thost="$FWD_C4"
+        tport="$FWD_C5"; pid="$FWD_C6"; ctl="$FWD_C7"; tunnel="$FWD_C8"
+        target="$FWD_C9"; rtt="$FWD_C10"
+        [[ -n "$node" ]] || node="-"
+        if [[ -n "$thost" && -n "$tport" ]]; then
+            target_disp="${thost}:${tport}"
+        else
+            target_disp="-"
+        fi
+        if [[ "$bind" == "127.0.0.1" || "$bind" == "localhost" ]]; then
+            printf -v bind_disp "%-${bindwidth}s" "$bind"
+        else
+            printf -v bind_disp "%-${bindwidth}s" "${bind}*"
+            bind_disp="${C_RED}${bind_disp}${C_RESET}"
+        fi
+        printf -v tunnel_pad "%-7s" "$tunnel"
+        if [[ "$tunnel" == "up" ]]; then
+            tunnel_disp="${C_GREEN}${tunnel_pad}${C_RESET}"
+        else
+            tunnel_disp="${C_RED}${tunnel_pad}${C_RESET}"
+        fi
+        printf -v tstate_pad "%-${tstatewidth}s" "$target"
+        case "$target" in
+            open|refused) target_state_disp="${C_GREEN}${tstate_pad}${C_RESET}" ;;
+            timeout|unreachable) target_state_disp="${C_YELLOW}${tstate_pad}${C_RESET}" ;;
+            *) target_state_disp="${C_RED}${tstate_pad}${C_RESET}" ;;
+        esac
+        # shellcheck disable=SC2059
+        printf "$fmt" "$entry" "$bind_disp" "$node" "$target_disp" "$tunnel_disp" "$target_state_disp" "${rtt}ms"
+    done
+    if printf '%s\n' "${FWD_STATUS_ROWS[@]}" | grep -qv '^127.0.0.1\|^localhost'; then
+        printf '%s* listening past loopback — reachable from the LAN%s\n' "$C_YELLOW" "$C_RESET"
+    fi
+}
+
+fwd_view_rm() {
+    local entry="${1:-}" pick lines r bind rent rnode rthost rtport rpid rctl pentry pbind prest
+    if [[ "$entry" == -* ]]; then
+        echo "usage: mlp fwd rm [entryport|bind:entryport]  (fzf pick when omitted)" >&2
+        exit 2
+    fi
+    if [[ -z "$entry" ]]; then
+        fwd_records
+        if [[ "${#FWD_RECORDS[@]}" -eq 0 ]]; then
+            echo "no forwards"
+            return 0
+        fi
+        lines=""
+        for r in "${FWD_RECORDS[@]}"; do
+            fwd_split_row "$r"
+            bind="$FWD_C1"; rent="$FWD_C2"; rnode="$FWD_C3"; rthost="$FWD_C4"
+            rtport="$FWD_C5"; rpid="$FWD_C6"; rctl="$FWD_C7"
+            [[ -n "$rnode" ]] || rnode="-"
+            if [[ -n "$rthost" && -n "$rtport" ]]; then
+                lines="${lines}${rent}	${bind}	${rnode}	${rthost}:${rtport}
+"
+            else
+                lines="${lines}${rent}	${bind}	${rnode}	-
+"
+            fi
+        done
+        pick="$(printf '%s' "$lines" | fzf --delimiter=$'\t' --with-nth=1,2,3,4 \
+                --header='ENTRY  BIND  NODE  TARGET' \
+                --prompt='forward> ' --height='~40%')"
+        [[ -n "$pick" ]] || return 0
+        pentry="${pick%%$'\t'*}"
+        prest="${pick#*$'\t'}"
+        pbind="${prest%%$'\t'*}"
+        entry="${pbind}:${pentry}"
+    fi
+    if fwd_remove "$entry"; then
+        printf '%sremoved forward on %s%s\n' "$C_GREEN" "$entry" "$C_RESET"
+        return 0
+    fi
+    case "$FWD_ERR" in
+        spec) die "bad entryport '${entry}' — want entryport or bind:entryport (e.g. 2222, 0.0.0.0:2222)" ;;
+        ambiguous)
+            printf 'several forwards share a port — pick one:\n%s' "$FWD_RM_CANDS" >&2
+            die "usage: mlp fwd rm <bind:entryport>"
+            ;;
+        *) die "no forward on entryport ${entry}" ;;
+    esac
+}
+
+# fwd_menu_add — View: interactive add for main_menu. Node comes from fzf
+#   over the same live view ls renders (gateway plus every gather_targets
+#   row, names only), the spec is typed at the prompt, then the normal add
+#   path runs. Never dials directly — resolution and startup stay inside
+#   the ViewModel it hands off to.
+fwd_menu_add() {
+    local name selected spec
+    resolve_gateway
+    open_gateway_master || die "Gateway unreachable (${GW_USER}@${GW_IP})"
+    selected="$(
+        {
+            printf 'gateway\n'
+            gather_targets | awk -F'\t' '{ print $1 }'
+        } | fzf --prompt='node> ' --height='~40%' \
+                --header='forward to which node?'
+    )"
+    close_gateway_master
+    [[ -n "$selected" ]] || { echo "aborted."; return 1; }
+    name="$selected"
+    printf 'spec ([entryip:]entryport[:targethost:targetport], e.g. 8080): '
+    read -r spec
+    [[ -n "$spec" ]] || { echo "aborted."; return 1; }
+    fwd_view_add "$name" "$spec"
+}
+
+cmd_fwd() {
+    local sub="${1:-}"
+    [[ $# -gt 0 ]] && shift
+    case "$sub" in
+        add) fwd_view_add "$@" ;;
+        ls|"") fwd_view_ls ;;
+        rm) fwd_view_rm "$@" ;;
+        -*)
+            echo "usage: mlp fwd {add|ls|rm}" >&2
+            exit 2
+            ;;
+        *)
+            echo "mlp: unknown fwd subcommand '${sub}' (expected add, ls or rm)" >&2
+            exit 2
+            ;;
+    esac
+}
+
 # ---- main menu --------------------------------------------------------------
 main_menu() {
     local choice action
@@ -1237,6 +1993,9 @@ main_menu() {
                 "rotate-real    replace the live Gateway for real (asks you to type its IP)" \
                 "worker-new     build and start a worker on a provider" \
                 "worker-rm      stop a worker and release its port" \
+                "fwd-add        forward a local port to a node (pick node, type spec)" \
+                "fwd-ls         list local forwards with live state" \
+                "fwd-rm         remove a local forward (pick)" \
                 "ssh-config     write an ssh_config so plain ssh/scp/rsync work" \
                 "trust-gateway  re-accept the Gateway's host key after a rotate" \
                 "quit           exit" \
@@ -1257,6 +2016,9 @@ main_menu() {
             rotate-real) cmd_rotate --real ;;
             worker-new) worker_new ;;
             worker-rm) worker_rm ;;
+            fwd-add) fwd_menu_add ;;
+            fwd-ls) cmd_fwd ls ;;
+            fwd-rm) cmd_fwd rm ;;
             ssh-config) cmd_ssh_config --write ;;
             trust-gateway) cmd_trust_gateway ;;
             quit) break ;;
@@ -1295,6 +2057,7 @@ main() {
         register) cmd_register "$@" ;;
         ssh-config) cmd_ssh_config "$@" ;;
         trust-gateway) cmd_trust_gateway "$@" ;;
+        fwd) cmd_fwd "$@" ;;
         *)
             echo "mlp: unknown command '${cmd}'" >&2
             usage
