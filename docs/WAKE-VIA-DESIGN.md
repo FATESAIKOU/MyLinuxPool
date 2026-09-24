@@ -19,19 +19,31 @@ fh-l 的喚醒只有一條路：`NODE_FH_L.power.launch.via` 是單一字串。
 
 ## 2. 上線順序與手機端（給 MyAiEntry 的 PM）
 
-使用者**明確選擇了「mlp 做完就翻 var」**，並且知道代價：手機端
-`powerWake` 的 `nodes.find(n => n.name === decl.launch.via)` 會拿陣列比對字串、
-回 `undefined`，走進驗證分支回「指向一台不存在的節點」。
-**喚醒會壞掉，而且錯誤訊息指向完全錯誤的方向。**
+使用者**明確選擇了「mlp 做完就翻 var」**，並且知道代價：手機端會壞掉。
 
-所以手機端要做的不是「支援 fallback」，第一優先是**不要壞**：
+壞法是 MyAiEntry 那側的 PM 逐行查證後更正給我們的，本節照他們的結論重寫過
+（初版寫的「回報指向一台不存在的節點」是錯的，那是我方的臆測）。我方另行
+核對過 `~/testAI/MyAiEntry` 的三處，與他們所述一致：
 
-- `launch.via` 的型別從今以後是 `string | string[]`
-- 最小修正：`const vias = Array.isArray(via) ? via : [via]`，取 `vias[0]` 即可
-  恢復今天的行為
-- 完整修正：依序試 `vias`，觸發條件見 §3——**不要用「送出成功」當判準**
+- `src/port/pool/poolSnapshot.ts:74` 的守衛是 `typeof launch.via === 'string'`。
+  陣列過不了，於是整個 `out.launch` 不會被寫進 snapshot——**資料在解析階段就被丟掉**。
+- `src/port/pool/types.ts:130` 明訂「宣告不合法 → `undefined`，畫面上就不提供開機動作」。
+- 所以症狀是 **fh-l 的開機按鈕直接消失**，不是按下去失敗，也沒有任何錯誤訊息。
 
-var 翻動的時間點會在 mlp UAT 通過後，另行通知。
+這比一則誤導的訊息更難察覺：它不說謊，它什麼都不說。
+
+要改的是解析層與型別，**不是呼叫層**——`powerOps` 收不到資料，只改它救不回來：
+
+- `types.ts:118` 的 `via: string` → `string | string[]`
+- `poolSnapshot.ts:71-77` 的守衛要接受兩種形狀
+- 最小修正到此為止即可恢復今天的行為（取第一個元素）
+- 完整修正再依序試，觸發條件見 §3——**不要用「送出成功」當判準**
+
+不受影響的：`hops.via` 是另一個欄位（`poolSnapshot.ts:175-177` 有自己的驗證），
+`device_list` 與 `device_exec` 照常。
+
+var 已於 2026-09-25 翻成陣列，現值 `["fh-proxy-asus", "fh-proxy"]`。
+手機端修不修、什麼時候修，由他們的使用者決定。
 
 ## 3. fallback 的觸發條件：fh-l 有沒有真的醒
 
