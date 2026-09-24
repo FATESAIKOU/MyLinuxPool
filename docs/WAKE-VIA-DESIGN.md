@@ -56,12 +56,26 @@ RUNBOOK §4.1 記的那條 PowerShell 路徑**從來沒送出過任何封包**�
 
 判準只能是既有的那個輪詢迴圈：Gateway 上 fh-l 的埠有沒有變 up。
 
-於是每個代送者有兩種失敗，處置不同：
+於是每個代送者有三種收場，處置各不同（回傳碼 `0`／`2`／`3`／`4`）：
 
-| 失敗 | 怎麼發現 | 處置 |
+| 收場 | 怎麼發現 | 處置 |
 |---|---|---|
 | 送不出去（代送者關機、沒裝 pool-wol、ssh 不通） | `run_on_node` 非 0 | **立刻**換下一台，不浪費等待預算 |
 | 送出了但機器沒醒 | 等待預算用完仍未 up | 換下一台 |
+| 送出了但無法驗證（Gateway master 打不開） | master 建連失敗 | 換下一台，記為 `unknown`，**不可說成沒醒** |
+
+最後一列不能併入前一列：沒醒是我們**觀察到**的（看完整個預算，埠一直是 down），
+無法驗證是我們**什麼都沒觀察到**。把後者說成前者，使用者會斷定代送者壞了、
+或去重開一台其實可能已經醒了的機器——說錯的代價不對稱，所以不確定的事不說成沒發生。
+這正是 fwd 目標探測分四態裡 `timeout` 與 `unreachable` 不合併的同一個理由
+（FWD-DESIGN.md §4：一個是「我不知道」，一個是「我知道到不了」）。
+
+MyAiEntry 那側有一個同源的狀態 `pool_unknown_result`，**判準相同但後果不同，
+所以刻意不共用名字**。共用的是原則：不確定的事不說成沒發生。
+分開的是政策——他們的 unknown 代表「不可重送、去讀狀態」，因為遠端指令可能已經執行；
+我們的 unknown 代表「繼續試下一台」，因為 WoL 魔術封包是冪等的，多送一次沒有代價。
+沿用他們的名字會把那條重送禁令一起帶進來，那在這裡是錯的。
+（這個區分是他們的 PM 提醒的：名字要跟後果綁在一起，不是跟症狀。）
 
 ## 4. 等待預算
 
@@ -98,7 +112,20 @@ waking fh-l via fh-proxy (2/2): ...
 ```
 
 成功那一行要指名是誰叫醒的。全部失敗時要列出每一台的失敗原因，
-不是只說「timed out」。
+不是只說「timed out」。有一台以上是 `unknown` 時，結尾不可說
+`could not wake`（那是在宣稱沒醒），要說無法確認並提示自行驗證；
+全數 `unknown` 時加註每一台都未驗證：
+
+```
+waking fh-l via fh-proxy-asus (1/2): unicast WoL to b4:2e:99:fb:63:5e @ 192.168.0.136 ...
+  fh-proxy-asus: sent, but fh-l did not come up within 90s
+waking fh-l via fh-proxy (2/2): ...
+  fh-proxy: sent, but could not verify whether fh-l woke (gateway unreachable, cannot verify wake)
+could not verify whether fh-l woke:
+  fh-proxy-asus: sent, but did not come up within 90s
+  fh-proxy: sent, but could not verify whether fh-l woke (gateway unreachable, cannot verify wake)
+mlp: wake result unknown for fh-l — check 'mlp ls' to verify
+```
 
 ## 7. 不做
 

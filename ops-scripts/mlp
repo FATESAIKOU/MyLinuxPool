@@ -730,12 +730,16 @@ wake_senders() {
 # wake_try_sender <sender> <mac> <target_ip> <port> <budget_secs> — ViewModel.
 #   Sends one WoL via sender, then polls the Gateway loopback port for up to
 #   budget seconds. Returns 0 woke | 2 could not send (fast, no budget spent)
-#   | 3 sent but still down. Sets WAKE_ELAPSED (seconds waited this try) and,
-#   on state 2, WAKE_SEND_ERR (captured send chatter for the View to list).
+#   | 3 sent but provably still down | 4 sent, unverifiable. Sets WAKE_ELAPSED
+#   (seconds waited this try) and, off the happy path, WAKE_SEND_ERR (captured
+#   send chatter or the verify failure, for the View to list).
 #   The trigger is the port poll, never the send exit code: pool-wol 0 proves
 #   nothing about the far side (RUNBOOK §4.1). Opens its own Gateway master
-#   so one call is one self-contained attempt; a master that will not open
-#   reads as state 3 (sent, unverifiable) without burning the budget.
+#   so one call is one self-contained attempt. States 3 and 4 never merge:
+#   3 means we watched the full budget expire with the port down; 4 means a
+#   dead Gateway master left us with no observation at all — reporting 4 as
+#   "did not wake" would blame the sender (or the sleeping box) for something
+#   we never saw, the same lie class as fwd's timeout-versus-unreachable.
 wake_try_sender() {
     local sender="$1" mac="$2" target_ip="$3" port="$4" budget="$5"
     local rc send_out state waited
@@ -750,7 +754,7 @@ wake_try_sender() {
     if ! open_gateway_master 2>/dev/null; then
         WAKE_SEND_ERR="gateway unreachable, cannot verify wake"
         close_gateway_master
-        return 3
+        return 4
     fi
     waited=0
     while [[ "$waited" -lt "$budget" ]]; do
@@ -770,7 +774,7 @@ wake_try_sender() {
 
 cmd_wake() {
     local node="${1:-}" json rc method mac target_ip port
-    local total i sender budget trc reason elapsed waited_total
+    local total i sender budget trc reason elapsed waited_total n_unknown
     local fail_names=() fail_reasons=() k
     if [[ "$node" == -* ]]; then
         echo "usage: mlp wake [<node-name>]  (node must declare .power.launch; fzf pick when omitted)" >&2
@@ -805,6 +809,7 @@ cmd_wake() {
 
     total="${#WAKE_SENDERS[@]}"
     waited_total=0
+    n_unknown=0
     i=0
     for sender in "${WAKE_SENDERS[@]}"; do
         i=$((i + 1))
@@ -832,18 +837,41 @@ cmd_wake() {
             fail_reasons+=("could not send: $reason")
             continue
         fi
+        if [[ "$trc" -eq 4 ]]; then
+            reason="$WAKE_SEND_ERR"
+            [[ -n "$reason" ]] || reason="unknown error"
+            printf '  %s: sent, but could not verify whether %s woke (%s)\n' "$sender" "$node" "$reason"
+            fail_names+=("$sender")
+            fail_reasons+=("sent, but could not verify whether ${node} woke (${reason})")
+            n_unknown=$((n_unknown + 1))
+            continue
+        fi
         printf '  %s: sent, but %s did not come up within %ss\n' "$sender" "$node" "$budget"
         fail_names+=("$sender")
         fail_reasons+=("sent, but did not come up within ${budget}s")
         waited_total=$((waited_total + budget))
     done
 
-    echo "could not wake ${node} — every sender failed:"
+    # Any unknown poisons "could not wake": an unverified send may well have
+    # worked, so the honest ending is unverified, not failed. The per-sender
+    # lines above already say which is which; the header just must not lie.
+    if [[ "$n_unknown" -gt 0 ]]; then
+        if [[ "$n_unknown" -eq "$total" ]]; then
+            echo "could not verify whether ${node} woke — every sender unverified:"
+        else
+            echo "could not verify whether ${node} woke:"
+        fi
+    else
+        echo "could not wake ${node} — every sender failed:"
+    fi
     k=0
     while [[ "$k" -lt "${#fail_names[@]}" ]]; do
         printf '  %s: %s\n' "${fail_names[$k]}" "${fail_reasons[$k]}"
         k=$((k + 1))
     done
+    if [[ "$n_unknown" -gt 0 ]]; then
+        die "wake result unknown for ${node} — check 'mlp ls' to verify"
+    fi
     die "all ${total} wake sender(s) failed for ${node}"
 }
 
