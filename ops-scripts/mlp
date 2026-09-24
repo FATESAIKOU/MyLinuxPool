@@ -700,8 +700,78 @@ pick_power_target() {
     esac
 }
 
+# wake_senders <json> — Model: normalize .power.launch.via to an array.
+#   A string is a one-element array, never a second code path; order is
+#   priority. Sets WAKE_SENDERS (deduped, woken node itself filtered — a
+#   powered-off box cannot wake itself) and returns 0. Missing/empty via,
+#   or everything filtered away, is an error: return 1. No output of its
+#   own; callers turn the bare code into messages.
+wake_senders() {
+    local json="$1" self s seen existing
+    WAKE_SENDERS=()
+    self="$(jq -r '.name // empty' 2>/dev/null <<< "$json")"
+    while IFS= read -r s; do
+        [[ -n "$s" ]] || continue
+        [[ "$s" == "$self" ]] && continue
+        seen=0
+        if [[ "${#WAKE_SENDERS[@]}" -gt 0 ]]; then
+            for existing in "${WAKE_SENDERS[@]}"; do
+                if [[ "$existing" == "$s" ]]; then
+                    seen=1
+                    break
+                fi
+            done
+        fi
+        [[ "$seen" -eq 0 ]] && WAKE_SENDERS+=("$s")
+    done < <(jq -r '.power.launch.via | if type == "array" then .[] elif type == "string" then . else empty end | select(type == "string" and length > 0)' 2>/dev/null <<< "$json")
+    [[ "${#WAKE_SENDERS[@]}" -gt 0 ]]
+}
+
+# wake_try_sender <sender> <mac> <target_ip> <port> <budget_secs> — ViewModel.
+#   Sends one WoL via sender, then polls the Gateway loopback port for up to
+#   budget seconds. Returns 0 woke | 2 could not send (fast, no budget spent)
+#   | 3 sent but still down. Sets WAKE_ELAPSED (seconds waited this try) and,
+#   on state 2, WAKE_SEND_ERR (captured send chatter for the View to list).
+#   The trigger is the port poll, never the send exit code: pool-wol 0 proves
+#   nothing about the far side (RUNBOOK §4.1). Opens its own Gateway master
+#   so one call is one self-contained attempt; a master that will not open
+#   reads as state 3 (sent, unverifiable) without burning the budget.
+wake_try_sender() {
+    local sender="$1" mac="$2" target_ip="$3" port="$4" budget="$5"
+    local rc send_out state waited
+    WAKE_SEND_ERR=""
+    WAKE_ELAPSED=0
+    send_out="$(run_on_node "$sender" "~/.mylinuxpool/bin/pool-wol ${mac} ${target_ip}" 2>&1)"
+    rc=$?
+    if [[ "$rc" -ne 0 ]]; then
+        WAKE_SEND_ERR="$send_out"
+        return 2
+    fi
+    if ! open_gateway_master 2>/dev/null; then
+        WAKE_SEND_ERR="gateway unreachable, cannot verify wake"
+        close_gateway_master
+        return 3
+    fi
+    waited=0
+    while [[ "$waited" -lt "$budget" ]]; do
+        state="$(gw_probe_port "$port")"
+        if [[ "$state" == "up" ]]; then
+            close_gateway_master
+            WAKE_ELAPSED="$waited"
+            return 0
+        fi
+        sleep 5
+        waited=$((waited + 5))
+    done
+    close_gateway_master
+    WAKE_ELAPSED="$waited"
+    return 3
+}
+
 cmd_wake() {
-    local node="${1:-}" json rc method via mac target_ip port waited state
+    local node="${1:-}" json rc method mac target_ip port
+    local total i sender budget trc reason elapsed waited_total
+    local fail_names=() fail_reasons=() k
     if [[ "$node" == -* ]]; then
         echo "usage: mlp wake [<node-name>]  (node must declare .power.launch; fzf pick when omitted)" >&2
         exit 2
@@ -724,40 +794,57 @@ cmd_wake() {
     fi
 
     method="$(printf '%s' "$json" | jq -r '.power.launch.method // empty')"
-    via="$(printf '%s' "$json" | jq -r '.power.launch.via // empty')"
     mac="$(printf '%s' "$json" | jq -r '.power.launch.mac // empty')"
     target_ip="$(printf '%s' "$json" | jq -r '.power.launch.target_ip // empty')"
     port="$(printf '%s' "$json" | jq -r '.gateway_port // empty')"
 
     [[ "$method" == "wol-unicast" ]] || die "NODE_${node}.power.launch.method is '${method:-<empty>}', expected wol-unicast"
-    [[ -n "$via" && -n "$mac" && -n "$target_ip" && -n "$port" ]] || die "NODE_${node}.power.launch is missing via/mac/target_ip, or gateway_port is missing"
+    [[ -n "$mac" && -n "$target_ip" && -n "$port" ]] || die "NODE_${node}.power.launch is missing mac/target_ip, or gateway_port is missing"
 
-    echo "waking ${node} via ${via}: unicast WoL to ${mac} @ ${target_ip} ..."
-    if ! run_on_node "$via" "~/.mylinuxpool/bin/pool-wol ${mac} ${target_ip}"; then
-        die "failed to send WoL packet via ${via}"
-    fi
+    wake_senders "$json" || die "${node} declares no usable .power.launch.via sender"
 
-    echo "packet sent — waiting for ${node}'s port (${port}) on the Gateway (up to 5 minutes)"
-    if ! open_gateway_master; then
-        die "Gateway unreachable while waiting"
-    fi
-
-    waited=0
-    while [[ "$waited" -lt 300 ]]; do
-        state="$(gw_probe_port "$port")"
-        if [[ "$state" == "up" ]]; then
-            close_gateway_master
-            printf '\n%s%s is up%s (after %ss)\n' "$C_GREEN" "$node" "$C_RESET" "$waited"
+    total="${#WAKE_SENDERS[@]}"
+    waited_total=0
+    i=0
+    for sender in "${WAKE_SENDERS[@]}"; do
+        i=$((i + 1))
+        if [[ "$i" -lt "$total" ]]; then
+            budget=90
+        else
+            # Last sender eats the remainder: once the list is exhausted
+            # there is nothing else to try, so waiting it out beats giving
+            # up early to arithmetic. Total budget stays 300 seconds.
+            budget=$((300 - waited_total))
+        fi
+        echo "waking ${node} via ${sender} (${i}/${total}): unicast WoL to ${mac} @ ${target_ip} ..."
+        wake_try_sender "$sender" "$mac" "$target_ip" "$port" "$budget"
+        trc=$?
+        if [[ "$trc" -eq 0 ]]; then
+            elapsed="$WAKE_ELAPSED"
+            printf '\n%s%s is up%s (after %ss, via %s)\n' "$C_GREEN" "$node" "$C_RESET" "$((waited_total + elapsed))" "$sender"
             return 0
         fi
-        printf '.'
-        sleep 5
-        waited=$((waited + 5))
+        if [[ "$trc" -eq 2 ]]; then
+            reason="$WAKE_SEND_ERR"
+            [[ -n "$reason" ]] || reason="unknown error"
+            printf '  %s: could not send (%s)\n' "$sender" "$reason"
+            fail_names+=("$sender")
+            fail_reasons+=("could not send: $reason")
+            continue
+        fi
+        printf '  %s: sent, but %s did not come up within %ss\n' "$sender" "$node" "$budget"
+        fail_names+=("$sender")
+        fail_reasons+=("sent, but did not come up within ${budget}s")
+        waited_total=$((waited_total + budget))
     done
 
-    close_gateway_master
-    echo ""
-    die "timed out after 5 minutes waiting for ${node}"
+    echo "could not wake ${node} — every sender failed:"
+    k=0
+    while [[ "$k" -lt "${#fail_names[@]}" ]]; do
+        printf '  %s: %s\n' "${fail_names[$k]}" "${fail_reasons[$k]}"
+        k=$((k + 1))
+    done
+    die "all ${total} wake sender(s) failed for ${node}"
 }
 
 cmd_down() {
