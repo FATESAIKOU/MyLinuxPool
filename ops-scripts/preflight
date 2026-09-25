@@ -46,6 +46,16 @@ while IFS= read -r f; do
     shell_files+=("$f")
 done < <(git ls-files | grep -E '\.sh$|^ops-scripts/(mlp|verify-profile|preflight)$|/files/pool-')
 
+# An empty enumeration is not "nothing to check", it is "the check did not
+# run" — and everything below that consumes shell_files would otherwise
+# report green off an empty list (0 scripts parsed OK, 0 port-less ssh
+# calls found). git ls-files returns nothing outside a checkout, and the
+# pattern above is one edit away from matching nothing; both look exactly
+# like a clean repo from downstream.
+if [ "${#shell_files[@]}" -eq 0 ]; then
+    bad "找不到任何 shell 檔可掃——列舉本身壞了（不在 git 樹裡？pattern 被改壞？）。下面依賴這份清單的檢查都沒有跑，它們的綠不算數"
+fi
+
 echo "── 語法 ──"
 n=0
 if (( ${#shell_files[@]} > 0 )); then
@@ -55,7 +65,11 @@ if (( ${#shell_files[@]} > 0 )); then
         n=$((n+1))
     done
 fi
-ok "$n 支 shell 腳本"
+if [ "$n" -eq 0 ]; then
+    bad "0 支 shell 腳本通過語法檢查——這不是通過，是沒跑到"
+else
+    ok "$n 支 shell 腳本"
+fi
 
 n=0
 while IFS= read -r f; do
@@ -96,7 +110,7 @@ if [ -f "$SSH_PORT_CHK" ] && command -v python3 >/dev/null 2>&1; then
     # Uses shell_files computed once above — never a second enumeration and
     # never a hand-kept subset (see the comment up there for why).
     if [ "${#shell_files[@]}" -eq 0 ]; then
-        ok "對 Gateway 的 ssh/scp 都指定了埠 (無 shell 檔可掃)"
+        bad "ssh 埠稽核沒有任何輸入檔——掃描器回報零問題是因為它什麼都沒掃，不是因為沒問題"
     elif out="$(python3 "$SSH_PORT_CHK" "${shell_files[@]}" 2>&1)"; then
         ok "對 Gateway 的 ssh/scp 都指定了埠"
     else
