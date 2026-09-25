@@ -200,6 +200,31 @@ install_user_gh() {
     log INFO "installed gh ${version} to ${LOCAL_BIN}/gh"
 }
 
+# tcp_probe <host> <port> <timeout_secs> — connectivity check.
+#   Returns 0 reachable, 1 unreachable, 3 cannot-even-check. Uses curl when
+#   present (it honors proxies, raw TCP cannot), else bash's own /dev/tcp
+#   bounded by timeout. Never a package this script installs later: curl is
+#   only USED when already present (its absence changes nothing — the old
+#   check ran bare curl, which exited 127 when missing and got misreported
+#   as "no network"), and where curl is absent timeout is guaranteed
+#   (coreutils is Essential; macOS always ships curl, so the bare /dev/tcp
+#   branch only runs where timeout exists). Tool-missing (3) and
+#   network-down (1) are different answers by construction.
+tcp_probe() {
+    local host="$1" port="$2" limit="$3"
+    if command -v curl >/dev/null 2>&1; then
+        curl -fsS --max-time "$limit" "https://${host}" >/dev/null 2>&1
+        return $?
+    fi
+    if command -v timeout >/dev/null 2>&1; then
+        if timeout "$limit" bash -c 'exec 3<>/dev/tcp/"$0"/"$1"' "$host" "$port" >/dev/null 2>&1; then
+            return 0
+        fi
+        return 1
+    fi
+    return 3
+}
+
 # ---- step 1: preflight -----------------------------------------------------
 step1_preflight() {
     log INFO "step 1/9: preflight checks"
@@ -211,8 +236,13 @@ step1_preflight() {
         exit 1
     fi
 
-    if ! curl -fsS --max-time 5 https://github.com >/dev/null 2>&1; then
-        log ERROR "no network connectivity to github.com"
+    local probe_rc=0
+    tcp_probe github.com 443 5 || probe_rc=$?
+    if [[ "$probe_rc" -eq 3 ]]; then
+        log ERROR "cannot check connectivity: neither curl nor timeout is available on this machine"
+        exit 1
+    elif [[ "$probe_rc" -ne 0 ]]; then
+        log ERROR "no network connectivity to github.com:443"
         exit 1
     fi
 
@@ -228,6 +258,7 @@ step1_preflight_sudo() {
     command -v rclone >/dev/null 2>&1 || pkgs+=(rclone)
     command -v git >/dev/null 2>&1 || pkgs+=(git)
     command -v gh >/dev/null 2>&1 || pkgs+=(gh)
+    command -v curl >/dev/null 2>&1 || pkgs+=(curl)
     command -v docker >/dev/null 2>&1 || pkgs+=(docker.io)
     dpkg -s openssh-server >/dev/null 2>&1 || pkgs+=(openssh-server)
 
@@ -262,6 +293,14 @@ step1_preflight_no_sudo() {
     local missing_root_pkg=0
     if ! command -v git >/dev/null 2>&1; then
         log ERROR "git is missing; --no-sudo cannot install it without root"
+        missing_root_pkg=1
+    fi
+    # curl is a hard dependency of the user-level jq/gh installs below
+    # (install_user_jq/install_user_gh download over HTTPS) — check it here
+    # next to git/docker, or a curl-less machine dies inside a download
+    # with a message about nothing.
+    if ! command -v curl >/dev/null 2>&1; then
+        log ERROR "curl is missing; --no-sudo cannot install it without root"
         missing_root_pkg=1
     fi
     if ! command -v docker >/dev/null 2>&1; then
@@ -653,6 +692,58 @@ step7_systemd() {
     fi
 }
 
+# ---- step 7.5: docker group membership + real verification ------------------
+# step5 declares capabilities ["docker","worker-host"], but nothing ever
+# verified the declaration — the third provider proved it: create-worker's
+# image build failed with permission denied on docker.sock because nobody
+# ever put the user in the docker group (the older two had it done by
+# hand). So both halves live here: make membership true, then PROVE the
+# daemon answers. The proof runs docker info as the user with freshly
+# resolved groups (sudo -u re-resolves them, so no re-login is needed to
+# test); `id -nG | grep docker` is NOT the proof — group changes apply to
+# new logins only, so the current session's groups answer a different
+# question than "can this user reach the daemon", exactly the kind of check
+# that passes while broken.
+step7_5_docker_group() {
+    log INFO "step 7.5/9: docker group membership + daemon verification"
+    local who
+    who="$(whoami)"
+
+    if [[ "$NO_SUDO" -eq 1 ]]; then
+        # No root anywhere: cannot usermod. Verify what the current session
+        # can actually do; on failure the admin runs usermod and this
+        # idempotent script is re-run from a fresh login.
+        if docker info >/dev/null 2>&1; then
+            log INFO "docker daemon reachable as ${who}"
+            return 0
+        fi
+        log ERROR "cannot talk to the docker daemon as ${who}"
+        log ERROR "ask an admin to run: sudo usermod -aG docker ${who} — then log back in (fresh groups) and re-run registration"
+        exit 1
+    fi
+
+    if ! ensure_sudo; then
+        log ERROR "sudo needs a password but this environment can't provide one (no TTY / no askpass)"
+        log ERROR "re-run this from a session with a real TTY, or add ${who} to the docker group yourself: sudo usermod -aG docker ${who}"
+        exit 1
+    fi
+
+    # Idempotent: already-a-member is a silent no-op, so no "check first"
+    # branch whose own answer could be stale.
+    sudo -n usermod -aG docker "$who" || {
+        log ERROR "could not add ${who} to the docker group"
+        exit 1
+    }
+    log INFO "ensured ${who} in docker group"
+
+    if sudo -n -u "$who" docker info >/dev/null 2>&1; then
+        log INFO "docker daemon reachable as ${who} with fresh groups"
+        return 0
+    fi
+    log ERROR "docker daemon still unreachable as ${who} with fresh groups — membership is set, so check the daemon/socket on this host"
+    exit 1
+}
+
 # ---- step 8: write this machine's authorized_keys from CLIENT_* ----------
 # KEY-DESIGN §8 removed ssh-admin (the old static-bundle unit); the login
 # list now comes from the CLIENT_* variables alone. A FRESH provider must
@@ -708,11 +799,15 @@ step9_verify() {
     }
     gw_ip="$(printf '%s' "$gw_json" | jq -r '.ip')"
     gw_user="$(printf '%s' "$gw_json" | jq -r '.tunnel_user')"
+    # NODE_GATEWAY.port is the one place that says which port the Gateway
+    # listens on (22 is long closed); without -p this ssh always fails and,
+    # under set -e, takes step 9.5 down with step 9.
+    gw_port="$(printf '%s' "$gw_json" | jq -r '.port // 22')"
 
     local tries=0 max_tries=30 ok=0 banner
     while (( tries < max_tries )); do
         banner="$(ssh -o StrictHostKeyChecking=accept-new -o BatchMode=yes -o ConnectTimeout=5 \
-            -i "$TUNNEL_KEY" "${gw_user}@${gw_ip}" \
+            -p "$gw_port" -i "$TUNNEL_KEY" "${gw_user}@${gw_ip}" \
             "timeout 2 bash -c 'exec 3<>/dev/tcp/127.0.0.1/${GATEWAY_PORT} && head -c 4 <&3' 2>/dev/null" \
             2>/dev/null || true)"
         if [[ "$banner" == SSH-* ]]; then
@@ -766,6 +861,7 @@ main() {
     step6_sudoers
     step6_5_tunnel_identity
     step7_systemd
+    step7_5_docker_group
     step8_authorized_keys
     step9_verify
     step95_enable_pool_sync
