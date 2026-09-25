@@ -308,7 +308,7 @@ else
 fi
 
 echo
-printf 'passed %d / failed %d\n' "$pass" "$fail"
+printf 'passed %d / failed %d / injection-fail %d\n' "$pass" "$fail" "$injfail"
 if [[ "$fail" -ne 0 ]]; then exit "$fail"; fi
 if [[ "$injfail" -ne 0 ]]; then exit 2; fi
 exit 0

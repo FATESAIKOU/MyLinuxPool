@@ -314,7 +314,9 @@ else
 fi
 
 echo
-printf 'passed %d / failed %d\n' "$pass" "$fail"
+demo_status="ok"
+if [[ "$DEMO_BROKEN" -ne 0 ]]; then demo_status="FAILED"; fi
+printf 'passed %d / failed %d / demo %s\n' "$pass" "$fail" "$demo_status"
 if [[ "$fail" -ne 0 ]]; then exit 1; fi
 if [[ "$DEMO_BROKEN" -ne 0 ]]; then exit 2; fi
 exit 0

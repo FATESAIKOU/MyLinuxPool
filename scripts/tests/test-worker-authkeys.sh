@@ -65,7 +65,7 @@ CMD="$(
 )"
 if [[ -z "$CMD" ]]; then
     bad "harness: create_worker_build_run_cmd 產不出指令，後面的斷言都跑不了"
-    printf 'passed %d / failed %d\n' "$pass" "$fail"; exit 1
+    printf 'passed %d / failed %d / injection-fail %d\n' "$pass" "$fail" "$injfail"; exit 1
 fi
 
 echo "=== 1-4. docker run 指令 ==="
@@ -192,7 +192,7 @@ else
 fi
 
 echo
-printf 'passed %d / failed %d\n' "$pass" "$fail"
+printf 'passed %d / failed %d / injection-fail %d\n' "$pass" "$fail" "$injfail"
 if [[ "$fail" -ne 0 ]]; then exit "$fail"; fi
 if [[ "$injfail" -ne 0 ]]; then exit 2; fi
 exit 0

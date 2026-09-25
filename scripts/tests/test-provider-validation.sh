@@ -243,10 +243,12 @@ else
 fi
 
 echo
-if [[ "$fail" -eq 0 ]]; then
-    echo "test-provider-validation: ${pass} passed"
+demo_status="ok"
+if [[ "$DEMO_BROKEN" -ne 0 ]]; then demo_status="FAILED"; fi
+if [[ "$fail" -eq 0 && "$DEMO_BROKEN" -eq 0 ]]; then
+    echo "test-provider-validation: ${pass} passed (demo ${demo_status})"
 else
-    echo "test-provider-validation: ${fail} FAILED, ${pass} passed"
+    echo "test-provider-validation: ${fail} FAILED, ${pass} passed (demo ${demo_status})"
 fi
 
 if [[ "$fail" -ne 0 ]]; then
