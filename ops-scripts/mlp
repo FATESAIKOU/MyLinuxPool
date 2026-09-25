@@ -324,7 +324,18 @@ close_gateway_master() {
 
 # Rides the shared ControlMaster; the remote-side `timeout` (present on
 # the Gateway) bounds the actual check, so no local `timeout` binary is
-# needed here — macOS doesn't ship one by default. Echoes up|down.
+# needed here — macOS doesn't ship one by default. Echoes one of:
+#   up            a banner was read — something is listening and speaks SSH.
+#   down          the remote check ran to completion and found no banner:
+#                 an OBSERVATION that it is not listening.
+#   inconclusive  ssh itself failed (master blipped, Gateway busy) or the
+#                 remote check left no trace: nothing was observed.
+# down and inconclusive never merge: "observed not listening" and "did not
+# observe" are different answers, and only the first is evidence. A failed
+# probe reported as down would make a Gateway hiccup look like every node
+# died — the failure shape this repo keeps re-hitting. The name matches
+# fwd_probe's inconclusive (docs/FWD-DESIGN.md §4: name the consequence,
+# not the symptom).
 #
 # `< /dev/null` on the LOCAL ssh here is not optional (2026-09-14
 # incident): this runs inside `while read ... done < <(gather_targets)`
@@ -334,11 +345,19 @@ close_gateway_master() {
 # gather_targets hadn't produced yet (fh-proxy and one worker vanished
 # from `mlp ls` this way). The `</dev/null` *inside* the quoted remote
 # command string is unrelated: that one runs on the Gateway, for `nc`.
+# The trailing marker is what separates "nc ran, found nothing" from "the
+# remote command never got to run": partial/absent output means NOT
+# observed, so it can be classified as inconclusive instead of down.
 gw_probe_port() {
-    local port="$1" banner
-    banner="$(ssh -S "$CTL" -o ConnectTimeout=5 "${GW_USER}@${GW_IP}" \
-        "timeout 2 nc 127.0.0.1 ${port} </dev/null | head -c 4" < /dev/null 2>/dev/null)"
-    if [[ "$banner" == SSH-* ]]; then
+    local port="$1" out rc
+    out="$(ssh -S "$CTL" -o ConnectTimeout=5 "${GW_USER}@${GW_IP}" \
+        "timeout 2 nc 127.0.0.1 ${port} </dev/null | head -c 4; printf %s NC_DONE" < /dev/null 2>/dev/null)"
+    rc=$?
+    if [[ $rc -ne 0 || "$out" != *"NC_DONE"* ]]; then
+        printf 'inconclusive'
+        return
+    fi
+    if [[ "$out" == SSH-* ]]; then
         printf 'up'
     else
         printf 'down'
@@ -412,6 +431,90 @@ run_on_node() {
     ssh_via_gateway "$GW_KNOWN_HOSTS" "$user0" "$host0" "$port0" "$user1" "$host1" "$port1" "$cmd" < /dev/null
 }
 
+# ---- LAN liveness: is the machine behind a silent port actually off? ------
+# 2026-09-25: fh-l was woken, the box was alive on the LAN, but boot hung —
+# sshd never started, so its port stayed silent and `mlp ls` said down.
+# Down and off are not the same thing: waking an already-powered machine
+# fixes nothing and, worse, hides the one state that needs a human. So for
+# a node we already observed as down AND that declares .power.launch (we
+# then know its LAN address and who can reach it), we ask a sender that is
+# currently up to ping it.
+#
+# layering: both are data-only (no printf/echo/fzf). cmd_ls, which is an
+# old output-and-action function, stays as it is otherwise — the probe
+# lives here so a future refactor has something to move.
+
+# lan_ping_probe <sender> <target_ip> — Model: one ping through one sender.
+#   Sets NODE_LAN_STATE and returns matching status:
+#     alive   (0)  ping answered: the machine is on the LAN
+#     off     (1)  ping ran, no answer: the machine is not responding
+#     unknown (2)  no verdict was produced — ssh failed, the sender has no
+#                  ping, or the address is malformed. Never claim off here:
+#                  "not observed" must stay visibly different from "off".
+#   Two traps this classification avoids:
+#   - run_on_node's own failures (bad hop chain, ssh down) also return 1,
+#     so its exit code alone cannot mean "ping ran, no reply". Its failures
+#     always print to stderr, and a successful probe prints nothing at all
+#     (remote stdout+stderr are discarded inside the remote command), so
+#     ANY captured output is infrastructure noise -> unknown, decided
+#     before the exit code is even consulted.
+#   - ping's exit code is the evidence, not run_on_node's: 1 is "ran, no
+#     answer" (ARP failed / no reply) and 124 is the same verdict cut off
+#     by the remote timeout; 2 (no route, permission) or anything else
+#     (127 = ping/timeout missing) is no evidence at all -> unknown.
+lan_ping_probe() {
+    local sender="$1" target_ip="$2" out rc
+    NODE_LAN_STATE=""
+    if [[ ! "$target_ip" =~ ^[0-9A-Fa-f:.]+$ ]]; then
+        NODE_LAN_STATE="unknown"
+        return 2
+    fi
+    out="$(run_on_node "$sender" \
+        "timeout 3 ping -c 1 -W 2 ${target_ip} >/dev/null 2>&1" 2>&1)"
+    rc=$?
+    if [[ -n "$out" ]]; then
+        NODE_LAN_STATE="unknown"
+        return 2
+    fi
+    case "$rc" in
+        0)     NODE_LAN_STATE="alive"; return 0 ;;
+        1|124) NODE_LAN_STATE="off";   return 1 ;;
+        *)     NODE_LAN_STATE="unknown"; return 2 ;;
+    esac
+}
+
+# node_lan_liveness <node_json> <live_senders_multiline> — ViewModel:
+#   normalizes the node's via list (wake_senders), intersects it with the
+#   senders the caller has just seen up, and pings through the first match.
+#   Sets NODE_LAN_STATE (same three values; unknown when nothing suitable is
+#   available). No output, no picker. Costs nothing unless called, and it is
+#   called only for a node already observed down.
+node_lan_liveness() {
+    local json="$1" live="$2" target_ip sender s
+    NODE_LAN_STATE=""
+    target_ip="$(jq -r '.power.launch.target_ip // empty' 2>/dev/null <<< "$json")"
+    if [[ -z "$target_ip" ]]; then
+        NODE_LAN_STATE="unknown"
+        return 2
+    fi
+    wake_senders "$json" || { NODE_LAN_STATE="unknown"; return 2; }
+    sender=""
+    if [[ "${#WAKE_SENDERS[@]}" -gt 0 ]]; then
+        for s in "${WAKE_SENDERS[@]}"; do
+            # exact line match against the caller's up list, not a glob:
+            # "fh-proxy" must not match "fh-proxy-asus".
+            case $'\n'"$live"$'\n' in
+                *$'\n'"$s"$'\n'*) sender="$s"; break ;;
+            esac
+        done
+    fi
+    if [[ -z "$sender" ]]; then
+        NODE_LAN_STATE="unknown"
+        return 2
+    fi
+    lan_ping_probe "$sender" "$target_ip"
+}
+
 # ---- gather providers + workers ------------------------------------------
 # Prints TSV: name<TAB>type<TAB>provider<TAB>port<TAB>user
 # type is one of: provider | worker (gateway is handled separately by
@@ -454,12 +557,27 @@ gather_targets() {
 }
 
 # ---- ls -------------------------------------------------------------------
+# print_state <state> <width> — color is the verdict, word is the evidence:
+#   up                       green  a banner was read
+#   down / off               red    port observed silent; off = the machine
+#                                   itself was pinged and did not answer
+#   out-of-pool              yellow machine ANSWERED on the LAN but its port
+#                                   is silent (boot hung, sshd never started)
+#                                   — needs a human, and must never look like
+#                                   "off": waking an already-powered machine
+#                                   fixes nothing (2026-09-25 incident)
+#   inconclusive / unknown   yellow nothing was observed; say so instead of
+#                                   guessing a verdict
+# Width is passed in because "out-of-pool" and "inconclusive" are longer
+# than the old fixed 4.
 print_state() {
-    if [[ "$1" == "up" ]]; then
-        printf '%s%-4s%s\n' "$C_GREEN" "up" "$C_RESET"
-    else
-        printf '%s%-4s%s\n' "$C_RED" "down" "$C_RESET"
-    fi
+    local state="$1" width="${2:-4}" pad
+    printf -v pad "%-${width}s" "$state"
+    case "$state" in
+        up) printf '%s%s%s\n' "$C_GREEN" "$pad" "$C_RESET" ;;
+        out-of-pool|inconclusive|unknown) printf '%s%s%s\n' "$C_YELLOW" "$pad" "$C_RESET" ;;
+        *) printf '%s%s%s\n' "$C_RED" "$pad" "$C_RESET" ;;
+    esac
 }
 
 cmd_ls() {
@@ -469,12 +587,13 @@ cmd_ls() {
         return 1
     fi
 
-    # Two passes: gather all rows first, then size NAME and PROVIDER to the
-    # longest ones actually seen (worker container names can run long,
-    # e.g. mlp-fh-proxy-base-34797874425, and so can provider names,
-    # e.g. fh-proxy-asus) — a fixed width just breaks alignment on those
-    # instead of ever being "wide enough". TYPE is a closed set capped at 8
-    # and PORT at 5 digits for any real ssh port, so those stay fixed.
+    # Two passes: gather all rows first, then size NAME, PROVIDER and STATE
+    # to the longest ones actually seen (worker container names can run
+    # long, e.g. mlp-fh-proxy-base-34797874425; so can provider names, e.g.
+    # fh-proxy-asus; and STATE now carries verdicts like out-of-pool) — a
+    # fixed width just breaks alignment on those instead of ever being
+    # "wide enough". TYPE is a closed set capped at 8 and PORT at 5 digits
+    # for any real ssh port, so those stay fixed.
     local name type provider port user state r
     local rows=()
     rows[0]="$(printf 'gateway\tgateway\t-\t%s\tup' "$GW_PORT")"
@@ -492,7 +611,38 @@ cmd_ls() {
 
     close_gateway_master
 
-    local namewidth=4 provwidth=8 r rname rlen rprov
+    # LAN-liveness follow-up (the 2026-09-25 incident): a node whose port we
+    # OBSERVED down may still be powered on with a hung boot. Only nodes that
+    # declare .power.launch can be asked about (we then know target_ip and
+    # via), and only the ones that are down — so an all-up `mlp ls` spends
+    # zero extra ssh, and today only fh-l can ever trigger the extra call.
+    # The up-list is the same pass's rows: what ls just showed is what gets
+    # used as senders, one source of truth for both.
+    local live="" nj i2=0
+    for r in "${rows[@]}"; do
+        fwd_split_row "$r"
+        [[ "$FWD_C5" == "up" ]] && live="${live}${FWD_C1}
+"
+    done
+    for r in "${rows[@]}"; do
+        fwd_split_row "$r"
+        name="$FWD_C1"; type="$FWD_C2"; state="$FWD_C5"
+        if [[ "$state" == "down" && "$type" == "provider" ]]; then
+            nj="$("$POOL_RESOLVE" "$name" 2>/dev/null)" || nj=""
+            if [[ -n "$nj" ]] && jq -e '.power.launch != null' >/dev/null 2>&1 <<< "$nj"; then
+                node_lan_liveness "$nj" "$live"
+                case "$NODE_LAN_STATE" in
+                    alive) state="out-of-pool" ;;
+                    off)   state="off" ;;
+                    *)     state="unknown" ;;
+                esac
+                rows[$i2]="$(printf '%s\t%s\t%s\t%s\t%s' "$FWD_C1" "$FWD_C2" "$FWD_C3" "$FWD_C4" "$state")"
+            fi
+        fi
+        i2=$((i2 + 1))
+    done
+
+    local namewidth=4 provwidth=8 statewidth=5 r rname rlen rprov rstate
     for r in "${rows[@]}"; do
         rname="${r%%$'\t'*}"
         rlen="${#rname}"
@@ -500,16 +650,19 @@ cmd_ls() {
         rprov="${r#*$'\t'}"; rprov="${rprov#*$'\t'}"; rprov="${rprov%%$'\t'*}"
         rlen="${#rprov}"
         [[ "$rlen" -gt "$provwidth" ]] && provwidth="$rlen"
+        rstate="${r##*$'\t'}"
+        rlen="${#rstate}"
+        [[ "$rlen" -gt "$statewidth" ]] && statewidth="$rlen"
     done
 
     local fmt="%-${namewidth}s  %-9s %-${provwidth}s %-6s "
-    printf "${C_BOLD}${fmt}%s${C_RESET}\n" "NAME" "TYPE" "PROVIDER" "PORT" "STATE"
+    printf "${C_BOLD}${fmt}%-${statewidth}s${C_RESET}\n" "NAME" "TYPE" "PROVIDER" "PORT" "STATE"
 
     for r in "${rows[@]}"; do
         fwd_split_row "$r"
         name="$FWD_C1"; type="$FWD_C2"; provider="$FWD_C3"; port="$FWD_C4"; state="$FWD_C5"
         printf "$fmt" "$name" "$type" "$provider" "$port"
-        print_state "$state"
+        print_state "$state" "$statewidth"
     done
 }
 
