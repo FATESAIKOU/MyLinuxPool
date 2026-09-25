@@ -86,12 +86,122 @@ rotate_assemble_sshproxy_keys() {
     printf '%s\n' "$all"
 }
 
+# The fixed label every preview machine is born with — and the EXACT string
+# deletion is gated on. The production Gateway's label is "fws"; equality
+# with "fws-preview" is false for it, so it can never become a deletion
+# candidate. Do not replace this with a suffix or pattern match: the point
+# is that "the live Gateway cannot match" is obvious from reading the
+# comparison, not from the reader working it out.
+ROTATE_PREVIEW_LABEL="fws-preview"
+
+# The sentinel a caller passes when it could NOT learn which machine
+# NODE_GATEWAY points at. Distinct from an empty string ("no protection
+# asserted", e.g. a dry run): an unreadable var is exactly when the guard
+# matters most (2026-09-25 qa F2), so it must refuse deletion rather than
+# fall open. "Could not read" != "nothing to protect".
+ROTATE_PROTECT_UNKNOWN="UNKNOWN"
+
+# _rotate_age_of <rfc3339> — seconds since creation, or empty when the
+#   timestamp cannot be parsed. Cosmetic only: a missing age never changes
+#   a decision. GNU date first, BSD (-j -f) second, so a Mac caller works.
+_rotate_age_of() {
+    local created="$1" epoch now
+    [[ -n "$created" ]] || return 0
+    created="${created%%.*}"; created="${created%Z}"
+    epoch="$(date -u -d "$created" +%s 2>/dev/null \
+          || date -u -j -f '%Y-%m-%dT%H:%M:%S' "$created" +%s 2>/dev/null \
+          || true)"
+    [[ -n "$epoch" ]] || return 0
+    now="$(date +%s)"
+    printf '%s' "$(( now - epoch ))"
+}
+
+# rotate_find_preview_linode — Model: locate the machine labeled exactly
+#   ROTATE_PREVIEW_LABEL. No output; sets ROTATE_PREVIEW_STATE and, when
+#   found, ROTATE_PREVIEW_ID/_IP/_CREATED/_AGE; also ROTATE_LINODE_LIST
+#   (the raw list that answered, for callers that need to inspect ids).
+#     found     (0) exactly one machine carries the exact label
+#     absent    (1) the API answered and nothing carries it
+#     unknown   (2) the API did not answer — NOTHING was observed, which
+#                   must never be read as "there is no machine"
+#     ambiguous (3) the API answered with more than one (impossible under
+#                   Linode's uniqueness rule; refuse to guess if it happens)
+rotate_find_preview_linode() {
+    ROTATE_PREVIEW_STATE=""
+    ROTATE_PREVIEW_ID=""; ROTATE_PREVIEW_IP=""; ROTATE_PREVIEW_CREATED=""; ROTATE_PREVIEW_AGE=""
+    ROTATE_LINODE_LIST=""
+    local out matches count
+
+    out="$(linode-cli linodes list --json 2>/dev/null)" || { ROTATE_PREVIEW_STATE="unknown"; return 2; }
+    [[ -n "$out" ]] || { ROTATE_PREVIEW_STATE="unknown"; return 2; }
+    printf '%s' "$out" | jq -e 'type == "array"' >/dev/null 2>&1 || { ROTATE_PREVIEW_STATE="unknown"; return 2; }
+    ROTATE_LINODE_LIST="$out"
+
+    # EXACT equality, never endswith/substring: "fws" is not "fws-preview".
+    matches="$(printf '%s' "$out" | jq -c --arg l "$ROTATE_PREVIEW_LABEL" '[.[] | select(.label == $l)]' 2>/dev/null)" \
+        || { ROTATE_PREVIEW_STATE="unknown"; return 2; }
+    [[ -n "$matches" ]] || { ROTATE_PREVIEW_STATE="unknown"; return 2; }
+    count="$(printf '%s' "$matches" | jq 'length' 2>/dev/null)"
+    case "$count" in
+        ''|*[!0-9]*) ROTATE_PREVIEW_STATE="unknown"; return 2 ;;
+        0) ROTATE_PREVIEW_STATE="absent"; return 1 ;;
+        1) : ;;
+        *) ROTATE_PREVIEW_STATE="ambiguous"; return 3 ;;
+    esac
+    ROTATE_PREVIEW_ID="$(printf '%s' "$matches" | jq -r '.[0].id // empty')"
+    ROTATE_PREVIEW_IP="$(printf '%s' "$matches" | jq -r '.[0].ipv4[0] // empty')"
+    ROTATE_PREVIEW_CREATED="$(printf '%s' "$matches" | jq -r '.[0].created // empty')"
+    ROTATE_PREVIEW_AGE="$(_rotate_age_of "$ROTATE_PREVIEW_CREATED")"
+    if [[ -z "$ROTATE_PREVIEW_ID" ]]; then
+        ROTATE_PREVIEW_STATE="unknown"
+        return 2
+    fi
+    ROTATE_PREVIEW_STATE="found"
+    return 0
+}
+
+# rotate_precheck_preview_collision — refuse to start when a machine already
+#   carries the preview label. Linode's own answer to that situation is
+#   "Label must be unique among your linodes", which sends the reader off to
+#   look at naming; the truth is an orphan left by an earlier rotate
+#   (2026-09-25). Fatal when the collision IS observed, so the real cause is
+#   named before anything is built. A list that cannot be read is a WARN
+#   only: a transient API hiccup must not wedge rotate, and the create call
+#   will still fail honestly if a collision turns out to exist.
+rotate_precheck_preview_collision() {
+    local age_note=""
+    rotate_find_preview_linode
+    case "$ROTATE_PREVIEW_STATE" in
+        found)
+            [[ -n "$ROTATE_PREVIEW_AGE" ]] && age_note=", age ${ROTATE_PREVIEW_AGE}s"
+            log ERROR "a machine labeled '${ROTATE_PREVIEW_LABEL}' already exists: id ${ROTATE_PREVIEW_ID}${ROTATE_PREVIEW_CREATED:+, created ${ROTATE_PREVIEW_CREATED}}${age_note}"
+            log ERROR "that is an orphan from an earlier rotate — not a naming problem, which is what Linode's 'Label must be unique' would have you believe"
+            log ERROR "wait for the 2h orphan sweep, or remove it now: linode-cli linodes rm ${ROTATE_PREVIEW_ID}"
+            return 1
+            ;;
+        ambiguous)
+            log ERROR "more than one machine carries label '${ROTATE_PREVIEW_LABEL}' — clean them up by hand before rotating"
+            return 1
+            ;;
+        unknown)
+            log WARN "could not read the Linode list to check for an existing '${ROTATE_PREVIEW_LABEL}' machine — continuing; a collision, if any, will surface on create"
+            return 0
+            ;;
+    esac
+    return 0
+}
+
 # rotate_create_preview_linode <region> <type> <image> <rendered_cloud_config_path>
 #   Prints `preview_id=<id>` and `preview_ip=<ip>` on success (one per
 #   line, KEY=value — the caller parses these into $GITHUB_OUTPUT itself).
+#   Refuses up front when a preview-labeled orphan already exists, and
+#   translates Linode's misleading uniqueness error if one slips through.
 rotate_create_preview_linode() {
     local region="$1" type="$2" image="$3" rendered="$4"
-    local root_pass create_json preview_id preview_ip
+    local root_pass create_json preview_id preview_ip create_err
+
+    # Before anything is built: name an existing orphan for what it is.
+    rotate_precheck_preview_collision || return 1
 
     # A random password thrown away at the end of this function meant the
     # documented LISH break-glass path stopped working the moment a rotate
@@ -112,15 +222,47 @@ rotate_create_preview_linode() {
         root_pass="$(openssl rand -base64 24 | tr -d '\n')"
         log WARN "GATEWAY_ROOT_PASS not set — generating a throwaway root password; LISH console rescue will NOT be possible on this machine"
     fi
-    create_json="$(linode-cli linodes create \
+    # stdout is the JSON result; stderr carries Linode's own error text, of
+    # which "Label must be unique among your linodes" is the one message
+    # that must not reach the user un-translated (it names a naming problem;
+    # the real cause is a leftover preview machine).
+    local create_out create_rc
+    create_out="$(linode-cli linodes create \
         --no-defaults \
-        --label fws-preview \
+        --label "$ROTATE_PREVIEW_LABEL" \
         --region "$region" \
         --type "$type" \
         --image "$image" \
         --root_pass "$root_pass" \
         --metadata.user_data "$(base64 -w0 < "$rendered")" \
-        --json)"
+        --json 2>&1)"
+    create_rc=$?
+    if [[ "$create_rc" -ne 0 ]]; then
+        if printf '%s' "$create_out" | grep -qi 'must be unique'; then
+            # Re-check so the message can name the actual machine and its
+            # age; if the re-check itself fails, still translate the cause.
+            rotate_find_preview_linode
+            if [[ "$ROTATE_PREVIEW_STATE" == "found" ]]; then
+                log ERROR "could not create the preview machine: '${ROTATE_PREVIEW_LABEL}' is taken by orphan id ${ROTATE_PREVIEW_ID}${ROTATE_PREVIEW_CREATED:+ (created ${ROTATE_PREVIEW_CREATED}${ROTATE_PREVIEW_AGE:+, age ${ROTATE_PREVIEW_AGE}s})}"
+                log ERROR "that is a leftover from an earlier rotate — not a naming problem. Remove it: linode-cli linodes rm ${ROTATE_PREVIEW_ID} (the 2h orphan sweep would also catch it)"
+            else
+                log ERROR "could not create the preview machine: a machine labeled '${ROTATE_PREVIEW_LABEL}' already exists (Linode reports 'Label must be unique')"
+                log ERROR "that is an orphan from an earlier rotate, not a naming problem — remove it (the 2h orphan sweep also catches it), then re-run"
+            fi
+        else
+            log ERROR "linode-cli linodes create failed: $(printf '%s' "$create_out" | head -c 300)"
+        fi
+        return 1
+    fi
+    # stdout held the JSON, but stderr was merged into $create_out to catch
+    # Linode's error text — so a stray warning on stderr would sit alongside
+    # it. Accept the run only when what we have really parses as the array
+    # linode-cli promises.
+    if ! printf '%s' "$create_out" | jq -e 'type == "array"' >/dev/null 2>&1; then
+        log ERROR "linode-cli linodes create returned something that is not JSON: $(printf '%s' "$create_out" | head -c 300)"
+        return 1
+    fi
+    create_json="$create_out"
 
     preview_id="$(jq -r '.[0].id' <<<"$create_json")"
     preview_ip="$(jq -r '.[0].ipv4[0]' <<<"$create_json")"
@@ -474,13 +616,32 @@ rotate_wait_for_providers() {
 }
 
 # rotate_promote_preview <old_label> <preview_id>
-#   Deletes the distinct old Linode (if found) and relabels the preview.
+#   Deletes the distinct old Linode (if found), then relabels the preview.
 #   Prints nothing the caller needs — it only needs the exit code.
+#
+#   The order stays delete-then-relabel because Linode enforces unique
+#   labels: "relabel the preview first" is impossible while the old machine
+#   still holds the name (2026-09-25 qa suggested it; it cannot be done
+#   without a rename dance that creates its own transient states). What
+#   actually closes the window QA found (F3) is elsewhere: the ONLY way
+#   NODE_GATEWAY can end up pointing at a deleted machine is the rollback
+#   step writing the old address back after this function deleted it — so
+#   that write is now gated on the old machine still existing
+#   (rotate_machine_exists, used by the workflow's rollback step).
+#
+#   An empty <preview_id> refuses up front (qa F4): that was the state a
+#   lost create-preview output produced, and the old code deleted the live
+#   Gateway before failing on `update ""`. Nothing is touched now.
 rotate_promote_preview() {
     local old_label="$1" preview_id="$2"
     local old_id
 
-    old_id="$(linode-cli linodes list --json | jq -r --arg l "$old_label" '.[] | select(.label == $l) | .id' | head -n1)"
+    if [[ -z "$preview_id" ]]; then
+        log ERROR "rotate_promote_preview called with an empty preview id — refusing to touch anything (the current Gateway is left alone)"
+        return 1
+    fi
+
+    old_id="$(linode-cli linodes list --json | jq -r --arg l "$old_label" --arg p "$preview_id" '.[] | select(.label == $l and (.id|tostring) != $p) | .id' | head -n1)"
     if [[ -n "$old_id" && "$old_id" != "$preview_id" ]]; then
         linode-cli linodes rm "$old_id"
         log INFO "deleted old Gateway linode ${old_id} (label ${old_label})"
@@ -488,35 +649,194 @@ rotate_promote_preview() {
         log WARN "could not find a distinct old Linode labeled '${old_label}' to delete"
     fi
 
-    linode-cli linodes update "$preview_id" --label "$old_label"
-}
-
-# rotate_cleanup_preview <preview_id>
-rotate_cleanup_preview() {
-    local preview_id="$1"
-    if linode-cli linodes rm "$preview_id"; then
-        log INFO "deleted preview linode ${preview_id}"
-    else
-        log WARN "could not delete preview linode ${preview_id} — the orphan sweep will catch it after 2h"
+    if ! linode-cli linodes update "$preview_id" --label "$old_label"; then
+        log ERROR "could not relabel preview linode ${preview_id} to '${old_label}' — the preview is alive but still labeled '${ROTATE_PREVIEW_LABEL}'; do NOT delete it, it is the only Gateway left"
         return 1
     fi
+    log INFO "preview linode ${preview_id} relabeled to '${old_label}'"
+}
+
+# rotate_machine_exists <ip> — Model: does a Linode answer at this address?
+#   0 exists | 1 verified absent | 2 could not look. Used by the rollback
+#   step before it points NODE_GATEWAY back at a machine: "could not look"
+#   and "exists" are both reasons not to write, but only the first is a
+#   diagnostic ("we did not verify") — never conflate them with "absent".
+rotate_machine_exists() {
+    local ip="$1" out res
+    [[ -n "$ip" ]] || return 2
+    out="$(linode-cli linodes list --json 2>/dev/null)" || return 2
+    [[ -n "$out" ]] || return 2
+    printf '%s' "$out" | jq -e 'type == "array"' >/dev/null 2>&1 || return 2
+    res="$(printf '%s' "$out" | jq -r --arg ip "$ip" '[.[] | select((.ipv4 // []) | index($ip))] | length' 2>/dev/null)" || return 2
+    [[ "$res" =~ ^[0-9]+$ ]] || return 2
+    (( res > 0 )) && return 0
+    return 1
+}
+
+# rotate_cleanup_preview [<preview_id>] [<protected_ip>]
+#   Deletes the preview machine. The id is used when the caller has one
+#   (fast, exact); with no id — or an id whose machine is already gone — it
+#   falls back to the FIXED `fws-preview` label, because the machine exists
+#   in the cloud whether or not the step output that was supposed to name it
+#   ever got written (2026-09-25: the id was lost to a stdout pollution bug,
+#   this step was skipped, and the machine sat there billing).
+#
+#   <protected_ip> is the address NODE_GATEWAY currently points at, or the
+#   sentinel ROTATE_PROTECT_UNKNOWN when the caller could not read it.
+#   This function DELETES MACHINES, so it must never remove the one the
+#   pool is being served by: after `rotate_promote_preview` the preview has
+#   been relabeled and IS the live Gateway, and a later failure runs this
+#   step with the promotion's own preview_id. The guard is therefore
+#   applied to the ID path too, not only the label path — resolved against
+#   the list before anything is removed. The caller supplies that ip (this
+#   library never calls gh).
+#
+#   The three values mean three different things, and must not collapse:
+#     ""        no protection asserted (dry run) — deletion may proceed
+#     "UNKNOWN" the caller could NOT read NODE_GATEWAY — refuse to delete
+#               anything: not knowing what to protect is not permission
+#     <ip>      delete anything except the machine at that address
+#
+#   Return codes — "nothing to delete" and "could not look" are different:
+#     0 nothing to do (verified absent) or deleted
+#     1 deletion attempted and failed
+#     2 could NOT observe: the list was unreadable, or the caller's
+#       protection state is unknown — nothing was deleted
+#     3 ambiguous (impossible under label uniqueness; refuse to guess)
+#     4 refused: the resolved machine is the protected one
+rotate_cleanup_preview() {
+    local want_id="${1:-}" protected_ip="${2:-}"
+    local target_id="" target_ip="" target_how="" list_ok=0
+
+    # Unknown protection state: refuse before even listing. If we cannot
+    # say which machine to spare, we cannot safely remove any candidate.
+    if [[ "$protected_ip" == "$ROTATE_PROTECT_UNKNOWN" ]]; then
+        log WARN "refusing to delete anything: NODE_GATEWAY could not be read, so the machine to protect is unknown — NOT verified safe; the 2h orphan sweep is the backstop"
+        return 2
+    fi
+
+    # Resolve first, delete second: the protection check must see every
+    # candidate, whichever path named it.
+    rotate_find_preview_linode
+    [[ "$ROTATE_PREVIEW_STATE" != "unknown" || -n "$ROTATE_LINODE_LIST" ]] && list_ok=1
+
+    if [[ -n "$want_id" ]]; then
+        target_id="$want_id"
+        target_how="id"
+        # Learn this id's address so the guard can act.
+        if [[ -n "$ROTATE_LINODE_LIST" ]]; then
+            target_ip="$(printf '%s' "$ROTATE_LINODE_LIST" \
+                | jq -r --argjson i "$want_id" '[.[] | select(.id == $i)][0].ipv4[0] // empty' 2>/dev/null || true)"
+        fi
+        # Protection requested, address unknown: the list could not be read,
+        # so whether this id is the live Gateway is NOT OBSERVED. Deleting
+        # now could remove the machine serving the pool — the one mistake
+        # this function must never make. Refuse; the sweep is the backstop.
+        if [[ -n "$protected_ip" && -z "$target_ip" && "$list_ok" -eq 0 ]]; then
+            log WARN "refusing to delete linode ${target_id} by id: the Linode list could not be read, so it could not be checked against the live Gateway (${protected_ip}) — NOT verified safe"
+            return 2
+        fi
+        if [[ -n "$protected_ip" && -n "$target_ip" && "$target_ip" == "$protected_ip" ]]; then
+            log WARN "refusing to delete linode ${target_id} (by id): it is the machine NODE_GATEWAY currently points at (${protected_ip}) — clean up by hand if it really is an orphan"
+            return 4
+        fi
+        if linode-cli linodes rm "$target_id"; then
+            if [[ -n "$target_ip" ]]; then
+                log INFO "deleted preview linode ${target_id} (by id, ${target_ip})"
+            else
+                log INFO "deleted preview linode ${target_id} (by id)"
+            fi
+            return 0
+        fi
+        log WARN "could not delete linode ${target_id} by id — falling back to label '${ROTATE_PREVIEW_LABEL}'"
+    fi
+
+    case "$ROTATE_PREVIEW_STATE" in
+        absent)
+            log INFO "no machine labeled '${ROTATE_PREVIEW_LABEL}' exists — nothing to clean up"
+            return 0
+            ;;
+        unknown)
+            log WARN "could not read the Linode list to clean up '${ROTATE_PREVIEW_LABEL}' — NOT verified as absent; the 2h orphan sweep will catch it"
+            return 2
+            ;;
+        ambiguous)
+            log WARN "more than one machine labeled '${ROTATE_PREVIEW_LABEL}' — refusing to guess; clean up by hand"
+            return 3
+            ;;
+    esac
+    target_id="$ROTATE_PREVIEW_ID"
+    target_ip="$ROTATE_PREVIEW_IP"
+    target_how="label '${ROTATE_PREVIEW_LABEL}'"
+
+    if [[ -n "$protected_ip" && -n "$target_ip" && "$target_ip" == "$protected_ip" ]]; then
+        log WARN "refusing to delete linode ${target_id} (${target_how}): it is the machine NODE_GATEWAY currently points at (${protected_ip}) — clean up by hand if it really is an orphan"
+        return 4
+    fi
+
+    if linode-cli linodes rm "$target_id"; then
+        log INFO "deleted preview linode ${target_id} (found by ${target_how})"
+        return 0
+    fi
+    log WARN "could not delete preview linode ${target_id} (${target_how}) — the orphan sweep will catch it after 2h"
+    return 1
 }
 
 # rotate_orphan_sweep [max_age_secs]
 #   Deletes any Linode labeled '*-preview' older than max_age_secs
 #   (default 2h) — cost protection for anything the two steps above
 #   missed (a killed job, a crashed runner).
+#
+#   This DELETES MACHINES. The live Gateway's label is "fws" and the
+#   filter below is written as an explicit exclusion of it, so "fws can
+#   never be swept" is visible in the code rather than something the reader
+#   has to derive from suffix matching. "fwsx-preview" or any other
+#   *-preview label still matches; the production label is the one
+#   singled out.
+#
+#   <protected_ip> (optional) is NODE_GATEWAY's current address, or
+#   ROTATE_PROTECT_UNKNOWN. A machine still wearing the preview label can
+#   be the live Gateway: a rotate that fails between the switch and the
+#   relabel leaves exactly that state, and cleanup's refusal to delete it
+#   is meaningless if the sweep removes it two hours later (2026-09-25 qa
+#   F5). Refuse protection-unknown too — not knowing what to protect is
+#   not permission to delete.
+#
+#   Age is computed through _rotate_age_of, which works on GNU and BSD
+#   date alike. The old inline `date -u -d` silently produced an empty
+#   epoch on macOS, and an empty epoch made every machine look infinitely
+#   old — the sweep deleted every preview on a Mac, which is the platform
+#   an operator doing a rescue would use (qa 附註). An age that cannot be
+#   parsed now skips the machine: not knowing its age is not permission to
+#   delete either.
 rotate_orphan_sweep() {
-    local max_age_secs="${1:-7200}"
-    local now_epoch label id created created_epoch age
+    local max_age_secs="${1:-7200}" protected_ip="${2:-}"
+    local now_epoch label id ip created age
+
+    if [[ "$protected_ip" == "$ROTATE_PROTECT_UNKNOWN" ]]; then
+        log WARN "orphan sweep: NODE_GATEWAY could not be read, so the machine to protect is unknown — skipping the sweep (nothing deleted)"
+        return 0
+    fi
 
     now_epoch=$(date +%s)
-    linode-cli linodes list --json | jq -c '.[] | select(.label | endswith("-preview"))' | while read -r row; do
+    linode-cli linodes list --json \
+        | jq -c '.[] | select(.label != "fws" and (.label | endswith("-preview")))' \
+        | while read -r row; do
         label="$(jq -r '.label' <<<"$row")"
         id="$(jq -r '.id' <<<"$row")"
-        created="$(jq -r '.created' <<<"$row")"
-        created_epoch="$(date -u -d "$created" +%s)"
-        age=$(( now_epoch - created_epoch ))
+        ip="$(jq -r '.ipv4[0] // empty' <<<"$row")"
+        created="$(jq -r '.created // empty' <<<"$row")"
+
+        if [[ -n "$protected_ip" && -n "$ip" && "$ip" == "$protected_ip" ]]; then
+            log WARN "orphan sweep: NOT deleting '${label}' (id ${id}) — it is the machine NODE_GATEWAY currently points at (${protected_ip})"
+            continue
+        fi
+
+        age="$(_rotate_age_of "$created")"
+        if [[ -z "$age" ]]; then
+            log WARN "orphan sweep: cannot determine the age of '${label}' (id ${id}) — skipping rather than guessing"
+            continue
+        fi
         if (( age > max_age_secs )); then
             log INFO "deleting orphan '${label}' (id ${id}), age ${age}s"
             linode-cli linodes rm "$id" || log WARN "failed to delete orphan '${label}' (id ${id})"
