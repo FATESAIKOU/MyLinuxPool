@@ -102,7 +102,12 @@ rotate_create_preview_linode() {
     # keeps the console path unusable but is no worse than before.
     if [[ -n "${GATEWAY_ROOT_PASS:-}" ]]; then
         root_pass="$GATEWAY_ROOT_PASS"
-        log INFO "using the caller-supplied root password (LISH rescue stays valid)"
+        # >&2: this function's stdout is its return value (the KEY=value
+        # pairs below, often written straight into $GITHUB_OUTPUT). The
+        # sibling branch already used log WARN (stderr) by accident, which
+        # is why this only detonated once GATEWAY_ROOT_PASS was set and
+        # this branch ran for the first time (2026-09-25).
+        log INFO "using the caller-supplied root password (LISH rescue stays valid)" >&2
     else
         root_pass="$(openssl rand -base64 24 | tr -d '\n')"
         log WARN "GATEWAY_ROOT_PASS not set — generating a throwaway root password; LISH console rescue will NOT be possible on this machine"
@@ -167,6 +172,12 @@ rotate_wait_for_cloud_init() {
     local user="$1" ip="$2" timeout_secs="${3:-600}"
     local out rc
 
+    # NOT >&2, deliberately: this function's stdout is captured by the
+    # caller (`... | tee /dev/stderr | tail -1`, which takes the LAST line as
+    # the STATUS= verdict). The human-readable stream is what tee forwards
+    # to stderr; an INFO line on stdout is harmless here because it never
+    # reaches the parser — but only because it comes before the final
+    # printf. Keep every log before the STATUS line so that stays true.
     log INFO "waiting for cloud-init to finish (up to ${timeout_secs}s)..."
     out="$(ssh -o StrictHostKeyChecking=accept-new "${user}@${ip}" \
         "sudo timeout ${timeout_secs} cloud-init status --wait --long" 2>&1)"

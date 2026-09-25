@@ -129,14 +129,18 @@ resolve_node() {
         node_out="$(state_file_lookup "$state_json" "$name")"
         node_rc=$?
         if [[ $node_rc -eq 0 ]]; then
+            # >&2: main captures this function's stdout (`json="$(resolve_node ...)"`)
+            # and parses it as JSON — an INFO line here corrupts that (the
+            # same class as rotate's 2026-09-25 preview bug; this one only
+            # triggers on --refresh, which is why it never surfaced).
             if [[ "$refresh" -eq 1 ]]; then
-                log INFO "pool-resolve: ${name}: serving from state.json (${STATE_FILE})"
+                log INFO "pool-resolve: ${name}: serving from state.json (${STATE_FILE})" >&2
             fi
             printf '%s\n' "$node_out"
             return 0
         fi
         if [[ "$refresh" -eq 1 ]]; then
-            log INFO "pool-resolve: ${name}: state.json present but node not in it — falling through to GitHub"
+            log INFO "pool-resolve: ${name}: state.json present but node not in it — falling through to GitHub" >&2
         fi
     fi
 

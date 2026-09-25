@@ -156,7 +156,25 @@ jobs:
             echo "::error::could not create the preview Gateway — see log above"
             exit 1
           }
-          echo "$output" >> "$GITHUB_OUTPUT"
+          # This step's stdout contract is "KEY=value lines only". Dumping
+          # it unconditionally into $GITHUB_OUTPUT turns any stray log line
+          # into a hard Actions parse error three screens away from its
+          # cause (2026-09-25: one log INFO on stdout, only reachable once
+          # GATEWAY_ROOT_PASSWORD was set — the other branch logged WARN to
+          # stderr). Filtering silently would hide that pollution; failing
+          # loudly turns it back into a bug report naming the offending
+          # line, which is what a broken contract should produce.
+          filtered=""
+          while IFS= read -r line; do
+            [[ -z "$line" ]] && continue
+            if [[ "$line" =~ ^[A-Za-z_][A-Za-z0-9_]*= ]]; then
+              filtered+="${line}"$'\n'
+            else
+              echo "::error::rotate_create_preview_linode wrote a non-KEY=value line to stdout (contract: stdout is the return value): ${line}"
+              exit 1
+            fi
+          done <<< "$output"
+          printf '%s' "$filtered" >> "$GITHUB_OUTPUT"
           preview_ip="$(printf '%s\n' "$output" | grep '^preview_ip=' | cut -d= -f2)"
           echo "::notice::created preview Gateway (${preview_ip})"
 
