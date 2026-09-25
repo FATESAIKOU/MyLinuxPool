@@ -106,6 +106,21 @@ exit 0
 FAKE
 chmod +x "$SHIMS/linode-cli"
 
+# gh stub：生產的 cleanup step 用它讀 NODE_GATEWAY 的 ip（protected_ip）。
+#   GH_READ_FAIL=1 模擬讀取失敗（網路抖動／限流）——F2 的夾具。
+#   成功時回 NODE_GATEWAY_JSON 裡的 .value 字串（gh 的 --jq .value 語意）。
+cat > "$SHIMS/gh" <<'FAKE'
+#!/usr/bin/env bash
+[[ "${GH_READ_FAIL:-0}" == "1" ]] && exit 1
+if [[ -n "${NODE_GATEWAY_JSON:-}" ]]; then
+    printf '%s' "$NODE_GATEWAY_JSON"
+else
+    printf '%s' '{"ip":""}'
+fi
+exit 0
+FAKE
+chmod +x "$SHIMS/gh"
+
 # ---- 夾具：一台正式 Gateway（fws）＋一台 preview ------------------------------
 FIX_NORMAL='[
  {"id":1000,"label":"fws","ipv4":["198.51.100.1"],"created":"2026-09-24T00:00:00"},
@@ -473,6 +488,223 @@ else
         fi
     fi
 fi
+echo "=== P. 生產呼叫形狀：-eo pipefail 下 workflow step 的行為 ==="
+# 為什麼多這一組：上面 21 條的 harness 是 `bash -c`（沒有 -e），所以它們
+# 看到的是函式的真值 rc——但**生產的呼叫形狀從未被測**。workflow 的
+# 清理步驟跑在 `bash -eo pipefail`（GitHub 預設），而它是**裸呼叫**：
+#     rotate_cleanup_preview ... ; case $? in ...
+# `-e` 之下函式回非 0（absent=1、unknown=2、ambiguous=3、refused=4）
+# 直接中止 step，後面的 `case $?` 是死碼，那些 ::warning:: 從來不會印
+# ——而 warning 才是使用者會看到的東西。
+#
+# 這一組抽「真 workflow 的 cleanup step」、以生產選項 `bash -eo pipefail`
+# 跑真 step，斷言的是**可觀測結果**：哪一個 ::warning:: 印出來（4 的分支
+# vs 一般失敗分支 vs 不印）、以及 linode-cli rm 帳。刻意**不**斷言 step
+# 的整體 rc——那是實作可選的設計（清理步驟是否該讓 workflow 失敗），
+# 猜它就等於替 impl 決定修法。rc 是否「活著」由「對應分支的 warning 真的
+# 印出來」證明：rc 死掉時什麼都不會印（今天的 bug）。
+python3 - "$REPO_ROOT/$WORKFLOW" "$SANDBOX/cleanup-step.sh" <<'PY'
+import sys, yaml
+doc = yaml.safe_load(open(sys.argv[1], encoding="utf-8"))
+for s in doc["jobs"]["rotate"]["steps"]:
+    if (s.get("name") or "").startswith("Clean up preview machine"):
+        open(sys.argv[2], "w", encoding="utf-8").write(s["run"])
+        break
+else:
+    sys.exit("cleanup step not found")
+PY
+if [[ ! -s "$SANDBOX/cleanup-step.sh" ]]; then
+    bad "P0. 抽不到 cleanup step——harness 問題"
+else
+    # step_run <fixture> <list-ok> <rm-rc> <preview-id> <gw-json> <tag>：
+    # 代換 ${{ ...preview_id }}，在 `bash -eo pipefail` 下跑真 step，量
+    # 刪除帳與 ::warning:: 行。印 `RM=[...] WARN=[...] OUT=[...]`。
+    step_run() {
+        local fixture="$1" list_ok="$2" rm_rc="$3" want_id="$4" gw="$5" tag="$6"
+        local gh_fail="${7:-0}"
+        printf '%s' "$fixture" > "$SANDBOX/list.json"
+        : > "$SANDBOX/lc.log"
+        python3 - "$SANDBOX/cleanup-step.sh" "$want_id" "$SANDBOX/step-run.sh" <<'PY'
+import sys
+src = open(sys.argv[1], encoding="utf-8").read()
+src = src.replace('${{ steps.create_preview.outputs.preview_id }}', sys.argv[2])
+open(sys.argv[3], "w", encoding="utf-8").write(src)
+PY
+        ( cd "$REPO" && GH_REPO=testowner/testrepo NODE_GATEWAY_JSON="$gw" \
+            GH_READ_FAIL="$gh_fail" \
+            LC_LIST_FILE="$SANDBOX/list.json" LC_LIST_OK="$list_ok" LC_RM_RC="$rm_rc" \
+            LC_LOG="$SANDBOX/lc.log" PATH="$SHIMS:$PATH" HOME="$HOME_DIR" \
+            bash -eo pipefail "$SANDBOX/step-run.sh" ) >"$SANDBOX/p-$tag.out" 2>"$SANDBOX/p-$tag.err"
+        printf 'RM=[%s] WARN=[%s] OUT=[%s] ERR=[%s]' \
+            "$(grep '^RM ' "$SANDBOX/lc.log" 2>/dev/null | tr '\n' '|')" \
+            "$(grep -o '::warning::[^"]*' "$SANDBOX/p-$tag.out" 2>/dev/null | sed 's/::warning:://' | tr '\n' '|')" \
+            "$(tr '\n' '|' < "$SANDBOX/p-$tag.out")" \
+            "$(tr '\n' '|' < "$SANDBOX/p-$tag.err")"
+    }
+    # P1：目標是正式 Gateway（protected）→ 使用者應看到「refused …
+    #     NODE_GATEWAY still points at it」這個**專屬** warning（不是一般
+    #     的那個），且零刪除。warning 印出來即證明 rc=4 活著抵達 case。
+    got="$(step_run "$FIX_PROMOTED" 1 0 3000 '{"ip":"198.51.100.1"}' p1)"
+    if printf '%s' "$got" | grep -qF 'RM=[]' \
+    && printf '%s' "$got" | grep -qF 'refused to delete the preview because NODE_GATEWAY still points at it' \
+    && ! printf '%s' "$got" | grep -qF 'could not delete preview linode'; then
+        ok "P1. -eo pipefail 下 protected：refused warning 印出、零刪除（rc 4 活著抵達分支）"
+    else
+        bad "P1. refused warning 沒印（rc 在真實呼叫點失效）或刪錯（got [$got]）"
+    fi
+    # P2：rm 失敗（函式 rc 1）→ 一般失敗 warning 印出。
+    got="$(step_run "$FIX_NORMAL" 1 1 2000 '{"ip":"198.51.100.1"}' p2)"
+    if printf '%s' "$got" | grep -qF 'could not delete preview linode' \
+    && printf '%s' "$got" | grep -qF 'RM=[RM 2000|'; then
+        ok "P2. -eo pipefail 下 rm 失敗：一般失敗 warning 印出、刪除有嘗試"
+    else
+        bad "P2. rm 失敗路徑的 warning 沒印（got [$got]）"
+    fi
+    # P3：unknown（清單讀不到）→ 使用者必須看到**某個** warning（確切文字
+    #     是 impl 的選擇：它可以與一般失敗分開，如現在的
+    #     「could not read the Linode list … nothing was deleted」），且零刪除。
+    #     契約是「有訊息、沒刪」，不是特定句子。
+    got="$(step_run "$FIX_PROMOTED" 0 0 3000 '{"ip":"198.51.100.1"}' p3)"
+    if printf '%s' "$got" | grep -qF 'WARN=[' \
+    && printf '%s' "$got" | grep -qF 'RM=[]' \
+    && printf '%s' "$got" | grep -qF '::warning::'; then
+        ok "P3. -eo pipefail 下清單讀不到：warning 印出、零刪除"
+    else
+        bad "P3. 清單讀不到時 warning 沒印或誤刪（got [$got]）"
+    fi
+    # P4：正常成功 → 無任何 warning、刪對機器。
+    got="$(step_run "$FIX_NORMAL" 1 0 2000 '{"ip":"198.51.100.1"}' p4)"
+    if printf '%s' "$got" | grep -qF 'RM=[RM 2000|' \
+    && ! printf '%s' "$got" | grep -qF '::warning::'; then
+        ok "P4. -eo pipefail 下成功：無 warning、刪對機器"
+    else
+        bad "P4. 成功路徑不對（got [$got]）"
+    fi
+    # P5（靜態，輔助）：呼叫端不得是「裸呼叫緊接 case $?」——-e 下 case 是
+    # 死碼。任一被接受的形狀（|| rc=$?、$() 捕捉、或不再裸呼叫）即可；
+    # 這條不取代 P1-P4，只是讓 F1 的失敗訊息更直指病灶。
+    if python3 - "$WORKFLOW" <<'PY'
+import re, sys
+src = open(sys.argv[1], encoding="utf-8").read()
+lines = src.split("\n")
+for i, l in enumerate(lines):
+    if re.match(r'^\s*rotate_cleanup_preview\b', l):
+        if '||' in l or '$(' in l or 'rc=' in l:
+            continue
+        nxt = next((x.strip() for x in lines[i+1:] if x.strip() and not x.strip().startswith('#')), '')
+        # 只認「裸呼叫緊接 case $?」這個確切的死碼形狀；其他重構都是實作自由。
+        if re.match(r'^case\s+\$\?\s+in', nxt):
+            sys.exit(1)
+sys.exit(0)
+PY
+    then
+        ok "P5. 呼叫端的 rc 是活的（非裸呼叫＋case \$?）"
+    else
+        bad "P5. rotate_cleanup_preview 仍是裸呼叫＋case \$?——-e 下 case 是死碼（F1）"
+    fi
+    # P6（F2，fail-open 的生產形狀）：讀 protected_ip 失敗 → 今天被當成
+    #     「呼叫者聲明不需要保護」→ 唯一活著的機器（promote 後就是正式
+    #     Gateway）被刪。斷言只看底線——**受保護的機器不得被刪**（RM 不含
+    #     3000）；訊息形狀是 impl 的自由。這是「讀不到 ≠ 不需要保護」在
+    #     真實呼叫點的樣子。
+    # 夾具必須讓函式真的走到刪除路徑（清單裡另有一台 preview，find 回 0），
+    # 才是在測 F2 而不是被 -e 中止掩蓋。目標 3000 是 relabel 後的正式
+    # Gateway（label fws、ip == 原 protected）；gh 讀 protected 失敗。
+    FIX_GHFAIL='[
+     {"id":3000,"label":"fws","ipv4":["198.51.100.1"],"created":"2026-09-25T10:00:00"},
+     {"id":4000,"label":"fws-preview","ipv4":["203.0.113.44"],"created":"2026-09-25T11:00:00"}
+    ]'
+    got="$(step_run "$FIX_GHFAIL" 1 0 3000 '{"ip":"198.51.100.1"}' p6 1)"
+    if printf '%s' "$got" | grep -q 'RM=\[\]'; then
+        ok "P6. protected_ip 讀不到 → 零刪除（沒觀察到不等於安全）"
+    else
+        bad "P6. protected_ip 讀不到竟把受保護機器刪了（F2 fail-open；got [$got]）"
+    fi
+fi
+
+# 12. 生產形狀的回歸注入：把 F1 的修法拿掉（裸呼叫＋case $?）→ P1/P3/P5 轉紅。
+#     注入打在**抽出的 step 文字**上（真 workflow 檔不動），這正是 qa 描述
+#     的原始形狀。
+if [[ ! -s "$SANDBOX/cleanup-step.sh" ]]; then
+    inj_bad "12. 抽出的 cleanup step 不存在——harness 問題"
+else
+    python3 - "$SANDBOX/cleanup-step.sh" "$SANDBOX/cleanup-nof1.sh" <<'PY'
+import sys
+src = open(sys.argv[1], encoding="utf-8").read()
+src = src.replace('rc=0\n', '', 1)
+src = src.replace(' || rc=$?', '')
+src = src.replace('case "$rc" in', 'case $? in')
+open(sys.argv[2], "w", encoding="utf-8").write(src)
+PY
+    # step_run2：同 step_run 但可指定 step 檔。
+    step_run2() {
+        local step="$1" fixture="$2" list_ok="$3" rm_rc="$4" want_id="$5" gw="$6" tag="$7"
+        local gh_fail="${8:-0}"
+        printf '%s' "$fixture" > "$SANDBOX/list.json"
+        : > "$SANDBOX/lc.log"
+        python3 - "$step" "$want_id" "$SANDBOX/step-run2.sh" <<'PY'
+import sys
+src = open(sys.argv[1], encoding="utf-8").read()
+src = src.replace('${{ steps.create_preview.outputs.preview_id }}', sys.argv[2])
+open(sys.argv[3], "w", encoding="utf-8").write(src)
+PY
+        ( cd "$REPO" && GH_REPO=testowner/testrepo NODE_GATEWAY_JSON="$gw" \
+            GH_READ_FAIL="$gh_fail" \
+            LC_LIST_FILE="$SANDBOX/list.json" LC_LIST_OK="$list_ok" LC_RM_RC="$rm_rc" \
+            LC_LOG="$SANDBOX/lc.log" PATH="$SHIMS:$PATH" HOME="$HOME_DIR" \
+            bash -eo pipefail "$SANDBOX/step-run2.sh" ) >"$SANDBOX/p-$tag.out" 2>"$SANDBOX/p-$tag.err"
+        printf 'RM=[%s] WARN=[%s] OUT=[%s]' \
+            "$(grep '^RM ' "$SANDBOX/lc.log" 2>/dev/null | tr '\n' '|')" \
+            "$(grep -o '::warning::[^"]*' "$SANDBOX/p-$tag.out" 2>/dev/null | sed 's/::warning:://' | tr '\n' '|')" \
+            "$(tr '\n' '|' < "$SANDBOX/p-$tag.out")"
+    }
+    got="$(step_run2 "$SANDBOX/cleanup-nof1.sh" "$FIX_PROMOTED" 1 0 3000 '{"ip":"198.51.100.1"}' i12)"
+    if printf '%s' "$got" | grep -qF '::warning::'; then
+        inj_bad "12. 拿掉 F1 後 warning 仍印——P1/P3 沒在看真實呼叫形狀（got [$got]）"
+    else
+        inj_ok "12. 拿掉 F1（裸呼叫＋case \$?）後 warning 全消失（got [$got]）——P1/P3/P5 會紅"
+    fi
+fi
+# 13. 把 F2 的 sentinel 退化回空字串（fail-open）→ P6 轉紅。
+python3 - "$REPO_ROOT/$WORKFLOW" "$SANDBOX/wf-nof2.txt" <<'PY'
+import sys, re
+src = open(sys.argv[1], encoding="utf-8").read()
+lines = src.split("\n")
+out, i = [], 0
+while i < len(lines):
+    l = lines[i]
+    if 'NODE_GATEWAY" --jq .value' in l and 'protected_ip="' in l:
+        indent = l[:len(l) - len(l.lstrip())]
+        # the F2 block is 3 lines: assignment, || sentinel, [[ -n ]] guard
+        out.append(indent + 'protected_ip="$(gh api "repos/${GH_REPO}/actions/variables/NODE_GATEWAY" --jq .value 2>/dev/null | jq -r \'.ip // empty\' 2>/dev/null || true)"')
+        j = i + 1
+        while j < len(lines) and lines[j].strip() and not lines[j].strip().startswith(('rc=', 'rotate_cleanup_preview', 'case')):
+            j += 1
+        i = j
+        continue
+    out.append(l)
+    i += 1
+open(sys.argv[2], "w", encoding="utf-8").write("\n".join(out))
+PY
+if [[ $? -ne 0 ]]; then
+    inj_bad "13. 注入腳本失敗（needle 落空）——harness 問題"
+else
+    python3 - "$SANDBOX/wf-nof2.txt" "$SANDBOX/cleanup-nof2.sh" <<'PY'
+import sys, yaml
+doc = yaml.safe_load(open(sys.argv[1], encoding="utf-8"))
+for s in doc["jobs"]["rotate"]["steps"]:
+    if (s.get("name") or "").startswith("Clean up preview machine"):
+        open(sys.argv[2], "w", encoding="utf-8").write(s["run"])
+        break
+PY
+    got="$(step_run2 "$SANDBOX/cleanup-nof2.sh" "$FIX_GHFAIL" 1 0 3000 '{"ip":"198.51.100.1"}' i13 1)"
+    if printf '%s' "$got" | grep -qF 'RM=[RM 3000|]'; then
+        inj_ok "13. sentinel 退化成空字串後正式 Gateway 被刪（got [$(printf '%s' "$got" | head -c 130)]）——P6 會紅"
+    else
+        inj_bad "13. 拿掉 F2 後受保護機器仍沒被刪（got [$got]）——P6 沒在看 fail-open"
+    fi
+fi
+
 echo
 printf 'passed %d / failed %d / injection-fail %d\n' "$pass" "$fail" "$injfail"
 if [[ "$fail" -ne 0 ]]; then exit "$fail"; fi
