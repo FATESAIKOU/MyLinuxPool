@@ -31,6 +31,22 @@ FAIL=0
 ok()   { printf '  \033[32mok\033[0m    %s\n' "$1"; }
 bad()  { printf '  \033[31mFAIL\033[0m  %s\n' "$1"; FAIL=1; }
 
+# ok_counted <n> <label> — for any check whose verdict is "I looked at N
+# things and none was wrong". Zero is never that verdict: it means the
+# enumeration handed this check nothing, and "nothing was wrong with
+# nothing" is indistinguishable from a clean repo. Every list here comes
+# from a `git ls-files` glob, and a glob stops matching for reasons that
+# have nothing to do with the repo being healthy — a rename, a moved
+# directory, running outside a checkout. Use this instead of `ok "$n ..."`
+# so the next check added here cannot reintroduce the silent pass.
+ok_counted() {
+    if [ "${1:-0}" -eq 0 ]; then
+        bad "0 $2——這不是通過，是列舉沒給這個檢查任何東西看（glob 改壞了？目錄搬了？不在 git 樹裡？）"
+    else
+        ok "$1 $2"
+    fi
+}
+
 echo "preflight: $(pwd)"
 echo
 
@@ -65,25 +81,21 @@ if (( ${#shell_files[@]} > 0 )); then
         n=$((n+1))
     done
 fi
-if [ "$n" -eq 0 ]; then
-    bad "0 支 shell 腳本通過語法檢查——這不是通過，是沒跑到"
-else
-    ok "$n 支 shell 腳本"
-fi
+ok_counted "$n" "支 shell 腳本"
 
 n=0
 while IFS= read -r f; do
     python3 -c "import json;json.load(open('$f'))" 2>/dev/null || { bad "JSON $f"; continue; }
     n=$((n+1))
 done < <(git ls-files '*.json')
-ok "$n 個 JSON"
+ok_counted "$n" "個 JSON"
 
 n=0
 while IFS= read -r f; do
     python3 -c "import yaml;yaml.safe_load(open('$f'))" 2>/dev/null || { bad "YAML $f"; continue; }
     n=$((n+1))
 done < <(git ls-files '*.yml' '*.yaml')
-ok "$n 個 YAML"
+ok_counted "$n" "個 YAML"
 
 echo
 echo "── 引用的檔案真的存在嗎（靜態檢查抓不到的那種）──"
@@ -97,7 +109,7 @@ while IFS= read -r df; do
         if [ -e "$src" ]; then n=$((n+1)); else bad "COPY 來源不存在: $src  (${df})"; fi
     done < <(grep -E '^\s*COPY ' "$df" 2>/dev/null | awk '{for(i=2;i<NF;i++) print $i}')
 done < <(git ls-files '*Dockerfile')
-ok "$n 個 Dockerfile COPY 來源"
+ok_counted "$n" "個 Dockerfile COPY 來源"
 
 # workflow 引用的 steps.<id>.outputs.<name> 真的被寫出來嗎。
 # GitHub 對「引用不存在的 output」不報錯，只回空字串——2026-09-16 就是這樣
@@ -161,7 +173,7 @@ while IFS= read -r pf; do
         if [ -f "shared-configs/$u/install.sh" ]; then n=$((n+1)); else bad "profile 宣告了不存在的 unit: $u  (${pf})"; fi
     done < <(python3 -c "import json,sys;print('\n'.join(json.load(open('$pf')).get('shared_config',[])))" 2>/dev/null)
 done < <(git ls-files 'profiles/*/*/profile.json')
-ok "$n 個 profile→unit 引用"
+ok_counted "$n" "個 profile→unit 引用"
 
 # unit.json 的 provides 對得上 files/ 嗎（僅提示）
 while IFS= read -r uj; do
