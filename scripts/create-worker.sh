@@ -16,6 +16,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
 source "${SCRIPT_DIR}/lib/log.sh"
 # shellcheck source=lib/profile.sh
 source "${SCRIPT_DIR}/lib/profile.sh"
+# shellcheck source=lib/ledger.sh
+source "${SCRIPT_DIR}/lib/ledger.sh"
 
 # A copy of this file may be sourced from an injected location where the
 # relative lib/ paths no longer resolve (e.g. a test that sed-mutates the
@@ -108,6 +110,24 @@ create_worker_missing_secrets() {
         val="$(jq -r --arg n "$secret_name" '.[$n] // empty' <<<"$all_secrets_json")"
         [[ -z "$val" ]] && printf '%s\n' "$secret_name"
     done < <(profile_secrets "$profile_json")
+}
+
+# create_worker_ledger_add <workers_json> <port> <provider> <image>
+#     <container> <created_at> <tunnel_public_key> <profile_json>
+#   Prints the new POOL_WORKERS array: ledger_add, plus the image profile's
+#   capabilities copied into the entry (CAPABILITY-DESIGN.md §3 — a worker's
+#   capabilities come from its image, so consumers reading POOL_WORKERS do
+#   not have to read the profile; a profile without the field yields `{}`,
+#   the "declared no capabilities" object, never null).
+#   Reads the profile here, not in the workflow, so the copy is one shared
+#   implementation (LAYOUT §3: the workflow stays a thin caller).
+create_worker_ledger_add() {
+    local workers_json="$1" port="$2" provider="$3" image="$4"
+    local container="$5" created_at="$6" tunnel_public_key="$7" profile_json="$8"
+    local caps
+    caps="$(profile_capabilities "$profile_json")" || return 1
+    ledger_add "$workers_json" "$port" "$provider" "$image" "$container" \
+        "$created_at" "$tunnel_public_key" "$caps"
 }
 
 # create_worker_build_claim_cmd <port_lo> <port_hi> <provider> <image>

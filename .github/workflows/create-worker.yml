@@ -146,6 +146,23 @@ jobs:
             exit 1
           fi
 
+          # The standing rule from CAPABILITY-DESIGN.md §2, enforced rather
+          # than trusted to a sentence in the doc: no worker profile may
+          # declare `github` until worker credential injection exists.
+          # A flag the credential story cannot honour is the silent lie this
+          # design is about.
+          if ! profile_validate_no_github "$profile"; then
+            echo "::error::${profile} violates CAPABILITY-DESIGN.md §2 — see message above"
+            exit 1
+          fi
+
+          # The capabilities value must be key:object; a string/null would
+          # poison POOL_WORKERS with a shape the contract forbids.
+          if ! create_worker_ledger_add '[]' 1 x x x 1970-01-01T00:00:00Z '' "$profile" >/dev/null 2>&1; then
+            echo "::error::${profile}.capabilities is not a key:object — CAPABILITY-DESIGN.md §1"
+            exit 1
+          fi
+
       - name: Resolve Gateway
         id: gateway
         shell: bash
@@ -356,13 +373,16 @@ jobs:
           set -euo pipefail
           source scripts/lib/ledger.sh
           cur="$(gh api "repos/${GH_REPO}/actions/variables/POOL_WORKERS" --jq .value 2>/dev/null || true)"
-          new="$(ledger_add "$cur" \
+          # capabilities come from the image profile (CAPABILITY-DESIGN §3),
+          # copied into the entry so consumers read POOL_WORKERS alone.
+          new="$(create_worker_ledger_add "$cur" \
                    "${{ steps.port.outputs.port }}" \
                    "${{ inputs.provider }}" \
                    "${{ inputs.image }}" \
                    "${{ steps.identity.outputs.container }}" \
                    "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-                   "${{ steps.checked_pubkey.outputs.public_key }}")"
+                   "${{ steps.checked_pubkey.outputs.public_key }}" \
+                   "profiles/worker/${{ inputs.image }}/profile.json")"
           printf '%s' "$new" | gh variable set POOL_WORKERS --repo "$GH_REPO"
           echo "POOL_WORKERS now holds $(printf '%s' "$new" | jq 'length') worker(s)"
 

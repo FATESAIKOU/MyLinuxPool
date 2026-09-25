@@ -488,6 +488,21 @@ step5_register_var() {
         --arg key_secret "$key_secret" \
         '[{via: "gateway"}, {host: "127.0.0.1", port: $port, user: $user, key_secret: $key_secret}]')"
 
+    # capabilities: key -> object, always an object and never null
+    # (CAPABILITY-DESIGN.md §1). A pre-existing value is only checked, never
+    # rewritten: an object (including unknown keys this script doesn't know)
+    # passes through untouched; a legacy array or any non-object is refused
+    # here instead of being blended into the new format — migration is a
+    # deliberate, reviewable step (`mlp migrate-capabilities`), not a
+    # side effect of re-registering.
+    if printf '%s' "$existing_json" | jq -e 'has("capabilities")' >/dev/null 2>&1; then
+        if ! printf '%s' "$existing_json" | jq -e '.capabilities | type == "object"' >/dev/null 2>&1; then
+            log ERROR "${VAR_NAME}.capabilities is not an object — the new contract is key:object (CAPABILITY-DESIGN.md §1)"
+            log ERROR "refusing to blend formats; migrate first: mlp migrate-capabilities --real"
+            exit 1
+        fi
+    fi
+
     # $existing merged with the fresh connectivity fields on top; anything
     # this script doesn't own (e.g. "power") passes through untouched, and
     # "capabilities" is only defaulted the first time, never overwritten.
@@ -506,7 +521,7 @@ step5_register_var() {
             key_secret: $key_secret,
             gateway_port: $gateway_port,
             hops: $hops,
-            capabilities: ($existing.capabilities // ["docker", "worker-host"])
+            capabilities: ($existing.capabilities // {"worker-host": {"runtime": "docker"}})
         }')"
 
     # No --body-file on gh 2.45.0 — `gh variable set` reads the body from
@@ -693,17 +708,21 @@ step7_systemd() {
 }
 
 # ---- step 7.5: docker group membership + real verification ------------------
-# step5 declares capabilities ["docker","worker-host"], but nothing ever
-# verified the declaration — the third provider proved it: create-worker's
-# image build failed with permission denied on docker.sock because nobody
-# ever put the user in the docker group (the older two had it done by
-# hand). So both halves live here: make membership true, then PROVE the
-# daemon answers. The proof runs docker info as the user with freshly
-# resolved groups (sudo -u re-resolves them, so no re-login is needed to
-# test); `id -nG | grep docker` is NOT the proof — group changes apply to
-# new logins only, so the current session's groups answer a different
-# question than "can this user reach the daemon", exactly the kind of check
-# that passes while broken.
+# worker-host's verification under the capability contract
+# (CAPABILITY-DESIGN.md §2): the criterion below is the whole of it — a real
+# `docker info` as the user, never `id -nG`. This is the one implementation;
+# `mlp verify-capabilities` shares the criterion for the "any time" case.
+#
+# step5 declares worker-host, but nothing ever verified the declaration —
+# the third provider proved it: create-worker's image build failed with
+# permission denied on docker.sock because nobody ever put the user in the
+# docker group (the older two had it done by hand). So both halves live
+# here: make membership true, then PROVE the daemon answers. The proof runs
+# docker info as the user with freshly resolved groups (sudo -u re-resolves
+# them, so no re-login is needed to test); `id -nG | grep docker` is NOT the
+# proof — group changes apply to new logins only, so the current session's
+# groups answer a different question than "can this user reach the daemon",
+# exactly the kind of check that passes while broken.
 step7_5_docker_group() {
     log INFO "step 7.5/9: docker group membership + daemon verification"
     local who
@@ -742,6 +761,45 @@ step7_5_docker_group() {
     fi
     log ERROR "docker daemon still unreachable as ${who} with fresh groups — membership is set, so check the daemon/socket on this host"
     exit 1
+}
+
+# step7_5_capabilities — walk the DECLARED capabilities (read back from the
+#   variable step5 just wrote) and run each key's verification. This is the
+#   contract wiring (CAPABILITY-DESIGN.md §2/§4): a declaration that nothing
+#   verifies can be silently false, which is the whole reason this design
+#   exists. worker-host dispatches to step7_5_docker_group — the ONE
+#   implementation of the docker check; a key with no defined verification
+#   is reported, not passed and not failed (nothing here can judge it).
+#   Name deliberately avoids "verify": main's step order is asserted by
+#   test-register-provider-tempclone.sh, which looks for the tunnel verify
+#   (step9_verify) as the first function matching that word.
+step7_5_capabilities() {
+    local caps key value runtime
+    caps="$(gh api "repos/${REPO}/actions/variables/${VAR_NAME}" --jq .value 2>/dev/null \
+        | jq -c '.capabilities // {}' 2>/dev/null || true)"
+    [[ -n "$caps" ]] || caps='{}'
+
+    if [[ "$(printf '%s' "$caps" | jq 'length' 2>/dev/null)" == "0" ]]; then
+        log INFO "no capabilities declared — nothing to verify"
+        return 0
+    fi
+
+    while IFS=$'\t' read -r key value; do
+        [[ -n "$key" ]] || continue
+        case "$key" in
+            worker-host)
+                runtime="$(printf '%s' "$value" | jq -r '.runtime // empty')"
+                if [[ "$runtime" != "docker" ]]; then
+                    log WARN "worker-host.runtime is '${runtime:-<missing>}' — no verification is defined for it; not verified"
+                    continue
+                fi
+                step7_5_docker_group
+                ;;
+            *)
+                log WARN "capability '${key}' has no verification defined — not verified (CAPABILITY-DESIGN.md §2)"
+                ;;
+        esac
+    done < <(printf '%s' "$caps" | jq -r 'to_entries[] | [.key, (.value | tojson)] | @tsv')
 }
 
 # ---- step 8: write this machine's authorized_keys from CLIENT_* ----------
@@ -861,7 +919,7 @@ main() {
     step6_sudoers
     step6_5_tunnel_identity
     step7_systemd
-    step7_5_docker_group
+    step7_5_capabilities
     step8_authorized_keys
     step9_verify
     step95_enable_pool_sync

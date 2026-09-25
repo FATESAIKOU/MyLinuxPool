@@ -136,6 +136,10 @@ usage: mlp [command]
                     forward a local port to a node (or through it to a third host)
    fwd ls           list local forwards with live state
    fwd rm [entryport|bind:entryport]  remove a forward (fzf pick when omitted)
+   verify-capabilities [<node>|--all]
+                    run each declared capability's verification
+   migrate-capabilities [--real]
+                    one-off rerunnable migration to key:object (dry run by default)
    -h, --help       show this help
 
 requires: fzf, jq, gh — install missing ones with `brew install <name>`
@@ -2333,6 +2337,330 @@ cmd_fwd() {
     esac
 }
 
+# ---- capabilities (docs/CAPABILITY-DESIGN.md) -------------------------------
+# Every capability key's value is an OBJECT ({} = "has it, no parameters";
+# null = "unknown", which is never valid). Unknown keys pass through
+# untouched — this code only ever adds or verifies what it understands.
+
+# cap_shape_ok <capabilities_json> — 0 when every value is an object.
+#   The shape check the format needs: a string or null value is a contract
+#   violation, not a variant. Prints nothing.
+cap_shape_ok() {
+    jq -e 'type == "object" and all(.[]; type == "object")' >/dev/null 2>&1 <<< "${1:-null}"
+}
+
+# cap_verify_worker_host <node> <value_json> — Model: verify `worker-host`.
+#   Sets CAP_STATE (pass|fail|unverifiable) and CAP_DETAIL. The criterion is
+#   §2's: run `docker info` AS the declared user, never `id -nG` — a group
+#   can be present while the socket is unreadable, and then id -nG answers
+#   the same as when everything is fine. The check runs through the same
+#   node hop (run_on_node), as the node's own user, so it verifies the
+#   declaration where it matters. `runtime` must be `docker`; anything else
+#   is unverifiable by this implementation, NOT a pass.
+cap_verify_worker_host() {
+    local node="$1" value_json="$2" runtime out rc
+    # Starts unverifiable, like cap_verify_github: only a path that actually
+    # observed something may raise the verdict to pass (2026-09-25 qa
+    # finding — an initial pass leaks "never inspected" out as "true").
+    CAP_STATE="unverifiable"; CAP_DETAIL=""
+    runtime="$(jq -r '.runtime // empty' 2>/dev/null <<< "$value_json")"
+    if [[ "$runtime" != "docker" ]]; then
+        CAP_STATE="unverifiable"
+        CAP_DETAIL="runtime '${runtime:-<missing>}' has no verification defined"
+        return 0
+    fi
+    out="$(run_on_node "$node" "docker info >/dev/null 2>&1 && printf MLP_DOCKER_OK" 2>&1)"
+    rc=$?
+    if [[ $rc -ne 0 ]]; then
+        CAP_STATE="unverifiable"
+        CAP_DETAIL="could not run docker info on ${node} (hop/ssh failed)"
+    elif [[ "$out" == *MLP_DOCKER_OK* ]]; then
+        CAP_STATE="pass"
+        CAP_DETAIL="docker info answered as the declared user"
+    elif [[ -n "$out" ]]; then
+        CAP_STATE="fail"
+        CAP_DETAIL="docker info failed on ${node}: $(printf '%s' "$out" | head -c 160)"
+    else
+        CAP_STATE="fail"
+        CAP_DETAIL="docker info failed on ${node} (no output)"
+    fi
+}
+
+# cap_verify_github <node> <value_json> — Model: verify `github`.
+#   For each declared repo, `read` is checked with a real API call
+#   (`gh api repos/<owner>/<repo>`), per §2. `write` and `trigger-actions`
+#   have no defined verification yet, so they are reported unverifiable —
+#   never passed. The API call runs through run_on_node (the provider holds
+#   the token; the caller's machine may not), reading the node's own
+#   ~/.mylinuxpool/gh_token.
+#
+#   Two lesson-shaped details (qa 2026-09-25):
+#   - CAP_STATE starts at `unverifiable`, not `pass`. "Not observed yet" is
+#     not "true": a malformed .repos makes the jq below exit 5, the process
+#     substitution yields nothing, the loop body never runs, and an initial
+#     `pass` would then be reported for a declaration that was never even
+#     looked at. Only the paths that actually performed an observation may
+#     raise the verdict to pass.
+#   - The value's schema is validated first, and violations are `fail`
+#     (the declaration itself is broken), not `unverifiable` ("no
+#     verification defined" is a different thing from "the declaration is
+#     malformed").
+cap_verify_github() {
+    local node="$1" value_json="$2" repo perms schema_err out rc observed=0
+    CAP_STATE="unverifiable"
+    CAP_DETAIL=""
+
+    # schema: .repos must be an object, every value an array, every element
+    # one of the defined permission words; .repos absent == no repos.
+    schema_err="$(jq -r '
+        if (has("repos") | not) then ""
+        elif (.repos | type) != "object" then ".repos must be an object"
+        elif [.repos[] | select(type != "array")] | length > 0 then "every .repos value must be an array"
+        elif [.repos[][] | select(. != "read" and . != "write" and . != "trigger-actions")] | length > 0
+          then "permission values must be read/write/trigger-actions"
+        else "" end' 2>/dev/null <<< "$value_json")"
+    if [[ -z "$schema_err" ]] && ! jq -e 'type == "object"' >/dev/null 2>&1 <<< "$value_json"; then
+        schema_err="capability value must be an object"
+    fi
+    if [[ -n "$schema_err" ]]; then
+        CAP_STATE="fail"
+        CAP_DETAIL="malformed github declaration: ${schema_err}"
+        return 0
+    fi
+
+    if [[ "$(jq '.repos // {} | length' 2>/dev/null <<< "$value_json")" == "0" ]]; then
+        CAP_STATE="pass"
+        CAP_DETAIL="no repos declared — nothing this capability claims to reach"
+        return 0
+    fi
+
+    while IFS=$'\t' read -r repo perms; do
+        [[ -n "$repo" ]] || continue
+        observed=1
+        # only `read` has a defined verification (§2)
+        if [[ "$perms" == *write* || "$perms" == *trigger-actions* ]]; then
+            [[ "$CAP_STATE" != "fail" ]] && CAP_STATE="unverifiable"
+            CAP_DETAIL="repo ${repo}: write/trigger-actions have no defined verification"
+            continue
+        fi
+        out="$(run_on_node "$node" \
+            "GH_TOKEN=\"\$(cat ~/.mylinuxpool/gh_token 2>/dev/null)\" gh api repos/${repo} >/dev/null 2>&1 && printf MLP_GH_OK" 2>&1)"
+        rc=$?
+        if [[ $rc -ne 0 ]]; then
+            [[ "$CAP_STATE" != "fail" ]] && CAP_STATE="unverifiable"
+            CAP_DETAIL="repo ${repo}: could not run the check (hop/ssh failed)"
+        elif [[ "$out" == *MLP_GH_OK* ]]; then
+            [[ "$CAP_STATE" == "unverifiable" ]] && CAP_STATE="pass"
+            [[ -z "$CAP_DETAIL" ]] && CAP_DETAIL="repo ${repo}: read verified"
+        else
+            CAP_STATE="fail"
+            CAP_DETAIL="repo ${repo}: gh api failed${out:+ ($(printf '%s' "$out" | head -c 120))}"
+        fi
+    done < <(jq -r '.repos // {} | to_entries[] | [.key, (.value | join(","))] | @tsv' 2>/dev/null <<< "$value_json")
+    # belt and braces: if the loop never observed anything, stay
+    # unverifiable — never promote to pass from an empty run.
+    if [[ "$observed" -eq 0 && "$CAP_STATE" == "pass" ]]; then
+        CAP_STATE="unverifiable"
+        CAP_DETAIL="nothing was observed"
+    fi
+    return 0
+}
+
+# cap_verify_node <node> <capabilities_json> — Model. Sets CAP_ROWS, each
+#   `key<TAB>state<TAB>detail`. No output, no picker. A declared key with no
+#   defined verification returns `unverifiable` — NEVER `pass`; that is the
+#   core of the design (a flag nobody can check must not be reported as
+#   true).
+cap_verify_node() {
+    local node="$1" caps="$2" key value n=0
+    CAP_ROWS=()
+    while IFS=$'\t' read -r key value; do
+        [[ -n "$key" ]] || continue
+        n=$((n + 1))
+        case "$key" in
+            worker-host) cap_verify_worker_host "$node" "$value" ;;
+            github)      cap_verify_github "$node" "$value" ;;
+            *)
+                CAP_STATE="unverifiable"
+                CAP_DETAIL="no verification is defined for '${key}'"
+                ;;
+        esac
+        CAP_ROWS+=("${key}"$'\t'"${CAP_STATE}"$'\t'"${CAP_DETAIL}")
+    done < <(jq -r 'to_entries[] | [.key, (.value | tojson)] | @tsv' 2>/dev/null <<< "$caps")
+    # If the walk itself failed to enumerate anything (malformed caps, or
+    # the process substitution yielded nothing), that is "not observed" —
+    # record it as unverifiable rather than returning an empty, silently
+    # successful row set. cap_verify_one's shape check normally arrives
+    # first; this keeps the Model honest when called directly.
+    if [[ "$n" -eq 0 && "$(jq 'length' 2>/dev/null <<< "$caps")" != "0" ]]; then
+        CAP_ROWS+=("<capabilities>"$'\t'"unverifiable"$'\t'"could not enumerate the declarations")
+    fi
+    return 0
+}
+
+# cap_migrate_value <capabilities_json> — prints the migrated object.
+#   Old array -> {"worker-host":{"runtime":"docker"}} iff worker-host is in
+#   it (the docker tag folds in; §5). A lone "wol-sender"/"wsl2" is dropped
+#   with no replacement (§2/§5). An already-object value (including unknown
+#   keys) prints unchanged. Anything else is an error (return 1): the
+#   migration must never guess at an unrecognized shape.
+cap_migrate_value() {
+    local caps="${1:-}"
+    if jq -e 'type == "object"' >/dev/null 2>&1 <<< "$caps"; then
+        jq -c '.' <<< "$caps"
+        return 0
+    fi
+    if jq -e 'type == "array"' >/dev/null 2>&1 <<< "$caps"; then
+        jq -c 'if index("worker-host") != null
+               then {"worker-host": {"runtime": "docker"}}
+               else {} end' <<< "$caps"
+        return 0
+    fi
+    return 1
+}
+
+# cmd_verify_capabilities [<node>|--all] — View: run the Model verifiers and
+#   render. Exit codes split by what actually happened (2026-09-25 qa):
+#     0  everything verified
+#     1  at least one FAILED (the declaration is broken — must fix)
+#     3  no failures, but at least one UNVERIFIABLE (no fault, but a
+#        declaration nobody can check)
+#   unverifiable is deliberately NOT collapsed into 0 — "not verified" is
+#   not "verified". Splitting it from 1 keeps a healthy pool with an
+#   unverifiable key from showing a permanent red light that people learn
+#   to ignore, which would be its own kind of lie.
+cmd_verify_capabilities() {
+    local node="" all=0
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --all) all=1; shift ;;
+            -*) echo "usage: mlp verify-capabilities [<node>|--all]" >&2; exit 2 ;;
+            *) node="$1"; shift ;;
+        esac
+    done
+    if [[ -z "$node" && "$all" -eq 0 ]]; then
+        echo "usage: mlp verify-capabilities [<node>|--all]" >&2
+        exit 2
+    fi
+    local var n rc_all=0 rc
+    if [[ -n "$node" ]]; then
+        cap_verify_one "$node"; rc=$?
+        cap_verify_summary "$rc"
+        return "$rc"
+    fi
+    local tally_ok=0 tally_fail=0 tally_unv=0
+    while IFS= read -r var; do
+        [[ -n "$var" ]] || continue
+        [[ "$var" == "NODE_GATEWAY" ]] && continue
+        n="$(printf '%s' "${var#NODE_}" | tr '[:upper:]' '[:lower:]' | tr '_' '-')"
+        cap_verify_one "$n"; rc=$?
+        case "$rc" in
+            0) tally_ok=$((tally_ok + 1)) ;;
+            3) tally_unv=$((tally_unv + 1)); [[ "$rc_all" -eq 0 ]] && rc_all=3 ;;
+            *) tally_fail=$((tally_fail + 1)); rc_all=1 ;;
+        esac
+    done < <(gh api "repos/${REPO}/actions/variables?per_page=100" --jq '.variables[].name' 2>/dev/null | grep '^NODE_')
+    printf '\n%s%s ok, %s fail, %s unverifiable%s\n' \
+        "$C_BOLD" "$tally_ok" "$tally_fail" "$tally_unv" "$C_RESET"
+    if [[ "$tally_fail" -eq 0 && "$tally_unv" -gt 0 ]]; then
+        printf '%sno failures, but %s declaration(s) have no verification defined%s\n' \
+            "$C_YELLOW" "$tally_unv" "$C_RESET"
+        printf 'that is not "broken" — it is "not checked yet"\n'
+    fi
+    return "$rc_all"
+}
+
+# cap_verify_summary <rc> — one closing line for the single-node path.
+cap_verify_summary() {
+    case "$1" in
+        0) return 0 ;;
+        3) printf '\n%s%s%s\n' "$C_YELLOW" "no failures, but something has no verification defined — not checked, not broken" "$C_RESET" ;;
+        *) : ;;
+    esac
+}
+
+# cap_verify_one <node> — View: resolve one node and render its rows.
+#   Returns 0 all-ok, 1 any fail, 3 unverifiable-only.
+cap_verify_one() {
+    local node="$1" json caps
+    json="$("$POOL_RESOLVE" "$node" 2>/dev/null)" || { echo "mlp: no such node: ${node}" >&2; return 1; }
+    caps="$(jq -c '.capabilities // empty' 2>/dev/null <<< "$json")"
+    if [[ -z "$caps" ]]; then
+        printf '%s%s%s: no capabilities declared\n' "$C_BOLD" "$node" "$C_RESET"
+        return 0
+    fi
+    if ! cap_shape_ok "$caps"; then
+        printf '%s%s%s: capabilities is not key:object — refusing to guess\n' "$C_RED" "$node" "$C_RESET"
+        return 1
+    fi
+    local n
+    n="$(jq 'length' <<< "$caps")"
+    printf '%s%s%s: %s declared\n' "$C_BOLD" "$node" "$C_RESET" "$n"
+    cap_verify_node "$node" "$caps"
+    local r key state detail mark rc=0
+    for r in "${CAP_ROWS[@]}"; do
+        fwd_split_row "$r"
+        key="$FWD_C1"; state="$FWD_C2"; detail="$FWD_C3"
+        case "$state" in
+            pass) mark="${C_GREEN}ok${C_RESET}" ;;
+            fail) mark="${C_RED}FAIL${C_RESET}"; rc=1 ;;
+            *)    mark="${C_YELLOW}unverifiable${C_RESET}"; [[ "$rc" -eq 0 ]] && rc=3 ;;
+        esac
+        printf '  %-14s %-14s %s\n' "$key" "$mark" "$detail"
+    done
+    return "$rc"
+}
+
+# cmd_migrate_capabilities — View: one-off, rerunnable migration of every
+#   NODE_* variable's capabilities to the new shape (CAPABILITY-DESIGN §5).
+#   MERGE, never overwrite: only the capabilities field changes; every other
+#   field is carried through byte-for-byte by re-reading the live var and
+#   merging. Dry run by default. Idempotent — an already-object var prints
+#   "already" and is skipped.
+cmd_migrate_capabilities() {
+    local real=0 rc_all=0
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --real) real=1; shift ;;
+            *) echo "usage: mlp migrate-capabilities [--real]" >&2; exit 2 ;;
+        esac
+    done
+    local var name json caps new
+    while IFS= read -r var; do
+        [[ -n "$var" ]] || continue
+        [[ "$var" == "NODE_GATEWAY" ]] && continue
+        name="$(printf '%s' "${var#NODE_}" | tr '[:upper:]' '[:lower:]' | tr '_' '-')"
+        # Read the RAW variable, not pool-resolve's view: the state.json
+        # snapshot can be stale, and the merge below must carry the exact
+        # bytes of every field it does not own.
+        json="$(gh api "repos/${REPO}/actions/variables/${var}" --jq .value 2>/dev/null)" \
+            || { echo "skip ${name}: could not read ${var}"; rc_all=1; continue; }
+        caps="$(jq -c '.capabilities // empty' 2>/dev/null <<< "$json")"
+        if [[ -z "$caps" ]]; then
+            echo "${name}: no capabilities — nothing to migrate"
+            continue
+        fi
+        if jq -e 'type == "object"' >/dev/null 2>&1 <<< "$caps"; then
+            echo "${name}: already the new shape — skipped"
+            continue
+        fi
+        new="$(cap_migrate_value "$caps")" || { echo "${name}: unrecognized capabilities shape — refusing" >&2; rc_all=1; continue; }
+        echo "${name}: $(jq -c . <<< "$caps") -> ${new}"
+        if [[ "$real" -eq 0 ]]; then
+            continue
+        fi
+        # merge: replace ONLY capabilities, keep every other key of the live
+        # declaration untouched (hops/power/tunnel_public_key/... must not
+        # move a byte).
+        printf '%s' "$json" | jq -c --argjson c "$new" '.capabilities = $c' \
+            | gh variable set "$var" --repo "$REPO" \
+            || { echo "${name}: write failed" >&2; return 1; }
+        echo "${name}: written"
+    done < <(gh api "repos/${REPO}/actions/variables?per_page=100" --jq '.variables[].name' 2>/dev/null | grep '^NODE_')
+    [[ "$real" -eq 1 ]] || echo "(dry run — pass --real to write)"
+    return "$rc_all"
+}
+
 # ---- main menu --------------------------------------------------------------
 main_menu() {
     local choice action
@@ -2428,6 +2756,8 @@ main() {
         ssh-config) cmd_ssh_config "$@" ;;
         trust-gateway) cmd_trust_gateway "$@" ;;
         fwd) cmd_fwd "$@" ;;
+        verify-capabilities) cmd_verify_capabilities "$@" ;;
+        migrate-capabilities) cmd_migrate_capabilities "$@" ;;
         *)
             echo "mlp: unknown command '${cmd}'" >&2
             usage

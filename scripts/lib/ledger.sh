@@ -32,23 +32,36 @@ _ledger_normalize() {
     printf '%s\n' "${out:-[]}"
 }
 
-# ledger_add <workers_json> <port> <provider> <image> <container> <created_at> [<tunnel_public_key>]
+# ledger_add <workers_json> <port> <provider> <image> <container> <created_at> [<tunnel_public_key>] [<capabilities_json>]
 #   Replaces the entry for <port>, or appends one; prints the array sorted
 #   by port. The port is the unique key (STATE_CONTRACT §1).
-#   The last argument is OPTIONAL: when given, the entry gains a
-#   `tunnel_public_key` field (the worker's own per-machine tunnel key,
-#   KEY-DESIGN §3.2); when omitted the record is exactly the five fields
-#   as before — the two outputs are byte-identical for existing callers.
+#   The last two arguments are OPTIONAL and each is independent:
+#   - <tunnel_public_key>: when given, the entry gains that field (the
+#     worker's own per-machine tunnel key, KEY-DESIGN §3.2).
+#   - <capabilities_json>: when given, the entry gains a `capabilities`
+#     field whose value is the image profile's capabilities object
+#     (CAPABILITY-DESIGN.md §3: a worker's capabilities come from its image
+#     profile, copied here so consumers read POOL_WORKERS and nothing else).
+#     The caller passes `{}` for "no capabilities" — an object, never null.
+#   When omitted, neither field appears and the output is byte-identical to
+#   the pre-existing callers (the same guarantee the 7th arg already had).
 #   ALWAYS prints an array — including when the ledger was empty, where
 #   the old code printed a bare record and polluted the master with a
 #   non-array value (STATE_CONTRACT §1; 2026-09-15 incident).
 ledger_add() {
     local workers_json="${1:-}" port="${2:-}"
     local provider="${3:-}" image="${4:-}" container="${5:-}" created_at="${6:-}"
-    local tunnel_public_key="${7:-}"
+    local tunnel_public_key="${7:-}" capabilities_json="${8:-}"
 
     if [[ ! "$port" =~ ^[0-9]+$ ]]; then
         printf 'ledger_add: port must be numeric, got %q\n' "$port" >&2
+        return 1
+    fi
+    # capabilities must be an object when present: a string/null would be
+    # the exact format violation the contract forbids (CAPABILITY-DESIGN §1).
+    if [[ -n "$capabilities_json" ]] \
+       && [[ "$(printf '%s' "$capabilities_json" | jq -r 'type' 2>/dev/null)" != "object" ]]; then
+        printf 'ledger_add: capabilities must be a JSON object, got %q\n' "$capabilities_json" >&2
         return 1
     fi
 
@@ -59,10 +72,12 @@ ledger_add() {
         --arg container "$container" \
         --arg created_at "$created_at" \
         --arg tpk "$tunnel_public_key" \
+        --argjson caps "${capabilities_json:-null}" \
         '([.[] | objects | select(.port != $port)]
           + [{port: $port, provider: $provider, image: $image,
               container: $container, created_at: $created_at}
-             + (if $tpk != "" then {tunnel_public_key: $tpk} else {} end)])
+             + (if $tpk != "" then {tunnel_public_key: $tpk} else {} end)
+             + (if $caps != null then {capabilities: $caps} else {} end)])
          | sort_by(.port)'
 }
 

@@ -35,3 +35,39 @@ profile_linger() {
 profile_sudoers_rules() {
     jq -r '.sudoers_rules[]?' "$1"
 }
+
+# profile_capabilities <profile.json>   -> compact JSON object, `{}` when
+# absent. A worker's capabilities come from its image profile, not from each
+# container (CAPABILITY-DESIGN.md §3); create-worker copies this value into
+# the POOL_WORKERS entry so consumers do not have to read the profile.
+# An old-style array (or any non-object) is refused with a non-zero exit:
+# the contract is key:object and a guess here would corrupt the ledger.
+profile_capabilities() {
+    local caps
+    caps="$(jq -c '.capabilities // {}' "$1" 2>/dev/null)" || return 1
+    if [[ "$(jq -r 'type' <<< "$caps" 2>/dev/null)" != "object" ]]; then
+        printf 'profile_capabilities: %s.capabilities is not an object — the contract is key:object (CAPABILITY-DESIGN.md §1)\n' "$1" >&2
+        return 1
+    fi
+    printf '%s\n' "$caps"
+}
+
+# profile_declares_capability <profile.json> <key> — 0 when the profile
+# declares that capability key (whatever its value).
+profile_declares_capability() {
+    jq -e --arg k "$2" '.capabilities // {} | has($k)' "$1" >/dev/null 2>&1
+}
+
+# profile_validate_no_github <profile.json> — guard for the standing rule in
+# CAPABILITY-DESIGN.md §2: until the worker credential-injection design is
+# done, no worker profile may declare `github` (the injection does not
+# exist yet, and a declared capability that cannot hold is exactly the
+# silent lie this design exists to prevent). Prints nothing; returns 1 and
+# explains on stderr when violated.
+profile_validate_no_github() {
+    if profile_declares_capability "$1" "github"; then
+        printf 'profile_validate_no_github: %s declares "github", but worker credential injection is not implemented yet — remove it until that design lands (CAPABILITY-DESIGN.md §2)\n' "$1" >&2
+        return 1
+    fi
+    return 0
+}
