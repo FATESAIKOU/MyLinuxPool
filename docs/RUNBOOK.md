@@ -6,6 +6,7 @@
 ## 目錄
 
 1. [新增一台 provider](#1-新增一台-provider)
+1.5 [移除一台 provider](#15-移除一台-provider)
 2. [Gateway rotate 之後要做什麼](#2-gateway-rotate-之後要做什麼)
 3. [更換 GH_POOL_TOKEN](#3-更換-gh_pool_token)
 4. [Fh-proxy 的 Windows 側設定](#4-fh-proxy-的-windows-側設定)
@@ -24,14 +25,19 @@
 
 ### 1.1 前置：兩個環境變數
 
-`register-provider.sh` 需要兩個環境變數，缺任一個會以退出碼 `2` 中止：
+`register-provider.sh` 只需要**一個**環境變數，缺了會以退出碼 `2` 中止：
 
 | 變數 | 是什麼 | 從哪來 |
 |---|---|---|
-| `FILE_CRYPTO_KEY` | 對稱解密金鑰（信任根） | 你保管的密碼，與 GitHub secret 同名 |
-| `GH_POOL_TOKEN` | classic PAT（scope `repo`），能讀 repo vars、clone 私有 repo | GitHub → Settings → Developer settings → Tokens (classic) |
+| `GH_POOL_TOKEN` | 能讀 repo vars、寫 `NODE_*` var、clone 私有 repo、觸發 workflow | GitHub → Settings → Developer settings |
 
-這是整套系統中**唯一的人工輸入機密**。不要在指令歷史、log 或聊天中留下它們。
+> **`FILE_CRYPTO_KEY` 不需要，而且是刻意的。** KEY-DESIGN §8 之後 provider 的
+> profile 只裝 `pool-runtime` 與 `gh`，兩者 `needs_key=false`——註冊機器不再碰
+> 信任根（`register-provider.sh:91` 的註解寫著同一件事）。舊版這裡列了兩個變數，
+> 2026-09-25 依實際程式碼更正。意義是：**登錄一台新機器不必把信任根帶上去**，
+> 那台機器被入侵也解不開 Gateway 的 rclone／dlpw／uppw。
+
+不要在指令歷史、log 或聊天中留下它。
 
 > **`GH_POOL_TOKEN` 只需要 repo 權限（Contents: Read、Variables:
 > Read/Write），不要多給。** 實測過：`gh auth login --with-token` 會強制要求
@@ -135,6 +141,69 @@ loginctl show-user "$USER" | grep Linger   # 必須是 Linger=yes
 
 ---
 
+## 1.5 移除一台 provider
+
+**沒有反註冊腳本。** 四步，手工，順序不能換。2026-09-25 拆一台測試機時走過一遍，
+第四步是讀 action 原始碼才發現的——漏掉它，Gateway 會繼續記著一台不存在的機器。
+
+以 `<NAME>`＝節點名（例如 `mlp-testbox`）為例：
+
+```bash
+# 1. 先刪掉它上面所有 worker（worker 先於機器，否則帳本會留孤兒）
+mlp ls                      # 找出 provider 欄是 <NAME> 的 worker
+gh workflow run delete-worker.yml -f name=<worker 容器名>
+#    每個 worker 一次，等 workflow 綠了再下一個
+
+# 2. 刪掉節點宣告
+gh variable delete NODE_<NAME 大寫底線>
+
+# 3. 關掉／回收那台機器本身
+#    （雲主機就刪掉；實體機就從池子的角度不管它了）
+
+# 4. 把 Gateway 的 state 快取壓回主本 —— 這步最容易漏
+GW=$(gh variable get NODE_GATEWAY)
+export PUSH_GATEWAY_IP=$(printf '%s' "$GW" | jq -r '.ip')
+export PUSH_GATEWAY_PORT=$(printf '%s' "$GW" | jq -r '.port // 22')
+export PUSH_GATEWAY_USER=$(printf '%s' "$GW" | jq -r '.user')
+export PUSH_HOST_KEY=$(printf '%s' "$GW" | jq -r '.host_key')
+export PUSH_SOURCE="manual-deregister"
+export GITHUB_WORKSPACE="$PWD"
+export GH_REPO="FATESAIKOU/MyLinuxPool"
+export GH_TOKEN="$(gh auth token)"
+eval "$(ssh-agent -s)"; ssh-add ~/.ssh/id_mlp
+bash .github/actions/push-state/run.sh
+ssh-agent -k
+```
+
+### 為什麼第 4 步不能省
+
+`mlp state` 會說 `node set differs (master vs gateway) / only in gateway: <NAME>`。
+Gateway 上的 `/var/lib/mylinuxpool/state.json` 是給 sshproxy 讀的快取，它不會自己
+跟上主本——只有 `push-state` 會寫它，而那個動作平常藏在 create-worker／
+delete-worker／rotate／repair 這幾個 workflow 裡面。拆機器不經過任何一個，
+所以要手動跑。
+
+### 為什麼不用 `repair-gateway`
+
+它也會 push state，但它連帶重跑整支 `provision-gateway.sh`。那支在 2026-09-20
+把 Gateway 弄掛過一次（`ssh.socket` 的 IPv6-only 綁定），修正後只在**新機器**上
+（rotate）驗過，沒有在活的 Gateway 上驗過。為了清一筆快取殘留去重新佈署整個
+入口，代價不對等。
+
+### 拆完核對
+
+```bash
+mlp ls        # 該機器與它的 worker 都不在了
+mlp state     # consistent
+```
+再確認 Gateway 上沒有殘留授權與監聽埠：
+```bash
+ssh <gateway> 'grep -c <NAME> ~/.ssh/authorized_keys; ss -ltn | grep -c <該機器的 port>'
+```
+兩個都要是 0。
+
+---
+
 ## 2. Gateway rotate 之後要做什麼
 
 **叢集本身什麼都不用做。** 但有兩件屬於你個人的收尾：
@@ -183,11 +252,28 @@ rotate 後第一次連線會因為金鑰不符被擋下，`ops-scripts/mlp` 會�
 
 ### 3.1 產生新 token
 
-GitHub → Settings → Developer settings → Tokens (classic) → 新建，
-scope 勾 `repo`。若改用 fine-grained，權限給**只給這個 repo 的
-Variables: Read、Contents: Read**，但記得它有到期日，到期就會出現上述症狀
-（Worker 用的 `GH_WORKER_TOKEN` 更窄：只有 Variables: Read，
-另見 `ARCHITECTURE.md` §3）。
+classic：GitHub → Settings → Developer settings → Tokens (classic) → 新建，
+scope 勾 `repo`。
+
+fine-grained：Repository access 只給這個 repo，權限要**三項**：
+
+| 權限 | 為什麼 |
+|---|---|
+| Contents: Read | step 3 `gh repo clone` 拉 runtime |
+| Variables: Read and write | step 5 寫 `NODE_<NAME>`；各處讀 `NODE_*`／`CLIENT_*` |
+| **Actions: Read and write** | step 6.5 觸發 `refresh-authorized-keys.yml`，讓 Gateway 接受新機器的隧道金鑰 |
+
+> **Actions 那項是硬需求，而且以前這裡漏寫。** 2026-09-25 用一把只有
+> Contents:Read + Variables:RW 的 token 實跑，登錄停在
+> `step 6.5` 並回 `could not dispatch refresh-authorized-keys.yml`。
+> 少了它，前面五步會成功、第六步才死——機器已經在主本裡登記了一半。
+> classic 的 `repo` scope 涵蓋 Actions，所以 classic 一直能用，這個漏寫才沒被發現。
+>
+> 「actions variables」與「actions」在 GitHub 是兩個不同的權限項：前者管 repo
+> variables，後者管觸發 workflow。兩個都要。
+
+fine-grained 有到期日，到期就會出現上述症狀。
+（Worker 用的 `GH_WORKER_TOKEN` 更窄：只有 Variables: Read，另見 `ARCHITECTURE.md` §3。）
 
 ### 3.2 更新 GitHub secret
 
@@ -197,43 +283,16 @@ gh secret set GH_POOL_TOKEN --repo FATESAIKOU/MyLinuxPool
 
 （貼上新 token；`GH_WORKER_TOKEN` 若也有 rotate 一併更新。）
 
-### 3.3 重新加密 repo 內的佈署檔
+### 3.3 （已移除）repo 內沒有加密的 token 檔
 
-> **2026-09-15 標記：這一節可能已經過時，尚未重寫。** 現行
-> `ops-scripts/register-provider.sh`／`shared-configs/gh/install.sh` 讀的
-> `GH_POOL_TOKEN` 完全來自呼叫時的環境變數，repo 裡（`shared-configs/`
-> 或任何地方）找不到對應的 `gh_pool_token.crypted`——下面這段「解密舊檔→
-> 換內容→重新加密→commit」的流程假設的是一個 repo 內加密儲存 token 的
-> 機制，這機制目前看起來不存在了。在確認現行正確的輪替方式之前，不要
-> 照抄這裡的指令。`static_secret_files/`、`scripts/decryptStdin.sh`／
-> `encryptStdin.sh` 這幾個路徑本身也早就不存在（前者已拆進
-> `shared-configs/<unit>/files/`，後者合併成 `scripts/lib/crypto.sh`）。
+以前這裡有一段「解密舊檔→換內容→重新加密→commit」的流程。**那個機制已經不存在**：
+`register-provider.sh` 與 `shared-configs/gh/install.sh` 讀的 `GH_POOL_TOKEN`
+完全來自呼叫時的環境變數，repo 裡找不到對應的 `.crypted` 檔，
+`static_secret_files/` 與 `scripts/{en,de}cryptStdin.sh` 這些路徑也早就不在了
+（前者拆進 `shared-configs/<unit>/files/`，後者併成 `scripts/lib/crypto.sh`）。
 
-在持有 `FILE_CRYPTO_KEY` 的信任機器上：
-
-```bash
-# 1. 解出舊檔
-cat static_secret_files/<path>/gh_pool_token.crypted \
-  | scripts/decryptStdin.sh "$FILE_CRYPTO_KEY" > /tmp/gh_pool_token
-
-# 2. 換成新 token（編輯 /tmp/gh_pool_token，只留純 token 一行）
-
-# 3. 重新加密回原位
-cat /tmp/gh_pool_token \
-  | scripts/encryptStdin.sh "$FILE_CRYPTO_KEY" \
-  > static_secret_files/<path>/gh_pool_token.crypted
-
-# 4. 立刻清掉明文
-rm -f /tmp/gh_pool_token
-
-# 5. commit
-git add static_secret_files/<path>/gh_pool_token.crypted
-git commit -m "Rotate GH_POOL_TOKEN"
-git push
-```
-
-> 加解密參數與 `FILE_CRYPTO_KEY` 的用法見 `POOL_RUNTIME_SPEC.md` §7 與
-> `scripts/{en,de}cryptStdin.sh`。**明文嚴禁進版控、日誌或指令參數以外的紀錄。**
+整節於 2026-09-25 刪除。它自 2026-09-15 起就掛著「可能已過時」的警告卻沒被移除——
+一段自己承認不可信、卻還留在流程中間的指示，比沒有更糟。
 
 ### 3.4 各 provider 重跑哪一段
 
