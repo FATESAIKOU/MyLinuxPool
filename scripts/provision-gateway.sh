@@ -164,6 +164,11 @@ provision_ssh_listen_ports() {
     # that only needs port 22 is left exactly as the distro shipped it.
     # The code below runs only when someone explicitly asks for a port set
     # other than the default and there is a drop-in to converge.
+    #
+    # 生產觸發條件：目前無人觸發。rotate 與 repair 都把 NODE_GATEWAY 的
+    # port（現為 2100）傳成 GATEWAY_SSH_LISTEN_PORTS，不等於 "22"，所以
+    # 這個 early return 在生產從未被走到；退場條件是 Gateway 改回 22——
+    # 那時它才會生效，也正是它的目的（不動發行版原狀）。
     if [[ "$GATEWAY_SSH_LISTEN_PORTS" == "22" && ! -f "$SSH_SOCKET_CONF" ]]; then
         log INFO "step 1b/6: default port 22 and no drop-in installed — leaving ssh.socket untouched"
         return 0

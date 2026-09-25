@@ -153,12 +153,20 @@ main() {
             log WARN "no unit.json for declared unit '${unit}' — skipping"
             continue
         fi
+        # 生產觸發條件：目前無人觸發。兩台 provider 的 profile 都只宣告
+        # pool-runtime 與 gh，兩者 needs_key 皆 false，所以這個 skip 不會
+        # 執行；它要等 provider profile 又宣告 rclone/standalonescripts
+        # （唯二 needs_key=true 的 unit）才會第一次生效。
         if [[ "$(jq -r '.needs_key // false' "$unit_json" 2>/dev/null || true)" == "true" ]]; then
             # N2: providers deliberately carry no decryption key; units
             # that need one are only handled at registration time.
             log INFO "skipped: ${unit} needs FILE_CRYPTO_KEY, only handled at registration"
             continue
         fi
+        # 生產觸發條件：目前 100% 走此路（每個 provider tick 都會）。兩台
+        # provider 的 profile 都宣告 gh，而 gh 的 unit.json 是 needs_root=true，
+        # 所以每一輪都在這裡被跳過；退場條件是 gh 的 needs_root 不再為 true
+        # （例如改成使用者層級安裝），那時它才會落到下面的 --check/install。
         if [[ "$(jq -r '.needs_root // false' "$unit_json" 2>/dev/null || true)" == "true" ]]; then
             # pool-sync runs as the ordinary user from a systemd user
             # timer — it has no root. Installing a needs_root unit would

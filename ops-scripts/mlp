@@ -949,6 +949,10 @@ wake_try_sender() {
         WAKE_SEND_ERR="$send_out"
         return 2
     fi
+    # 生產觸發條件：目前無人觸發（正常情況網關都在）。只在 Gateway master
+    # 打不開時才走此路——即「送出了但無法驗證結果」，與「觀察到沒醒」不同一個
+    # 狀態（WAKE-VIA-DESIGN.md §3 的第四態）。它沒有退場條件：網關任何一次
+    # 閃斷都會走到，這是它存在的理由，不是待修的分支。
     if ! open_gateway_master 2>/dev/null; then
         WAKE_SEND_ERR="gateway unreachable, cannot verify wake"
         close_gateway_master

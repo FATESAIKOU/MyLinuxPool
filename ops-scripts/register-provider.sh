@@ -246,6 +246,10 @@ step1_preflight() {
         exit 1
     fi
 
+    # 生產觸發條件：no-sudo 分支由 `--no-sudo` 觸發，目前由 fh-proxy 使用
+    # （LAYOUT.md §2.「provider/no-sudo：fh-proxy」、RUNBOOK §1；它的 sudo
+    # 密碼不可得）。退場條件是 fh-proxy 取得可用 sudo 並改用預設 profile，
+    # 那時這條分支在生產歸零。
     if [[ "$NO_SUDO" -eq 1 ]]; then
         step1_preflight_no_sudo
     else

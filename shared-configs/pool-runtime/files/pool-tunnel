@@ -284,6 +284,11 @@ resolve_connection_info() {
     # Follow mode: the port is still ours to know (create-worker assigned
     # it), but the Gateway address comes from the provider's published
     # file and is re-read on every drift cycle.
+    # 生產觸發條件：目前 100% 走此路（每個 worker 都由 create-worker 帶
+    # POOL_GATEWAY_FILE 起容器，見 create-worker.sh 的 docker run）。provider
+    # 的 pool-tunnel 不設這兩個變數，所以 provider 走下面的 pool-resolve 路徑；
+    # 這條分支的退場條件是「worker 不再從 gateway.json 跟隨」——那等於放棄
+    # rotate 後的自我收斂，不預期發生。
     if [[ -n "$GATEWAY_FOLLOW_FILE" && -n "${POOL_GATEWAY_PORT:-}" ]]; then
         local pub i
         MY_PORT="$POOL_GATEWAY_PORT"

@@ -77,6 +77,12 @@ else
     log INFO "gh already present"
 fi
 
+# 生產觸發條件：Gateway 上 100% 走此路（provision-gateway 的 rotate/repair
+# 呼叫只帶 POOL_TRUSTED_IPS 與 GATEWAY_SSH_LISTEN_PORTS，不帶
+# GH_POOL_TOKEN——Gateway 依 spec §10.2b 刻意不持有 GitHub 憑證）；provider
+# 上不觸發（register-provider 執行時環境裡有 GH_POOL_TOKEN，會往下走寫
+# token 檔與 credential helper）。退場條件是 Gateway 政策改變、開始持有
+# GitHub 憑證——那與 §10.2b 直接衝突，不預期發生。
 if [[ -z "${GH_POOL_TOKEN:-}" ]]; then
     log INFO "GH_POOL_TOKEN not set — installing the gh binary only (no token file/credential helper)"
     exit 0

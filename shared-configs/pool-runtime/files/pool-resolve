@@ -124,6 +124,12 @@ resolve_node() {
         fi
     fi
 
+    # 生產觸發條件：目前無人觸發。唯一會在生產帶 --refresh 的呼叫者
+    # （pool-tunnel 的 30s drift check）參數恆為 `gateway`，而 gateway 在
+    # 上一行就被 `!= "gateway"` 排除；mlp 的 --refresh 呼叫同樣只打 gateway。
+    # 這條分支要等「有人對非 gateway 節點下 --refresh」才會第一次執行——
+    # 正是 2026-09-25 那種從未被走過的分支。若將來真的需要，這裡的 stdout
+    # 契約（純 JSON）才有被驗證的機會。
     if [[ -n "$state_json" ]]; then
         local node_out node_rc
         node_out="$(state_file_lookup "$state_json" "$name")"

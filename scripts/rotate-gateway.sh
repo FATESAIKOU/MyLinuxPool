@@ -210,6 +210,9 @@ rotate_create_preview_linode() {
     # the same password survives every rotate and stays worth recording;
     # fall back to random only when the caller hasn't provided one, which
     # keeps the console path unusable but is no worse than before.
+    # 生產觸發條件：目前 100% 走此路（GATEWAY_ROOT_PASSWORD secret 已設，
+    # rotate workflow 的 create_preview step 把它匯出成 GATEWAY_ROOT_PASS）；
+    # 若哪天移除該 secret 則歸零，改走 else 的隨機密碼，LISH 救援失效。
     if [[ -n "${GATEWAY_ROOT_PASS:-}" ]]; then
         root_pass="$GATEWAY_ROOT_PASS"
         # >&2: this function's stdout is its return value (the KEY=value
