@@ -1286,29 +1286,138 @@ cmd_status() {
 # stays local.
 
 # wf_dispatch <workflow-file> <label> [-f k=v ...]
+#   Dispatches a run and, when a run can be singled out, follows it. The
+#   dispatch API returns nothing tying the request to the run it creates,
+#   so ownership is *inferred* from a before/after view of this workflow's
+#   visible run window. The return codes say how far that inference got —
+#   not what the run did:
+#     0  exactly one new run appeared in the window, and it finished
+#        successfully
+#     1  the dispatch request failed; or the run that was singled out
+#        finished non-successfully; or the wait ended with a successful
+#        read of the window showing no new run
+#     3  the dispatch request was accepted, but no run could be singled out
+#        — more than one new run appeared, the baseline could not be read,
+#        or the window could not be observed at the end
+#   "Exactly one new run" is necessary but NOT sufficient for that run to
+#   be the one we dispatched: someone else's run can land in the window
+#   while ours has not appeared yet (or arrives across two polls), and the
+#   difference is then one run that is not ours. rc 0 must be read as "one
+#   new run appeared and finished successfully", never as "our run
+#   succeeded"; rc 3 must never be folded into 0 or 1 — telling them apart
+#   is the whole reason the third answer exists. Real attribution needs a
+#   run-name/nonce on the workflow side; that is a separate decision.
 wf_dispatch() {
     local wf="$1" label="$2"; shift 2
-    local before after run_id i
+    local before after run_id i new_ids count ambiguous=0 rid
+    local before_rc baseline_ok=1 last_read_ok=0
 
     # The dispatch API returns nothing identifying the run it creates, so
-    # remember the newest id first and watch for a different one.
-    before="$(gh run list --workflow="$wf" --repo "$REPO" --limit 1 \
-                --json databaseId --jq '.[0].databaseId // 0' 2>/dev/null)"
+    # the run has to be found by difference: what existed before vs after.
+    # A single "newest id" cannot express that difference. Someone else's
+    # run may land first, or land inside the same poll interval — then
+    # --limit 1 shows only the newest of the two, and the old code claimed
+    # it either way, silently. Snapshot the whole visible window instead,
+    # and refuse to guess when the window shows more than one new run.
+    # Residual: a window holding exactly ONE new run still cannot be
+    # checked — it may be someone else's. Clearing that needs a
+    # run-name/nonce on the workflow side, which is a separate decision.
+    before="$(gh run list --workflow="$wf" --repo "$REPO" --limit 30 \
+                --json databaseId --jq '.[].databaseId' 2>/dev/null)"
+    before_rc=$?
+    # A baseline that could not be read is not an empty baseline. Diffing
+    # against "" calls every visible run "new" — which is only accidentally
+    # safe while the window happens to hold several runs; with a sparse
+    # window it "singles out" a run we never dispatched (qa 2026-09-25).
+    # Empty output WITH rc 0 is a real baseline (the workflow has no runs
+    # yet), and must not be confused with this case.
+    [[ "$before_rc" -eq 0 ]] || baseline_ok=0
 
     gh workflow run "$wf" --repo "$REPO" "$@" >/dev/null 2>&1 \
         || die "could not dispatch ${wf} (is gh authenticated for ${REPO}?)"
 
     printf '%s%s%s dispatched, waiting for the run to appear' "$C_BOLD" "$label" "$C_RESET"
+
+    if [[ "$baseline_ok" -eq 0 ]]; then
+        echo ""
+        # No baseline means no difference can be computed, ever — polling
+        # would not add information. The dispatch request was accepted, so
+        # this is the unknown answer, not a failure: saying rc 1 here would
+        # invite a re-run of something that may be under way.
+        printf '%sthe run list could not be read when the dispatch went out — there is nothing to compare against, so this run cannot be singled out%s\n' \
+            "$C_YELLOW" "$C_RESET"
+        echo "  check the latest runs yourself: https://github.com/${REPO}/actions"
+        echo "  the dispatch went out — look yourself before doing anything else"
+        return 3
+    fi
+
     run_id=""
     for i in $(seq 1 20); do
         sleep 3
-        after="$(gh run list --workflow="$wf" --repo "$REPO" --limit 1 \
-                   --json databaseId --jq '.[0].databaseId // 0' 2>/dev/null)"
-        if [[ -n "$after" && "$after" != "$before" ]]; then run_id="$after"; break; fi
+        after="$(gh run list --workflow="$wf" --repo "$REPO" --limit 30 \
+                   --json databaseId --jq '.[].databaseId' 2>/dev/null)"
+        if [[ $? -ne 0 ]]; then
+            # A failed read observed nothing, so it must not enter the
+            # difference: an empty "after" would otherwise make every entry
+            # of the baseline look new (or, in a one-entry baseline, look
+            # like one new run). Record that the latest observation is
+            # dark and keep waiting.
+            last_read_ok=0
+            printf '.'
+            continue
+        fi
+        last_read_ok=1
+        new_ids="$(comm -13 <(printf '%s\n' "$before" | sort) \
+                            <(printf '%s\n' "$after" | sort) | grep . || true)"
+        count="$(printf '%s\n' "$new_ids" | grep -c . || true)"
+        case "$count" in ''|*[!0-9]*) count=0 ;; esac
+        if [[ "$count" -eq 1 ]]; then
+            run_id="$(printf '%s\n' "$new_ids" | head -n 1)"
+            break
+        fi
+        if [[ "$count" -gt 1 ]]; then
+            ambiguous=1
+            break
+        fi
         printf '.'
     done
     echo ""
-    [[ -n "$run_id" ]] || die "the run never appeared — check https://github.com/${REPO}/actions"
+
+    if [[ "$ambiguous" -eq 1 ]]; then
+        # More than one new run appeared, so at most one of them could be
+        # the dispatched one — and there is no way to tell which. Do not
+        # pick one and do not follow it. For a destructive rotate this
+        # distinction is the whole point: reporting this as "failed"
+        # invites a hasty re-run of something that may be replacing the
+        # live Gateway right now, and reporting it as "succeeded" would be
+        # a guess. rc 3 is the third answer, and the caller must keep it.
+        printf '%smore than one new run appeared — cannot tell which one is ours, or whether ours has appeared yet%s\n' \
+            "$C_YELLOW" "$C_RESET"
+        printf '%s\n' "$new_ids" | while IFS= read -r rid; do
+            [[ -n "$rid" ]] || continue
+            echo "  https://github.com/${REPO}/actions/runs/${rid}"
+        done
+        echo "  the dispatch request was accepted — our run may not be in that list yet; look yourself before doing anything else"
+        return 3
+    fi
+
+    if [[ -z "$run_id" ]]; then
+        # Timed out. Which answer this is depends on whether the wait ended
+        # with a clean look: the last read is what the verdict has to rest
+        # on, and a failed one is "we did not observe", never "no run
+        # exists" — the same fold this function exists to prevent, in the
+        # direction that hurts a destructive rotate (rc 1 reads as "nothing
+        # happened", inviting a re-run while a run may be replacing the
+        # live Gateway).
+        if [[ "$last_read_ok" -eq 0 ]]; then
+            printf '%sthe last read of the run list failed, so the wait ended without a clean look — no run was observed, which is unknown, not absent%s\n' \
+                "$C_YELLOW" "$C_RESET"
+            echo "  check the latest runs yourself: https://github.com/${REPO}/actions"
+            echo "  the dispatch went out — look yourself before doing anything else"
+            return 3
+        fi
+        die "the run never appeared — check https://github.com/${REPO}/actions"
+    fi
 
     echo "  https://github.com/${REPO}/actions/runs/${run_id}"
     echo ""
@@ -1369,8 +1478,12 @@ cmd_rotate() {
         echo "dry run: builds, provisions and verifies a preview machine, then deletes it."
         echo "NODE_GATEWAY and the live Gateway are not touched."
         echo ""
+        # rc 3 (could not tell which run is ours) is passed through, not
+        # collapsed: a dry run touching nothing makes the distinction
+        # harmless here, but swallowing it in one caller and keeping it in
+        # the other is how the two would drift apart.
         wf_dispatch rotate-gateway.yml "rotate (dry run)" -f dry_run=true
-        return
+        return $?
     fi
 
     resolve_gateway
@@ -1387,9 +1500,26 @@ cmd_rotate() {
         return 1
     fi
 
-    wf_dispatch rotate-gateway.yml "rotate" -f dry_run=false || return 1
-    echo ""
-    echo "next: run 'mlp trust-gateway' to accept the new machine's host key."
+    # A real rotate is destructive, so rc 3 must survive: the dispatch
+    # went out, and the run may well have replaced the live Gateway — the
+    # "trust-gateway" step below is needed if it did. Reporting 3 as a
+    # plain failure is the one wrong answer with real damage: someone sees
+    # red at midnight and re-runs a rotate that may already have run. So
+    # the hint prints for both success and unknown; only a definite
+    # failure skips it.
+    local rc=0
+    wf_dispatch rotate-gateway.yml "rotate" -f dry_run=false || rc=$?
+    if [[ "$rc" -eq 0 || "$rc" -eq 3 ]]; then
+        echo ""
+        echo "next: run 'mlp trust-gateway' to accept the new machine's host key."
+    fi
+    if [[ "$rc" -eq 3 ]]; then
+        echo ""
+        printf '%sthe rotate run could not be identified — it may have replaced the live Gateway.%s\n' \
+            "$C_YELLOW" "$C_RESET"
+        echo "check what was printed above (and 'mlp ls') before running rotate again."
+    fi
+    return "$rc"
 }
 
 cmd_worker() {
@@ -1431,10 +1561,20 @@ worker_new() {
                --header='which profiles/worker/<image> to build?')"
     [[ -n "$image" ]] || { echo "aborted."; return 1; }
 
+    # rc 3: the dispatch went out, so a worker run may be running; not
+    # being able to name it is not a reason to tell the user the create
+    # failed.
+    local rc=0
     wf_dispatch create-worker.yml "create-worker (${provider}/${image})" \
-        -f provider="$provider" -f image="$image" || return 1
-    echo ""
-    echo "next: 'mlp ls' to see it, 'mlp ssh' to connect."
+        -f provider="$provider" -f image="$image" || rc=$?
+    if [[ "$rc" -eq 0 ]]; then
+        echo ""
+        echo "next: 'mlp ls' to see it, 'mlp ssh' to connect."
+    elif [[ "$rc" -eq 3 ]]; then
+        echo ""
+        echo "the create-worker run could not be identified — check what was printed above; if it landed, 'mlp ls' will show the worker."
+    fi
+    return "$rc"
 }
 
 worker_rm() {
@@ -1462,7 +1602,17 @@ worker_rm() {
     read -r confirm
     [[ "$confirm" == "yes" ]] || { echo "aborted."; return 1; }
 
-    wf_dispatch delete-worker.yml "delete-worker (${name})" -f name="$name"
+    # rc 3: same third answer as the other callers. The port and ledger
+    # entry are released by the run, so an unidentified run means the
+    # deletion may already have happened — say so instead of implying it
+    # did not.
+    local rc=0
+    wf_dispatch delete-worker.yml "delete-worker (${name})" -f name="$name" || rc=$?
+    if [[ "$rc" -eq 3 ]]; then
+        echo ""
+        echo "the delete-worker run could not be identified — check what was printed above before retrying; it may already have removed the worker."
+    fi
+    return "$rc"
 }
 
 worker_images() {
