@@ -490,6 +490,18 @@ else
     fi
 fi
 
+# 這條不驗行為，驗的是「來源」：哨兵字串本身是跨 repo 的契約。
+# 上面那些 fixture 也寫死 NC_DONE，所以改名確實會讓它們變紅——但紅的訊息會是
+# 「banner 沒認出來」，看到的人最自然的動作是把 fixture 一起改掉，然後綠燈恢復，
+# 而 MyAiEntry 那邊靜靜地壞掉。所以這裡要一條**訊息會講話**的斷言：改名的人
+# 必須先讀完這段話，才改得動它。
+echo "── 6. 哨兵字串是跨 repo 契約（改名前必讀） ──"
+if grep -q 'printf %s NC_DONE' "$MLP" && grep -q '"\$out" != \*"NC_DONE"\*' "$MLP"; then
+    ok "6. gw_probe_port 仍用 NC_DONE，且仍同時檢查 rc 與標記"
+else
+    bad "6. 哨兵或其檢查被改了。這不是本地細節：MyAiEntry 的 poolReachability 照同一個形狀重寫了這支探測，改掉哨兵名、拿掉它、或只檢查 rc，都會把他們的三態退回兩態——而他們的兩態會把「沒觀察到」報成「不可達」，後果是一條指令沒跑完就讓整池機器被標成全滅、喚醒那邊白燒 300 秒。兩邊沒有任何 build 會發現。要改就先通知他們（ops-scripts/mlp 的 gw_probe_port 註解有寫）"
+fi
+
 echo
 printf 'passed %d / failed %d / injection-fail %d\n' "$pass" "$fail" "$injfail"
 if [[ "$fail" -ne 0 ]]; then exit "$fail"; fi
