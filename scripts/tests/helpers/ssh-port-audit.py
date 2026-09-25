@@ -110,7 +110,10 @@ for path in sys.argv[1:]:
         src = open(path, encoding='utf-8').read().split('\n')
         fn = ""
         for k in range(lineno - 1, -1, -1):
-            m = re.match(r'^([a-z_]+)\(\) \{', src[k])
+            # Names carry digits here (step9_verify, step6_5_...): [a-z_]+
+            # skipped straight past them to enable_linger, misattributing
+            # every numbered step's finding.
+            m = re.match(r'^([a-z_][a-z0-9_]*)\(\) \{', src[k])
             if m:
                 fn = m.group(1); break
         if any(path.endswith(f) and frag == fn for f, frag, _ in ALLOW):

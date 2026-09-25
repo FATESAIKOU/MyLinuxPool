@@ -34,13 +34,27 @@ bad()  { printf '  \033[31mFAIL\033[0m  %s\n' "$1"; FAIL=1; }
 echo "preflight: $(pwd)"
 echo
 
+# The single enumeration of every shell file in the repo, shared by the
+# syntax check below and the ssh-port audit further down. There is exactly
+# one on purpose: two copies drift apart, and the drift fails silently in
+# one direction — a file can keep passing the syntax check while quietly
+# dropping out of the port audit (that is how register-provider.sh's
+# port-less ssh survived: the old hand-kept eight-file list simply never
+# named it). No exclusion list, ever.
+shell_files=()
+while IFS= read -r f; do
+    shell_files+=("$f")
+done < <(git ls-files | grep -E '\.sh$|^ops-scripts/(mlp|verify-profile|preflight)$|/files/pool-')
+
 echo "── 語法 ──"
 n=0
-while IFS= read -r f; do
-    head -1 "$f" 2>/dev/null | grep -q python && continue
-    bash -n "$f" 2>/dev/null || { bad "bash -n $f"; continue; }
-    n=$((n+1))
-done < <(git ls-files | grep -E '\.sh$|^ops-scripts/(mlp|verify-profile|preflight)$|/files/pool-')
+if (( ${#shell_files[@]} > 0 )); then
+    for f in "${shell_files[@]}"; do
+        head -1 "$f" 2>/dev/null | grep -q python && continue
+        bash -n "$f" 2>/dev/null || { bad "bash -n $f"; continue; }
+        n=$((n+1))
+    done
+fi
 ok "$n 支 shell 腳本"
 
 n=0
@@ -79,12 +93,11 @@ ok "$n 個 Dockerfile COPY 來源"
 # 2100 時，這類呼叫一個一個在正式流程上炸出來，總共八處；一次抓完比較好。
 SSH_PORT_CHK="scripts/tests/helpers/ssh-port-audit.py"
 if [ -f "$SSH_PORT_CHK" ] && command -v python3 >/dev/null 2>&1; then
-    if out="$(python3 "$SSH_PORT_CHK" \
-            scripts/rotate-gateway.sh scripts/create-worker.sh \
-            .github/actions/push-state/run.sh \
-            shared-configs/pool-runtime/files/pool-tunnel \
-            shared-configs/pool-runtime/files/pool-status \
-            ops-scripts/mlp ops-scripts/verify-profile scripts/lib/ssh.sh 2>&1)"; then
+    # Uses shell_files computed once above — never a second enumeration and
+    # never a hand-kept subset (see the comment up there for why).
+    if [ "${#shell_files[@]}" -eq 0 ]; then
+        ok "對 Gateway 的 ssh/scp 都指定了埠 (無 shell 檔可掃)"
+    elif out="$(python3 "$SSH_PORT_CHK" "${shell_files[@]}" 2>&1)"; then
         ok "對 Gateway 的 ssh/scp 都指定了埠"
     else
         while IFS= read -r line; do
