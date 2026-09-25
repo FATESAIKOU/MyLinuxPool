@@ -101,6 +101,16 @@ die() {
     exit 1
 }
 
+# interactive_only — succeeds iff a human is present to answer fzf.
+#   Pitfall shape worth naming: fzf is correct interactively and hangs
+#   forever non-interactively (scripts, agents, CI, background jobs feed it
+#   from a pipe or /dev/null, never a keyboard). The test is stdin, not
+#   stdout: piped stdout stays legal (mlp ls | grep x has a human watching),
+#   while piped stdin never does. Callers print their own usage on failure.
+interactive_only() {
+    [[ -t 0 ]]
+}
+
 usage() {
     cat <<'EOF'
 usage: mlp [command]
@@ -639,6 +649,13 @@ cmd_ssh() {
         echo "usage: mlp ssh [<node-name|worker-name|port>]  (fzf pick when omitted)" >&2
         exit 2
     fi
+    # NOTE: the non-interactive guard for the omitted-name case lives at
+    # main's ssh dispatch, one frame up. test-tab-field-collapse.sh calls
+    # cmd_ssh directly with a stubbed fzf and non-TTY stdin on purpose (to
+    # exercise the pick-then-dial path headlessly) — a guard at this level
+    # would delete that coverage. The CLI can only reach this function
+    # through main, and main's menu is itself TTY-gated, so the boundary
+    # guard covers every real invocation.
     resolve_gateway
 
     if [[ -n "$target" ]]; then
@@ -708,6 +725,15 @@ pick_power_target() {
             printf '%s\n' "${nodes[0]}"
             ;;
         *)
+            # Several candidates need a human to choose; without one, say
+            # which argument would have avoided the question.
+            interactive_only || {
+                case "$action" in
+                    launch) echo "usage: mlp wake [<node-name>]  (node must declare .power.launch; fzf pick when omitted)" >&2 ;;
+                    *) echo "usage: mlp down [<node-name>]  (node must declare .power.shutdown; fzf pick when omitted)" >&2 ;;
+                esac
+                exit 2
+            }
             printf '%s\n' "${nodes[@]}" \
                 | fzf --prompt="${action}> " --height='~40%' \
                       --header="multiple nodes declare .power.${action} — pick one"
@@ -794,6 +820,18 @@ cmd_wake() {
     if [[ "$node" == -* ]]; then
         echo "usage: mlp wake [<node-name>]  (node must declare .power.launch; fzf pick when omitted)" >&2
         exit 2
+    fi
+    if [[ -z "$node" ]]; then
+        # Omitting the name opens the picker — or, with exactly one
+        # candidate, pick_power_target returns it without fzf. That made
+        # `mlp wake </dev/null` wake the sole node FOR REAL and exit 0:
+        # not a hang but a side effect nobody asked for (2026-09-25).
+        # Refuse before resolve_gateway: no network, no side effect,
+        # immediately.
+        interactive_only || {
+            echo "usage: mlp wake [<node-name>]  (node must declare .power.launch; fzf pick when omitted)" >&2
+            exit 2
+        }
     fi
     resolve_gateway
 
@@ -895,6 +933,15 @@ cmd_down() {
     if [[ "$node" == -* ]]; then
         echo "usage: mlp down [<node-name>]  (node must declare .power.shutdown; fzf pick when omitted)" >&2
         exit 2
+    fi
+    if [[ -z "$node" ]]; then
+        # Same as wake: an omitted name means the picker — and worse, the
+        # confirmation read below would eat whatever came down the pipe
+        # instead of asking (2026-09-25). Refuse before resolve_gateway.
+        interactive_only || {
+            echo "usage: mlp down [<node-name>]  (node must declare .power.shutdown; fzf pick when omitted)" >&2
+            exit 2
+        }
     fi
     resolve_gateway
 
@@ -1207,6 +1254,13 @@ worker_targets() {
 worker_new() {
     local provider image
 
+    # No flag form exists for these two picks, so there is no usage line to
+    # point at — say plainly what is missing instead of hanging.
+    interactive_only || {
+        echo "mlp worker new needs an interactive terminal to pick provider and image (stdin is not a TTY)" >&2
+        exit 2
+    }
+
     provider="$(worker_targets | awk -F'\t' '$2 == "provider" { print $1 }' \
                  | fzf --prompt='provider> ' --height='~40%' \
                        --header='which machine should host the worker?')"
@@ -1229,6 +1283,10 @@ worker_rm() {
         exit 2
     fi
     if [[ -z "$name" ]]; then
+        interactive_only || {
+            echo "usage: mlp worker rm [<worker-name>]  (fzf pick when omitted)" >&2
+            exit 2
+        }
         name="$(worker_targets \
                  | awk -F'\t' '$2 == "worker" { printf "%s\t(on %s, port %s)\n", $1, $3, $4 }' \
                  | fzf --prompt='worker> ' --height='~40%' \
@@ -2026,6 +2084,10 @@ fwd_view_rm() {
         exit 2
     fi
     if [[ -z "$entry" ]]; then
+        interactive_only || {
+            echo "usage: mlp fwd rm [entryport|bind:entryport]  (fzf pick when omitted)" >&2
+            exit 2
+        }
         fwd_records
         if [[ "${#FWD_RECORDS[@]}" -eq 0 ]]; then
             echo "no forwards"
@@ -2075,6 +2137,13 @@ fwd_view_rm() {
 #   the ViewModel it hands off to.
 fwd_menu_add() {
     local name selected spec
+    # Reachable only from main_menu (itself gated in main), but the picker
+    # and the spec prompt both need a human — guard here too so the
+    # invariant is local, not an argument about who calls whom.
+    interactive_only || {
+        echo "mlp fwd add needs an interactive terminal to pick a node and type a spec (stdin is not a TTY)" >&2
+        exit 2
+    }
     resolve_gateway
     open_gateway_master || die "Gateway unreachable (${GW_USER}@${GW_IP})"
     selected="$(
@@ -2179,9 +2248,23 @@ main() {
     fi
 
     case "$cmd" in
-        "") main_menu ;;
+        "")
+            # No subcommand means the interactive menu, which needs a human.
+            interactive_only || { usage >&2; exit 2; }
+            main_menu
+            ;;
         ls) cmd_ls "$@" ;;
-        ssh) cmd_ssh "$@" ;;
+        ssh)
+            # Boundary guard for the omitted-name picker (see cmd_ssh's
+            # note): refuse before anything resolves.
+            if [[ $# -eq 0 ]]; then
+                interactive_only || {
+                    echo "usage: mlp ssh [<node-name|worker-name|port>]  (fzf pick when omitted)" >&2
+                    exit 2
+                }
+            fi
+            cmd_ssh "$@"
+            ;;
         wake) cmd_wake "$@" ;;
         down) cmd_down "$@" ;;
         status) cmd_status "$@" ;;
