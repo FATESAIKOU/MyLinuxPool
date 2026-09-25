@@ -42,6 +42,16 @@
 
 ### 1.2 操作步驟
 
+> ⚠️ **先確認你現在這條連線用的是已登記的金鑰。**
+> step 8 會把 `authorized_keys` 收斂成「只有 `CLIENT_*` 宣告的金鑰」。
+> 如果你是用登錄前手動放上去的臨時 key 連進這台機器（例如 Mac 的預設
+> `id_rsa`），step 8 會在你腳下把門換鎖，當場把你關在外面。
+> 這是正確行為——宣告即真相——所以不能靠改程式碼解決，只能事先知道。
+> 2026-09-24 登錄 `fh-proxy-asus` 時真的發生過，得改用登記在
+> `CLIENT_FATESAIKOU_FWM` 的 `id_mlp` 才進得去。
+>
+> 動手前先問：斷線之後我還進得來嗎？進不來的話，先把你要用的 key 登記好。
+
 在新 provider 上：
 
 ```bash
@@ -54,7 +64,7 @@ bash ops-scripts/register-provider.sh --name <node-name> --gateway-port <port>
 
 `--name` 是這台機器在叢集中的名字（`gateway`、`fh-l`、`fh-proxy`）。
 `--gateway-port` 是它在 Gateway 上佔用的固定埠（provider 段 2220–2299；
-現況：`fh-l` = 2222、`fh-proxy` = 2226）。
+現況：`fh-l` = 2222、`fh-proxy` = 2226、`fh-proxy-asus` = 2230）。
 
 `--branch <name>`（預設 `master`）：開發期間 `pool/` 還在功能分支上、尚未併回
 `master` 時，指向該測試分支，例如：
