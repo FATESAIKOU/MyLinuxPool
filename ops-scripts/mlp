@@ -459,10 +459,12 @@ cmd_ls() {
         return 1
     fi
 
-    # Two passes: gather all rows first, then size the NAME column to the
-    # longest one actually seen (worker container names can run long,
-    # e.g. mlp-fh-proxy-base-34797874425) — a fixed width just breaks
-    # alignment on those instead of ever being "wide enough".
+    # Two passes: gather all rows first, then size NAME and PROVIDER to the
+    # longest ones actually seen (worker container names can run long,
+    # e.g. mlp-fh-proxy-base-34797874425, and so can provider names,
+    # e.g. fh-proxy-asus) — a fixed width just breaks alignment on those
+    # instead of ever being "wide enough". TYPE is a closed set capped at 8
+    # and PORT at 5 digits for any real ssh port, so those stay fixed.
     local name type provider port user state
     local rows=()
     rows[0]="$(printf 'gateway\tgateway\t-\t%s\tup' "$GW_PORT")"
@@ -475,14 +477,17 @@ cmd_ls() {
 
     close_gateway_master
 
-    local namewidth=4 r rname rlen
+    local namewidth=4 provwidth=8 r rname rlen rprov
     for r in "${rows[@]}"; do
         rname="${r%%$'\t'*}"
         rlen="${#rname}"
         [[ "$rlen" -gt "$namewidth" ]] && namewidth="$rlen"
+        rprov="${r#*$'\t'}"; rprov="${rprov#*$'\t'}"; rprov="${rprov%%$'\t'*}"
+        rlen="${#rprov}"
+        [[ "$rlen" -gt "$provwidth" ]] && provwidth="$rlen"
     done
 
-    local fmt="%-${namewidth}s  %-9s %-12s %-6s "
+    local fmt="%-${namewidth}s  %-9s %-${provwidth}s %-6s "
     printf "${C_BOLD}${fmt}%s${C_RESET}\n" "NAME" "TYPE" "PROVIDER" "PORT" "STATE"
 
     for r in "${rows[@]}"; do
