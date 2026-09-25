@@ -241,6 +241,11 @@ fi
 echo "=== 4. 危險排序：failure()/always() 清理步驟的函式是否可達 ==="
 # 這種步驟最危險：出事時救援也壞，平常永遠不會發現。今天沒有缺的，
 # 但要以行為面確認——抽每個這類 step，在它自己的 source 下解析函式是否存在。
+#
+# 界線（不要把這節的綠讀過頭）：它只證明這些步驟「叫得動」，不證明它們
+# 「收得乾淨」。一個不會 127 的回滾，仍然可能漏掉容器、漏掉埠、或刪錯
+# 對象。要證明那個，得真的讓 create 在特定步驟失敗，再從池側查三邊
+# （POOL_WORKERS / placeholder / ss）有沒有殘留——本測試沒有做這件事。
 python3 - "$REPO_ROOT" "$SANDBOX/risky.txt" <<'PY'
 import glob, os, re, sys, yaml
 root, out = sys.argv[1], sys.argv[2]
