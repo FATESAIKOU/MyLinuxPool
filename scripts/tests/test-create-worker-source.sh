@@ -244,8 +244,17 @@ echo "=== 4. 危險排序：failure()/always() 清理步驟的函式是否可達
 #
 # 界線（不要把這節的綠讀過頭）：它只證明這些步驟「叫得動」，不證明它們
 # 「收得乾淨」。一個不會 127 的回滾，仍然可能漏掉容器、漏掉埠、或刪錯
-# 對象。要證明那個，得真的讓 create 在特定步驟失敗，再從池側查三邊
-# （POOL_WORKERS / placeholder / ss）有沒有殘留——本測試沒有做這件事。
+# 對象。要證明那個，得真的讓 create 在特定步驟失敗，再從池側查殘留——
+# 本測試沒有做這件事。
+#
+# 殘骸有四種形狀，每一種只有一個視角看得見，所以四邊都要看：
+#   容器留著（跑著或 Exited）  provider 的 `docker ps -a`（不是 ps——
+#                              停掉但沒刪掉的容器是回滾漏掉的一種）
+#   帳本留著一筆死的           POOL_WORKERS
+#   孤兒 placeholder           Gateway 的 ~/.mylinuxpool/workers.d
+#   隧道還在但上面沒東西       Gateway 的 ss
+# 孤兒 placeholder 最安靜：它不影響任何現有 worker，只會讓那個埠永遠
+# 配不出去，要等埠段用滿才有人發現。
 python3 - "$REPO_ROOT" "$SANDBOX/risky.txt" <<'PY'
 import glob, os, re, sys, yaml
 root, out = sys.argv[1], sys.argv[2]
