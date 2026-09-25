@@ -7,7 +7,7 @@
 #   遠端命令往返；換成只問本機的寫法時，「斷線仍回報可用」的斷言必須轉紅。
 #   目標分類要看結束碼加 stderr：只看結束碼時，「主機不存在」與「主機在、
 #   沒服務」都回 rc=1，前者（No route）卻被誤報成後者（refused），違背
-#   「refused 證明封包到達了主機」的承諾。新契約分四態：open、timeout
+#   「refused 證明封包到達了主機」的承諾。新契約分四態：open、inconclusive
 #   （我不知道）、refused（主機在沒服務，仍算健康）、unreachable
 #   （我知道到不了，不算健康）。
 #   stub 必須忠實：真實 refused 會在 stderr 留字；stub 若只回結束碼，
@@ -87,7 +87,7 @@ inj_bad() { injfail=$((injfail+1)); printf '  FAIL  (注入) %s\n' "$1"; }
 #   stderr——真實世界長這樣：refused 會留 "Connection refused"，沒路由會留
 #   "No route to host"。stub 若只回結束碼不吐字，分類測到的就是假東西
 #   （四態契約就是被這種落差逼出來的）。四情境：
-#   RC=0 → open；RC=124 → timeout；RC=1＋refused 字 → refused；
+#   RC=0 → open；RC=124 → inconclusive；RC=1＋refused 字 → refused；
 #   RC=1＋其他字 → unreachable。
 #   -O exit：永遠回 0。
 #   啟動標記：以 FAKE_START_RC 離開。
@@ -243,11 +243,11 @@ if [[ "$got" == "RC=0 TUNNEL=up TARGET=refused OUT=0 ERR=0" ]]; then
 else
     bad "2b. 沒服務被誤報成壞掉（got [$got]）"
 fi
-# 2c：隧道活著、目標逾時 → timeout（誠實說分不出）。
+# 2c：隧道活著、目標逾時 → inconclusive（誠實說分不出）。
 : > "$SANDBOX/argv.log"
 got="$(MLP_FILE="$MLP_FILE" SSH_OVERRIDE="-" FWD_OVERRIDE="$SANDBOX/fwdstate" TMP_OUT="$T_PROBE_OUT" TMP_ERR="$T_PROBE_ERR" PROBE_CTL="$SANDBOX/fwdstate/ctl-a" PROBE_THOST="10.0.0.5" PROBE_TPORT="443" ARGV_LOG="$SANDBOX/argv.log" FAKE_TUNNEL_RC=0 FAKE_TARGET_RC=124 probe_run "$MLP_FILE" "-")"
-if [[ "$got" == "RC=0 TUNNEL=up TARGET=timeout OUT=0 ERR=0" ]]; then
-    ok "2c. 目標逾時 → timeout（不假裝知道是沒路由還是被擋）"
+if [[ "$got" == "RC=0 TUNNEL=up TARGET=inconclusive OUT=0 ERR=0" ]]; then
+    ok "2c. 目標逾時 → inconclusive（不假裝知道是沒路由還是被擋）"
 else
     bad "2c. 不對（got [$got]）"
 fi
@@ -287,12 +287,12 @@ if [[ "$got" == "RC=0 TUNNEL=up TARGET=unreachable OUT=0 ERR=0" ]]; then
 else
     bad "2g. 主機不存在被誤報成到達（got [$got]）"
 fi
-# 2h：健康語意——open/refused 算健康，timeout/unreachable 不算。
+# 2h：健康語意——open/refused 算健康，inconclusive/unreachable 不算。
 #   四情境同一子行程各跑一次，healthy 函式即契約的健康劃分。
 got="$(MLP_FILE="$MLP_FILE" FWD_OVERRIDE="$SANDBOX/fwdstate" ARGV_LOG="$SANDBOX/dyn-argv.log" HOME="$SANDBOX/home" PATH="$SANDBOX/shims:$PATH" \
   bash -c 'source "$MLP_FILE" >/dev/null 2>&1; FWD_DIR="$FWD_OVERRIDE"; : > "$ARGV_LOG"; healthy() { case "$1" in open|refused) printf 1;; *) printf 0;; esac; }; FAKE_TUNNEL_RC=0; export FAKE_TUNNEL_RC; FAKE_TARGET_RC=0; FAKE_TARGET_ERR=""; export FAKE_TARGET_RC FAKE_TARGET_ERR; fwd_probe "$FWD_OVERRIDE/ctl-h" 10.0.0.5 443 >/dev/null 2>&1; t1="$FWD_PROBE_TARGET"; FAKE_TARGET_RC=1; FAKE_TARGET_ERR="bash: connect: Connection refused"; export FAKE_TARGET_RC FAKE_TARGET_ERR; fwd_probe "$FWD_OVERRIDE/ctl-h" 10.0.0.5 443 >/dev/null 2>&1; t2="$FWD_PROBE_TARGET"; FAKE_TARGET_RC=124; FAKE_TARGET_ERR=""; export FAKE_TARGET_RC FAKE_TARGET_ERR; fwd_probe "$FWD_OVERRIDE/ctl-h" 10.0.0.5 443 >/dev/null 2>&1; t3="$FWD_PROBE_TARGET"; FAKE_TARGET_RC=1; FAKE_TARGET_ERR="bash: connect: No route to host"; export FAKE_TARGET_RC FAKE_TARGET_ERR; fwd_probe "$FWD_OVERRIDE/ctl-h" 10.0.0.5 443 >/dev/null 2>&1; t4="$FWD_PROBE_TARGET"; printf "%s:%s %s:%s %s:%s %s:%s" "$t1" "$(healthy "$t1")" "$t2" "$(healthy "$t2")" "$t3" "$(healthy "$t3")" "$t4" "$(healthy "$t4")"' 2>&1)"
-if [[ "$got" == "open:1 refused:1 timeout:0 unreachable:0" ]]; then
-    ok "2h. 健康劃分：open/refused 健康，timeout/unreachable 不健康"
+if [[ "$got" == "open:1 refused:1 inconclusive:0 unreachable:0" ]]; then
+    ok "2h. 健康劃分：open/refused 健康，inconclusive/unreachable 不健康"
 else
     bad "2h. 健康劃分不對（got [$got]）"
 fi

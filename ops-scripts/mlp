@@ -1634,7 +1634,7 @@ fwd_records() {
 
 # fwd_probe <ctl> <targethost> <targetport> — Model: two live segments.
 #   Sets FWD_PROBE_TUNNEL (up|down), FWD_PROBE_TARGET
-#   (open|refused|timeout|unreachable|unknown), FWD_PROBE_RTT (ms) and the
+#   (open|refused|inconclusive|unreachable|unknown), FWD_PROBE_RTT (ms) and the
 #   joined FWD_PROBE_RESULT. 0 when the tunnel answered, 1 when it did not.
 #   Tunnel verdict rides the master itself (a remote true through it):
 #   asking the local master process would answer OK with the line dead,
@@ -1643,8 +1643,8 @@ fwd_records() {
 #   side, classified by exit code AND far-side stderr: only an explicit
 #   "Connection refused" proves the packet reached the host (RST came back),
 #   so only that counts as healthy alongside open; anything else non-zero
-#   (no route, host down) is unreachable, while 124 stays timeout — "I do
-#   not know" versus "I know it cannot get there", never merged.
+#   (no route, host down) is unreachable, while 124 stays inconclusive —
+#   "I do not know" versus "I know it cannot get there", never merged.
 fwd_probe() {
     local ctl="$1" thost="$2" tport="$3" rc start_ms now_ms target_err
     FWD_PROBE_TUNNEL=""
@@ -1682,7 +1682,7 @@ fwd_probe() {
     if [[ "$rc" -eq 0 ]]; then
         FWD_PROBE_TARGET="open"
     elif [[ "$rc" -eq 124 ]]; then
-        FWD_PROBE_TARGET="timeout"
+        FWD_PROBE_TARGET="inconclusive"
     elif [[ "$target_err" == *"Connection refused"* ]]; then
         FWD_PROBE_TARGET="refused"
     else
@@ -1994,7 +1994,7 @@ fwd_view_ls() {
         printf -v tstate_pad "%-${tstatewidth}s" "$target"
         case "$target" in
             open|refused) target_state_disp="${C_GREEN}${tstate_pad}${C_RESET}" ;;
-            timeout|unreachable) target_state_disp="${C_YELLOW}${tstate_pad}${C_RESET}" ;;
+            inconclusive|unreachable) target_state_disp="${C_YELLOW}${tstate_pad}${C_RESET}" ;;
             *) target_state_disp="${C_RED}${tstate_pad}${C_RESET}" ;;
         esac
         # shellcheck disable=SC2059
