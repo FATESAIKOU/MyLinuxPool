@@ -352,6 +352,15 @@ close_gateway_master() {
 # The trailing marker is what separates "nc ran, found nothing" from "the
 # remote command never got to run": partial/absent output means NOT
 # observed, so it can be classified as inconclusive instead of down.
+#
+# The marker is a CROSS-REPO contract, not a local detail. MyAiEntry's
+# poolReachability re-implements this probe from the same shape, so
+# renaming NC_DONE, dropping it, or reading rc differently here silently
+# turns their three states back into two — and their two collapse the way
+# this one used to (2026-09-26: theirs still reports "absent from the
+# output" as unreachable rather than unknown, which makes one truncated
+# command read as "every machine is down"). Change any of it and tell
+# them; there is no build that will.
 gw_probe_port() {
     local port="$1" out rc
     out="$(ssh -S "$CTL" -o ConnectTimeout=5 "${GW_USER}@${GW_IP}" \
