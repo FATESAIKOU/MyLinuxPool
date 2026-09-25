@@ -371,7 +371,15 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          source scripts/lib/ledger.sh
+          # create_worker_ledger_add is defined in scripts/create-worker.sh,
+          # NOT in ledger.sh — sourcing only ledger.sh here left it
+          # undefined and this step died with exit 127 AFTER the port was
+          # claimed, the image built and the container started
+          # (run 36165724544). create-worker.sh is a pure function library
+          # (no main, no top-level side effects beyond sourcing its own
+          # libs: log/profile/ledger/refresh-wait), so sourcing it is the
+          # same thing the Validate step above already does.
+          source scripts/create-worker.sh
           cur="$(gh api "repos/${GH_REPO}/actions/variables/POOL_WORKERS" --jq .value 2>/dev/null || true)"
           # capabilities come from the image profile (CAPABILITY-DESIGN §3),
           # copied into the entry so consumers read POOL_WORKERS alone.

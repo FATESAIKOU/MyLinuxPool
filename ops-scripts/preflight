@@ -108,6 +108,24 @@ else
     bad "找不到 ${SSH_PORT_CHK} 或 python3——無法檢查 ssh 埠"
 fi
 
+# 2026-09-25 真線：create-worker 的 "Record the worker in POOL_WORKERS" 換了
+# 呼叫的函式名（capabilities 重構）卻沒換 source，於是埠已佔、image 已建、
+# 容器已起之後才 exit 127。判準是機械事實：step 呼叫的我方函式必須被它
+# source 的東西定義；跨檔 source 由「被 source 的檔案自己的 source 行」
+# 遞迴展開，沒有排除清單。詳見 helper 的檔頭。
+WF_FN_CHK="scripts/tests/helpers/wf-fn-sources.py"
+if [ -f "$WF_FN_CHK" ] && command -v python3 >/dev/null 2>&1; then
+    if out="$(python3 "$WF_FN_CHK" . 2>&1)"; then
+        ok "workflow step 呼叫的函式都被它 source 的東西定義"
+    else
+        while IFS= read -r line; do
+            [ -n "$line" ] && bad "$line"
+        done <<< "$out"
+    fi
+else
+    bad "找不到 ${WF_FN_CHK} 或 python3——無法檢查 step 的 source 是否足夠"
+fi
+
 WF_OUT_CHK="scripts/tests/helpers/wf-step-outputs.py"
 if [ -f "$WF_OUT_CHK" ] && command -v python3 >/dev/null 2>&1; then
     if out="$(python3 "$WF_OUT_CHK" .github/workflows/*.yml 2>&1)"; then
