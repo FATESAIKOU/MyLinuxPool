@@ -59,22 +59,26 @@
 #     糟：它會讓人以為覆蓋到位。
 #   * 注入 27（兩次渲染的 RTT 不同）：**17b 仍綠**。非對齊的量測值變化不再造成紅。
 #
-# ---- 為什麼 17b 在這台機器上「從來沒有搖過」：比運氣更確定的事 ------------
+# ---- 兩個平台走不同的 RTT 路徑：注入 27 為什麼兩行都要 patch ---------------
 #
 # qa 的判斷是「macOS 綠是因為兩次測量剛好相同」。實測之後：**兩次根本都沒有測
 # 量**。fwd_probe 用 `python3 -c 'import time;print(int(time.time()*1000))'` 取時
 # 間戳；在这个 harness 的環境裡 `command -v python3` **找得到**
 # （本機是 asdf shim），但那支 python3 **回空字串**，於是 start_ms/now_ms 空 →
 # `if [[ -n "$start_ms" && -n "$now_ms" ]]` 不成立 → 走 else → RTT 恆為字面 0。
-# 實測三次渲染的 RTT 欄都是 `0ms`，而注入計數檔完全沒被寫入。
+# 實測三次渲染的 RTT 欄都是 `0ms`。
 #
-# 也就是說：在這個 harness 裡 RTT 欄是**結構性確定**的 0，17b 的綠與「兩次測量
-# 相同」無關。這個缺陷要浮現，需要 `python3 -c` 在 harness 裡真的能跑（CI runner、
-# 或沒有 asdf shim 的機器）。所以：
+# 也就是說：**這個 harness 裡** RTT 欄是結構性確定的 0，17b 的綠與「兩次測量
+# 相同」無關。但 CI runner（Linux，python3 真的會跑）走的是**另一條**——真量測行
+# `FWD_PROBE_RTT="$(( now_ms - start_ms ))"`，RTT 是毫秒抖動。同一條注入如果只
+# patch fallback 行，在 Linux 上是**惰性的**（計數檔空），「兩次渲染不同」只剩
+# 抖動在撐；兩次剛好量到同一組值時 27 自己 `inj_bad`。**CI 兩次紅
+# （306a9b8、0137929 的 `injection-fail 1`）就是這個**，根因診斷見
+# `OUT-mlpfwd-flake.md`。所以：
 #   * 別把 17b 當成「在 macOS 上是穩定的」——它只是**在這個環境裡**穩定；
-#   * 注入 27 因此打在 **else 分支那一行**（`FWD_PROBE_RTT="0"`），因為那是這個
-#     環境裡真的會跑的路徑。打量測那行會得到一個「注入沒生效」——第一版就是
-#     這樣，浪費了一輪。
+#   * 注入 27 **兩條路徑都 patch**（真量測行與 fallback 行），讓「兩次渲染必
+#     不同」在任何 python3 行為下都決定性成立。只 patch 一條 = 換一個平台就
+#     變惰性注入。
 #
 # 為什麼不用真實網路：ssh、ps、解析與 gh 全部用 PATH 上的 stub 蓋掉，
 #   stub 只記 argv 與回放罐頭答案，不連任何東西。寫法沿用
@@ -800,12 +804,17 @@ fi
 #     的另一半證明：22 說明對齊壞掉時仍會紅，這一條說明非對齊的量測值變化不再
 #     造成紅。兩者同時成立，17b 才是「只量它要量的東西」。
 #
-#     **注入點是 else 分支那一行，不是量測那一行**——理由見檔頭：在這個 harness
-#     的環境裡 `python3 -c 'import time;...'` 回空字串，量測那行根本不會執行
-#     （實測：`command -v python3` 找得到，回傳值是空的 → start_ms 空 →
-#     走 else → RTT 恆為 0）。所以注入 else 分支才是「在這個環境裡真的會跑的
-#     那條路徑」。這也解釋了為什麼 17b 在這台機器上從來不搖：不是兩次測量剛好
-#     相同，是**兩次都沒有測量**。
+#     **注入點是兩條路徑，不是只有 else 分支那一行。** fwd_probe 的 RTT 有
+#     兩條路（ops-scripts/mlp:2077 真量測、:2079 fallback），走哪條取決於
+#     `python3 -c 'import time;...'` 是否回得出值：
+#       * macOS 本機（asdf shim 回空字串）→ fallback；
+#       * CI runner／容器（python3 真的會跑）→ 真量測行。
+#     只 patch fallback 的話，在 Linux 上注入是**惰性的**——計數檔空、RTT 是
+#     毫秒抖動，「兩次渲染不同」靠運氣；兩次剛好相同時 27 自己 inj_bad，
+#     CI 就紅在 harness 缺陷上（OUT-mlpfwd-flake.md 的根因）。
+#     兩條都 patch 之後，RTT 一律由計數檔決定（每次探測遞增；同一份渲染的三列
+#     是連續值，下一次渲染接著遞增），在任何平台上都決定性不同——這條注入在
+#     任何環境都真的在測它宣稱要測的東西。
 #
 #     路徑在 patch 時內插進注入檔，不靠環境變數傳遞（本條第一版用環境變數，
 #     穿過 function + command substitution 之後沒生效，而斷言只報「注入沒讓
@@ -815,13 +824,18 @@ python3 - "$MLP" "$INJ_RTT" "$SANDBOX/rtt-jitter-ctr" <<'RTT_PY'
 import sys
 src = open(sys.argv[1], encoding="utf-8").read()
 ctr = sys.argv[3]
-old = '        FWD_PROBE_RTT="0"\n'
+old_real = '        FWD_PROBE_RTT="$(( now_ms - start_ms ))"\n'
+old_fb = '        FWD_PROBE_RTT="0"\n'
 new = ('        # INJECTED: 每次探測遞增，讓兩次渲染的 RTT 欄不同\n'
        '        _c=$(cat "' + ctr + '" 2>/dev/null || echo 0)\n'
        '        _c=$((_c + 1)); printf %s "$_c" > "' + ctr + '"\n'
        '        FWD_PROBE_RTT="$_c"\n')
-assert src.count(old) == 1, "rtt-fallback needle count=%d" % src.count(old)
-open(sys.argv[2], "w", encoding="utf-8").write(src.replace(old, new, 1))
+# 兩條路徑都要 assert count==1：形狀若變了，這條注入必須大聲壞掉，
+# 而不是靜靜變成惰性注入（那正是這張工單修的形狀）。
+assert src.count(old_real) == 1, "rtt-real needle count=%d" % src.count(old_real)
+assert src.count(old_fb) == 1, "rtt-fallback needle count=%d" % src.count(old_fb)
+src = src.replace(old_real, new, 1).replace(old_fb, new, 1)
+open(sys.argv[2], "w", encoding="utf-8").write(src)
 RTT_PY
 if [[ $? -ne 0 ]]; then
     inj_bad "27. 注入腳本失敗（被測物形狀變了）——harness 問題"
