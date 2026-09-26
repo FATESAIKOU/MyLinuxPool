@@ -219,8 +219,12 @@ jobs:
             #     行程槽。Runner 跑完就丟，所以這裡接受。
             outlog="$RUNNER_TEMP/$n.log"
             start=$SECONDS
-            timeout -k 10 "$PER_TEST_TIMEOUT" bash "$t" > "$outlog" 2>&1
-            rc=$?
+            # GitHub 跑 run: 預設是 bash -e（log 見 shell: /usr/bin/bash -e {0}）。
+            # 測試失敗是預期內的資料、不是 shell 錯誤：這一行的非 0 不能觸發 -e
+            # 整步退出，否則下面的分類、tail、彙總永遠走不到。用 || 接住 rc，
+            # 其餘行保留 -e（意外的 shell 錯誤仍會大聲退出，而不是靜默續跑）。
+            rc=0
+            timeout -k 10 "$PER_TEST_TIMEOUT" bash "$t" > "$outlog" 2>&1 || rc=$?
             took=$(( SECONDS - start ))
             if [[ "$rc" -eq 0 ]]; then
               printf '  ok    %-40s %ss\n' "$n" "$took"
