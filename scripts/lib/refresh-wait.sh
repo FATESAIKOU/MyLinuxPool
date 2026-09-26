@@ -16,6 +16,7 @@
 #   - scripts/create-worker.sh (workflows create/delete-worker call it via
 #     create_worker_build_run_cmd's caller)
 #   - ops-scripts/register-client (mlp register client)
+#   - ops-scripts/register-provider.sh (mlp register provider)
 # A grep for the function DEFINITION across the repo should find exactly
 # one place: here.
 

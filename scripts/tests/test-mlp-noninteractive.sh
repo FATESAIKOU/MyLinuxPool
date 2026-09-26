@@ -10,6 +10,39 @@
 #   判定用 stdin 不是 stdout：stdout 接管線仍有人在看（mlp ls | grep），
 #   stdin 接管線就沒人了。這條選擇要釘住，否則改成 stdout 會擋掉正常管線。
 #
+# ---- 2026-09-26：pty 夾具與「2a/2b 到底在驗什麼」------------------------
+#
+# **qa 的結論在這台機器上重現不出來，但指出的漏洞是真的。** qa 說
+# `pty-run.py` 在 Popen 之後立刻 `os.close(master)` 會讓 slave 掉掉 tty 特性，
+# 並附上 IN-NOTTY 的對照。實測（macOS 26.6.2 / bash 3.2.57，各 40 次）：
+# 關 master 與保留 master **都是 40/40 IN-TTY**，而 `tty` 報 `/dev/ttys023`。
+# 所以「關 master 就掉 tty」在這裡是假的——但它仍是一個該修的隱憂，理由不是
+# qa 說的那個：
+#
+#   * 關掉 master 之後，子行程的 fd0 指向一個**對端已不存在**的 pty。之後任何
+#     對 fd0 的讀取立刻拿到 EOF/EIO，而 `isatty()` 在關閉 master 之後的行為
+#     是**平台相關**的。也就是說舊版把這三條斷言的成立與否押在一個未記載的
+#     平台行為上——正是這個 repo 修過多次的「測試環境比生產寬容」。
+#   * 若被測物真的讀 stdin（現在的內層腳本不讀），舊版會讀到 EOF 而**看起來
+#     像非互動**，於是斷言會以一個**假的理由**變紅。
+# 修法：master 留到子行程結束才關，並用一個執行緒把 master 讀空（否則「沒人在
+# 讀的 pty 寫滿緩衝區」會變成新的死鎖）。
+#
+# **2a/2b 與 2c 驗的不是同一件事**（這是量出來的，不是推論的）。反轉
+# `interactive_only()` 的判斷之後：
+#   * 2c（跑無子指令的 `mlp`）→ 變紅，因為那條路徑真的過守衛。
+#   * 2a（`mlp ls`）、2b（`mlp state`）→ **不會變**，因為這兩條命令本來就沒有
+#     被 interactive_only 守衛（唯讀清單／比對命令不需要鍵盤）。它們量的是
+#     「tty stdin ＋ 管線 stdout 這個環境不會擋住正常輸出」，是**環境 canary**。
+#   * §1 也抓不到反轉：stdin=/dev/null 時 `! -t 0` 為假 → 照樣拒絕 → exit 2。
+# 所以 2c 是這個檔案裡**唯一**能分辨「守衛讀了 tty」與「守衛反了」的斷言。
+# 這一點連同「2a/2b 不受影響」都釘在注入 7 裡，將來有人把它們說成守衛覆蓋時
+# 會先被擋下。
+#
+# 2z 是新增的夾具自我驗證：把「stdin 真的是 tty」從 2a/2b/2c 的附帶條件提成
+# 獨立一條。為什麼要提：若真正壞掉的是 pty 夾具（沒給 tty），2a/2b/2c 會用
+# 「mlp 誤擋」這個**假的理由**紅，而真正的故障沒有任何地方會講出來。
+#
 # 三類斷言：
 #   1. 七條互動路徑（無子指令、wake、down、ssh、fwd rm、fwd add、worker new）
 #      非互動 → exit 2、各自的提示、且 ssh／fzf／pool-resolve／gh 全零呼叫
@@ -195,19 +228,52 @@ echo "=== 2. 合理用法：stdin 是 TTY、stdout 是管線 ==="
 # 不會擋掉正常管線用法。inner script 自報 IN-TTY 讓夾具可自證。
 cat > "$SANDBOX/pty-run.py" <<'PY'
 #!/usr/bin/env python3
-import os, pty, subprocess, sys
+# 用真的 pty 當 stdin，把子行程的 stdout／stderr 導到管線。
+#
+# **master 必須開到子行程結束。** 舊版在 Popen 之後立刻 `os.close(master)`。
+# 那不會讓子行程的 fd0 變成非 tty（實測：本機 macOS 26.6 / bash 3.2.57，
+# 關與不關都是 40/40 IN-TTY），但它會留下一個**對端已經不存在的 pty**：任何
+# 對 fd0 的讀取立刻拿到 EOF/EIO，而 isatty() 在關閉 master 後的行為是
+# **平台相關**的（Linux 的 slave 保持 tty、讀取 EIO；macOS 上本實測保持 tty）。
+# 換句話說舊版把這個斷言的成立與否押在一個未記載的平台行為上——這正是本 repo
+# 修過多次的那種形狀（「測試環境比生產寬容」）。
+#
+# master 留著還有一個實務理由：若子行程（或被測物）真的讀 stdin，舊版會讀到
+# EOF 而看起來像「非互動」，於是斷言會以一個**假的理由**變紅。
+# 留著 master 之後要擔心的是相反方向——沒有人在讀的 pty 寫滿緩衝區會死鎖。
+# 內層腳本不寫 tty（stdout/stderr 都是管線），但這不是應該靠假設的性質，
+# 所以用一個執行緒把 master 讀空。
+import os, pty, subprocess, sys, threading
+
 master, slave = pty.openpty()
 proc = subprocess.Popen(['bash', sys.argv[1]], stdin=slave,
                         stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+# 父行程自己那份 slave 可以關：子行程已經有自己的 fd 0 副本。
 os.close(slave)
-os.close(master)
+drained = []
+def drain():
+    try:
+        while True:
+            chunk = os.read(master, 4096)
+            if not chunk:
+                break
+            drained.append(chunk)
+    except OSError:
+        pass
+t = threading.Thread(target=drain)
+t.daemon = True
+t.start()
 out, err = proc.communicate()
+t.join(timeout=5)
+os.close(master)          # 最後才關，而且只在子行程結束後
 sys.stdout.write(out.decode('utf-8', 'replace'))
 sys.stdout.write('--STDERR--\n')
 sys.stdout.write(err.decode('utf-8', 'replace'))
 sys.stdout.write('--PTY-RC--%d\n' % proc.returncode)
+sys.stdout.write('--TTY-BYTES--%d\n' % sum(len(c) for c in drained))
 PY
 pty_out=""
+TTY_CANARY=0
 pty_run() { pty_out="$(python3 "$SANDBOX/pty-run.py" "$1" 2>&1)"; }
 
 cat > "$SANDBOX/inner-ls.sh" <<EOF
@@ -216,6 +282,26 @@ cd $REPO
 PATH="$SHIMS:\$PATH" HOME=$HOME_DIR bash $REPO/$MLP ls 2>$SANDBOX/pty-ls.err | tail -2
 printf 'MLPRC=%s\n' "\${PIPESTATUS[0]}"
 EOF
+# 夾具自我驗證（2z）：這一段是「stdin 真的是 tty」這件事**唯一的**證據。
+# 為什麼要獨立成條：2a/2b/2c 都把 IN-TTY 當附帶條件，而它們失敗時的訊息讀起來
+# 是「mlp 被誤擋」。若真正壞掉的是 pty 夾具（沒有真的 tty），那三條會用一個
+# **假的理由**紅——「mlp 擋掉了這條命令」——而真正的故障（夾具沒給 tty）不會
+# 被任何地方講出來。獨立的 2z 讓兩件事分開。
+cat > "$SANDBOX/inner-canary.sh" <<EOF
+test -t 0 && echo IN-TTY || echo IN-NOTTY
+printf 'TTYNAME=%s\n' "\$(tty 2>/dev/null || echo none)"
+EOF
+pty_run "$SANDBOX/inner-canary.sh"
+if printf '%s' "$pty_out" | grep -qx 'IN-TTY' \
+&& printf '%s' "$pty_out" | grep -q '^TTYNAME=/dev/' \
+&& ! printf '%s' "$pty_out" | grep -q 'IN-NOTTY'; then
+    ok "2z. pty 夾具自我驗證：子行程的 fd0 真的是 tty（$(printf '%s' "$pty_out" | sed -n 's/^TTYNAME=//p' | head -1)）"
+    TTY_CANARY=1
+else
+    bad "2z. pty 夾具沒給出 tty——後面 2a/2b/2c 的失敗會被誤讀成「mlp 誤擋」（got [$(printf '%s' "$pty_out" | tr '\n' ' ' | head -c 160)]）"
+    TTY_CANARY=0
+fi
+
 pty_run "$SANDBOX/inner-ls.sh"
 if printf '%s' "$pty_out" | grep -q 'IN-TTY' \
 && printf '%s' "$pty_out" | grep -q 'MLPRC=0' \
@@ -357,6 +443,56 @@ else
         inj_bad "6. 拿掉 worker new 守衛後仍 rc=2 且零呼叫——沒被量到"
     else
         inj_ok "6. 拿掉守衛後回到副作用路徑（got rc=$MLP_RC ssh=$MLP_SSH fzf=${MLP_FZF}）——該路徑斷言會紅"
+    fi
+fi
+
+# 7. **把判斷反過來**（`[[ ! -t 0 ]]`）→ 受守衛的那一條（2c）必須轉紅。
+#
+#    這一條是「2c 真的在驗 tty」的證明。為什麼需要它：2c 斷的是「stdin 是 tty
+#    時不該被擋」，而**正確的守衛與一個永遠放行的守衛在那個情境裡給出同一個
+#    結果**——只靠正向情境分辨不出「守衛有在讀 tty」與「守衛根本沒讀」。反過來
+#    之後兩者第一次產生可觀察差異。
+#
+#    量測結果是 **1/3，不是 3/3**，而那個 1 就是 2c。原因是機械的：
+#      * 2a 跑 `mlp ls`、2b 跑 `mlp state`——**這兩條命令本來就沒有被
+#        interactive_only 守衛**（它們是唯讀的清單／比對命令）。所以守衛怎麼
+#        改，它們的 rc 都不變。它們量的是「tty stdin ＋ 管線 stdout 這個環境
+#        不會擋住正常輸出」，是**環境canary**，不是守衛斷言。
+#      * 2c 跑的是無子指令的 `mlp`，那條路徑才真的過 interactive_only。
+#    §1（非互動）也抓不到反轉：stdin=/dev/null 時 `! -t 0` 為假 → 照樣拒絕 →
+#    exit 2 → §1 全綠。**所以 2c 是這個檔案裡唯一能分辨「守衛讀了 tty」與
+#    「守衛反了」的斷言。**
+#    這一條順帶把「2a/2b 不受影響」釘成事實：將來有人把它們說成守衛覆蓋，
+#    這一條會先把那個說法擋下來（2a/2b 若跟著紅，就表示它們的範圍變了）。
+INJ4="$SANDBOX/mutant-inverted.sh"
+python3 - "$REPO/$MLP" "$INJ4" <<'PYEOF'
+import sys
+src = open(sys.argv[1], encoding="utf-8").read()
+old = '    [[ -t 0 ]]\n'
+assert src.count(old) == 1, "t0 needle count != 1"
+open(sys.argv[2], "w", encoding="utf-8").write(src.replace(old, '    [[ ! -t 0 ]]\n', 1))
+PYEOF
+if [[ $? -ne 0 ]]; then
+    inj_bad "7. 注入腳本失敗（needle 落空）——harness 問題"
+elif ! bash -n "$INJ4" 2>/dev/null; then
+    inj_bad "7. 注入版語法錯誤——harness 問題"
+else
+    cp -p "$INJ4" "$REPO/$MLP"
+    pty_run "$SANDBOX/inner-menu.sh"
+    guarded_rc="$pty_out"
+    pty_run "$SANDBOX/inner-ls.sh"
+    unguarded_ls="$pty_out"
+    pty_run "$SANDBOX/inner-state.sh"
+    unguarded_state="$pty_out"
+    cp -p "$SANDBOX/mlp-fixed-keep" "$REPO/$MLP"
+    g_red=0; u_ls_red=0; u_st_red=0
+    printf '%s' "$guarded_rc"     | grep -q 'MLPRC=0' || g_red=1
+    printf '%s' "$unguarded_ls"  | grep -q 'MLPRC=0' || u_ls_red=1
+    printf '%s' "$unguarded_state" | grep -q 'MLPRC=0' || u_st_red=1
+    if [[ "$g_red" -eq 1 && "$u_ls_red" -eq 0 && "$u_st_red" -eq 0 ]]; then
+        inj_ok "7. 反轉 [[ -t 0 ]] → 2c（受守衛）紅、2a/2b（未受守衛的 ls/state）不紅——2c 確實在讀 tty，而且只有它能讀"
+    else
+        inj_bad "7. 反轉後 guarded_red=${g_red} 2a_red=${u_ls_red} 2b_red=${u_st_red}（期望 1/0/0）——2c 的覆蓋或本檔對 2a/2b 的理解有問題"
     fi
 fi
 

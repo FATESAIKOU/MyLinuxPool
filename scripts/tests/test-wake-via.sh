@@ -151,7 +151,7 @@ sender_case() {
     got="$(WJSON="$4" MLP_FILE="$MLP_FILE" OUTF="$SANDBOX/s-out" ERRF="$SANDBOX/s-err" HOME="$SANDBOX/home" PATH="$SANDBOX/shims:$PATH" \
       bash -c 'source "$MLP_FILE" >/dev/null 2>&1; if ! declare -F wake_senders >/dev/null 2>&1; then printf "MISSING"; exit 0; fi; : > "$OUTF"; : > "$ERRF"; if wake_senders "$WJSON" >"$OUTF" 2>"$ERRF"; then rc=0; else rc=$?; fi; n="${#WAKE_SENDERS[@]}"; list=""; if [[ "$n" -gt 0 ]]; then list="${WAKE_SENDERS[*]}"; fi; printf "RC=%s N=%s LIST=%s OUT=%s ERR=%s" "$rc" "$n" "$list" "$(wc -c < "$OUTF" | tr -d " ")" "$(wc -c < "$ERRF" | tr -d " ")"' 2>&1)"
     if [[ "$got" == "MISSING" ]]; then
-        bad "$label（wake_senders 未落地）"
+        bad "${label}（wake_senders 未落地）"
         return
     fi
     if [[ "$want_list" == "-" ]]; then
@@ -218,7 +218,7 @@ try_case() {
         done < "$EVENT_LOG" 2>/dev/null
         printf "RC=%s ELAPSED=%s HASERR=%s SLEEPS=%s OUT=%s ERR=%s" "$rc" "$WAKE_ELAPSED" "$e" "$sl" "$(wc -c < "$OUTF" | tr -d " ")" "$(wc -c < "$ERRF" | tr -d " ")"' 2>&1)"
     if [[ "$got" == "MISSING" ]]; then
-        bad "$label（wake_try_sender 未落地）"
+        bad "${label}（wake_try_sender 未落地）"
         return
     fi
     if [[ "$got" == "RC=${want_rc} ELAPSED="* ]] && printf '%s' "$got" | grep -q "SLEEPS=${want_sleeps} OUT=0 ERR=0"; then

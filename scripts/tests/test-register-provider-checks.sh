@@ -177,10 +177,18 @@ done
 # planted 漏網的觸發字串（ssh＋變數目標）只能在執行期組出來：
 # 字面寫在這裡會被 preflight 自己的 ssh-port 掃描掃到（本檔亦在掃描範圍），
 # 正是 test-workers-d-path.sh 檔頭記的那一坑。
+#
+# 2026-09-26：加了一行 shell shebang。preflight 的列舉改成「第一行是 shell
+# shebang」之後，這個 planted 檔沒有 shebang 就不會被掃到，1a 會紅——而它
+# 紅的原因是夾具自己不再合法，不是被測物有問題。加上 shebang 之後 1a 證的
+# 是本來就該證的那件事：「列舉是照內容掃整個 repo，不是照某個檔名清單」，
+# 因為沒有人把 extra-pool-ssh.sh 寫進任何清單。shebang 在第 1 行，所以
+# 稽核器報的行號從 6 變 7，下面兩處 needle 跟著改。
 python3 - "$PCREPO/extra-pool-ssh.sh" <<'PY'
 import sys
 at, dl = '@', '$'
 lines = [
+    '#!/usr/bin/env bash',
     'enable_linger() {',
     '    log INFO "linger probe"',
     '}',
@@ -199,9 +207,9 @@ git -C "$PCREPO" init -q
 git -C "$PCREPO" add -A
 pc_out="$(bash "$PCREPO/ops-scripts/preflight" 2>&1)"
 pc_rc=$?
-if printf '%s' "$pc_out" | grep -q 'extra-pool-ssh.sh:6' \
+if printf '%s' "$pc_out" | grep -q 'extra-pool-ssh.sh:7' \
 && printf '%s' "$pc_out" | grep -q 'step9_verify()'; then
-    ok "1a. 全 repo 掃描抓到清單外的漏網（extra-pool-ssh.sh:6，歸屬 step9_verify）"
+    ok "1a. 全 repo 掃描抓到清單外的漏網（extra-pool-ssh.sh:7，歸屬 step9_verify）"
 else
     bad "1a. 漏網沒被抓到（rc=$pc_rc out [$(printf '%s' "$pc_out" | tr '\n' ' ' | head -c 300)])"
 fi
@@ -222,16 +230,27 @@ fi
 #   needle 是收斂後的共用 shell_files 塊（全檔唯一）；突變後同形賦硬清單，
 #   後續 if／傳陣列沿用不動。列舉出現次數：原檔 1、突變後 0——
 #   孿生列舉已不存在，!= 0 即有人又立第二份，正是原檢查要抓的事。
+#
+# 2026-09-26 兩處跟著 preflight 的列舉改寫（見 preflight 檔頭）：
+#   1. needle 的列舉文字從 `git ls-files | grep -E '<檔名規則>'` 換成
+#      `git ls-files | is_shell_script`。這是預期的失效——針打空會讓本測試
+#      報 harness 問題，而那正是它該做的（形狀變了就出聲，不要靜靜地測
+#      別的東西）。
+#   2. 判斷「漏網被抓到」的 needle 從 `extra-pool-ssh.sh` 收緊成
+#      `extra-pool-ssh.sh:7`。preflight 現在多了一條交叉檢查，訊息裡也會出現
+#      這個檔名——但語意相反：稽核報 `檔名:行號` 是「抓到了」，交叉檢查報
+#      「沒被稽核：檔名」是「抓不到」。用沒有行號的檔名當 needle 會讓這個
+#      注入一直 inj_bad。帶行號才能分辨兩者，這也順手讓 needle 更精確。
 INJ1="$SANDBOX/preflight-8list.sh"
 python3 - "$REPO_ROOT/$PREFLIGHT" "$INJ1" <<'PY'
 import sys
 src = open(sys.argv[1], encoding="utf-8").read()
-enum_pat = 'git ls-files | grep -E'
+enum_pat = 'git ls-files | is_shell_script'
 assert src.count(enum_pat) == 1, "orig enumeration count != 1"
 old = ('shell_files=()\n'
        'while IFS= read -r f; do\n'
        '    shell_files+=("$f")\n'
-       'done < <(git ls-files | grep -E %s)\n' % ("'\\.sh$|^ops-scripts/(mlp|verify-profile|preflight)$|/files/pool-'",))
+       'done < <(%s)\n' % (enum_pat,))
 new = ('shell_files=(scripts/rotate-gateway.sh scripts/create-worker.sh .github/actions/push-state/run.sh shared-configs/pool-runtime/files/pool-tunnel shared-configs/pool-runtime/files/pool-status ops-scripts/mlp ops-scripts/verify-profile scripts/lib/ssh.sh)\n')
 assert src.count(old) == 1, "8list needle count != 1"
 open(sys.argv[2], "w", encoding="utf-8").write(src.replace(old, new, 1))
@@ -240,18 +259,23 @@ if [[ $? -ne 0 ]]; then
     inj_bad "1. 注入腳本失敗（被測物形狀變了）——harness 問題"
 elif ! bash -n "$INJ1" 2>/dev/null; then
     inj_bad "1. 注入版語法錯誤——harness 問題"
-elif [[ "$(grep -c 'git ls-files | grep -E' "$INJ1")" -ne 0 ]]; then
+elif [[ "$(grep -c 'git ls-files | is_shell_script' "$INJ1")" -ne 0 ]]; then
     inj_bad "1. 突變後還有列舉殘留（期望 0）——harness 問題"
 else
     cp "$INJ1" "$PCREPO/ops-scripts/preflight"
     git -C "$PCREPO" add -A
     inj_out="$(bash "$PCREPO/ops-scripts/preflight" 2>&1)"
     cp -p "$REPO_ROOT/$PREFLIGHT" "$PCREPO/ops-scripts/preflight"
-    if printf '%s' "$inj_out" | grep -q 'extra-pool-ssh.sh'; then
+    if printf '%s' "$inj_out" | grep -q 'extra-pool-ssh.sh:7'; then
         inj_bad "1. 改回八檔清單後漏網仍被抓到——掃描範圍沒被量到"
     else
         if printf '%s' "$inj_out" | grep -q '都指定了埠'; then
             inj_ok "1. 改回八檔清單後漏網消失（回報乾淨）——1a 會紅"
+            # 附加證據（不是原注入的目標）：那條交叉檢查也把同一個漏網
+            # 點名了，方向相反但同一個病灶。抓不到就只是少了這一條。
+            if printf '%s' "$inj_out" | grep -q '沒被稽核：extra-pool-ssh.sh'; then
+                inj_ok "1b. 同一個漏網也被交叉檢查點名（『沒被稽核』）——列舉範圍被量到了兩次"
+            fi
         else
             inj_bad "1. 行為變了但不是預期的乾淨（out [$(printf '%s' "$inj_out" | tr '\n' ' ' | head -c 200)]）——harness 問題"
         fi

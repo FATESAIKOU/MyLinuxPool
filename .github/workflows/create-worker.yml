@@ -494,6 +494,40 @@ jobs:
       # entry needs the same treatment, or POOL_WORKERS keeps advertising a
       # worker that was torn down. Seen for real on run 34853882457, which
       # failed at the push after the entry was written.
+      #
+      # ---- 這一格本來是 exit 0，2026-09-26 改成失敗就出聲 --------------------
+      #
+      # 原本 `gh variable set` 失敗時走 `::warning::` 分支，而那個分支的最後一個
+      # 命令是 `echo`，所以 **step 是綠的**。（工單描述這個 step 帶著
+      # `continue-on-error: true`——實際上沒有：那個旗標在「capture container
+      # logs」那一支上，這裡的問題是 `if/else` 讓失敗的結尾變成 `echo`。結論
+      # 一樣：失敗在沒有失敗的 run 裡。）
+      #
+      # **為什麼這件事特別嚴重，而不只是「少一個訊號」：下面那兩條補救都是從這
+      # 份帳本重建的**（重推快取、重跑 refresh）。所以當這格靜默失敗時：
+      #   * 重推的快取**仍然宣告那台死 worker**——不是「沒做事」，是把要清的殘留
+      #     重新發布到一份讀取端無條件相信的檔案上；
+      #   * 重跑的 refresh **把那把死 worker 的公鑰再裝回** Gateway。
+      # 原本的殘留是「多了一個沒人用的條目」，經過這條路變成被主動重寫上去。
+      # **上游的失敗會被下游「很努力地」放大。**
+      #
+      # 為什麼改成 exit 1 不會遮蔽原始的失敗原因（工單要求確認這點）：
+      # 這是失敗路徑，job 的結論早已由前面那個真正失敗的 step 決定；Actions 的
+      # 介面標的是**第一個**失敗的 step，原始原因不會被後來的紅步驟改寫。得到的是
+      # 「兩個紅 step」而不是「一個」——而那個多出來的红正是有價值的資訊：它說
+      # 「回滾本身失敗了，要人手動」。
+      #
+      # 殘餘的問題（寫下來是因為它**沒有**被這個改法解決）：即使現在會紅，下面
+      # 兩條補救仍然會跑，而它們仍然會從一份還含著死 worker 的帳本重建。也就是說
+      # 「阻止重發布」這件事**沒有**被處理——被處理的是「看不見」。要真的阻止，得
+      # 讓補救在重建前先確認帳本裡已經沒有那個 port，而那需要一個新的 step 帶一個
+      # 可被引用的 output：`scripts/tests/test-rollback-coverage.sh` 的 guard_ok
+      # 只認 `steps.X.outputs.Y != ''` 與 `== '<literal>'` 兩種形狀，而它的模擬器
+      # 只帶著既知那幾個 step 的 output 值，一個新 id 會被判成「永遠不成立」→
+      # 守衛立刻誤報兩個缺口都沒補。所以那個修法要連守衛一起改，不在這張工單的
+      # 邊界內。**現況的收斂路徑**：這格紅了 → 人手動把帳本修對 → 下一次任何
+      # 會重建的池子操作（create／delete／rotate 都會 push）會把快取與
+      # authorized_keys 收斂過來。
       - name: On failure, remove the entry from POOL_WORKERS
         if: failure() && steps.port.outputs.port != ''
         shell: bash
@@ -505,5 +539,197 @@ jobs:
           if printf '%s' "$new" | gh variable set POOL_WORKERS --repo "$GH_REPO"; then
             echo "rolled port ${{ steps.port.outputs.port }} back out of POOL_WORKERS"
           else
-            echo "::warning::could not roll port ${{ steps.port.outputs.port }} out of POOL_WORKERS — check the variable by hand"
+            echo "::error::could not roll port ${{ steps.port.outputs.port }} out of POOL_WORKERS"
+            echo "::error::the two rollback steps after this one rebuild the state cache and the Gateway authorized_keys FROM THIS LEDGER — left as-is they will republish the dead worker instead of clearing it. Fix POOL_WORKERS by hand, then trigger refresh-authorized-keys.yml so both converge."
+            exit 1
           fi
+
+      # ---- 第五樣（共六樣）：重推狀態快取 --------------------------------
+      #
+      # 成功路徑寫六樣池側狀態：容器／埠／帳本／placeholder／**authorized_keys**／
+      # 快取。前四樣的回滾一直都在，後兩樣（快取、authorized_keys）都沒有——這兩
+      # 支是 2026-09-26 補的，隔了幾輪才補到第二個。
+      # 少了這一步，「Push the state cache」成功之後再失敗時，回滾會留下「四邊都
+      # 收乾淨了，快取繼續宣告一台已死的 worker」——而讀取端無條件相信它
+      # （push-state/run.sh 檔頭：readers trust this cache unconditionally）。所以
+      # 資料面每一台 provider 的 pool-tunnel 都會拿到一份指向死 worker 的解析結果
+      # （STATE_CONTRACT §2：state.json 是 644 root-owned）。
+      #
+      # 順序是硬性的，**必須在「On failure, remove the entry from
+      # POOL_WORKERS」之後**：在它之前推，推上去的會是還帶著那筆死 worker 的
+      # 帳本，那不是回滾，是把錯誤寫得更牢。快取是從帳本重建的，所以刪完帳本
+      # 再推，重建的內容自然就不含那台 worker——這也是為什麼這個補救不需要
+      # 知道 worker 的任何身分。
+      #
+      # 對照 delete-worker.yml 的「Remove the worker from POOL_WORKERS」→
+      # 「Push the state cache」（錨 step 名稱不錨行號）：刪完帳本就推快取，是對稱的。
+      #
+      # `if:` 為什麼只掛 `steps.port.outputs.port != ''`：
+      #   * 埠有值 →「Parse claimed port」成功 →「Claim a worker port on the
+      #     Gateway」成功 →「Build claim-port command」成功 →「Resolve
+      #     Gateway」成功。所以下面用到的 gateway.outputs.{ip,ssh_port,
+      #     host_key} 三個都非空。這個相依是實際的，不是推論的（claim-port
+      #     的 cmd 是用 steps.gateway.outputs.port_lo/port_hi 組出來的，
+      #     而 port 是從 Claim 那步的 stdout 解析的）。
+      #   * 失敗發生在「Push the state cache」**之前**時，快取根本還沒被寫過，
+      #     重推是多餘的但無害——它會把當下的真實狀態寫進去，而那正是快取
+      #     該有的內容。分辨不出「有沒有真的推過」是因為 push-state 是
+      #     composite action、**沒有任何 output**（見 action.yml），而這個
+      #     workflow 也不該為了分辨而改那個 action。所以一律重推。
+      #
+      # 為什麼**沒有** continue-on-error。
+      #
+      # ⚠️ 這段理由改寫過一次（2026-09-26），因為**原文在寫的時候是準確的，而修正
+      # 讓它變成謊話**。原文是「旁邊那個刪帳本的步驟會吞掉自己的失敗，这个不抄」
+      # ——而那個步驟在同一天被改成 `exit 1` 了。留著它等於叫讀者去拿一個不存在的
+      # 反例理解一個現存的選擇。
+      #
+      # 現在成立的理由是「整條回滾路徑對『會改狀態』一致」：
+      #   * 「On failure, remove the entry from POOL_WORKERS」——失敗就 exit 1。
+      #     它旁邊的理由是：下游那兩條補救從這份帳本重建，所以靜默失敗會被放大。
+      #   * 「On failure, refresh the Gateway authorized keys」——失敗就紅。
+      #   * 這一條（重推快取）——失敗就紅，因為 push-state 自己的說明寫得很直接：
+      #     「A failed push fails the step — readers trust this cache
+      #     unconditionally, so a stale half-written copy must never look like
+      #     success」。把它降級成軟性警告等於把原來的洞裝進回滾裡。
+      #   * 對照 delete-worker.yml 的「Refresh the Gateway authorized keys」
+      #     （錨 step 名稱不錨行號）：那支是 `|| { echo "::error::..."; exit 1; }`，
+      #     註解明講「a leftover authorized key is a security issue, not something
+      #     to swallow」。同一個操作在兩支 workflow 裡不該一個出聲一個安靜。
+      #
+      # 失敗路徑上**仍然**容忍失敗的是那兩支不負責改狀態的：capture container
+      # logs（有 continue-on-error: true，證據不該擋住清理）與 remove the
+      # container（`docker rm -f ... || true`，刪除本來就該容忍「已經不在了」）。
+      # **界線是「有沒有改狀態」，不是「有沒有在失敗路徑上」。**
+      #
+      # 而「原始失敗會不會被蓋掉」不會發生：這是失敗路徑，job 的結論早已由前面
+      # 那個真正失敗的 step 決定，Actions UI 標的是**第一個**失敗的 step，原因不會
+      # 被後來的紅步驟改寫。多出來的紅步驟正是有價值的資訊：它說「回滾本身也失敗」。
+      #
+      # 條件與嚴重度（別把動機寫得比實際寬）：
+      #   觸發條件是窄的——「Push the state cache」成功，**而且**失敗發生在它
+      #   之後。死在它之前的那些點，快取從來沒被寫過，沒有東西可殘留。
+      #   2026-09-26 觀察到的一次：run 36202314872 打在「Verify worker is
+      #   actually reachable (not just alive)」→ 四邊逐字無變化，state.json
+      #   留下 port=2304 / container=mlp-fh-proxy-asus-default-36202314872，
+      #   serial 9→10、source=create-worker#36202314872。頻率見下面 authorized
+      #   keys 那段的量化（兩者是同一個條件的兩種後果）。
+      #
+      # 錨點用 step 名稱不用編號：編號是 SHA 的屬性。同一個 step 在 master
+      # 與在 2357422（出事那次 run 用的 SHA）就差一位，中間插一個 step 就全錯。
+
+      - name: On failure, re-push the state cache
+        if: failure() && steps.port.outputs.port != ''
+        uses: ./.github/actions/push-state
+        with:
+          gateway-ip: ${{ steps.gateway.outputs.ip }}
+          gateway-port: ${{ steps.gateway.outputs.ssh_port }}
+          host-key: ${{ steps.gateway.outputs.host_key }}
+          source: create-worker#${{ github.run_id }}
+          ssh-key: ${{ secrets.SSH_KEY_ACTIONS }}
+
+      # ---- 第六樣（共六樣）：重跑 authorized keys 的 refresh ------------------
+      #
+      # 同一個形狀的第二個洞。它比第一個更難被看見，因為症狀是「多了一把沒人用的
+      # 鑰匙」，不是「資料面拿到一份指向死 worker 的解析結果」：
+      # 「Refresh the Gateway authorized keys」呼叫
+      # create_worker_dispatch_refresh_and_wait，它發動 refresh-authorized-keys.yml，
+      # 而那支是**從 POOL_WORKERS 全部重組** sshproxy 的 authorized_keys。回滾把帳本
+      # 項目刪了卻沒有重跑 refresh，那把死 worker 的公鑰就留在 Gateway 上。
+      #
+      # **條件是窄的，別把動機寫得比實際寬**：要「Refresh the Gateway authorized
+      # keys」成功，**而且**失敗發生在它之後。死在它之前的那些點，Gateway 根本沒被
+      # 動過，沒有鑰匙可以孤兒。
+      #
+      # 量化（2026-09-26，qa 查 7 天內全部 31 次 Create Worker：20 成功／11 失敗；
+      # run 歷史我這邊查不到，數字是 qa 的）：
+      #   11 次失敗中 **3 次（27%）**在 Gateway 留下一把或多把孤兒隧道公鑰，
+      #   其餘 8 次死在 refresh 之前。至少 2 次是 master 上有機發生的，不是測試——
+      #   其中 2026-09-20 15:53 那兩次相隔 12 秒，兩把孤兒鑰匙同時被裝進去。
+      #   一次已確認的實例：run 36202314872（23:46:43–23:47:47）觸發的 refresh 是
+      #   #36202342137（23:47:10 success），那時帳本裡還有 2304 → 死 worker 的公鑰
+      #   被裝進 Gateway；回滾沒有重跑。
+      #
+      # 為什麼「13 分鐘後被洗掉」不算回滾：那把鑰匙孤兒了 13 分鐘，到 00:00:21 一次
+      # **不相干**的 refresh 才把它洗掉。而那個洗掉的機制**不在版控裡**——
+      # refresh-authorized-keys.yml 只有 `workflow_dispatch` 一個 trigger，整個 repo
+      # 沒有任何 workflow 有排程觸發（兩個空白都會被寫成 `workflow_dispatch` 加
+      # `schedule`，這裡刻意不寫那個字面詞，免得日后 `grep schedule` 把我這段註解
+      # 當成一個真的排程）。那 7 天的 294 次 refresh 全部是有人（推測是手機端輪詢）
+      # 發動的。**所以「下一次不相干的操作會洗掉」是依賴一個不在版控內的外部程序；
+      # 那個程序停掉，窗口就是無限。** 在那個窗口裡，Gateway 授權了一條通往已不存在的
+      # worker 的隧道。
+      #
+      # 順序：必須在「On failure, remove the entry from POOL_WORKERS」**之後**——
+      # 在它之前重跑，重建出來的 authorized_keys 仍然含那把死鑰匙。
+      #
+      # **排在 push-state 之後**，理由不是「正確性需要」：兩者都是從帳本重建，帳本
+      # 正確之後內容都對，所以彼此順序不影響正確性。影響的是「哪個瑕疵先被關掉」：
+      # 快取比較嚴重（讀取端無條件相信它，每台 provider 的 pool-tunnel 都吃它），
+      # 而且 push-state 是單次 SSH push（秒級），refresh 是發動另一支 workflow 再等
+      # 它跑完（上限 300 秒）。把慢的放前面，只會讓快取的多餘髒化窗口從秒級變成
+      # 分鐘級，換不到任何好處。兩個步驟都用 `if: failure()`、彼此不依賴，所以其中
+      # 一個失敗不會讓另一個被跳過——順序不需要承擔「誰先跑」的成敗責任。
+      #
+      # `if:` 與上面兩個回滾步驟同形（`steps.port.outputs.port != ''`）：埠有值就表示
+      # 這台 worker 已經被寫進帳本過。分辨不出「『Refresh the Gateway authorized
+      # keys』到底跑過沒」——它沒有 `id:`，沒有 output 可引用。**刻意不補 `id:`**：
+      # `steps.<id>.outcome` 這類條件 test-rollback-coverage.sh 的 guard_ok 不認得
+      # （它只認 `steps.X.outputs.Y != ''` 與 `== '<literal>'` 兩種），補了會讓守衛報
+      # harness limitation。所以這個 `if:` 比條件嚴格一點：失敗落在「Claim a worker
+      # port on the Gateway」之後、refresh 之前的那些點時，這次 refresh 是多餘的
+      # ——它會把當下的真實帳本重寫進 Gateway，而那正是 authorized_keys 該有的內容，
+      # 代價是一次額外的 workflow dispatch。這個取捨是：寧可多做一次 dispatch，也不
+      # 要一個「以為做過了其實沒做」的無聲窗口。
+      #
+      # 為什麼**沒有** `|| true`。三個理由，都指向「同一個操作不該一個出聲一個
+      # 安靜」：
+      #   * guard 的參考實作裡有 `|| true`，但那是探針的方便，不是要求。
+      #   * 同一支 workflow 的成功路徑（同一個「Refresh the Gateway authorized
+      #     keys」呼叫）**沒有**——成功路徑失敗會讓整個 create 紅，回滾路徑失敗
+      #     卻不紅，是同一個操作兩種待遇。
+      #   * delete-worker.yml 的「Refresh the Gateway authorized keys」是
+      #     `|| { echo "::error::..."; exit 1; }`，註解明講「a leftover
+      #     authorized key is a security issue, not something to swallow」。
+      # 而這一格現在與整條回滾路徑一致（見上面「第五樣」那段的界線：**有沒有改
+      # 狀態**，不是有沒有在失敗路徑上）。
+      # 至於「會不會蓋掉原始失敗」：這是失敗路徑，job 的結論早已由前面那個真正
+      # 失敗的 step 決定，Actions UI 標的是**第一個**失敗的 step，原因不會被後來
+      # 的紅步驟改寫。
+      #
+      # ---- 已知限制：它等到的可能不是自己那次 refresh（2026-09-26）----------
+      #
+      # `create_worker_dispatch_refresh_and_wait` → `dispatch_refresh_and_wait`
+      # （`scripts/lib/refresh-wait.sh`）**沒有取得自己那次 dispatch 的 run id**：
+      # 它 `gh workflow run` 之後是用 `gh run list --limit 1` 取**最新那筆**來等。
+      # 撞到別人同時發動的 refresh 時，它等的是別人的 run，卻回報成功。
+      #
+      # 這是 `ops-scripts/mlp` 的 `wf_dispatch` 今天修掉的**同一個歸屬缺陷的第三個
+      # 實例**（那個改成 dispatch 前後快照比對、讀不到基線時 refuses to guess），
+      # 而這裡更糟：它不只是「猜錯 run」，而是**為別人的 run 回報成功**。機率
+      # 不低——refresh 是被外部程序用 `workflow_dispatch` 頻繁觸發的（7 天 294 次，
+      # repo 裡沒有任何排程，見上面那段）。
+      #
+      # **最壞情況是什麼**（工單要求回答）：等到一個**早就完成**的 run → 讀到
+      # `conclusion == success` → 立刻返回 0 → **這個 step 報「完成」，而自己那次
+      # 還沒跑完甚至還沒被建立**。於是 authorized_keys 還沒被收斂，而回滾報綠。
+      # 而且因為它回傳 0，本檔這個 step 也是綠的——**一次什麼都沒收斂的補救會
+      # 以成功的外觀結束**。那正是這支 workflow 前面兩個註解一直在講的形狀，
+      # 只是這次藏在共用函式裡。
+      #
+      # 沒有在這裡繞過，是因為正確的修法要動 `scripts/lib/refresh-wait.sh`，而且
+      # 不是兩行：要在 workflow 端加 run-name／nonce 才能真正歸屬（只改成快照比對
+      # 仍有「視窗裡剛好只有一筆新 run、而那是別人的」這個殘餘，`wf_dispatch` 的
+      # 註解裡也記了同一句）。那是另一張已裁示的工單。
+      #
+      # 在那之前的緩解只有一條，而且是操作層的：**看到這個 step 綠不代表
+      # authorized_keys 已經收斂**。真的需要確定時，去 Actions 介面看
+      # refresh-authorized-keys.yml 那次 run 的時間戳是不是在這個 run 之後。
+      - name: On failure, refresh the Gateway authorized keys
+        if: failure() && steps.port.outputs.port != ''
+        shell: bash
+        run: |
+          set -uo pipefail
+          source scripts/create-worker.sh
+          create_worker_dispatch_refresh_and_wait 300
+

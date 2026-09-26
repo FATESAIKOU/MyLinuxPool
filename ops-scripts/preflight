@@ -50,6 +50,28 @@ ok_counted() {
 echo "preflight: $(pwd)"
 echo
 
+# is_shell_script — reads paths on stdin, writes the ones whose first line is
+# a shell shebang. Lives next to the enumeration so the criterion is one thing
+# in one place. The cross-checks further down deliberately use *different*
+# criteria, so a broken criterion is caught by them instead of being validated
+# by itself.
+#
+# The interpreter is matched as a *word* (`[/[:space:]]` before, space-or-end
+# after), not as a substring, so `bashful` and `csh` do not match and
+# `#!/usr/bin/env bash` / `#!/usr/bin/env -S bash -e` both do. Matching the
+# basename loosely is what makes `csh`/`tcsh`/`fish` fall out: they are not in
+# the list on purpose — `bash -n` cannot parse them, so including them would
+# only manufacture noise.
+is_shell_script() {
+    local f
+    while IFS= read -r f; do
+        head -1 "$f" 2>/dev/null \
+            | grep -qE '^#!.*[/[:space:]](ba|z|k|da|a)?sh([[:space:]]|$)' \
+            && printf '%s\n' "$f"
+    done
+    return 0
+}
+
 # The single enumeration of every shell file in the repo, shared by the
 # syntax check below and the ssh-port audit further down. There is exactly
 # one on purpose: two copies drift apart, and the drift fails silently in
@@ -57,26 +79,116 @@ echo
 # dropping out of the port audit (that is how register-provider.sh's
 # port-less ssh survived: the old hand-kept eight-file list simply never
 # named it). No exclusion list, ever.
+#
+# The criterion is CONTENT (first line is a shell shebang), not the file
+# name. The old criterion was the name — `\.sh$` plus three hand-spelled
+# ops-scripts — and a name list cannot be complete by construction:
+# ops-scripts/register-client has no `.sh` suffix and was not one of the
+# three, so it had never been `bash -n`'d and had never been port-audited.
+#
+# ---- 這跟 ok_counted 擋的不是同一種失效，別當成同一件事 ----------------
+#
+# ok_counted 擋「掃描器什麼都沒拿到」（計數 0）。這裡的問題是計數 77——
+# 非空、但不完整：掃描器拿到了大部分，而漏掉的那個檔案不會有任何徵兆，計數
+# 也不會小到任何人會去查的大小。ok_counted 在這種情況下完全幫不上忙，而且
+# 因為它已經在了，看起來像「已經防住了」。非空但不完整是第三種狀態。
+# （改成 shebang 判準之後報 76——比 77 少，而覆蓋比 77 多。計數在這裡不是
+# 品質的指標，這也是為什麼要兩條判準不同的交叉檢查。）
+#
+# ---- 為什麼這個判準對兩個消費者是足的 --------------------------------
+#
+# 語法檢查跑 `bash -n`，埠稽核找 ssh/scp。兩者只有在「shell 會讀這個檔案」
+# 時才有意義。第一行是 shell shebang 的檔案，shell 一定會讀它——不管是被
+# 執行還是被 source。工具是 `bash -n`，所以白名單是 shell 家族，不是
+# 「任何 shebang」（見下方界線）。
+#
+# ---- 它漏得掉什麼（寫下來是因為那是這條判準的邊界）------------------
+#
+# 1. **沒有 shebang、但被別人 source 的片段。** 逆命題不成立，而被 source
+#    的片段按慣例就不寫 shebang——所以這是實質的洞，不是理論上的。現況
+#    repo 內所有被追蹤的 .sh 都有 shebang（已逐一查過），今天沒有東西在
+#    這個洞裡；洞本身靠下面的交叉檢查 (b) 從另一側封住。
+# 2. 非 POSIX 的 shell（csh/tcsh/fish）不在白名單裡，所以不會被掃。這個
+#    方向是安全的：`bash -n` 本來就解析不了它們，列入只會產生噪音。
+# 3. **未被追蹤的檔案整份不在裡面。** 這是對的：preflight 的用途是「推
+#    master 之前」，沒 commit 的檔案不會被推。但記住它的後果——新寫的
+#    腳本在 `git add` 之前完全沒有被稽核過。test-script-self-location.sh
+#    用的是 `git ls-files --cached --others`，那兩個判準不一樣、互補。
 shell_files=()
 while IFS= read -r f; do
     shell_files+=("$f")
-done < <(git ls-files | grep -E '\.sh$|^ops-scripts/(mlp|verify-profile|preflight)$|/files/pool-')
+done < <(git ls-files | is_shell_script)
 
 # An empty enumeration is not "nothing to check", it is "the check did not
 # run" — and everything below that consumes shell_files would otherwise
 # report green off an empty list (0 scripts parsed OK, 0 port-less ssh
 # calls found). git ls-files returns nothing outside a checkout, and the
-# pattern above is one edit away from matching nothing; both look exactly
+# criterion above is one edit away from matching nothing; both look exactly
 # like a clean repo from downstream.
 if [ "${#shell_files[@]}" -eq 0 ]; then
-    bad "找不到任何 shell 檔可掃——列舉本身壞了（不在 git 樹裡？pattern 被改壞？）。下面依賴這份清單的檢查都沒有跑，它們的綠不算數"
+    bad "找不到任何 shell 檔可掃——列舉本身壞了（不在 git 樹裡？shebang 判準被改壞？）。下面依賴這份清單的檢查都沒有跑，它們的綠不算數"
+fi
+
+# ---- 交叉檢查：用「位置」與「名字」，不用「shebang」------------------
+#
+# 上面那條判準沒有辦法自己證明自己完整——拿同一條規則去檢查同一條規則是
+# 循環的。這兩條的判準都不同，所以其中一個壞掉時另一個會抓到。
+#
+#   (a) 位置：ops-scripts/ 底下每一個被追蹤的檔案。這個目錄的定義就是
+#       「人會去執行的東西」（LAYOUT §5），所以裡面每一個都是可執行的
+#       腳本，都必須在稽核清單裡。
+#   (b) 名字：每一個被追蹤的 *.sh。這一條封的是 shebang 判準那個洞——
+#       「沒有 shebang 但被 source 的片段」長得就是 .sh。少了它，(1) 那
+#       個洞就是靜悄悄的；有了它，.sh 沒被掃到會指名報錯。
+#
+# (b) 不是多餘的：改成 shebang 判準之後，repo 裡如果有 shebang-less 的
+# .sh，它會從「被稽核」變成「被跳過」——那是拿一個無聲的洞換另一個。
+# (b) 讓它變成出聲的失敗。（test-register-provider-checks.sh 造的 planted
+# 漏網檔本來就沒有 shebang，它過去是靠 `\.sh$` 這條名字規則被掃到的。）
+in_shell_files() {
+    local needle="$1" f
+    for f in ${shell_files[@]+"${shell_files[@]}"}; do
+        [ "$f" = "$needle" ] && return 0
+    done
+    return 1
+}
+
+echo "── 稽核範圍（判準不同的交叉檢查）──"
+n=0
+miss=""
+while IFS= read -r f; do
+    in_shell_files "$f" || miss="${miss}${f} "
+    n=$((n+1))
+done < <(git ls-files -- 'ops-scripts/')
+if [ -n "$miss" ]; then
+    for f in $miss; do bad "ops-scripts/ 底下被追蹤、卻沒被稽核：$f"; done
+else
+    ok "ops-scripts/ 底下的 $n 個被追蹤檔案都在稽核清單裡"
+fi
+
+n=0
+miss=""
+while IFS= read -r f; do
+    in_shell_files "$f" || miss="${miss}${f} "
+    n=$((n+1))
+done < <(git ls-files -- '*.sh')
+if [ -n "$miss" ]; then
+    # ${f} 而不是 $f：macOS 的 bash 3.2 在 UTF-8 locale 下會把 `$f（` 的變數名
+    # 解析成 `f` 加那個多位元組字元的第一個位元組（`is_namechar` 吃寬字元），
+    # 然後報 "f?: unbound variable"。它只在這行真的要印出檔名時才觸發——也就是
+    # 只在這條檢查抓到東西的時候才觸發，所以寫的時候與綠的時候都看不到。
+    for f in $miss; do bad "被追蹤的 .sh 沒被稽核：${f}（沒有 shell shebang？補上，或確認它真的不是 shell）"; done
+else
+    ok "$n 個被追蹤的 .sh 都在稽核清單裡"
 fi
 
 echo "── 語法 ──"
 n=0
 if (( ${#shell_files[@]} > 0 )); then
     for f in "${shell_files[@]}"; do
-        head -1 "$f" 2>/dev/null | grep -q python && continue
+        # 沒有「跳過 python」這一步了：列舉是按 shebang 判的，python 檔本來
+        # 就進不來。留著那個 guard 會是一個永遠不會觸發的檢查——而一個不會
+        # 觸發的檢查比沒有檢查更誤導（它看起來像在防什麼）。
         bash -n "$f" 2>/dev/null || { bad "bash -n $f"; continue; }
         n=$((n+1))
     done
@@ -110,6 +222,32 @@ while IFS= read -r df; do
     done < <(grep -E '^\s*COPY ' "$df" 2>/dev/null | awk '{for(i=2;i<NF;i++) print $i}')
 done < <(git ls-files '*Dockerfile')
 ok_counted "$n" "個 Dockerfile COPY 來源"
+
+# `$識別字` 後面緊接非 ASCII 位元組。macOS 的 bash 3.2 會把變數名讀成
+# 「名字 + 那個位元組的第一個」，於是 `set -u` 下 crash。
+#
+# 為什麼值得一條專門的檢查：它**只出現在診斷訊息裡**，那些字串只有在「有
+# 東西要報」時才會被求值。所以正常的綠燈永遠碰不到它，而真的抓到問題的那
+# 一次，訊息本身崩潰並把整支腳本帶走——**失敗訊息在有失敗要報的那一刻變成
+# 當機**。`bash -n` 抓不到（語法正確），所以它能活到今天。
+#
+# 輸入是上面那一份 shell_files，不另開清單。已知的四處（2026-09-26 修）全部
+# 在 scripts/tests/ 底下，屬於測試碼；生產碼當時是 0。差別只在後果輕重：
+# 測試碼是「診斷難看」，生產碼是「正式流程上的診斷消失」。
+NAKED_VAR_CHK="scripts/tests/helpers/naked-var-multibyte.py"
+if [ -f "$NAKED_VAR_CHK" ] && command -v python3 >/dev/null 2>&1; then
+    if [ "${#shell_files[@]}" -eq 0 ]; then
+        bad "多位元組變數名掃描沒有任何輸入檔——回報乾淨是因為它什麼都沒看"
+    elif out="$(python3 "$NAKED_VAR_CHK" "${shell_files[@]}" 2>&1)"; then
+        ok "沒有 \${var} 緊接非 ASCII 的展開（bash 3.2 會把變數名讀壞）"
+    else
+        while IFS= read -r line; do
+            [ -n "$line" ] && bad "$line"
+        done <<< "$out"
+    fi
+else
+    bad "找不到 ${NAKED_VAR_CHK} 或 python3——無法檢查變數名被多位元組字元讀壞"
+fi
 
 # workflow 引用的 steps.<id>.outputs.<name> 真的被寫出來嗎。
 # GitHub 對「引用不存在的 output」不報錯，只回空字串——2026-09-16 就是這樣

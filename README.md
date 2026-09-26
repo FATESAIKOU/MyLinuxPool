@@ -204,7 +204,7 @@ provider 邊緣刻意不放解密金鑰；KEY-DESIGN §8 之後也不再有任�
 | `profiles/` | 角色宣告：`gateway/`、`provider/`、`worker/`（含 Dockerfile） |
 | `shared-configs/` | 可分發安裝單位，見 `docs/LAYOUT.md` |
 | `scripts/` | 業務邏輯，**不依賴 GitHub Actions**（沒有 `${{ }}`、`$GITHUB_OUTPUT`），含 `lib/{log,crypto,ssh,profile}.sh` |
-| `ops-scripts/` | 人手動跑的：`mlp`、`register-client`、`register-provider.sh`、`verify-profile`、`preflight` |
+| `ops-scripts/` | 人手動跑的：`mlp`、`register-client`、`register-provider.sh`、`verify-profile`、`preflight`、`pool-residue.sh`（唯讀量測殘骸用） |
 | `.github/` | workflow 與 `pool-ssh` composite action。所有 GitHub 專屬的東西只出現在這裡 |
 | `docs/` | 見文件表 |
 

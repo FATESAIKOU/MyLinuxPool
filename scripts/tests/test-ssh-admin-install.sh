@@ -108,7 +108,7 @@ else
     if [[ "$INJ_RC" -eq 0 ]]; then
         printf '  inj ok    %s\n' "注入後（拿掉 CLIENT_ACTIONS 防線）缺 Actions 仍 rc=0——第 3 條會紅"
     else
-        bad "注入. 注入版仍非 0（rc=$INJ_RC）——注入沒生效（harness 問題）"
+        bad "注入. 注入版仍非 0（rc=${INJ_RC}）——注入沒生效（harness 問題）"
     fi
     rm -rf "$SANDBOX"
 fi

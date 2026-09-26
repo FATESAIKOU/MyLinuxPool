@@ -32,6 +32,50 @@
 #   靜態分層會同盲：grep 圖案漏了某種輸出原語就與實作一起瞎掉，所以另有
 #   動態分層——七個函式成功與失敗路徑實際執行，stdout/stderr 都必須 0 位元組。
 #
+# ---- 17b：跨渲染比對的斷言曾經把即時測量值放進比對範圍 --------------------
+#
+# **教訓（這是這一條存在的理由）：一個比較兩次獨立渲染的斷言，不可以讓非決定性
+# 的值進入比對範圍。否則它的綠只代表那兩次剛好一樣。**
+#
+# 17b 原本把「無色渲染」與「剝掉 ANSI 的有色渲染」整份逐位元組 cmp。而這張表的最後
+# 一欄是 RTT = FWD_PROBE_RTT = `now_ms - start_ms`（ops-scripts/mlp 的
+# fwd_probe），**每渲染一次就重新量一次**。兩次渲染的量測值不同時，cmp 會紅，
+# 而那一列的欄位起點完全沒動——那種紅把「量測值變了」講成「上色破壞了對齊」，
+# 方向剛好相反：它會讓人去查對齊，而真正的問題是斷言比了不該比的东西。
+#
+# 修法不是把量測值從輸出移走（那會動到被測物），而是**把判準改成它要量的東西**：
+# 上色不該改變的是「欄位幾何」，不是「每個 byte」。新的 17b 比：
+#   * 標題列（完全沒有量測值）逐位元組；
+#   * 每個資料列的 TUNNEL 欄與最後一欄的**起始偏移**。
+# 欄位的值可以變，起點不能變。17c 是同一個形狀的**行內**版本（同一份渲染裡三列
+# 之間），17b 是**跨渲染**版本；兩者都免疫於量測值。EQ_BYTES 仍然算，但只當
+# 診斷資訊印出來，不再是判準。
+#
+# 兩個注入一起釘住「修法沒有只是把紅燈關掉」：
+#   * 注入 22（先上色後墊空白 → 有色版欄位左移）：**17b 的欄位幾何紅**
+#     （實測 GA 的 70→69、87→86）。對齊壞掉仍然被抓到。
+#     注意這一條原本查的是 color_cmp 的整份 cmp——17b 的判準換成欄位幾何之後，
+#     用 color_cmp 查等於替一個沒被改到的判準背書。用錯工具的注入比沒有注入更
+#     糟：它會讓人以為覆蓋到位。
+#   * 注入 27（兩次渲染的 RTT 不同）：**17b 仍綠**。非對齊的量測值變化不再造成紅。
+#
+# ---- 為什麼 17b 在這台機器上「從來沒有搖過」：比運氣更確定的事 ------------
+#
+# qa 的判斷是「macOS 綠是因為兩次測量剛好相同」。實測之後：**兩次根本都沒有測
+# 量**。fwd_probe 用 `python3 -c 'import time;print(int(time.time()*1000))'` 取時
+# 間戳；在这个 harness 的環境裡 `command -v python3` **找得到**
+# （本機是 asdf shim），但那支 python3 **回空字串**，於是 start_ms/now_ms 空 →
+# `if [[ -n "$start_ms" && -n "$now_ms" ]]` 不成立 → 走 else → RTT 恆為字面 0。
+# 實測三次渲染的 RTT 欄都是 `0ms`，而注入計數檔完全沒被寫入。
+#
+# 也就是說：在這個 harness 裡 RTT 欄是**結構性確定**的 0，17b 的綠與「兩次測量
+# 相同」無關。這個缺陷要浮現，需要 `python3 -c` 在 harness 裡真的能跑（CI runner、
+# 或沒有 asdf shim 的機器）。所以：
+#   * 別把 17b 當成「在 macOS 上是穩定的」——它只是**在這個環境裡**穩定；
+#   * 注入 27 因此打在 **else 分支那一行**（`FWD_PROBE_RTT="0"`），因為那是這個
+#     環境裡真的會跑的路徑。打量測那行會得到一個「注入沒生效」——第一版就是
+#     這樣，浪費了一輪。
+#
 # 為什麼不用真實網路：ssh、ps、解析與 gh 全部用 PATH 上的 stub 蓋掉，
 #   stub 只記 argv 與回放罐頭答案，不連任何東西。寫法沿用
 #   test-client-identity.sh 把 argv 記到檔案的那一套。
@@ -671,6 +715,51 @@ color_cmp() {
     if grep -q "$esc" "$rd/colored" 2>/dev/null; then res="${res} HAS_COLOR=1"; else res="${res} HAS_COLOR=0"; fi
     printf '%s' "$res"
 }
+# color_geom <無色檔> <剝色後的有色檔>：比對**欄位幾何**。
+#
+# 為什麼不比整份位元組：這個表的最後一欄是 FWD_PROBE_RTT，而它是
+# `now_ms - start_ms` 的即時測量（ops-scripts/mlp 的 fwd_probe），每渲染一次
+# 就重新量一次。17a/17b 各渲染一次，兩次的量測值可能不同（實測本機兩次都是
+# 0ms——那是運氣），於是舊的整份 cmp 會在一個數字上紅，而那一列的欄位起點完全
+# 沒動。那種紅把「量測值變了」講成「上色破壞了對齊」，方向剛好相反：它會讓人
+# 去查對齊，而真正的問題是斷言把非決定性的值放進了比對範圍。
+#
+# 這裡比的是「上色不該改變的東西」：
+#   * 標題列：完全沒有量測值，逐位元組比。
+#   * 每個資料列：TUNNEL 欄與最後一欄的起始偏移。
+# 欄位的**值**不比——值可以變，起點不能變。17c 是同一個形狀的**行內**版本
+# （同一份渲染裡三列之間），17b 是**跨渲染**版本；兩者都免疫於量測值。
+color_geom() {
+    python3 - "$1" "$2" <<'GEOM_PY'
+import re, sys
+
+def load(p):
+    return [l.rstrip('\n') for l in open(p, encoding='utf-8')]
+
+def geom(lines):
+    out = []
+    for l in lines:
+        if not l or 'listening' in l:
+            continue
+        m1 = re.search(r' (up|down)  +', l)
+        m2 = re.search(r'\S+\s*$', l)
+        out.append((m1.start() if m1 else -1, m2.start() if m2 else -1))
+    return out
+
+def header(lines):
+    for l in lines:
+        if l and 'ENTRY' in l:
+            return l
+    return None
+
+a, b = load(sys.argv[1]), load(sys.argv[2])
+ha, hb = header(a), header(b)
+ga, gb = geom(a), geom(b)
+eq = 1 if (ha == hb and ga == gb and len(ga) == len(gb) and len(ga) > 0) else 0
+print('EQ_GEOM=%d HDR=%s N=%d/%d GA=%s GB=%s'
+      % (eq, 'same' if ha == hb else 'diff', len(ga), len(gb), ga, gb))
+GEOM_PY
+}
 got="$(color_case "$MLP_FILE" "$SANDBOX/color-ok")"
 cmpgot="$(color_cmp "$SANDBOX/color-ok")"
 if printf '%s' "$cmpgot" | grep -q 'HAS_COLOR=1' && [[ "$got" != POUT=0* ]]; then
@@ -678,10 +767,14 @@ if printf '%s' "$cmpgot" | grep -q 'HAS_COLOR=1' && [[ "$got" != POUT=0* ]]; the
 else
     bad "17a. 顏色沒開起來或輸出為空（got [$got] cmp [$cmpgot]）——後面等於沒測"
 fi
-if printf '%s' "$cmpgot" | grep -q 'EQ=1'; then
-    ok "17b. 剝掉 ANSI 後有色與無色逐位元組相同（各欄起點相同）"
+# 17b 的判準是「**欄位幾何**」，不是整份逐位元組比對。理由見檔頭：表裡有
+# RTT 這個即時測量值，兩次渲染之間它會變，而舊的判準會因此在一個**數字**上紅，
+# 與欄位對齊無關。EQ_BYTES 仍然算（當診斷資訊印出來），但它不再是判準。
+geom="$(color_geom "$SANDBOX/color-ok/plain" "$SANDBOX/color-ok/stripped")"
+if printf '%s' "$geom" | grep -q 'EQ_GEOM=1'; then
+    ok "17b. 剝掉 ANSI 後欄位幾何相同（標題列逐位元組＋每列欄位起點）"
 else
-    bad "17b. 有色版欄位偏移（cmp [$cmpgot]）"
+    bad "17b. 有色版欄位偏移（geom [$geom]）"
     diff "$SANDBOX/color-ok/plain" "$SANDBOX/color-ok/stripped" | head -8
 fi
 pygot="$(python3 - "$SANDBOX/color-ok/stripped" <<'PY'
@@ -702,6 +795,51 @@ if [[ "$pygot" == "ROWS=3 TUN1=True RTT1=True" ]]; then
     ok "17c. 行內自洽：三列的 TUNNEL 與 RTT 起始欄各相同"
 else
     bad "17c. 行內欄位沒對齊（got [$pygot]）"
+fi
+# 27. **兩次渲染的 RTT 不同 → 17b 必須仍然綠。** 這是「修法沒有只是把紅燈關掉」
+#     的另一半證明：22 說明對齊壞掉時仍會紅，這一條說明非對齊的量測值變化不再
+#     造成紅。兩者同時成立，17b 才是「只量它要量的東西」。
+#
+#     **注入點是 else 分支那一行，不是量測那一行**——理由見檔頭：在這個 harness
+#     的環境裡 `python3 -c 'import time;...'` 回空字串，量測那行根本不會執行
+#     （實測：`command -v python3` 找得到，回傳值是空的 → start_ms 空 →
+#     走 else → RTT 恆為 0）。所以注入 else 分支才是「在這個環境裡真的會跑的
+#     那條路徑」。這也解釋了為什麼 17b 在這台機器上從來不搖：不是兩次測量剛好
+#     相同，是**兩次都沒有測量**。
+#
+#     路徑在 patch 時內插進注入檔，不靠環境變數傳遞（本條第一版用環境變數，
+#     穿過 function + command substitution 之後沒生效，而斷言只報「注入沒讓
+#     兩次渲染不同」——至少它沒假綠，但浪費了一輪）。
+INJ_RTT="$SANDBOX/mutant-rtt-jitter.sh"
+python3 - "$MLP" "$INJ_RTT" "$SANDBOX/rtt-jitter-ctr" <<'RTT_PY'
+import sys
+src = open(sys.argv[1], encoding="utf-8").read()
+ctr = sys.argv[3]
+old = '        FWD_PROBE_RTT="0"\n'
+new = ('        # INJECTED: 每次探測遞增，讓兩次渲染的 RTT 欄不同\n'
+       '        _c=$(cat "' + ctr + '" 2>/dev/null || echo 0)\n'
+       '        _c=$((_c + 1)); printf %s "$_c" > "' + ctr + '"\n'
+       '        FWD_PROBE_RTT="$_c"\n')
+assert src.count(old) == 1, "rtt-fallback needle count=%d" % src.count(old)
+open(sys.argv[2], "w", encoding="utf-8").write(src.replace(old, new, 1))
+RTT_PY
+if [[ $? -ne 0 ]]; then
+    inj_bad "27. 注入腳本失敗（被測物形狀變了）——harness 問題"
+elif ! bash -n "$INJ_RTT" 2>/dev/null; then
+    inj_bad "27. 注入版語法錯誤——harness 問題"
+else
+    : > "$SANDBOX/rtt-jitter-ctr"
+    color_case "$INJ_RTT" "$SANDBOX/color-jitter" >/dev/null
+    cmpjit="$(color_cmp "$SANDBOX/color-jitter")"
+    geomjit="$(color_geom "$SANDBOX/color-jitter/plain" "$SANDBOX/color-jitter/stripped")"
+    # 先確認這個注入**真的**讓兩次渲染的 RTT 不同，否則這一條什麼都沒測
+    if cmp -s "$SANDBOX/color-jitter/plain" "$SANDBOX/color-jitter/stripped"; then
+        inj_bad "27. 注入沒有讓兩次渲染的 RTT 不同（cmp [$cmpjit]）——這一條等於沒測"
+    elif printf '%s' "$geomjit" | grep -q 'EQ_GEOM=1'; then
+        inj_ok "27. 兩次渲染的 RTT 不同（cmp [$cmpjit]）而 17b 仍綠（geom [$geomjit]）——量測值不再混進對齊判準"
+    else
+        inj_bad "27. RTT 不同時 17b 變紅（geom [$geomjit]）——欄位幾何判準抓到了不該抓的東西"
+    fi
 fi
 
 echo "=== 18. fwd_add 重疊規則五格（PM 第二版） ==="
@@ -1038,11 +1176,16 @@ elif ! bash -n "$INJ8" 2>/dev/null; then
 else
     got="$(color_case "$INJ8" "$SANDBOX/color-inj")"
     cmpgot="$(color_cmp "$SANDBOX/color-inj")"
-    if printf '%s' "$cmpgot" | grep -q 'EQ=1'; then
-        inj_bad "22. 改回先上色後 17b 仍綠——欄寬斷言沒在看顏色"
+    # **用 17b 真正的判準（color_geom）**，不要用 color_cmp 的整份 cmp。
+    # 2026-09-26 之前這一條查的是 color_cmp 的結果，而 17b 的判準已經換成欄位
+    # 幾何——那樣這條注入會替一個沒被改到的判準背書。用錯工具的注入比沒有注入
+    # 更糟：它會讓人以為覆蓋到位。
+    geominj="$(color_geom "$SANDBOX/color-inj/plain" "$SANDBOX/color-inj/stripped")"
+    if printf '%s' "$geominj" | grep -q 'EQ_GEOM=1'; then
+        inj_bad "22. 改回先上色後 17b 仍綠——欄寬斷言沒在看顏色（geom [$geominj]）"
     else
         if printf '%s' "$cmpgot" | grep -q 'HAS_COLOR=1'; then
-            inj_ok "22. 改回先上色後剝掉仍對不上（cmp [$cmpgot]）——17b 會紅"
+            inj_ok "22. 改回先上色後 17b 的欄位幾何紅（geom [$geominj]）——上色破壞對齊仍被抓到"
         else
             inj_bad "22. 顏色沒開起來（cmp [$cmpgot]）——harness 問題"
         fi
@@ -1065,7 +1208,7 @@ open(sys.argv[2], "w", encoding="utf-8").write(src.replace(old, new, 1))
 PY
 if [[ $? -ne 0 ]]; then
     inj_bad "23. 注入腳本失敗（被測物形狀變了）——harness 問題"
-elif ! bash -n "$INJ9" 2>/dev/null; then
+elif ! bash -n "$INJ_RTT" 2>/dev/null; then
     inj_bad "23. 注入版語法錯誤——harness 問題"
 else
     mc_live "fwd-127.0.0.1-2222"

@@ -5,7 +5,7 @@ Root
 ├── profiles/<role>/<name>/     角色設定，明確列出要載入哪些 unit
 ├── shared-configs/<unit>/      服務／工具的分發單位（自帶 install.sh 與 tests/）
 ├── scripts/                    業務邏輯，不依賴 GitHub Actions
-├── ops-scripts/                人手動跑的東西（register-provider、mlp、verify-profile）
+├── ops-scripts/                人手動跑的東西（register-provider、mlp、verify-profile、register-client、preflight、pool-residue）
 │
 ├── .github/workflows/          薄殼：只做 GitHub 專屬的事，其餘呼叫 scripts/
 ├── docs/                       文件
@@ -255,7 +255,17 @@ function library，可以 `source` 進來直接測，不需要真機。
 
 - `register-provider.sh`（原 `provider/register.sh`）
 - `mlp`（原 `bin/mlp`）
+- `register-client`：把「這台機器」註冊成 client，`mlp register client` 轉呼叫它
 - `verify-profile`：把某台機器的實際狀態與它的 profile 宣告對照，見 §6
+- `preflight`：推 master 前在本機跑一次的靜態檢查（引用的檔案真的存在嗎）
+- `pool-residue.sh`：池側殘骸的唯讀快照，列容器／`POOL_WORKERS`／Gateway 的
+  placeholder、`ss`、`state.json` 五個視角，給「create-worker 失敗回滾到底收不
+  乾淨」用；不注入故障、不下結論
+
+> 這份清單與 `README.md` §目錄表是**同一件事的兩份副本**。2026-09-26 發現
+> `register-client` 與 `preflight` 早已在 `ops-scripts/` 卻不在這裡——兩份都
+> 是手寫的，漏了不會有任何人發現。`scripts/tests/test-script-self-location.sh`
+> 改成從 repo 列舉檔名（同一個形狀的第三份複本，見該檔檔頭）。
 
 ## 為什麼要這樣改
 

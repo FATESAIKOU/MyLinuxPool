@@ -304,7 +304,7 @@ PING_RC=0 ls_run "$REPO/$MLP" s7
 if [[ "$LS_SSH" == "5" && "$LS_PING" == "0" && "$LS_PR" == "4" ]]; then
     ok "3a. 全 up：恰 5 次 ssh（master＋3 探測＋alloc）、0 ping、0 額外解析（4＝gateway＋3 節點）"
 else
-    bad "3a. 全 up 仍多花成本（ssh=$LS_SSH ping=$LS_PING pr=$LS_PR）"
+    bad "3a. 全 up 仍多花成本（ssh=${LS_SSH} ping=${LS_PING} pr=${LS_PR}）"
 fi
 # 對照：有 down 節點時只多一個 ping（證明成本是「只對 down 才問」的）。
 printf '2300:up\n2323:down\n2305:down\n' > "$SANDBOX/probe-map"
