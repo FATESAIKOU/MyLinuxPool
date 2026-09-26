@@ -117,10 +117,23 @@ _fake_emit() {
 }
 case "${1:-}" in
     api) echo '{}' ;;
-    workflow) printf 'dispatch|%s\n' "$*" >> "${ARGV_LOG}" ;;
+    workflow)
+        printf 'dispatch|%s\n' "$*" >> "${ARGV_LOG}"
+        # Title contract (2026-09-26 nonce attribution): the waiter matches
+        # displayTitle against the nonce it just dispatched with. Record the
+        # argv so the listed run can carry it; without this the waiter would
+        # spin to the outer timeout on the one non---no-refresh run below.
+        printf '%s' "$*" > "${ARGV_LOG}.dispatch-args"
+        ;;
     run)
         case "${2:-}" in
-            list) _fake_emit '[{"databaseId":1,"status":"completed","conclusion":"success"}]' ;;
+            list)
+                _t=""
+                [[ -f "${ARGV_LOG}.dispatch-args" ]] \
+                    && _t="refresh-authorized-keys: $(cat "${ARGV_LOG}.dispatch-args")"
+                _fake_emit "$(jq -c -n --arg t "$_t" \
+                    '[{databaseId:1,status:"completed",conclusion:"success",displayTitle:$t}]')"
+                ;;
             view) _fake_emit '{"databaseId":1,"status":"completed","conclusion":"success"}' ;;
             *) _fake_emit '{}' ;;
         esac
