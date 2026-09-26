@@ -208,6 +208,14 @@ fi
 # logic itself is covered by test-worker-tunnel-key.sh; what matters here is
 # that registration gets past it. --jq is applied the same way the api branch
 # does it, so the caller s own filter is what runs.
+# Title contract (2026-09-26 nonce attribution): the waiter matches
+# displayTitle against the nonce it dispatched with, so the listed run must
+# carry the recorded dispatch argv. Without it the wait spins to its timeout
+# and registration aborts -- for fake reasons, not subject reasons.
+if [[ "${1:-}" == "workflow" && "${2:-}" == "run" ]]; then
+    printf '%s' "$*" > "${HOME:?}/.gh-dispatch.args"
+    exit 0
+fi
 if [[ "${1:-}" == "run" ]]; then
     filter=""; prev=""
     for a in "$@"; do
@@ -215,7 +223,11 @@ if [[ "${1:-}" == "run" ]]; then
         prev="$a"
     done
     if [[ "${2:-}" == "list" ]]; then
-        body="[{\"databaseId\":1,\"status\":\"completed\"}]"
+        _t=""
+        [[ -f "${HOME:?}/.gh-dispatch.args" ]] \
+            && _t="refresh-authorized-keys: $(cat "${HOME}/.gh-dispatch.args")"
+        body="$(jq -c -n --arg t "$_t" \
+            "[{\"databaseId\":1,\"status\":\"completed\",\"conclusion\":\"success\",\"displayTitle\":\$t}]")"
     else
         body="{\"conclusion\":\"success\"}"
     fi

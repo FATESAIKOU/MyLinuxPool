@@ -211,13 +211,21 @@ _emit() {
     local cur="$1" sub="$2"; shift 2
     local concl=""
     [[ "$cur" == "completed" ]] && concl="${FAKE_GH_CONCLUSION:-success}"
+    # Contract under test (2026-09-26 nonce attribution): run titles carry
+    # the dispatch arguments (real GitHub via the workflow's `run-name:`).
+    # Without titles the waiter under test cannot recognize its own run —
+    # which is exactly the defect's shape — so a title-less fake would prove
+    # nothing either way. Titles embed the recorded dispatch argv verbatim.
+    local title=""
+    [[ -f "${FAKE_GH_STATE_DIR:?}/dispatch.args" ]] \
+        && title="refresh-authorized-keys: $(cat "${FAKE_GH_STATE_DIR}/dispatch.args")"
     local raw
     if [[ "$sub" == "view" ]]; then
-        raw="$(jq -c -n --argjson id "${FAKE_GH_RUN_ID:-42}" --arg s "$cur" --arg c "$concl" \
-            '{databaseId:$id,status:$s,conclusion:$c}')"
+        raw="$(jq -c -n --argjson id "${FAKE_GH_RUN_ID:-42}" --arg s "$cur" --arg c "$concl" --arg t "$title" \
+            '{databaseId:$id,status:$s,conclusion:$c,displayTitle:$t}')"
     else
-        raw="$(jq -c -n --argjson id "${FAKE_GH_RUN_ID:-42}" --arg s "$cur" --arg c "$concl" \
-            '[{databaseId:$id,status:$s,conclusion:$c}]')"
+        raw="$(jq -c -n --argjson id "${FAKE_GH_RUN_ID:-42}" --arg s "$cur" --arg c "$concl" --arg t "$title" \
+            '[{databaseId:$id,status:$s,conclusion:$c,displayTitle:$t}]')"
     fi
     _apply_jq "$raw" "$@"
 }
@@ -228,6 +236,7 @@ case "${1:-} ${2:-}" in
             echo "gh: could not create workflow dispatch event" >&2
             exit 1
         fi
+        printf '%s' "$*" > "${FAKE_GH_STATE_DIR:?}/dispatch.args"
         exit 0
         ;;
     "run list")
@@ -818,9 +827,16 @@ for _a in "$@"; do [[ "$_p" == "--jq" ]] && _f="$_a"; _p="$_a"; done
 case "${1:-}" in
     api) printf '%s\n' '{}' ;;
     variable) : ;;
-    workflow) : ;;
+    workflow) printf '%s' "$*" > "${S5_ARGV_LOG:?}.dispatch-args" ;;
     run)
-        _j='{"databaseId":1,"status":"completed","conclusion":"success"}'
+        # Same title contract as the T2 fake above: the listed run's title
+        # carries the dispatch argv, so the shared waiter (now attributing)
+        # recognizes it at once instead of spinning to the outer timeout.
+        _t=""
+        [[ -f "${S5_ARGV_LOG:?}.dispatch-args" ]] \
+            && _t="refresh-authorized-keys: $(cat "${S5_ARGV_LOG}.dispatch-args")"
+        _j="$(jq -c -n --arg t "$_t" \
+            '{databaseId:1,status:"completed",conclusion:"success",displayTitle:$t}')"
         if [[ "${2:-}" == "list" ]]; then _j="[$_j]"; fi
         if [[ -n "$_f" ]]; then printf '%s' "$_j" | jq -r "$_f"; else printf '%s\n' "$_j"; fi ;;
 esac

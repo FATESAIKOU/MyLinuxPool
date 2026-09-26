@@ -203,17 +203,18 @@ if [[ "${1:-}" == "api" ]]; then
 fi
 if [[ "${1:-}" == "variable" ]]; then cat >/dev/null; exit 0; fi
 # workflow run / run list / run view — register-provider.sh 的 step 6.5 會
-# dispatch_refresh_and_wait（scripts/lib/refresh-wait.sh），它輪詢
-# `gh run list` 直到 status=completed，再讀 `gh run view` 的 conclusion。
+# dispatch_refresh_and_wait（scripts/lib/refresh-wait.sh），它用 nonce 認領
+# 自己的 run（displayTitle 比對），等到 completed 才讀 conclusion。
 # 假 gh 以前對這三個都是「印 nothing、exit 0」：dispatch 被接受，但 run 永遠
 # 不會出現，於是那個迴圈撐到 300 秒逾時。症狀是這一段每次慢 5 分鐘，然後以
 # 「refresh failed」收場——而不是任何一條與傳輸有關的斷言。
 # 這裡把三個都答成「成功」，讓 step 6.5 真的走完；`--jq` 是真的 gh 做的，
-# 假 gh 直接印 post-jq 的結果。
+# 假 gh 直接印 post-jq 的結果——也就是 waiter 當前查詢的形狀
+# ("<id> <status> <conclusion>"，舊碼是兩欄的 "<id> <status>")。
 if [[ "${1:-}" == "workflow" ]]; then exit 0; fi
 if [[ "${1:-}" == "run" ]]; then
     case "${2:-}" in
-        list)  printf '4242 completed\n'; exit 0 ;;
+        list)  printf '4242 completed success\n'; exit 0 ;;
         view)  printf 'success\n'; exit 0 ;;
     esac
     exit 0
