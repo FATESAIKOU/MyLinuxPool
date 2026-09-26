@@ -503,3 +503,4 @@ scp installer.sh host:/tmp/ && cat crypto_key | ssh host 'bash /tmp/installer.sh
 | [`docs/POOL_RUNTIME_SPEC.md`](docs/POOL_RUNTIME_SPEC.md) | 實作契約與實機驗收紀錄 |
 | [`docs/LAYOUT.md`](docs/LAYOUT.md) | 目錄結構契約、unit 與 profile 的格式 |
 | [`docs/REQ.md`](docs/REQ.md) | 原始需求 |
+| [`docs/AUDIT.md`](docs/AUDIT.md) | provider 宿主機稽核的覆蓋範圍與盲區 |
