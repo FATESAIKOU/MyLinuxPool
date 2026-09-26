@@ -650,6 +650,18 @@ enable_linger() {
 step6_5_tunnel_identity() {
     log INFO "step 6.5/9: mint and publish this machine's tunnel identity"
 
+    # The fetched clone can be partial (step 3 fetches it over the network), so
+    # a file sourced here may not exist. `set -e` does abort on the failed
+    # source — but on bash 3.2 (macOS) the EXIT trap's own success then becomes
+    # the script's exit status: verified 2026-09-26, abort happens, `exit 0`
+    # reported. bash 5.2 (runner, providers) reports 1 for the same shape, so
+    # this only matters on the Mac path. Same guard shape as step 8's
+    # refresh-authkeys.sh check below.
+    if [[ ! -f "${REPO_DIR}/scripts/lib/tunnel-key.sh" \
+          || ! -f "${REPO_DIR}/scripts/lib/refresh-wait.sh" ]]; then
+        log ERROR "scripts/lib/tunnel-key.sh or scripts/lib/refresh-wait.sh missing in the fetched repo — cannot establish tunnel identity"
+        exit 1
+    fi
     # shellcheck source=../scripts/lib/tunnel-key.sh
     TUNNEL_KEY_REPO_DIR="$REPO_DIR" . "${REPO_DIR}/scripts/lib/tunnel-key.sh"
     # shellcheck source=../scripts/lib/refresh-wait.sh

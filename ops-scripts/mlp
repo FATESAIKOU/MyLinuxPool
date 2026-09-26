@@ -1186,7 +1186,7 @@ cmd_state() {
         die "Gateway unreachable (${GW_USER}@${GW_IP})"
     fi
 
-    local master_nodes master_ports master_serial
+    local master_nodes master_ledger_ports master_serial
     local gw_json gw_serial gw_nodes gw_ports gw_workers
     local local_json local_serial local_nodes local_ports
 
@@ -1194,7 +1194,22 @@ cmd_state() {
     # state.json uses for .nodes keys (NODE_FH_L -> fh-l), so the comm
     # comparisons below compare like with like.
     master_nodes="$({ gh api "repos/${REPO}/actions/variables?per_page=100" --jq '.variables[].name' 2>/dev/null | grep '^NODE_' | sed 's/^NODE_//' | tr '[:upper:]' '[:lower:]' | tr '_' '-' | sort; })"
-    master_ports="$(gw_run '~/.mylinuxpool/bin/pool-port-alloc --list' | jq -r '[.[].port] | sort | .[]' 2>/dev/null)"
+    # The ports column of the master row is read from POOL_WORKERS (the master
+    # ledger, STATE_CONTRACT §1) — NOT from `pool-port-alloc --list` on the
+    # Gateway, which is the placeholder (cache) view. 2026-09-26 之前這裡讀的是
+    # placeholder，卻印在 `master` 標籤底下：兩欄裡 nodes 是真的主本、ports 是
+    # Gateway 視角，所以那個標籤看起來像被驗證過；而下面的 drift 比對會把
+    # 「Gateway 有、帳本沒有」印成 "only in master"，方向剛好反了。
+    # 名字也跟著改（master_ports → master_ledger_ports；不叫 ledger_ports——那是 scripts/lib/ledger.sh 裡一個同名函式，意思是「把一段 workers JSON 變成埠清單」，跟這裡的區域變數撞名只會讓人誤會兩者有關）：舊名字承載的就是那個錯誤宣稱。
+    # 讀不到 POOL_WORKERS 時這裡是空的——那會讓 drift 段把每個 Gateway 埠都報成
+    # "only in gateway"，是吵的方向，不是靜的方向（跟 master_nodes 讀不到時一樣）。
+    #
+    # 附帶：`pool-port-alloc --list` 不是唯讀的（它會 mkdir -p 並建立／截斷 lock
+    # 檔），所以改之前 `mlp state` 這個「看狀態」的指令每次執行都對 Gateway 有
+    # 副作用。改之後這條路徑不再呼叫它——但那是換資料源的附帶結果，不是修了它：
+    # `--list` 本體沒動，`mlp` 別處（ls 系）與 delete-worker 的 List 步驟還在用，
+    # 那個副作用還在。真要修得動 pool-port-alloc，不在這裡。
+    master_ledger_ports="$(gh api "repos/${REPO}/actions/variables/POOL_WORKERS" --jq '.value' 2>/dev/null | jq -r 'def coerce: if type == "string" then (try fromjson catch []) else . end; coerce | [.[] | objects | .port // empty] | sort | .[]' 2>/dev/null)"
 
     gw_json="$(gw_run 'cat /var/lib/mylinuxpool/state.json')"
     if [[ -z "$gw_json" ]]; then
@@ -1225,7 +1240,7 @@ cmd_state() {
 
     printf '%s%sSTATE%s\n' "$C_BOLD" "$C_BOLD" "$C_RESET"
     printf '  %-10s %-10s %-10s %-10s\n' "copy" "serial" "nodes" "ports"
-    printf '  %-10s %-10s %-10s %-10s\n' "master" "${master_serial:--}" "$(printf '%s' "$master_nodes" | grep -c . || true)" "$(printf '%s' "$master_ports" | grep -c . || true)"
+    printf '  %-10s %-10s %-10s %-10s\n' "master" "${master_serial:--}" "$(printf '%s' "$master_nodes" | grep -c . || true)" "$(printf '%s' "$master_ledger_ports" | grep -c . || true)"
     printf '  %-10s %-10s %-10s %-10s\n' "gateway" "${gw_serial:--}" "$(printf '%s' "$gw_nodes" | grep -c . || true)" "$(printf '%s' "$gw_ports" | grep -c . || true)"
     printf '  %-10s %-10s %-10s %-10s\n' "local" "${local_serial:--}" "$(printf '%s' "$local_nodes" | grep -c . || true)" "$(printf '%s' "$local_ports" | grep -c . || true)"
 
@@ -1248,8 +1263,8 @@ cmd_state() {
 
     # worker port sets
     local only_ports_master only_ports_gw
-    only_ports_master="$(comm -23 <(printf '%s\n' "$master_ports") <(printf '%s\n' "$gw_ports") 2>/dev/null)"
-    only_ports_gw="$(comm -13 <(printf '%s\n' "$master_ports") <(printf '%s\n' "$gw_ports") 2>/dev/null)"
+    only_ports_master="$(comm -23 <(printf '%s\n' "$master_ledger_ports") <(printf '%s\n' "$gw_ports") 2>/dev/null)"
+    only_ports_gw="$(comm -13 <(printf '%s\n' "$master_ledger_ports") <(printf '%s\n' "$gw_ports") 2>/dev/null)"
     if [[ -n "$only_ports_master" || -n "$only_ports_gw" ]]; then
         echo ""
         echo "worker port set differs (master vs gateway):"

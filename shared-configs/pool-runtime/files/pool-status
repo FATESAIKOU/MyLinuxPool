@@ -166,6 +166,13 @@ GW_PORT="22"
 GW_USER=""
 GW_TUNNEL_USER=""
 GW_ERR=""
+# Worker port range defaults: replaced below when the declaration is readable.
+# They live here (not only inside the resolve-success branch) so a failed
+# resolve still leaves a marked fallback instead of empty strings — empty
+# bounds would make range_ports match nothing and every placeholder look
+# stale, which is loud but for the wrong reason.
+WORKER_LO=2300; WORKER_HI=2399
+WORKER_RANGE_SRC="寫死預設值（主本讀不到）"
 if [[ ! -x "$POOL_RESOLVE" ]]; then
     report FAIL "pool-resolve gateway" "${POOL_RESOLVE} 不存在或不可執行"
 else
@@ -188,6 +195,35 @@ else
         GW_PORT="$(printf '%s' "$GW_JSON" | jq -r '.port // 22' 2>/dev/null)"
         GW_USER="$(printf '%s' "$GW_JSON" | jq -r '.user // empty' 2>/dev/null)"
         GW_TUNNEL_USER="$(printf '%s' "$GW_JSON" | jq -r '.tunnel_user // empty' 2>/dev/null)"
+
+        # Worker port range: same rule as pool-port-alloc (env first, then the
+        # declaration), because a diagnostic that disagrees with the allocator
+        # about which ports are workers' will report live workers as dead —
+        # and that is the one misdiagnosis that induces rollback/cleanup.
+        # Shrinking the range is safe (unused ports get their placeholders
+        # released, both sides stay consistent); MOVING it is what breaks.
+        WORKER_LO=""; WORKER_HI=""; WORKER_RANGE_SRC=""
+        if [[ -n "${POOL_WORKER_PORT_RANGE:-}" ]]; then
+            read -r WORKER_LO WORKER_HI <<< "$POOL_WORKER_PORT_RANGE" || true
+            if [[ "$WORKER_LO" =~ ^[0-9]+$ && "$WORKER_HI" =~ ^[0-9]+$ ]]; then
+                WORKER_RANGE_SRC="env POOL_WORKER_PORT_RANGE"
+            else
+                WORKER_LO=""; WORKER_HI=""
+            fi
+        fi
+        if [[ -z "$WORKER_RANGE_SRC" ]]; then
+            WORKER_LO="$(printf '%s' "$GW_JSON" | jq -r '.ports.worker[0] // empty' 2>/dev/null)"
+            WORKER_HI="$(printf '%s' "$GW_JSON" | jq -r '.ports.worker[1] // empty' 2>/dev/null)"
+            if [[ "$WORKER_LO" =~ ^[0-9]+$ && "$WORKER_HI" =~ ^[0-9]+$ ]]; then
+                WORKER_RANGE_SRC="NODE_GATEWAY.ports.worker（主本）"
+            else
+                WORKER_LO=""; WORKER_HI=""
+            fi
+        fi
+        if [[ -z "$WORKER_RANGE_SRC" ]]; then
+            WORKER_LO=2300; WORKER_HI=2399
+            WORKER_RANGE_SRC="寫死預設值（前面兩條路都沒走通，見上）"
+        fi
 
         # Declaration wins: pin the host key NODE_GATEWAY carries into a
         # temp known_hosts ("<ip> <host_key>" one line) and point ssh at
@@ -296,6 +332,16 @@ if [[ "$GW_LOGIN_OK" -eq 1 ]]; then
     else
         GW_PORTS="$(printf '%s\n' "$GW_SS" | grep -o '127\.0\.0\.1:[0-9]*' | cut -d: -f2 | sort -n -u)"
         GW_PORTS_OK=1
+        # 2000–2999 是寫死的顯示窗口，不是斷言——它只決定摘要列「有 listener」
+        # 還是「無任何 listener」，不指名任何 worker，所以它漏掉埠不會誘導
+        # rollback／清理。2026-09-26 刻意不把它接到主本，理由：
+        #   * 它的失敗方向跟 worker 段相反：worker 段報錯會讓人去清東西，這裡
+        #     最多讓摘要少列幾個埠（例如 ports.provider 搬到 [3000,3100] 之後，
+        #     provider 埠不再出現在這一列——但 C 段是逐個 provider 按宣告的埠去
+        #     查的，不走這個窗口，所以不斷言不斷）。
+        #   * 把它改成「worker 段＋provider 段的聯集」是更多的程式碼換一個顯示
+        #     行，而那個聯集本身又需要一個主本（provider 埠是逐節點宣告的，沒有
+        #     單一範圍）。哪天要動它，先把 provider 埠的主本定下來。
         LIST_2000="$(printf '%s\n' "$GW_PORTS" | range_ports 2000 2999)"
         if [[ -n "$LIST_2000" ]]; then
             pretty="$(printf '%s\n' "$LIST_2000" | tr '\n' ' ' | sed 's/ *$//' | tr ' ' ',')"
@@ -401,14 +447,15 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# D. worker ports (2300–2399) vs the workers.d placeholders on the Gateway
+# D. worker ports ($WORKER_LO–$WORKER_HI, resolved above) vs the workers.d
+# placeholders on the Gateway
 # ---------------------------------------------------------------------------
 if [[ "$GW_LOGIN_OK" -ne 1 ]]; then
     report WARN "worker 埠" "略過（Gateway 無法登入）"
 elif [[ "$GW_PORTS_OK" -ne 1 ]]; then
     report WARN "worker 埠" "略過（Gateway listener 清單不可得）"
 else
-    W_LISTEN="$(printf '%s\n' "$GW_PORTS" | range_ports 2300 2399)"
+    W_LISTEN="$(printf '%s\n' "$GW_PORTS" | range_ports "$WORKER_LO" "$WORKER_HI")"
     W_LS="$(gw_ssh 'if [ -d "$HOME/.mylinuxpool/workers.d" ]; then ls -1 "$HOME/.mylinuxpool/workers.d"; else echo __POOL_WORKERS_D_MISSING__; fi')"
     if printf '%s' "$W_LS" | grep -q '__POOL_WORKERS_D_MISSING__'; then
         report WARN "worker 埠" "Gateway 上 ~/.mylinuxpool/workers.d/ 不存在"
@@ -423,7 +470,7 @@ else
             printf '%s\n' "$W_LISTEN" | grep -qx "$p" || stale_files="${stale_files} ${p}"
         done
         if [[ -z "$orphan_listeners" && -z "$stale_files" ]]; then
-            report OK "worker 埠" "2300–2399 的 listener 與 workers.d 佔位檔一致"
+            report OK "worker 埠" "${WORKER_LO}–${WORKER_HI} 的 listener 與 workers.d 佔位檔一致（範圍來源：${WORKER_RANGE_SRC}）"
         else
             [[ -n "$orphan_listeners" ]] && report WARN "worker 埠" "有 listener 但無佔位檔（孤兒）:${orphan_listeners}"
             [[ -n "$stale_files" ]] && report WARN "worker 埠" "有佔位檔但無 listener（worker 可能已死）:${stale_files}"
