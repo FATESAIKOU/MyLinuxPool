@@ -26,29 +26,6 @@ name: Refresh Authorized Keys
 
 on:
   workflow_dispatch:
-    inputs:
-      nonce:
-        description: 'Optional correlation token from the dispatcher. dispatch_refresh_and_wait passes an unpredictable value here so it can recognize its own run in a frequently-dispatched workflow. External and hand dispatches leave it empty.'
-        required: false
-        default: ''
-        type: string
-
-# Lets a dispatcher recognize its own run: dispatch_refresh_and_wait
-# (scripts/lib/refresh-wait.sh) passes an unpredictable nonce as `nonce`
-# and polls displayTitle for it, instead of trusting "the newest run is
-# mine" (which fails open when a foreign refresh lands between dispatch
-# and poll — the normal case at ~10 dispatches/hour from outside the repo).
-# External and hand dispatches pass nothing and keep the plain static title.
-#
-# Residual risk (the one technical unknown of this mechanism, impl-runname
-# hard requirement 3): whether `inputs.*` interpolation inside `run-name:`
-# actually lands in `gh run list --json displayTitle` has NOT been verified
-# from a real dispatch yet — this round must not dispatch, so that check
-# waits for the post-merge live verification (OUT-d2-refresh.md describes
-# exactly what to run and what counts as passing). If it does not appear,
-# this attribution silently degrades to "never recognize" (safe non-zero),
-# never to guessing somebody else's run.
-run-name: refresh-authorized-keys ${{ inputs.nonce }}
 
 permissions:
   contents: read
