@@ -113,7 +113,19 @@ jobs:
             echo "Its port and ledger entry have been released. The provider's \`pool-sync\` removes containers that POOL_WORKERS no longer lists, so this clears itself on the next boot."
           } >> "$GITHUB_STEP_SUMMARY"
 
+      # S6. No `continue-on-error` and no `if: failure()` retry, on purpose:
+      # a retry of ONLY this step would clear the placeholder while the
+      # ledger/key/cache stay dirty — and then a rerun could no longer find
+      # the worker (Find reads the placeholder), turning a rerun-healable
+      # residue into manual ledger surgery. A full-tail retry would duplicate
+      # Remove-from-POOL_WORKERS → Refresh → Resolve → Push (whose gateway
+      # outputs do not exist yet at this point) and intrude on D3/D4/D5,
+      # which are decided known limits. So S6 stays fail-loud, and the
+      # failure step at the bottom tells the operator the exact rerun.
+      # `id: release` exists only so that step can tell "died here" from
+      # "died later"; it changes no behavior.
       - name: Release the port on the Gateway
+        id: release
         uses: ./.github/actions/pool-ssh
         with:
           node: gateway
@@ -176,3 +188,110 @@ jobs:
         shell: bash
         run: |
           echo "Deleted worker on ${{ steps.find.outputs.provider }} (container ${{ steps.find.outputs.container }}), released port ${{ steps.find.outputs.port }}."
+
+      # --- S6 failure containment: explain, don't auto-retry -----------------
+      #
+      # What S6 failure leaves behind (D2): the container is already gone,
+      # but the placeholder (workers.d/<port>.json), the POOL_WORKERS entry,
+      # the authorized key, and the state-cache declaration all remain, and
+      # every step after S6 is skipped. `pool-port-alloc --claim` avoids
+      # placeholders (spec §10.1), and no daily flow releases one
+      # (--release is called only here and in create-worker's failure path;
+      # pool-status is read-only; pool-sync sweeps containers, not
+      # placeholders; rotate restores claims FROM the still-dirty ledger),
+      # so the port stays unusable until someone reruns this deletion.
+      # History: 0 occurrences (46 runs, 3 failures, all pre-write — qa
+      # 2026-09-26). Measured severity: 1 port out of 2300–2399 (100), 4
+      # live workers.
+      #
+      # Why this step instead of an automatic retry: see the S6 note above.
+      # Why this step prints different text per branch:
+      #   * died before Find produced a port → nothing was written (this is
+      #     the only shape ever seen); say so, so nobody goes hunting residue.
+      #   * Release itself failed → rerunning the SAME deletion replays the
+      #     whole chain to clean (rm of the missing container is absorbed by
+      #     continue-on-error, --release is idempotent, ledger_remove always
+      #     exits 0). Proven by scripts/tests/test-delete-release-port.sh.
+      #   * died at/after ledger removal (D3/D4/D5, decided known limits) →
+      #     warn that a rerun does NOT heal: Find reads the placeholder,
+      #     which is already gone, so the rerun dies at Find. (This corrects
+      #     OUT-qa-c3 §1's blanket "rerun heals D2–D5", which holds only for
+      #     D2.) Manual path: ledger_remove + `gh variable set POOL_WORKERS`,
+      #     dispatch refresh-authorized-keys.yml for the key, and let the next
+      #     create/delete/rotate push converge the cache (no schedule trigger
+      #     exists in this repo).
+      #
+      # This step only prints (log + $GITHUB_STEP_SUMMARY). It runs no ssh,
+      # no gh, and cannot fail the run further — a failing failure-handler
+      # would confuse attribution, so there is nothing here that can fail.
+      - name: On failure, explain the residue and how to recover
+        if: failure()
+        shell: bash
+        env:
+          FIND_PORT: ${{ steps.find.outputs.port }}
+          FIND_CONTAINER: ${{ steps.find.outputs.container }}
+          FIND_PROVIDER: ${{ steps.find.outputs.provider }}
+          RM_OUTCOME: ${{ steps.rm_container.outcome }}
+          RELEASE_OUTCOME: ${{ steps.release.outcome }}
+        run: |
+          set -uo pipefail
+          display_name="${FIND_CONTAINER:-}"
+          [[ -z "${display_name}" && -n "${FIND_PORT:-}" ]] && display_name="worker-${FIND_PORT}"
+          {
+            echo "### Delete worker failed — residue and recovery"
+            echo ""
+            if [[ -z "${FIND_PORT:-}" ]]; then
+              echo "The run died before anything was written (Validate inputs /"
+              echo "List claims / Find claim — the only three failure points ever"
+              echo "seen). No container, placeholder, ledger entry, key, or cache"
+              echo "entry was touched. Fix the inputs and dispatch again."
+            elif [[ "${RELEASE_OUTCOME:-}" == "failure" ]]; then
+              echo "Step \`Release the port on the Gateway\` failed. The steps"
+              echo "after it were skipped, so the worker is half-deleted:"
+              echo ""
+              if [[ "${RM_OUTCOME:-}" == "failure" ]]; then
+                echo "- container \`${display_name}\` is STILL on \`${FIND_PROVIDER:-}\`"
+                echo "  (the provider was unreachable; its pool-sync sweeps"
+                echo "  containers the ledger no longer lists on its next boot)."
+              else
+                echo "- container \`${display_name}\` is removed."
+              fi
+              echo "- placeholder \`workers.d/${FIND_PORT}.json\` is still on the"
+              echo "  Gateway, so port ${FIND_PORT} stays unusable for new workers."
+              echo "- POOL_WORKERS still lists port ${FIND_PORT}, the worker key is"
+              echo "  still authorized, and the state cache still declares it:"
+              echo "  \`mlp state\` looks consistent while \`mlp ls\` shows the"
+              echo "  worker as down. The residue IS visible, just not as red."
+              echo ""
+              echo "Recovery: rerun the SAME deletion. It replays the whole chain;"
+              echo "the missing container is absorbed and the release is idempotent:"
+              echo ""
+              echo "  mlp worker rm '${display_name}'"
+              echo "  # or: gh workflow run delete-worker.yml -f port=${FIND_PORT}"
+            elif [[ "${RELEASE_OUTCOME:-}" == "success" ]]; then
+              echo "The failure happened at or after \`Remove the worker from"
+              echo "POOL_WORKERS\` (known limits D3/D4/D5 — deliberately not"
+              echo "auto-remedied). The placeholder is already released, so port"
+              echo "${FIND_PORT} is reusable, BUT rerunning delete-worker does NOT"
+              echo "heal this: Find reads the placeholder, which is gone, so the"
+              echo "rerun dies at Find with \"no worker port claim found\"."
+              echo "Manual recovery, three copy-pasteable steps (look at step 1"
+              echo "output before running step 3 — step 3 is the destructive one):"
+              echo "1. cur=\$(gh api \"repos/\${GH_REPO}/actions/variables/POOL_WORKERS\" --jq .value)"
+              echo "2. new is the output of: ledger_remove \"\$cur\" \"${FIND_PORT}\""
+              echo "   (source scripts/lib/ledger.sh first, in a throwaway shell;"
+              echo "   pure function, no network)"
+              echo "3. printf '%s' \"\$new\" | gh variable set POOL_WORKERS"
+              echo "4. gh workflow run refresh-authorized-keys.yml --repo \${GH_REPO}"
+              echo "   (re-authorizes the Gateway without the dead key; the state"
+              echo "   cache converges on the next create/delete/rotate push — no"
+              echo "   schedule trigger exists in this repo, nothing to run by hand)"
+            else
+              echo "The run failed outside the traced steps (cancelled, or a step"
+              echo "was skipped before Release ran). Check the log for the first"
+              echo "red step. If \`pool-port-alloc --list\` still shows the port,"
+              echo "rerunning the deletion heals it:"
+              echo ""
+              echo "  mlp worker rm '${display_name}'"
+            fi
+          } | tee -a "${GITHUB_STEP_SUMMARY}"
