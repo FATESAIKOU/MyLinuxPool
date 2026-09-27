@@ -1,41 +1,35 @@
 #!/usr/bin/env bash
-# test-wf-dispatch-attribution.sh — `wf_dispatch` 認不出自己的 run 時，不准猜。
+# test-wf-dispatch-attribution.sh — `wf_dispatch` 只認有歸屬證據的 run，認不出時不准猜。
 #
 # 在防什麼（真線會咬人的那一種）：
-#   dispatch API 不回傳它建立的 run id，所以舊碼記下「最新的 id」、輪詢等到
-#   一個不同的就認領。這個差集分不出**歸屬**：
-#     - 別人的 run 先出現 → 認領別人的（順序完全正確也一樣會錯）
-#     - 我們的先建、同一個輪詢間隔內別人的也建出來 → `--limit 1` 只看得到
-#       最新那筆 → 還是認錯
-#   三個呼叫端是 rotate ×2、create-worker、delete-worker；rotate 是**破壞
-#   性**的：真正的風險路徑是「rotate 其實成功了卻被報成失敗，人半夜看到紅字
-#   重跑一次 rotate」。
+#   舊碼 dispatch 後記下「最新/可見窗」的差集、認領唯一那筆新 run。那個差集
+#   分不出**歸屬**：別人的 run 先出現時照樣被認領（順序完全正確也一樣）；
+#   我們的先建、同一輪內別人的也建出來時只看到最新那筆，一樣錯。三個呼叫端
+#   是 rotate ×2、create-worker、delete-worker；rotate 是**破壞性**的：真正
+#   的風險路徑是「rotate 其實成功了卻被報成失敗，人半夜看到紅字重跑一次」。
 #
-# 這不是新發明，是既有規則的落實。docs/FWD-DESIGN.md §4（141–152）寫著：
-#   `inconclusive` 是「我不知道」，不可以跟任何確定狀態合併，後果要寫進名字。
-#   `wake` / `mlp ls` / `gw_probe_port` 三處已是這個先例。
-#   本檔驗的是「現況違反既有規則」，不是「新功能有沒有做」。
+# ---- 2026-09-27（D2b route C）：歸屬證據換了，這支測試的斷言跟著翻 --------
 #
-# 要驗的（行為面，不驗實作細節）：
-#   1. 恰好一筆新 run → 認領它，行為與從前完全一樣（回歸保護）。
-#   2. 兩筆新 run 同時出現 → 不認領任何一筆，兩筆的 URL 都要印出來。
-#   3. 別人的先出現、我們的後出現 → 同樣不認領。獨立一條，因為它是
-#      「順序完全正確也照樣認錯」的案例；只有第 2 條的話，讀的人會以為
-#      「順序對就安全」。
-#   4. 零筆新 run → 照舊逾時失敗（回歸保護）。
-#   5. **三態可分**：0 成功 / 1 明確失敗 / 3 未知。未知不可折疊成 0
-#      （「猜成功」）也不可折疊成 1（「半夜叫人重跑 rotate」）。具體數字
-#      由 impl 決定；本檔驗的是三者互異且 3 不是 0 也不是 1。
+# 新的 `wf_dispatch` 用兩個頻道取得「哪一筆是我們的」：
+#   1. 主：`gh workflow run` 的 stdout（gh>=2.87 送 return_run_details，
+#      非 TTY 印一行 run URL）→ 直接拿到 run id。
+#   2. 退路：dispatch 時帶 `-f nonce=<16hex>`，比對 `displayTitle` 含該 nonce
+#      的那筆。三支 workflow 都加了 `nonce` 輸入與 `run-name:` 內插它
+#      （refresh-authorized-keys.yml 是第四支，同樣形狀）。
+#   兩個都沒有 → rc 3「不知道」，**不退回差集**（「恰好一筆」沒有歸屬證據）。
+# 舊斷言的前提（差集是唯一線索、窗的密度重要、baseline 讀不到要另立分支）
+# 隨設計一起消失；每一條的翻轉寫在下面各節的註解，完整對照表在
+# OUT-d2b-route-c.md。**沒有一條是為了求綠而刪的**：語意還在的斷言都留著
+# （8a–8c 呼叫端、讀取失敗、未知不可折疊），只是夾具換成新契約能表達的形狀。
 #
-# 注入（照 docs/TESTPLAN.md §1.5 的三問；每個 needle 命中數恰好 1、
-# mutant 過語法檢查、紅的 got 值與預測一致）：
-#   A. 收集退回 `--limit 1` 的形狀（只看最新那筆）→ 2、3 兩條必須紅，
-#      且紅在「它認領了」。
-#   B. 把「未知」折疊成「失敗」→ 三態那條必須紅（3 變 1）。
+# 不驗實作細節：假 gh 同時提供兩個頻道，「新版模式」印 URL、「舊版模式」不
+# 印；`displayTitle` 由假 gh 在 run list 時把呼叫端傳的 nonce 內插進標題
+# （模擬 run-name 已生效）。判準只看 rc、有沒有 follow 錯人、訊息說不說得出
+# 認不出。做法若換成任何等效形式，這些斷言照樣成立。
 #
-# 全離線：gh／sleep 走 PATH stub，gh 套用 `--jq` 的語意與真 gh 相同
-#   （沿用 test-worker-tunnel-key.sh:146 的手法）。mlp 以「剝掉尾端
-#   standalone main 呼叫」的副本 source（本體是函式庫）。
+# 全離線：gh／sleep 走 PATH stub，gh 套用 `--json` 投影與 `--jq` 的語意與真
+#   gh 相同。mlp 以「剝掉尾端 standalone main 呼叫」的副本 source（本體是
+#   函式庫）。
 # bash 3.2 相容（測試本體不用陣列、不用 ${var,,}、無 mapfile）。
 #
 # Run: scripts/tests/test-wf-dispatch-attribution.sh
@@ -57,7 +51,7 @@ trap 'rm -rf "$SANDBOX"' EXIT INT TERM
 SHIMS="$SANDBOX/shims"
 HOME_DIR="$SANDBOX/home"
 STATE="$HOME_DIR/state"
-mkdir -p "$SHIMS" "$STATE"
+mkdir -p "$SHIMS" "$HOME_DIR" "$STATE"
 
 pass=0; fail=0; injfail=0
 ok()  { pass=$((pass+1)); printf '  ok    %s\n' "$1"; }
@@ -65,37 +59,74 @@ bad() { fail=$((fail+1)); printf '  FAIL  %s\n' "$1"; }
 inj_ok()  { printf '  ok    (注入) %s\n' "$1"; }
 inj_bad() { injfail=$((injfail+1)); printf '  FAIL  (注入) %s\n' "$1"; }
 
-# ---- 假 gh：記 argv、套 --jq（真 gh 的語意）、run list 依序回放 --------------
-#   $FAKE_STATE/lists：一行代表一次 run list 的 JSON 陣列；用完停在最後一行。
-#   $FAKE_STATE/view：run view 的 payload。
-#   沿用 test-worker-tunnel-key.sh 的 _apply_jq 手法，不另造一套。
+# ---- 假 gh：記 argv、套 --json／--jq（真 gh 的語意） -------------------------
+# 狀態檔（$FAKE_STATE）：
+#   lists  一行 = 一次 run list 的原始 JSON（%NONCE%／%OURID% 會被代換）；
+#          一行 "FAIL" 代表該次讀取失敗（exit 1）；用完停在最後一行。
+#   view   run view 的 payload（同樣代換）；run view 永遠查得到。
+#   mode   new|legacy  workflow run 印不印 run URL
+#   nonce  dispatch 時收到的 -f nonce 值（假 gh 自己記）
+#   ourid  我們那筆 run 的 databaseId（scenario 用檔指定，預設 102）
+#   dispatch_rc  非 0 → dispatch 被拒
 cat > "$SHIMS/gh" <<'FAKE'
 #!/usr/bin/env bash
 printf '%s\n' "$*" >> "${GH_LOG:-/dev/null}"
 _apply_jq() {
     local json="$1"; shift
-    local filter="" prev=""
+    local fields="" filter="" prev=""
     for a in "$@"; do
+        [[ "$prev" == "--json" ]] && fields="$a"
         [[ "$prev" == "--jq" ]] && filter="$a"
         prev="$a"
     done
+    if [[ -n "$fields" ]]; then
+        if [[ "$json" == \[* ]]; then
+            json="$(printf '%s' "$json" | jq -c "[.[] | {${fields}}]")"
+        else
+            json="$(printf '%s' "$json" | jq -c "{${fields}}")"
+        fi
+    fi
     if [[ -n "$filter" ]]; then printf '%s' "$json" | jq -r "$filter"
     else printf '%s\n' "$json"; fi
 }
+_subst() {
+    # 把 fixture 的佔位符代換成這次 dispatch 的實況（nonce 是執行時產生的，
+    # 夾具寫不了字面值）。
+    local s=""
+    [[ -f "$FAKE_STATE/nonce" ]] && s="$(cat "$FAKE_STATE/nonce")"
+    local o="102"
+    [[ -f "$FAKE_STATE/ourid" ]] && o="$(cat "$FAKE_STATE/ourid")"
+    printf '%s' "$1" | sed -e "s/%NONCE%/${s}/g" -e "s/%OURID%/${o}/g"
+}
 case "${1:-} ${2:-}" in
-  "workflow run") exit "${FAKE_DISPATCH_RC:-0}" ;;
+  "workflow run")
+    args="$*"
+    # 記下 -f nonce= 的值：後面 run list 的標題要靠它。
+    for a in "$@"; do
+        case "$a" in
+            nonce=*) printf '%s' "${a#nonce=}" > "$FAKE_STATE/nonce" ;;
+        esac
+    done
+    if [[ "${FAKE_DISPATCH_RC:-0}" -ne 0 ]]; then
+        echo "could not create workflow dispatch event (fake 500)" >&2
+        exit 1
+    fi
+    if [[ "$(cat "$FAKE_STATE/mode")" == "new" ]]; then
+        o="102"; [[ -f "$FAKE_STATE/ourid" ]] && o="$(cat "$FAKE_STATE/ourid")"
+        printf 'https://github.com/testowner/testrepo/actions/runs/%s\n' "$o"
+    fi
+    exit 0 ;;
   "run list")
     n=0; [[ -f "$FAKE_STATE/list.idx" ]] && n="$(cat "$FAKE_STATE/list.idx")"
     line="$(sed -n "$((n+1))p" "$FAKE_STATE/lists")"
     [[ -z "$line" ]] && line="$(tail -n 1 "$FAKE_STATE/lists")"
     printf '%s' "$((n+1))" > "$FAKE_STATE/list.idx"
-    # 一行 "FAIL" 代表這次讀取失敗（exit 1）——量「讀不到」與「確實沒有」
-    # 的差別時用得到（qa §3 的形狀）。
     if [[ "$line" == "FAIL" ]]; then exit 1; fi
-    _apply_jq "$line" "$@"
+    # 真 gh 的列表是新的在前；fixture 可以任意順序寫，這裡照 id 排。
+    _apply_jq "$(_subst "$line" | jq -c 'sort_by(-.databaseId)')" "$@"
     exit 0 ;;
   "run view")
-    _apply_jq "$(cat "$FAKE_STATE/view")" "$@"
+    _apply_jq "$(_subst "$(cat "$FAKE_STATE/view")")" "$@"
     exit 0 ;;
 esac
 exit 0
@@ -106,8 +137,14 @@ chmod +x "$SHIMS/gh" "$SHIMS/sleep"
 # ---- 被測物：剝掉尾端 standalone main 的 mlp 副本 ---------------------------
 # mlp 尾端是 `if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then main "$@"; fi`，
 # source 時本來就不會跑 main；但把它剝掉可避免任何 future 變動讓 source
-# 意外執行 CLI。diff 證明只差那三行。
-python3 - "$REPO_ROOT/$MLP" "$SANDBOX/mlp-lib.sh" <<'PY'
+# 意外執行 CLI。副本放在一棵 symlink 回 repo `scripts/` 的樹下（同
+# test-wf-dispatch-own-run.sh）：mlp 現在會 `source ${REPO_ROOT}/scripts/lib/
+# refresh-wait.sh`（借 refresh_new_nonce），REPO_ROOT 是「這份副本的上一層」，
+# 少了這棵樹，那個 source 會靜默失敗 → nonce 為空 → contains("") 命中每一筆。
+TREE="$SANDBOX/tree"
+mkdir -p "$TREE/ops-scripts"
+ln -s "$REPO_ROOT/scripts" "$TREE/scripts"
+python3 - "$REPO_ROOT/$MLP" "$TREE/ops-scripts/mlp-lib.sh" <<'PY'
 import re, sys
 src = open(sys.argv[1], encoding="utf-8").read()
 out = re.sub(
@@ -116,18 +153,24 @@ out = re.sub(
 assert 'main "$@"' not in out, "standalone main call not stripped"
 open(sys.argv[2], "w", encoding="utf-8").write(out)
 PY
-if [[ $? -eq 0 ]] && ! grep -q 'main "\$@"' "$SANDBOX/mlp-lib.sh"; then
-    ok "harness. 剝尾 standalone main 的副本可安全 source"
+LIB_COPY="$TREE/ops-scripts/mlp-lib.sh"
+if [[ $? -eq 0 ]] && ! grep -q 'main "\$@"' "$LIB_COPY" \
+&& ( bash -c "source '$LIB_COPY' >/dev/null 2>&1; declare -F refresh_new_nonce >/dev/null" ); then
+    ok "harness. 剝尾副本可 source，且 refresh_new_nonce（mlp 借用的 nonce 產生器）讀得到"
 else
-    bad "harness. 剝尾失敗——後面所有斷言都不可信"
+    bad "harness. 剝尾失敗或 refresh_new_nonce 讀不到——後面所有斷言都不可信"
 fi
 
-# run_wf <mlp-lib-path> <lists-file-content-verbatim> <view-json> \
-#        [dispatch-rc]：回傳 rc，stdout→$WF_OUT、stderr→$WF_ERR。
+# run_wf <mlp-lib-path> <lists> <view> [dispatch-rc] [mode]
+#   mode 預設 legacy（不印 URL → 走 nonce 退路）；'new' 走 run id 主路徑。
+#   回傳 rc，stdout→$WF_OUT、stderr→$WF_ERR。
 run_wf() {
-    local lib="$1" lists="$2" view="$3" dispatch_rc="${4:-0}"
+    local lib="$1" lists="$2" view="$3" dispatch_rc="${4:-0}" mode="${5:-legacy}"
     printf '%s\n' "$lists" > "$STATE/lists"
     printf '%s' "$view" > "$STATE/view"
+    printf '%s' "$mode" > "$STATE/mode"
+    rm -f "$STATE/nonce"
+    printf '102' > "$STATE/ourid"
     : > "$STATE/list.idx"
     : > "$SANDBOX/gh-argv.log"
     LIB="$lib" FAKE_STATE="$STATE" GH_LOG="$SANDBOX/gh-argv.log" \
@@ -147,82 +190,145 @@ run_wf() {
         "$(printf '%s' "$WF_ERR" | tr '\n' '|')"
 }
 
-# 常數：before 快照、單筆/雙筆 after、逾時用的重複 after。
-BEFORE='[{"databaseId":101},{"databaseId":100}]'
-ONE_NEW='[{"databaseId":102},{"databaseId":101},{"databaseId":100}]'
-TWO_NEW='[{"databaseId":103},{"databaseId":102},{"databaseId":101},{"databaseId":100}]'
-NO_NEW='[{"databaseId":101},{"databaseId":100}]'
+# ---- 夾具常數 ---------------------------------------------------------------
+# 外部 run（別人的）：沒有我們的 nonce，標題只是 workflow 名。
+FOREIGN100='{"databaseId":100,"status":"completed","conclusion":"success","displayTitle":"Test Worker"}'
+FOREIGN101='{"databaseId":101,"status":"completed","conclusion":"success","displayTitle":"Test Worker"}'
+FOREIGN103='{"databaseId":103,"status":"completed","conclusion":"success","displayTitle":"Test Worker"}'
+FOREIGN104='{"databaseId":104,"status":"completed","conclusion":"success","displayTitle":"Test Worker"}'
+# 我們的 run：標題含本次 dispatch 的 nonce（run-name 已生效的形狀）。
+OUR102_OK='{"databaseId":%OURID%,"status":"completed","conclusion":"success","displayTitle":"Test Worker %NONCE%"}'
+OUR102_FAIL='{"databaseId":%OURID%,"status":"completed","conclusion":"failure","displayTitle":"Test Worker %NONCE%"}'
+OUR206_FAIL='{"databaseId":206,"status":"completed","conclusion":"failure","displayTitle":"Test Worker %NONCE%"}'
 VIEW_OK='{"status":"completed","conclusion":"success","jobs":[]}'
+VIEW_FAIL='{"status":"completed","conclusion":"failure","jobs":[]}'
 
-echo "=== 0. 先決條件 ==="
-if grep -q '^wf_dispatch() {' "$MLP" && grep -q '^wf_follow() {' "$MLP"; then
-    ok "0. wf_dispatch 與 wf_follow 都在"
+echo "=== 0. 先決條件＋workflow 端的結構守衛 ==="
+if grep -q 'wf_dispatch() {' "$MLP" && grep -q 'wf_follow() {' "$MLP"; then
+    ok "0a. wf_dispatch 與 wf_follow 都在"
 else
-    bad "0. wf_dispatch／wf_follow 不存在——實作還沒落地？"
+    bad "0a. wf_dispatch／wf_follow 不存在——實作還沒落地？"
+fi
+# 結構守衛：兩個頻道的其中一個（nonce 標題）靠三支＋refresh 的 yml 宣告。
+# 假 gh 對任何 -f 欄位照單全收，所以少了這一段，「忘了在 yml 加 run-name」
+# 會讓整支測試照樣綠（OUT-test-d2b-agnostic §7-1 記的正是這個洞）。
+guard_py="$(python3 - "$REPO_ROOT" <<'PY'
+import sys, yaml
+root = sys.argv[1]
+want = {
+    "create-worker.yml": "Create Worker",
+    "delete-worker.yml": "Delete Worker",
+    "rotate-gateway.yml": "Rotate Gateway",
+    "refresh-authorized-keys.yml": None,  # refresh 的標題前綴不同（小寫），只驗欄位
+}
+bad = []
+for fn, prefix in want.items():
+    path = root + "/.github/workflows/" + fn
+    try:
+        doc = yaml.safe_load(open(path, encoding="utf-8"))
+    except Exception as exc:
+        bad.append("%s: unreadable (%s)" % (fn, exc))
+        continue
+    on = doc.get("on") or doc.get(True)  # YAML 會把 on: 讀成布林 True
+    inputs = ((on or {}).get("workflow_dispatch") or {}).get("inputs") or {}
+    nonce = inputs.get("nonce")
+    if not isinstance(nonce, dict) or nonce.get("default") != "":
+        bad.append("%s: nonce input missing or default != ''" % fn)
+    rn = doc.get("run-name") or ""
+    if "inputs.nonce" not in rn:
+        bad.append("%s: run-name does not interpolate inputs.nonce (%r)" % (fn, rn))
+    if prefix and not rn.startswith(prefix):
+        bad.append("%s: run-name %r does not start with %r" % (fn, rn, prefix))
+print("; ".join(bad) if bad else "ok")
+PY
+)"
+if [[ "$guard_py" == "ok" ]]; then
+    ok "0b. 四支 workflow 都有選填 nonce input（default ''）且 run-name 內插它"
+else
+    bad "0b. workflow 端結構不完整：[$guard_py]"
 fi
 
-echo "=== 1. 恰好一筆新 run → 認領它（回歸保護） ==="
-got="$(run_wf "$SANDBOX/mlp-lib.sh" "$(printf '%s\n%s' "$BEFORE" "$ONE_NEW")" "$VIEW_OK")"
-if [[ "$got" == RC=0* ]] \
-&& printf '%s' "$got" | grep -qF 'actions/runs/102' \
-&& ! printf '%s' "$got" | grep -qF 'actions/runs/103'; then
-    ok "1a. 單筆新 run：rc 0、認領 102（行為與從前一樣）"
+echo "=== 1. 主路徑：gh 印出 run URL → 直接認領（有證據） ==="
+# 舊 1a（「恰好一筆新 run → 認領」）的翻轉：認領的理由從「窗內唯一」變成
+# 「API 說就是這筆」。rc 的意義不變（我們那次成功=0）。
+got="$(run_wf "$LIB_COPY" "$(printf '%s\n%s' "[$FOREIGN101,$FOREIGN100]" "[$OUR102_OK,$FOREIGN101,$FOREIGN100]")" "$VIEW_OK" 0 new)"
+if [[ "$got" == RC=0* ]] && printf '%s' "$got" | grep -qF 'actions/runs/102'; then
+    ok "1a. 新版 gh：rc 0、認領 API 回報的 102"
 else
-    bad "1a. 單筆新 run 沒被認領（got [$got]）"
+    bad "1a. 新版模式下沒認領 API 回報的 run（got [$got]）"
 fi
-# 1b：確真的 follow 了它（run view 帶著那個 id）。
+# 1b：確真的 follow 了它（run view 帶著那個 id）。語意不變，保留。
 if grep -q '^run view 102 ' "$SANDBOX/gh-argv.log" 2>/dev/null; then
     ok "1b. 認領後真的 follow 了 102（run view 帶對 id）"
 else
     bad "1b. 沒有對 102 跑 run view（argv [$(tr '\n' '|' < "$SANDBOX/gh-argv.log" | head -c 200)]）"
 fi
-
-echo "=== 2. 兩筆新 run 同時出現 → 不認領、兩筆 URL 都印 ==="
-got="$(run_wf "$SANDBOX/mlp-lib.sh" "$(printf '%s\n%s' "$BEFORE" "$TWO_NEW")" "$VIEW_OK")"
-if printf '%s' "$got" | grep -qF 'actions/runs/102' \
-&& printf '%s' "$got" | grep -qF 'actions/runs/103' \
-&& ! printf '%s' "$got" | grep -qF 'run finished'; then
-    ok "2a. 兩筆 URL 都印出來、沒有認領任何一筆（沒有 'run finished'）"
+# 1c（新）：nonce 真的有被傳出去，且是不可預測的 16 hex——退路頻道的存在
+# 前提。16 hex 的形狀由 refresh_new_nonce 保證；這裡從 argv 反讀。
+nonce_seen="$(sed -n 's/.*-f nonce=\([^ ]*\).*/\1/p' "$SANDBOX/gh-argv.log" | head -n 1)"
+if [[ "$nonce_seen" =~ ^[0-9a-f]{16}$ ]]; then
+    ok "1c. dispatch 帶了 16-hex nonce（${nonce_seen:0:4}…）——標題頻道的燃料"
 else
-    bad "2a. 兩筆新 run 時認領了其中一筆或漏印 URL（got [$got]）"
+    bad "1c. dispatch 沒有帶合法的 nonce（argv [$(head -1 "$SANDBOX/gh-argv.log" | head -c 140)]）"
 fi
-if ! grep -q '^run view ' "$SANDBOX/gh-argv.log" 2>/dev/null; then
-    ok "2b. 零 run view：真的沒有 follow 任何一筆"
+# 1d：同一份 stdout 若沒有 URL，不得把標題裡「長得像 URL」的隨機文字當 id。
+got="$(run_wf "$LIB_COPY" "$(printf '%s\n%s' "[$FOREIGN101]" "[$OUR102_OK,$FOREIGN101]")" "$VIEW_OK" 0 legacy)"
+if [[ "$got" == RC=0* ]] && printf '%s' "$got" | grep -qF 'actions/runs/102'; then
+    ok "1d. 舊版 gh：rc 0、靠標題裡的 nonce 認領 102（退路頻道真的在工作）"
 else
-    bad "2b. 認領後仍 follow 了（argv [$(grep '^run view' "$SANDBOX/gh-argv.log" | tr '\n' '|')]）"
-fi
-
-echo "=== 3. 別人的先出、我們的後出 → 同樣不認領（順序對也照錯） ==="
-# 這是「順序完全正確」的案例：舊碼會在第一筆新 run 出現時就認領（--limit 1
-# 只看得到最新那筆），於是永遠拿不到真正屬於我們的那一筆。
-got="$(run_wf "$SANDBOX/mlp-lib.sh" "$(printf '%s\n%s' "$BEFORE" "$TWO_NEW")" "$VIEW_OK")"
-if printf '%s' "$got" | grep -qF 'actions/runs/103' \
-&& printf '%s' "$got" | grep -qF 'actions/runs/102' \
-&& ! printf '%s' "$got" | grep -qF 'run finished'; then
-    ok "3a. 順序正確的兩筆新 run：仍不認領、兩筆都列（不靠『先到先贏』）"
-else
-    bad "3a. 順序正確時竟認領了（got [$got]）"
-fi
-# 3b：把「我們的」放在較舊的位置，證明不是「拿最新那筆」的巧合。
-OLDER='[{"databaseId":104},{"databaseId":103},{"databaseId":101},{"databaseId":100}]'
-got="$(run_wf "$SANDBOX/mlp-lib.sh" "$(printf '%s\n%s' "$BEFORE" "$OLDER")" "$VIEW_OK")"
-if printf '%s' "$got" | grep -qF 'actions/runs/103' \
-&& printf '%s' "$got" | grep -qF 'actions/runs/104' \
-&& ! printf '%s' "$got" | grep -qF 'run finished'; then
-    ok "3b. 兩筆新 run 但我們的較舊：一樣不認領（不是『拿最新』的巧合）"
-else
-    bad "3b. 較舊那筆被誤認領（got [$got]）"
+    bad "1d. 舊版模式下沒有靠 nonce 認領（got [$got]）"
 fi
 
-echo "=== 4. 零筆新 run → 逾時失敗（回歸保護） ==="
-got="$(run_wf "$SANDBOX/mlp-lib.sh" "$(printf '%s\n%s' "$BEFORE" "$NO_NEW")" "$VIEW_OK")"
-if [[ "$got" == RC=1* ]] && printf '%s' "$got" | grep -qF 'never appeared'; then
-    ok "4a. 零筆新 run：逾時失敗（rc 1、訊息說 never appeared）"
+echo "=== 2. 兩筆新 run 同時出現：認我們那筆（有 nonce）、不碰別人的 ==="
+# 舊 2a（「兩筆 → 不認領、兩筆 URL 都印」）的翻轉：現在有歸屬證據了，正確
+# 行為是認領自己的；「印出所有候選讓人自己猜」不再是要求。
+got="$(run_wf "$LIB_COPY" "$(printf '%s\n%s' "[$FOREIGN101,$FOREIGN100]" "[$FOREIGN103,$OUR102_OK,$FOREIGN101,$FOREIGN100]")" "$VIEW_OK")"
+if [[ "$got" == RC=0* ]] && printf '%s' "$got" | grep -qF 'actions/runs/102'; then
+    ok "2a. 窗內有別人的 103：認領我們帶 nonce 的 102、rc 0"
 else
-    bad "4a. 零筆新 run 的行為不對（got [$got]）"
+    bad "2a. 有證據時沒認領對的那筆（got [$got]）"
 fi
-# 4b：dispatch 本身失敗 → 明確失敗（不可被誤認為未知）。
-got="$(run_wf "$SANDBOX/mlp-lib.sh" "$(printf '%s\n%s' "$BEFORE" "$ONE_NEW")" "$VIEW_OK" 1)"
+# 2b（舊：未知時零 view）翻轉成「只 follow 我們那筆」：別人一次都不能被 view。
+if grep -q '^run view 102 ' "$SANDBOX/gh-argv.log" 2>/dev/null \
+&& ! grep -q '^run view 103 ' "$SANDBOX/gh-argv.log" 2>/dev/null \
+&& ! grep -q '^run view 101 ' "$SANDBOX/gh-argv.log" 2>/dev/null; then
+    ok "2b. 只 follow 了 102；103／101（別人的）一次都沒被 view"
+else
+    bad "2b. follow 了不該 follow 的 id（argv [$(grep '^run view' "$SANDBOX/gh-argv.log" | tr '\n' '|')]）"
+fi
+
+echo "=== 3. 別人的先出、我們的後出（或較舊）：仍認我們那筆 ==="
+# 舊 3a（「順序完全正確時仍不認領」）的翻轉：舊碼錯的原因正是「先到先贏／
+# 只看最新」；現在歸屬看 nonce，與位置、到達順序無關。
+got="$(run_wf "$LIB_COPY" "$(printf '%s\n%s' "[$FOREIGN101,$FOREIGN100]" "[$OUR206_FAIL,$FOREIGN101,$FOREIGN100]")" "$VIEW_FAIL")"
+if [[ "$got" == RC=1* ]] && printf '%s' "$got" | grep -qF 'actions/runs/206' \
+&& ! grep -q '^run view 101 ' "$SANDBOX/gh-argv.log" 2>/dev/null; then
+    ok "3a. 別人的先出現：認領後到的 206（我們那次失敗 → rc 1）、沒碰 101"
+else
+    bad "3a. 順序／位置干擾了歸屬（got [$got]）"
+fi
+# 3b：我們的 id 比別人小（排在列表後面）——證明不是「拿最新」的巧合。
+got="$(run_wf "$LIB_COPY" "$(printf '%s\n%s' "[$FOREIGN104,$FOREIGN103]" "[$FOREIGN104,$FOREIGN103,$OUR102_OK,$FOREIGN101,$FOREIGN100]")" "$VIEW_OK")"
+if [[ "$got" == RC=0* ]] && printf '%s' "$got" | grep -qF 'actions/runs/102'; then
+    ok "3b. 我們那筆在列表較舊的位置：一樣認 102（不是『拿最新』的巧合）"
+else
+    bad "3b. 較舊位置時認錯或漏認（got [$got]）"
+fi
+
+echo "=== 4. 沒有證據時：rc 3『不知道』，不猜、不 follow ==="
+# 舊 4a（「零筆新 run → rc 1 never appeared」）的翻轉：新設計裡「沒有新 run」
+# 觀測不到——標題沒出現可能是 run-name 沒展開，dispatch 其實成功了。所以
+# 「乾淨讀到列表但沒有我們的 nonce」是**未知（rc 3）**，不是明確失敗。
+# rc 1 只剩「dispatch 本身失敗」一種（見 4b、8b 的「我們那次失敗」）。
+got="$(run_wf "$LIB_COPY" "$(printf '%s\n%s' "[$FOREIGN101,$FOREIGN100]" "[$FOREIGN101,$FOREIGN100]")" "$VIEW_OK")"
+if [[ "$got" == RC=3* ]] && printf '%s' "$got" | grep -qF 'no run carries this dispatch nonce' \
+&& ! grep -q '^run view ' "$SANDBOX/gh-argv.log" 2>/dev/null; then
+    ok "4a. 讀得到列表、但沒有我們的 nonce：rc 3、訊息點名 nonce、零 run view"
+else
+    bad "4a. 無證據時的處理不對（got [$got]）"
+fi
+# 4b：dispatch 本身失敗 → 明確失敗（不可被誤認為未知）。語意不變。
+got="$(run_wf "$LIB_COPY" "$(printf '%s\n%s' "[$FOREIGN101,$FOREIGN100]" "[$OUR102_OK,$FOREIGN101,$FOREIGN100]")" "$VIEW_OK" 1)"
 if [[ "$got" == RC=1* ]] && printf '%s' "$got" | grep -qF 'could not dispatch'; then
     ok "4b. dispatch 失敗：rc 1、明確說 could not dispatch"
 else
@@ -230,10 +336,10 @@ else
 fi
 
 echo "=== 5. 三態可分：未知不是成功、也不是失敗 ==="
-# 收集三種情境的 rc：成功（恰好一筆）、明確失敗（零筆逾時）、未知（兩筆歧義）。
-rc_ok="$(run_wf "$SANDBOX/mlp-lib.sh" "$(printf '%s\n%s' "$BEFORE" "$ONE_NEW")" "$VIEW_OK")"
-rc_fail="$(run_wf "$SANDBOX/mlp-lib.sh" "$(printf '%s\n%s' "$BEFORE" "$NO_NEW")" "$VIEW_OK")"
-rc_unknown="$(run_wf "$SANDBOX/mlp-lib.sh" "$(printf '%s\n%s' "$BEFORE" "$TWO_NEW")" "$VIEW_OK")"
+# 舊 5a 的夾具換了（差集窗 → 兩個頻道），判準不變：0／1／3 互異。
+rc_ok="$(run_wf "$LIB_COPY" "[$OUR102_OK,$FOREIGN100]" "$VIEW_OK" 0 new)"
+rc_fail="$(run_wf "$LIB_COPY" "[$OUR102_FAIL,$FOREIGN100]" "$VIEW_FAIL")"
+rc_unknown="$(run_wf "$LIB_COPY" "[$FOREIGN101,$FOREIGN100]" "$VIEW_OK")"
 r_ok="${rc_ok%% *}"; r_fail="${rc_fail%% *}"; r_unknown="${rc_unknown%% *}"
 r_ok="${r_ok#RC=}"; r_fail="${r_fail#RC=}"; r_unknown="${r_unknown#RC=}"
 if [[ "$r_ok" == "0" && "$r_fail" == "1" && "$r_unknown" != "0" && "$r_unknown" != "1" ]]; then
@@ -241,176 +347,217 @@ if [[ "$r_ok" == "0" && "$r_fail" == "1" && "$r_unknown" != "0" && "$r_unknown" 
 else
     bad "5a. 三態沒有分開（ok=${r_ok} fail=${r_fail} unknown=${r_unknown}）——未知被折疊成成功或失敗"
 fi
-# 5b：未知時 stdout 必須說得出「我不能確定」，而不是「成功」或一般失敗訊息。
-if printf '%s' "$rc_unknown" | grep -qF 'cannot tell which one is ours'; then
+# 5b：未知時 stdout 必須說得出「我不能確定」。舊措辭（cannot tell which one
+# is ours）隨差集邏輯消失；新措辭以「could not identify our run」開頭，
+# 這裡用 regex 同時接受兩種（不綁死實作字串）。
+if printf '%s' "$rc_unknown" | grep -qE "could not identify|cannot tell which one is ours"; then
     ok "5b. 未知的輸出直說『認不出來』（不是靜靜回一個碼）"
 else
     bad "5b. 未知情境沒有說出不能確定（got [$rc_unknown]）"
 fi
-# 5c：未知不可被 follow——run view 一次都不能發生。
+# 5c：未知不可被 follow——run view 一次都不能發生。語意不變。
 if ! grep -q '^run view ' "$SANDBOX/gh-argv.log" 2>/dev/null; then
     ok "5c. 未知時零 run view（不 follow 猜測的那一筆）"
 else
     bad "5c. 未知時仍 follow 了（argv [$(grep '^run view' "$SANDBOX/gh-argv.log" | tr '\n' '|')]）"
 fi
 
-echo "=== 9. 讀取失敗 ≠ 確實沒有新 run（qa 缺口 1） ==="
-# 這兩件事意義相反，現在都走同一個 die：
-#   - 讀取成功但窗內確實沒有新 run → 「確定沒有」→ rc 1
-#   - 讀取本身持續失敗 → 「沒觀察到」→ rc 3（未知）
-# 夾具：lists 的第一行是 before，之後每行是一次輪詢的 after；一行 "FAIL"
-# 代表該次讀取失敗（gh exit 1）。
-# 9a：before 成功（有內容）、after 20 次全 FAIL → rc 3，且輸出說「沒有乾淨
-#     看一眼」，不是 never appeared。
-got="$(run_wf "$SANDBOX/mlp-lib.sh" "$(printf '%s\n%s' '[{"databaseId":101},{"databaseId":100}]' 'FAIL')" "$VIEW_OK")"
+echo "=== 9. 讀不到列表 ≠ 列表裡沒有我們的 nonce（兩種未知要分得開） ==="
+# 9a：整段等待中每一次讀取都失敗 → rc 3，訊息說「讀不到」。
+#    lists 只有一行 "FAIL"（用完停在最後一行）＝每一次讀取都失敗。
+got="$(run_wf "$LIB_COPY" 'FAIL' "$VIEW_OK")"
 if [[ "$got" == RC=3* ]] \
-&& printf '%s' "$got" | grep -qF 'the last read of the run list failed' \
-&& ! printf '%s' "$got" | grep -qF 'never appeared'; then
-    ok "9a. after 讀取持續失敗：rc 3、輸出含 'the last read of the run list failed'、不含 'never appeared'"
+&& printf '%s' "$got" | grep -qF 'could not be read at any point' \
+&& ! printf '%s' "$got" | grep -qF 'no run carries this dispatch nonce'; then
+    ok "9a. 每次讀取都失敗：rc 3、訊息說讀不到、不含『nonce 不在』"
 else
-    bad "9a. 讀取持續失敗時 rc 不是 3 或出現 never appeared（got [$got]）"
+    bad "9a. 讀取持續失敗時 rc 或訊息不對（got [$got]）"
 fi
-# 9b：before 成功但空（workflow 尚無 run）、after 全 FAIL → 同樣 rc 3。
-got="$(run_wf "$SANDBOX/mlp-lib.sh" "$(printf '%s\n%s' '[]' 'FAIL')" "$VIEW_OK")"
-if [[ "$got" == RC=3* ]] && printf '%s' "$got" | grep -qF 'the last read of the run list failed'; then
-    ok "9b. 空 baseline＋讀取失敗：rc 3、不含 never appeared"
+# 9b：讀得到、但沒有我們的 nonce → rc 3，訊息說「列表裡沒有這個 nonce」。
+# 與 9a 兩句不同、可分辨——這是 PM 追加要求的「兩種未知都寫明」。
+got="$(run_wf "$LIB_COPY" "[$FOREIGN101]" "$VIEW_OK")"
+if [[ "$got" == RC=3* ]] \
+&& printf '%s' "$got" | grep -qF 'no run carries this dispatch nonce' \
+&& ! printf '%s' "$got" | grep -qF 'could not be read at any point'; then
+    ok "9b. 讀得到但 nonce 不在：rc 3、訊息與 9a 可分辨（點名 nonce）"
 else
-    bad "9b. 空 baseline＋讀取失敗時 rc 或訊息不符（got [$got]）"
+    bad "9b. 讀得到但沒 nonce 時的 rc 或訊息不對（got [$got]）"
 fi
-# 9c（回歸）：before 成功、after 成功但確實沒有新 run → rc 1 never appeared。
-#     這一條不能因為 9a/9b 的修正而被改壞——「確定沒有」仍是明確失敗。
-got="$(run_wf "$SANDBOX/mlp-lib.sh" "$(printf '%s\n%s' '[{"databaseId":101},{"databaseId":100}]' '[{"databaseId":101},{"databaseId":100}]')" "$VIEW_OK")"
-if [[ "$got" == RC=1* ]] && printf '%s' "$got" | grep -qF 'never appeared'; then
-    ok "9c. 讀取成功且窗內無新 run：rc 1、輸出含 never appeared"
-else
-    bad "9c. 讀取成功且無新 run 時 rc 或訊息不符（got [$got]）"
-fi
-# 9d：before 成功、其中一輪 after FAIL、之後成功且有一筆新 run →
-#     失敗那輪不進差集，最終仍正確認領（不可因單輪抖動誤判）。
-got="$(run_wf "$SANDBOX/mlp-lib.sh" "$(printf '%s\n%s\n%s' '[{"databaseId":101},{"databaseId":100}]' 'FAIL' '[{"databaseId":102},{"databaseId":101},{"databaseId":100}]')" "$VIEW_OK")"
+# 9d：其中一輪讀取失敗、之後成功且有一筆我們的 run → 失敗那輪不進結論，
+# 最終仍正確認領（不可因單輪抖動誤判）。語意不變。
+got="$(run_wf "$LIB_COPY" "$(printf '%s\n%s\n%s' "[$FOREIGN101]" 'FAIL' "[$OUR102_OK,$FOREIGN101]")" "$VIEW_OK")"
 if [[ "$got" == RC=0* ]] && printf '%s' "$got" | grep -qF 'actions/runs/102'; then
     ok "9d. 單輪讀取失敗＋之後恢復：rc 0、輸出含 actions/runs/102"
 else
     bad "9d. 單輪失敗後回復時 rc 或認領 id 不符（got [$got]）"
 fi
 
-echo "=== 10. before 讀失敗 → 未知，與窗的密度無關（qa 缺口 2） ==="
-# 完整窗之所以安全是**意外的**：30 筆全被當新 → 超過一筆 → rc 3。稀疏窗
-# 下同樣的 bug 會「認出」一筆從未 dispatch 的 run（qa §3 子情況 2）。
-# 這裡同時涵蓋完整窗與稀疏窗，訊息寫明驗的是「before 讀不到就未知」，
-# 不是「窗裡筆數夠多所以安全」。
-# 10a：before FAIL＋稀疏窗（1 筆）→ rc 3、零認領、零 follow。
-got="$(run_wf "$SANDBOX/mlp-lib.sh" "$(printf '%s\n%s' 'FAIL' '[{"databaseId":100}]')" "$VIEW_OK")"
-if [[ "$got" == RC=3* ]] \
-&& printf '%s' "$got" | grep -qF 'the run list could not be read when the dispatch went out' \
-&& ! printf '%s' "$got" | grep -qF 'actions/runs/100' \
+echo "=== 10. 窗的密度不重要：沒有 nonce 就不認，再多筆也一樣 ==="
+# 舊 10a／10b 守的是 baseline 讀取（分支已不存在）。翻轉成同樣的判準：
+# 「窗裡有幾筆別人的 run」不影響結論——沒有歸屬證據就 rc 3，絕不 follow
+# 任何一筆。稀疏窗與密集窗兩條都要求同一件事，正是「密度不再重要」的證明。
+got_sparse="$(run_wf "$LIB_COPY" "[$FOREIGN100]" "$VIEW_OK")"
+if [[ "$got_sparse" == RC=3* ]] \
+&& printf '%s' "$got_sparse" | grep -qF 'no run carries this dispatch nonce' \
 && ! grep -q '^run view ' "$SANDBOX/gh-argv.log" 2>/dev/null; then
-    ok "10a. before 讀不到＋稀疏窗（1 筆）：rc 3、輸出無 actions/runs/100、零 run view 呼叫、含 'the run list could not be read when the dispatch went out'"
+    ok "10a. 稀疏窗（只有一筆別人的）：rc 3、零 run view"
 else
-    bad "10a. before 讀不到且窗只有 1 筆時 rc 不是 3、或認領了那筆、或 follow 了（got [$got]）"
+    bad "10a. 稀疏窗時認領了沒有證據的 run（got [$got_sparse]）"
 fi
-# 10b：before FAIL＋完整窗（多筆）→ 同樣 rc 3，且訊息與 10a 相同——證明
-#      判定來自分支（baseline 讀不到），不是來自「窗裡剛好有很多筆」。
-got="$(run_wf "$SANDBOX/mlp-lib.sh" "$(printf '%s\n%s' 'FAIL' '[{"databaseId":903},{"databaseId":902},{"databaseId":901},{"databaseId":900}]')" "$VIEW_OK")"
-if [[ "$got" == RC=3* ]] \
-&& printf '%s' "$got" | grep -qF 'the run list could not be read when the dispatch went out' \
-&& ! printf '%s' "$got" | grep -qF 'cannot tell which one is ours'; then
-    ok "10b. before 讀不到＋完整窗（4 筆）：rc 3、同一句 'the run list could not be read when the dispatch went out'、不含 'cannot tell which one is ours'"
+got_dense="$(run_wf "$LIB_COPY" "[$FOREIGN104,$FOREIGN103,$FOREIGN101,$FOREIGN100]" "$VIEW_OK")"
+if [[ "$got_dense" == RC=3* ]] \
+&& printf '%s' "$got_dense" | grep -qF 'no run carries this dispatch nonce' \
+&& ! grep -q '^run view ' "$SANDBOX/gh-argv.log" 2>/dev/null; then
+    ok "10b. 密集窗（四筆別人的）：同一種 rc 3、同一句訊息——判準與筆數無關"
 else
-    bad "10b. before 讀不到且窗有 4 筆時走了別條分支（got [$got]）"
+    bad "10b. 密集窗走了別條分支（got [$got_dense]）"
 fi
-# 10c（回歸）：before 成功但空（真的沒有任何 run）是合法 baseline →
-#      之後出現一筆新 run 就該認領它（不可把「空 baseline」誤當「讀不到」）。
-got="$(run_wf "$SANDBOX/mlp-lib.sh" "$(printf '%s\n%s' '[]' '[{"databaseId":700}]')" "$VIEW_OK")"
-if [[ "$got" == RC=0* ]] && printf '%s' "$got" | grep -qF 'actions/runs/700'; then
-    ok "10c. 空 baseline（rc 0、無內容）→ rc 0、輸出含 actions/runs/700"
+# 10c：窗裡只有我們自己的 run（帶 nonce）→ 認領它。翻轉自舊「空 baseline」
+# 案例：證據是 nonce，不是「窗裡只有一筆」。
+got="$(run_wf "$LIB_COPY" "[$OUR102_OK]" "$VIEW_OK")"
+if [[ "$got" == RC=0* ]] && printf '%s' "$got" | grep -qF 'actions/runs/102'; then
+    ok "10c. 窗裡只有我們那筆（帶 nonce）→ rc 0、認領 102"
 else
-    bad "10c. 空 baseline 時 rc 或認領 id 不符（got [$got]）"
+    bad "10c. 只有我們那筆時 rc 或認領 id 不符（got [$got]）"
 fi
 
-echo "=== 11. 跨輪詢 sequential race（已知限制，記錄用） ==="
-# 別人的第 1 輪出現、我們的第 2 輪才出現。在 1 筆窗之下，第 1 輪就會看到
-# 恰好一筆新 run 而認領它——即使 before 完全正常。**這條修不掉**（根因是
-# 沒有 nonce，屬於另一個決策）；斷言寫成「目前認錯，這是已知限制」，
-# 不寫成「應該要對」。若哪天加上 nonce 而修好了，這條會轉紅，提醒把它
-# 改成「應該要對」。
-got="$(run_wf "$SANDBOX/mlp-lib.sh" "$(printf '%s\n%s\n%s' '[]' '[{"databaseId":101}]' '[{"databaseId":102},{"databaseId":101}]')" "$VIEW_OK")"
-if [[ "$got" == RC=0* ]] \
-&& printf '%s' "$got" | grep -qF 'actions/runs/101' \
-&& ! printf '%s' "$got" | grep -qF 'actions/runs/102'; then
-    ok "11a. sequential race（第 1 輪 [101]、第 2 輪 [102,101]）：rc 0、輸出含 actions/runs/101、不含 actions/runs/102——已知限制"
+echo "=== 11. 跨輪詢 race（舊的已知限制，已修） ==="
+# 舊 11a 的斷言是「認錯 101，這是已知限制（根因：沒有 nonce）」，並註明
+# 「若哪天加上 nonce 而修好了，這條會轉紅，提醒把它改成應該要對」。
+# 就是現在：翻轉成「認對 102」。
+got="$(run_wf "$LIB_COPY" "$(printf '%s\n%s\n%s' '[]' "[$FOREIGN101]" "[$OUR102_FAIL,$FOREIGN101]")" "$VIEW_FAIL")"
+if [[ "$got" == RC=1* ]] \
+&& printf '%s' "$got" | grep -qF 'actions/runs/102' \
+&& ! grep -q '^run view 101 ' "$SANDBOX/gh-argv.log" 2>/dev/null; then
+    ok "11a. sequential race（第 1 輪只看到 101、第 2 輪才出現 102）：認 102（我們失敗→rc 1）、沒碰 101"
 else
-    if [[ "$got" == RC=3* ]] || printf '%s' "$got" | grep -qF 'actions/runs/102'; then
-        bad "11a. 認領的 id 變了（got [$got]）——若 nonce 已落地，請改寫這條斷言"
+    bad "11a. race 下認錯或沒認出（got [$got]）"
+fi
+# 舊 11b（兩筆同輪 → rc 3）翻轉：同輪也認得出（nonce 在標題裡）。
+got="$(run_wf "$LIB_COPY" "[$FOREIGN103,$OUR102_OK]" "$VIEW_OK")"
+if [[ "$got" == RC=0* ]] && printf '%s' "$got" | grep -qF 'actions/runs/102' \
+&& ! grep -q '^run view 103 ' "$SANDBOX/gh-argv.log" 2>/dev/null; then
+    ok "11b. 兩筆同輪出現：認 102（帶 nonce）、不碰 103"
+else
+    bad "11b. 兩筆同輪時認錯或沒認出（got [$got]）"
+fi
+
+echo "=== 12. nonce 取不到時：拒絕 dispatch（零次）、非 0、說出原因 ==="
+# 2026-09-27 review 實測的假綠：`refresh_new_nonce` 不存在 → nonce 空 →
+# 退路 `contains("")` 命中每一筆 → 認領別人的 run、回 0。這條把「沒有歸屬
+# 憑證就不得發動」釘住：**dispatch 之前**檢查，不成立就拒絕（rc 1）且
+# gh 一個字都沒送出去。
+#
+# 夾具：把 mlp 副本的 `refresh_new_nonce` 覆寫成回空字串（模擬函式壞掉／
+# 被改名／回空），掛在副本尾端（與注入 mutant 同一手法）。
+# 判準三件事：rc 非 0、stderr 說出原因（提到 nonce／refusing）、**零 dispatch**。
+# 「零 dispatch」由假 gh 的 argv log 驗——dispatch 若送出去，log 會有
+# `workflow run`。
+# 用 legacy 模式（stdout 不印 URL）＋一個「有 run 可被誤認」的列表：舊寫法
+# 在這裡會認領 101 並回 0（12 的注入就是重演這個）。
+mk_nonce_empty() {  # <dst>
+    { cat "$LIB_COPY"; printf '%s\n' 'refresh_new_nonce() { printf ""; }'; } > "$1"
+    bash -n "$1" 2>/dev/null
+}
+EMPTY_LIB="$TREE/ops-scripts/mlp-nonce-empty.sh"
+if mk_nonce_empty "$EMPTY_LIB"; then
+    : > "$SANDBOX/gh-argv.log"
+    got="$(run_wf "$EMPTY_LIB" "[$FOREIGN101,$FOREIGN100]" "$VIEW_OK")"
+    if [[ "$got" != RC=0* ]] \
+    && printf '%s' "$got" | grep -qiE 'nonce|refus' \
+    && ! grep -q '^workflow run' "$SANDBOX/gh-argv.log" 2>/dev/null; then
+        ok "12a. refresh_new_nonce 回空：拒絕 dispatch（rc ${got%% *}）、訊息說出原因、零次 workflow run"
     else
-        bad "11a. 行為變了但不預期（got [$got]）——harness 問題"
+        bad "12a. 空 nonce 時沒有拒絕（dispatch 送出了或訊息沒說原因；got [$got]；argv [$(head -1 "$SANDBOX/gh-argv.log" 2>/dev/null | head -c 120)]）"
     fi
-fi
-# 11b：同一 race 在窗內一次給兩筆（第 1 輪就同時看到）→ 正確地未知。
-#      對照 11a，說明差別只在「何時被看到」，不在「有沒有守衛」。
-got="$(run_wf "$SANDBOX/mlp-lib.sh" "$(printf '%s\n%s' '[]' '[{"databaseId":102},{"databaseId":101}]')" "$VIEW_OK")"
-if [[ "$got" == RC=3* ]] && printf '%s' "$got" | grep -qF 'cannot tell which one is ours'; then
-    ok "11b. 同一 race 兩筆同輪出現：rc 3、輸出含 cannot tell which one is ours"
+    # 12b：函式**不存在**（source 不到 refresh-wait.sh 的形狀）→ 同樣拒絕。
+    # 用 `unset -f`（副本尾端）模擬；bash -c 子程序每次重開，不會污染別的案例。
+    NOFN_LIB="$TREE/ops-scripts/mlp-nonce-nofn.sh"
+    { cat "$LIB_COPY"; printf '%s\n' 'unset -f refresh_new_nonce'; } > "$NOFN_LIB"
+    if bash -n "$NOFN_LIB" 2>/dev/null; then
+        : > "$SANDBOX/gh-argv.log"
+        got="$(run_wf "$NOFN_LIB" "[$FOREIGN101,$FOREIGN100]" "$VIEW_OK")"
+        if [[ "$got" != RC=0* ]] \
+        && printf '%s' "$got" | grep -qiE 'nonce|refus' \
+        && ! grep -q '^workflow run' "$SANDBOX/gh-argv.log" 2>/dev/null; then
+            ok "12b. refresh_new_nonce 不存在：同樣拒絕（rc ${got%% *}）、零次 workflow run"
+        else
+            bad "12b. 函式不存在時沒拒絕（got [$got]）"
+        fi
+    else
+        bad "12b. 夾具建不起來（語法錯）——harness 問題"
+    fi
+    # 12c：非空但**不符字元集**（例如挾帶 shell／jq 中繼字元）→ 一樣拒絕。
+    # 這一條守的是「不要拿一個會破壞 --jq 或 -f 的值去 dispatch」。
+    BADCH_LIB="$TREE/ops-scripts/mlp-nonce-badchars.sh"
+    { cat "$LIB_COPY"; printf '%s\n' 'refresh_new_nonce() { printf "abc\"; touch /tmp/pwned; echo \"x"; }'; } > "$BADCH_LIB"
+    if bash -n "$BADCH_LIB" 2>/dev/null; then
+        : > "$SANDBOX/gh-argv.log"
+        got="$(run_wf "$BADCH_LIB" "[$FOREIGN101,$FOREIGN100]" "$VIEW_OK")"
+        if [[ "$got" != RC=0* ]] && ! grep -q '^workflow run' "$SANDBOX/gh-argv.log" 2>/dev/null; then
+            ok "12c. nonce 挾帶中繼字元：拒絕（rc ${got%% *}）、零次 workflow run"
+        else
+            bad "12c. 不符字元集的 nonce 沒有被拒（got [$got]）"
+        fi
+    else
+        bad "12c. 夾具建不起來（語法錯）——harness 問題"
+    fi
 else
-    bad "11b. 兩筆同輪時 rc 或訊息不符（got [$got]）"
+    bad "12. 空 nonce 夾具建不起來（語法錯）——harness 問題"
 fi
-
 
 echo "=== 6-7. 注入：拿掉修正，斷言必須轉紅 ==="
-# 6. 收集退回「只看最新一筆」（--limit 1 的舊形狀）→ 2、3 必須紅，
-#    且紅在「它認領了」。needle 是新的兩行收集窗；mutant 改成拿最新一筆。
-python3 - "$REPO_ROOT/$MLP" "$SANDBOX/mutant-limit1.sh" <<'PY'
+# 6. 收集換成「不看 nonce、拿列表第一筆（最新）」→ 2a／3a 必須紅，且紅在
+#    「它認領了別人的」。needle 是新的 nonce 過濾；mutant 換成整表第一筆。
+python3 - "$REPO_ROOT/$MLP" "$TREE/ops-scripts/mutant-first-entry.sh" <<'PY'
 import sys
 src = open(sys.argv[1], encoding="utf-8").read()
-old = '''        new_ids="$(comm -13 <(printf '%s\\n' "$before" | sort) \\
-                            <(printf '%s\\n' "$after" | sort) | grep . || true)"'''
-new = '''        new_ids="$(printf '%s\\n' "$after" | head -n 1 | grep . || true)"'''
-assert src.count(old) == 1, "limit1 needle count != 1: %d" % src.count(old)
+old = """        row="$(gh run list --workflow="$wf" --repo "$REPO" --limit 50 \\
+            --json databaseId,status,displayTitle \\
+            --jq '[.[] | select((.displayTitle // "") | contains("'"${nonce}"'"))] | first // empty | "\\(.databaseId // 0)"' \\
+            2>/dev/null)\""""
+new = """        row="$(gh run list --workflow="$wf" --repo "$REPO" --limit 50 \\
+            --json databaseId,status,displayTitle \\
+            --jq 'first // empty | "\\(.databaseId // 0)"' \\
+            2>/dev/null)\""""
+assert src.count(old) == 1, "first-entry needle count != 1: %d" % src.count(old)
 open(sys.argv[2], "w", encoding="utf-8").write(src.replace(old, new, 1))
 PY
-if [[ $? -ne 0 ]] || ! bash -n "$SANDBOX/mutant-limit1.sh" 2>/dev/null; then
+if [[ $? -ne 0 ]] || ! bash -n "$TREE/ops-scripts/mutant-first-entry.sh" 2>/dev/null; then
     inj_bad "6. 注入失敗（needle 落空或語法錯）——harness 問題"
 else
-    got="$(run_wf "$SANDBOX/mutant-limit1.sh" "$(printf '%s\n%s' "$BEFORE" "$TWO_NEW")" "$VIEW_OK")"
-    # 釘死被認領的是 103（最新那筆）——只說「有認領」不夠精確。
+    got="$(run_wf "$TREE/ops-scripts/mutant-first-entry.sh" "$(printf '%s\n%s' "[$FOREIGN101,$FOREIGN100]" "[$FOREIGN103,$OUR102_OK,$FOREIGN101,$FOREIGN100]")" "$VIEW_OK")"
     if printf '%s' "$got" | grep -qF 'run finished' \
-    && printf '%s' "$got" | grep -qF 'actions/runs/103' \
-    && ! printf '%s' "$got" | grep -qF 'cannot tell which one is ours'; then
-        inj_ok "6a. 退回只看最新一筆後，它認領了 103 並跑完（got [$(printf '%s' "$got" | head -c 150)]）——2a 會紅"
+    && ! printf '%s' "$got" | grep -qF 'actions/runs/102'; then
+        inj_ok "6a. 換成拿列表第一筆後，它認領了別人的 ${got##*actions/runs/}並跑完（got [$(printf '%s' "$got" | head -c 150)]）——2a 會紅"
     else
-        inj_bad "6a. 退回只看最新一筆後 2a 仍綠或認領的不是 103（got [$got]）"
+        inj_bad "6a. 換成拿列表第一筆後 2a 仍綠或認領對了（got [$got]）"
     fi
-    # 6b：順序正確的案例（別人的先出）也要紅。
-    got="$(run_wf "$SANDBOX/mutant-limit1.sh" "$(printf '%s\n%s' "$BEFORE" "$OLDER")" "$VIEW_OK")"
-    if printf '%s' "$got" | grep -qF 'run finished' \
-    && printf '%s' "$got" | grep -qF 'actions/runs/104' \
-    && ! printf '%s' "$got" | grep -qF 'actions/runs/103'; then
-        inj_ok "6b. 退回只看最新一筆後，認領了 104（最新那筆；103 才是我們的）（got [$(printf '%s' "$got" | head -c 150)]）——3b 會紅"
+    # 6b：我們的在較舊位置時也要紅（拿最新的形狀）。
+    got="$(run_wf "$TREE/ops-scripts/mutant-first-entry.sh" "$(printf '%s\n%s' "[$FOREIGN104,$FOREIGN103]" "[$FOREIGN104,$FOREIGN103,$OUR102_OK,$FOREIGN101,$FOREIGN100]")" "$VIEW_OK")"
+    if printf '%s' "$got" | grep -qF 'actions/runs/104' \
+    && printf '%s' "$got" | grep -qF 'run finished' \
+    && ! printf '%s' "$got" | grep -qF 'actions/runs/102'; then
+        inj_ok "6b. 拿列表第一筆後認領了 104（102 才是我們的）（got [$(printf '%s' "$got" | head -c 150)]）——3b 會紅"
     else
-        inj_bad "6b. 退回只看最新一筆後 3b 仍綠或認領的不是 104（got [$got]）"
+        inj_bad "6b. 換成拿列表第一筆後 3b 仍綠（got [$got]）"
     fi
 fi
-# 7. 把「未知」折疊成「失敗」→ 三態那條必須紅（3 變 1）。needle 是
-#    未知分支的 `return 3`。
-python3 - "$REPO_ROOT/$MLP" "$SANDBOX/mutant-fold-fail.sh" <<'PY'
+# 7. 把「未知」折疊成「失敗」→ 三態那條必須紅（3 變 1）。needle 是未知
+#    分支收尾的那個 `return 3`（在「could not identify」訊息之後）。
+python3 - "$REPO_ROOT/$MLP" "$TREE/ops-scripts/mutant-fold-fail.sh" <<'PY'
 import sys
 src = open(sys.argv[1], encoding="utf-8").read()
-# 只改 wf_dispatch 歧義分支的那個 return 3（檔內第一個恰好是這一個？
-# 不——先定位到歧義訊息，再改它後面的 return 3）。
-# 定位到 ambiguous 分支的收尾句（impl 的措辭可能微調；取該分支的
-# return 3 即可）。退而求其次：找「cannot tell which one is ours」之後。
-marker = "look yourself before doing anything else"
-i = src.index("cannot tell which one is ours")
-_ = src.index(marker, i) if marker in src[i:] else i
-j = src.index("return 3", i)
-assert src[j - 8:j + 8] == "        return 3", repr(src[j - 8:j + 8])
-src = src[:j] + "return 1" + src[j + 8:]
+marker = 'echo "  the dispatch went out — look yourself before doing anything else"\n        return 3'
+j = src.index(marker)
+k = src.index("return 3", j)
+src = src[:k] + "return 1" + src[k + len("return 3"):]
 open(sys.argv[2], "w", encoding="utf-8").write(src)
 PY
-if [[ $? -ne 0 ]] || ! bash -n "$SANDBOX/mutant-fold-fail.sh" 2>/dev/null; then
+if [[ $? -ne 0 ]] || ! bash -n "$TREE/ops-scripts/mutant-fold-fail.sh" 2>/dev/null; then
     inj_bad "7. 注入失敗（needle 落空或語法錯）——harness 問題"
 else
-    got="$(run_wf "$SANDBOX/mutant-fold-fail.sh" "$(printf '%s\n%s' "$BEFORE" "$TWO_NEW")" "$VIEW_OK")"
+    got="$(run_wf "$TREE/ops-scripts/mutant-fold-fail.sh" "$(printf '%s\n%s' "[$FOREIGN101,$FOREIGN100]" "[$FOREIGN101,$FOREIGN100]")" "$VIEW_OK")"
     if [[ "$got" == RC=3* ]]; then
         inj_bad "7. 折疊成失敗後仍回 3——注入沒生效（got [$got]）"
     else
@@ -426,19 +573,22 @@ echo "=== 8. 呼叫端：未知不可以被折成成功或失敗（rotate 的半
 # 真正的風險路徑不在 wf_dispatch 本身，在它的破壞性呼叫端：rotate 其實
 # 成功了卻被報成失敗 → 人半夜看到紅字重跑一次 rotate。所以釘 cmd_rotate：
 # 未知時 rc 必須仍是 3（不是 0、不是 1），且輸出要說「可能已經換掉 Gateway」。
-# 需要 resolve_gateway 的夾具（只走 --real 分支才用得到）。
+# 夾具換成新契約（legacy＋nonce），判準與舊版一字不差。
 cat > "$SHIMS/ssh" <<'FAKE'
 #!/usr/bin/env bash
 exit 0
 FAKE
 chmod +x "$SHIMS/ssh"
 
-# run_cmd_rotate <mlp-lib-path> <lists> <view> <confirm-text>：
+# run_cmd_rotate <mlp-lib-path> <lists> <view> <confirm-text> [mode]：
 # 跑 `cmd_rotate --real`，確認字串從 stdin 餵入；印 rc 與輸出。
 run_cmd_rotate() {
-    local lib="$1" lists="$2" view="$3" confirm_text="$4"
+    local lib="$1" lists="$2" view="$3" confirm_text="$4" mode="${5:-legacy}"
     printf '%s\n' "$lists" > "$STATE/lists"
     printf '%s' "$view" > "$STATE/view"
+    printf '%s' "$mode" > "$STATE/mode"
+    rm -f "$STATE/nonce"
+    printf '102' > "$STATE/ourid"
     : > "$STATE/list.idx"
     : > "$SANDBOX/gh-argv.log"
     LIB="$lib" FAKE_STATE="$STATE" GH_LOG="$SANDBOX/gh-argv.log" \
@@ -470,7 +620,8 @@ exit 0
 FAKE
 chmod +x "$SANDBOX/fake-pool-resolve"
 
-got="$(run_cmd_rotate "$SANDBOX/mlp-lib.sh" "$(printf '%s\n%s' "$BEFORE" "$TWO_NEW")" "$VIEW_OK" "9.9.9.9")"
+# 8a：未知（沒有我們的 nonce）→ rc 3、警告『可能已換掉』＋仍提示 trust-gateway。
+got="$(run_cmd_rotate "$LIB_COPY" "[$FOREIGN101,$FOREIGN100]" "$VIEW_OK" "9.9.9.9")"
 if [[ "$got" == RC=3* ]] \
 && printf '%s' "$got" | grep -qF 'could not be identified' \
 && printf '%s' "$got" | grep -qF 'may have replaced the live Gateway' \
@@ -479,15 +630,17 @@ if [[ "$got" == RC=3* ]] \
 else
     bad "8a. cmd_rotate 把未知折疊了或不說明後果（got [$got]）"
 fi
-# 8b：明確失敗（零筆逾時）→ rc 1，且**不**提示 trust-gateway（沒換機）。
-got="$(run_cmd_rotate "$SANDBOX/mlp-lib.sh" "$(printf '%s\n%s' "$BEFORE" "$NO_NEW")" "$VIEW_OK" "9.9.9.9")"
+# 8b：明確失敗（認到我們那筆、結論 failure）→ rc 1，且**不**提示 trust-gateway。
+#     舊版靠 NO_NEW 夾具得到 rc 1；現在 rc 1 的來源是「我們那次失敗」，夾具
+#     換成帶 nonce 的失敗 run。
+got="$(run_cmd_rotate "$LIB_COPY" "[$OUR102_FAIL,$FOREIGN101,$FOREIGN100]" "$VIEW_FAIL" "9.9.9.9")"
 if [[ "$got" == RC=1* ]] && ! printf '%s' "$got" | grep -qF 'trust-gateway'; then
     ok "8b. cmd_rotate 明確失敗：rc 1、不提示 trust-gateway（沒有換機）"
 else
     bad "8b. 明確失敗的處理不對（got [$got]）"
 fi
-# 8c：成功 → rc 0，提示 trust-gateway（回歸保護）。
-got="$(run_cmd_rotate "$SANDBOX/mlp-lib.sh" "$(printf '%s\n%s' "$BEFORE" "$ONE_NEW")" "$VIEW_OK" "9.9.9.9")"
+# 8c：成功（認到我們那筆、結論 success）→ rc 0，提示 trust-gateway。
+got="$(run_cmd_rotate "$LIB_COPY" "[$OUR102_OK,$FOREIGN101,$FOREIGN100]" "$VIEW_OK" "9.9.9.9")"
 if [[ "$got" == RC=0* ]] && printf '%s' "$got" | grep -qF 'trust-gateway'; then
     ok "8c. cmd_rotate 成功：rc 0、提示 trust-gateway（與從前一樣）"
 else
@@ -495,8 +648,9 @@ else
 fi
 
 # 8. 把呼叫端的「未知」折疊成失敗（`|| return 1` 的舊形狀）→ 8a 必須紅。
-#    這正是「rotate 其實成功卻報成失敗、人半夜重跑」的形狀。
-python3 - "$REPO_ROOT/$MLP" "$SANDBOX/mutant-caller-fold.sh" <<'PY'
+#    這正是「rotate 其實成功卻報成失敗、人半夜重跑」的形狀。cmd_rotate 的
+#    原文沒動，needle 與舊版一字不差。
+python3 - "$REPO_ROOT/$MLP" "$TREE/ops-scripts/mutant-caller-fold.sh" <<'PY'
 import sys
 src = open(sys.argv[1], encoding="utf-8").read()
 old = "\n".join([
@@ -523,10 +677,10 @@ new = "\n".join([
 assert src.count(old) == 1, "caller-fold needle count != 1: %d" % src.count(old)
 open(sys.argv[2], "w", encoding="utf-8").write(src.replace(old, new, 1))
 PY
-if [[ $? -ne 0 ]] || ! bash -n "$SANDBOX/mutant-caller-fold.sh" 2>/dev/null; then
+if [[ $? -ne 0 ]] || ! bash -n "$TREE/ops-scripts/mutant-caller-fold.sh" 2>/dev/null; then
     inj_bad "8. 注入失敗（needle 落空或語法錯）——harness 問題"
 else
-    got="$(run_cmd_rotate "$SANDBOX/mutant-caller-fold.sh" "$(printf '%s\n%s' "$BEFORE" "$TWO_NEW")" "$VIEW_OK" "9.9.9.9")"
+    got="$(run_cmd_rotate "$TREE/ops-scripts/mutant-caller-fold.sh" "[$FOREIGN101,$FOREIGN100]" "$VIEW_OK" "9.9.9.9")"
     if [[ "$got" == RC=3* ]]; then
         inj_bad "8. 呼叫端折疊後仍回 3——注入沒生效（got [$got]）"
     else
@@ -538,82 +692,86 @@ else
     fi
 fi
 
-# 9. 把「輪詢讀取失敗」記成成功讀取（last_read_ok 恆 1）→ 9a/9b 必須紅：
-#    讀不到被折成「確定沒有」，回 rc 1。
-python3 - "$REPO_ROOT/$MLP" "$SANDBOX/mutant-readok.sh" <<'PY'
+# 9. 把「讀取失敗」記成成功讀取 → 9a 的訊息必須紅（兩種未知被混成一句）。
+#    needle 是輪詢裡判斷讀取失敗的 if 行；mutant 讓它永遠不成立。
+python3 - "$REPO_ROOT/$MLP" "$TREE/ops-scripts/mutant-readok.sh" <<'PY'
 import sys
 src = open(sys.argv[1], encoding="utf-8").read()
-old = """        if [[ $? -ne 0 ]]; then
-            # A failed read observed nothing, so it must not enter the
-            # difference: an empty "after" would otherwise make every entry
-            # of the baseline look new (or, in a one-entry baseline, look
-            # like one new run). Record that the latest observation is
-            # dark and keep waiting.
-            last_read_ok=0
-            printf '.'
-            continue
-        fi
-        last_read_ok=1"""
-new = """        last_read_ok=1"""
+old = "        if [[ $? -ne 0 ]]; then"
 assert src.count(old) == 1, "readok needle count != 1: %d" % src.count(old)
-open(sys.argv[2], "w", encoding="utf-8").write(src.replace(old, new, 1))
+src = src.replace(old, "        if false; then", 1)
+open(sys.argv[2], "w", encoding="utf-8").write(src)
 PY
-if [[ $? -ne 0 ]] || ! bash -n "$SANDBOX/mutant-readok.sh" 2>/dev/null; then
+if [[ $? -ne 0 ]] || ! bash -n "$TREE/ops-scripts/mutant-readok.sh" 2>/dev/null; then
     inj_bad "9. 注入失敗（needle 落空或語法錯）——harness 問題"
 else
-    # 9a 夾具：before 有內容、after 全 FAIL。折疊後：after 空字串 → 差集
-    # 為空 → count 0 → 20 輪迴圈 → last read「看似成功」→ never appeared rc 1。
-    got="$(run_wf "$SANDBOX/mutant-readok.sh" "$(printf '%s\n%s' '[{"databaseId":101},{"databaseId":100}]' 'FAIL')" "$VIEW_OK")"
-    if [[ "$got" == RC=3* ]]; then
-        inj_bad "9. 讀取失敗被記成成功後仍回 3——注入沒生效（got [$got]）"
+    got="$(run_wf "$TREE/ops-scripts/mutant-readok.sh" "$(printf '%s\n%s' "[$FOREIGN101]" 'FAIL')" "$VIEW_OK")"
+    if [[ "$got" == RC=3* ]] && printf '%s' "$got" | grep -qF 'could not be read at any point'; then
+        inj_bad "9. 讀取失敗被記成成功後仍說『讀不到』——注入沒生效（got [$got]）"
     else
-        if [[ "$got" == RC=1* ]] && printf '%s' "$got" | grep -qF 'never appeared'; then
-            inj_ok "9. 讀不到被折成『確定沒有』（rc 3→1、never appeared；got [$(printf '%s' "$got" | head -c 130)]）——9a/9b 會紅"
+        if [[ "$got" == RC=3* ]] && printf '%s' "$got" | grep -qF 'no run carries this dispatch nonce'; then
+            inj_ok "9. 讀取失敗被折成『讀到了、只是沒 nonce』（訊息變了；got [$(printf '%s' "$got" | head -c 130)]）——9a 會紅"
         else
             inj_bad "9. 行為變了但不是預期的折疊（got [$got]）——harness 問題"
         fi
     fi
 fi
-# 10. 拿掉 baseline 讀取守衛（把「讀不到」當成空 baseline）→ 10a 必須紅：
-#     稀疏窗下認領一筆從未 dispatch 的 run。
-python3 - "$REPO_ROOT/$MLP" "$SANDBOX/mutant-nobaseline.sh" <<'PY'
+# 10. 空 nonce（contains("") 命中每一筆）→ 2a／3a 必須紅：它會認領列表
+#     第一筆（別人的）。needle 是 nonce 內插那一小段。
+python3 - "$REPO_ROOT/$MLP" "$TREE/ops-scripts/mutant-empty-nonce.sh" <<'PY'
 import sys
 src = open(sys.argv[1], encoding="utf-8").read()
-old = """    before_rc=$?
-    # A baseline that could not be read is not an empty baseline. Diffing
-    # against "" calls every visible run "new" — which is only accidentally
-    # safe while the window happens to hold several runs; with a sparse
-    # window it "singles out" a run we never dispatched (qa 2026-09-25).
-    # Empty output WITH rc 0 is a real baseline (the workflow has no runs
-    # yet), and must not be confused with this case.
-    [[ "$before_rc" -eq 0 ]] || baseline_ok=0"""
-new = """    before_rc=$?
-    : "$before_rc\""""
-assert src.count(old) == 1, "nobaseline needle count != 1: %d" % src.count(old)
-open(sys.argv[2], "w", encoding="utf-8").write(src.replace(old, new, 1))
+old = """contains("'"${nonce}"'")"""
+assert src.count(old) == 1, "empty-nonce needle count != 1: %d" % src.count(old)
+# 換成空字串：contains("") 對每個標題都真 → 永遠命中第一筆。
+src = src.replace(old, 'contains("")', 1)
+open(sys.argv[2], "w", encoding="utf-8").write(src)
 PY
-if [[ $? -ne 0 ]] || ! bash -n "$SANDBOX/mutant-nobaseline.sh" 2>/dev/null; then
+if [[ $? -ne 0 ]] || ! bash -n "$TREE/ops-scripts/mutant-empty-nonce.sh" 2>/dev/null; then
     inj_bad "10. 注入失敗（needle 落空或語法錯）——harness 問題"
 else
-    # 10a 夾具：before FAIL、稀疏窗 1 筆。拿掉守衛後 before="" → 100 看似新
-    # → 認領 100（rc 0、錯 id）。
-    got="$(run_wf "$SANDBOX/mutant-nobaseline.sh" "$(printf '%s\n%s' 'FAIL' '[{"databaseId":100}]')" "$VIEW_OK")"
-    if [[ "$got" == RC=3* ]]; then
-        inj_bad "10. 拿掉 baseline 守衛後仍回 3——注入沒生效（got [$got]）"
+    got="$(run_wf "$TREE/ops-scripts/mutant-empty-nonce.sh" "$(printf '%s\n%s' "[$FOREIGN101,$FOREIGN100]" "[$FOREIGN103,$OUR102_OK,$FOREIGN101,$FOREIGN100]")" "$VIEW_OK")"
+    if printf '%s' "$got" | grep -qF 'run finished' \
+    && ! printf '%s' "$got" | grep -qF 'actions/runs/102'; then
+        inj_ok "10a. 空 nonce 命中每一筆、認領了別人的（非 102；got [$(printf '%s' "$got" | head -c 150)]）——2a 會紅"
     else
-        if [[ "$got" == RC=0* ]] && printf '%s' "$got" | grep -qF 'actions/runs/100'; then
-            inj_ok "10. before 讀不到被當空 baseline，稀疏窗下認領了從未 dispatch 的 100（got [$(printf '%s' "$got" | head -c 130)]）——10a 會紅"
-        else
-            inj_bad "10. 行為變了但不是預期的誤認（got [$got]）——harness 問題"
-        fi
+        inj_bad "10a. 空 nonce 後 2a 仍綠或認領對了（got [$got]）"
     fi
-    # 10b 對照：完整窗下同一注入走 ambiguous（意外的安全）——證明 10b 的
-    # 訊息「判準是讀不到，不是筆數」是對的觀測。
-    got="$(run_wf "$SANDBOX/mutant-nobaseline.sh" "$(printf '%s\n%s' 'FAIL' '[{"databaseId":903},{"databaseId":902},{"databaseId":901},{"databaseId":900}]')" "$VIEW_OK")"
-    if [[ "$got" == RC=3* ]] && printf '%s' "$got" | grep -qF 'cannot tell which one is ours'; then
-        inj_ok "10b. 同一注入在完整窗下靠『筆數多』僥倖回 3（got [$(printf '%s' "$got" | head -c 110)]）——證明完整窗的安全是意外的"
+    got="$(run_wf "$TREE/ops-scripts/mutant-empty-nonce.sh" "$(printf '%s\n%s' "[$FOREIGN104,$FOREIGN103]" "[$FOREIGN104,$FOREIGN103,$OUR102_OK,$FOREIGN101,$FOREIGN100]")" "$VIEW_OK")"
+    if printf '%s' "$got" | grep -qF 'run finished' \
+    && ! printf '%s' "$got" | grep -qF 'actions/runs/102'; then
+        inj_ok "10b. 空 nonce 後認領了別人的（非 102；got [$(printf '%s' "$got" | head -c 150)]）——3b 會紅"
     else
-        inj_bad "10b. 完整窗未展現預期的僥倖路徑（got [$got]）——harness 問題"
+        inj_bad "10b. 空 nonce 後 3b 仍綠或認領對了（got [$got]）"
+    fi
+fi
+# 11（空 nonce 護欄的注入）：把「dispatch 前的 nonce 檢查」拿掉，再讓
+#    refresh_new_nonce 回空 → **12a 必須紅**。這是 review 實測的假綠重演：
+#    沒有護欄時，空 nonce 會被拿去 dispatch，退路 `contains("")` 命中每一筆，
+#    認領別人的 run 並回 0。needle 是護欄的 if 條件整行。
+python3 - "$REPO_ROOT/$MLP" "$TREE/ops-scripts/mutant-no-guard.sh" <<'PY'
+import sys
+src = open(sys.argv[1], encoding="utf-8").read()
+old = """    if [[ -z "$nonce" || ! "$nonce" =~ ^[0-9a-f-]+$ || "${#nonce}" -lt 12 ]]; then"""
+assert src.count(old) == 1, "no-guard needle count != 1: %d" % src.count(old)
+# 條件反轉成「永不成立」＝護欄不在，但保留 return 那幾行的語法形狀。
+src = src.replace(old, """    if false; then""", 1)
+open(sys.argv[2], "w", encoding="utf-8").write(src)
+PY
+if [[ $? -ne 0 ]] || ! bash -n "$TREE/ops-scripts/mutant-no-guard.sh" 2>/dev/null; then
+    inj_bad "11. 注入失敗（needle 落空或語法錯）——harness 問題"
+else
+    # 把 mutant 的 refresh_new_nonce 再覆寫成回空（與 12a 同一夾具）。
+    NOGUARD_EMPTY="$TREE/ops-scripts/mutant-no-guard-empty.sh"
+    { cat "$TREE/ops-scripts/mutant-no-guard.sh"; printf '%s\n' 'refresh_new_nonce() { printf ""; }'; } > "$NOGUARD_EMPTY"
+    : > "$SANDBOX/gh-argv.log"
+    got="$(run_wf "$NOGUARD_EMPTY" "[$FOREIGN101,$FOREIGN100]" "$VIEW_OK")"
+    if [[ "$got" == RC=0* ]] \
+    && grep -q '^workflow run' "$SANDBOX/gh-argv.log" 2>/dev/null \
+    && printf '%s' "$got" | grep -qF 'run finished'; then
+        inj_ok "11. 拿掉護欄＋空 nonce：dispatch 出去了（空 nonce 照送）、認領了別人的 run 並回 ${got%% *}（got [$(printf '%s' "$got" | head -c 150)]）——12a 會紅（重演 review 的假綠）"
+    else
+        inj_bad "11. 拿掉護欄後 12a 仍綠（got [$got]；argv [$(head -1 "$SANDBOX/gh-argv.log" 2>/dev/null | head -c 120)]）——守衛沒在守這個"
     fi
 fi
 

@@ -71,6 +71,12 @@ REPO="${POOL_REPO:-FATESAIKOU/MyLinuxPool}"
 
 # shellcheck source=../scripts/lib/ssh.sh
 source "${REPO_ROOT}/scripts/lib/ssh.sh"
+# wf_dispatch (below) needs refresh_new_nonce so that every caller of every
+# workflow in this repo mints its correlation token the same way. Reusing
+# the one implementation beats copying it: a second copy would drift, and
+# "unpredictable nonce" is a property, not a snippet.
+# shellcheck source=../scripts/lib/refresh-wait.sh
+source "${REPO_ROOT}/scripts/lib/refresh-wait.sh"
 
 MLP_STATE_DIR="${HOME}/.mylinuxpool"
 GW_KNOWN_HOSTS="${MLP_STATE_DIR}/known_hosts"
@@ -1310,140 +1316,175 @@ cmd_status() {
 # stays local.
 
 # wf_dispatch <workflow-file> <label> [-f k=v ...]
-#   Dispatches a run and, when a run can be singled out, follows it. The
-#   dispatch API returns nothing tying the request to the run it creates,
-#   so ownership is *inferred* from a before/after view of this workflow's
-#   visible run window. The return codes say how far that inference got —
-#   not what the run did:
-#     0  exactly one new run appeared in the window, and it finished
-#        successfully
-#     1  the dispatch request failed; or the run that was singled out
-#        finished non-successfully; or the wait ended with a successful
-#        read of the window showing no new run
-#     3  the dispatch request was accepted, but no run could be singled out
-#        — more than one new run appeared, the baseline could not be read,
-#        or the window could not be observed at the end
-#   "Exactly one new run" is necessary but NOT sufficient for that run to
-#   be the one we dispatched: someone else's run can land in the window
-#   while ours has not appeared yet (or arrives across two polls), and the
-#   difference is then one run that is not ours. rc 0 must be read as "one
-#   new run appeared and finished successfully", never as "our run
-#   succeeded"; rc 3 must never be folded into 0 or 1 — telling them apart
-#   is the whole reason the third answer exists. Real attribution needs a
-#   run-name/nonce on the workflow side; that is a separate decision.
+#   Dispatches a run, learns WHICH run it created, and follows that one.
+#
+#   How ownership is established (2026-09-27, D2b route C):
+#     1. PRIMARY — gh >= 2.87 sends `return_run_details: true` on a
+#        workflow_dispatch, and on a non-TTY stdout prints one line:
+#        https://github.com/<owner>/<repo>/actions/runs/<id>. That id is
+#        the run the API just created for THIS call — direct evidence, no
+#        window, no guessing. Verified on real gh v2.101.0 (OUT-d2a-live.md).
+#        Older gh, or a 204 answer for any reason (the CLI's own comment:
+#        "old GHE versions still return 204. Even on github.com, we may
+#        still get 204 for any reason"), prints nothing — fall to 2.
+#     2. FALLBACK — an unpredictable nonce (refresh_new_nonce: 16 hex from
+#        /dev/urandom, or a dashed decimal fallback where urandom is
+#        unreadable) is passed as the optional `nonce` input every
+#        dispatchable workflow now declares, and the workflow's `run-name`
+#        interpolates it into displayTitle. Poll the run list for the entry
+#        whose displayTitle contains THAT nonce. The nonce is checked and
+#        the dispatch refused if it is empty or malformed — a token-less
+#        dispatch cannot be attributed at all, and the fallback would then
+#        match every title.
+#     3. NEITHER — rc 3, unknown, and no run is followed. Deliberately NOT
+#        a third fallback to the old before/after difference: that is the
+#        defect this replaced. "Exactly one new run appeared" was always
+#        necessary-and-not-sufficient; a window holding exactly one fresh
+#        run has no evidence of ownership, and the D2b decision (PM,
+#        2026-09-27) is that we do not follow it (see test 3b of
+#        test-wf-dispatch-own-run.sh).
+#   The return codes still say how far the claim got, not what the run did:
+#     0  our run finished successfully
+#     1  the dispatch request failed, our run finished non-successfully, or
+#        the dispatch was refused before it happened (no usable nonce — see
+#        the guard in the function body; nothing was sent)
+#     3  no run could be shown to be ours — the dispatch request was
+#        accepted, but neither channel named a run we can call ours
+#   rc 3 must never be folded into 0 or 1 — telling them apart is the whole
+#   reason the third answer exists (a destructive rotate reported as "1"
+#   invites a hasty re-run of something that may be replacing the live
+#   Gateway right now).
+#
+#   Why refresh follows the nonce and the other three follow the run id:
+#   this function's callers are interactive (a human ran mlp), so the gh
+#   process that prints the URL is right here. dispatch_refresh_and_wait
+#   (scripts/lib/refresh-wait.sh) also runs inside Actions and on provider
+#   machines, where gh may predate 2.87 — there the nonce is the reliable
+#   channel. Both mechanisms ship in every dispatchable workflow, so each
+#   caller can lead with the one its environment can trust; keeping both
+#   also means a gh regression on either side degrades to rc 3, not to a
+#   wrong answer.
 wf_dispatch() {
     local wf="$1" label="$2"; shift 2
-    local before after run_id i new_ids count ambiguous=0 rid
-    local before_rc baseline_ok=1 last_read_ok=0
+    local nonce out run_id i read_ok row title
 
-    # The dispatch API returns nothing identifying the run it creates, so
-    # the run has to be found by difference: what existed before vs after.
-    # A single "newest id" cannot express that difference. Someone else's
-    # run may land first, or land inside the same poll interval — then
-    # --limit 1 shows only the newest of the two, and the old code claimed
-    # it either way, silently. Snapshot the whole visible window instead,
-    # and refuse to guess when the window shows more than one new run.
-    # Residual: a window holding exactly ONE new run still cannot be
-    # checked — it may be someone else's. Clearing that needs a
-    # run-name/nonce on the workflow side, which is a separate decision.
-    before="$(gh run list --workflow="$wf" --repo "$REPO" --limit 30 \
-                --json databaseId --jq '.[].databaseId' 2>/dev/null)"
-    before_rc=$?
-    # A baseline that could not be read is not an empty baseline. Diffing
-    # against "" calls every visible run "new" — which is only accidentally
-    # safe while the window happens to hold several runs; with a sparse
-    # window it "singles out" a run we never dispatched (qa 2026-09-25).
-    # Empty output WITH rc 0 is a real baseline (the workflow has no runs
-    # yet), and must not be confused with this case.
-    [[ "$before_rc" -eq 0 ]] || baseline_ok=0
-
-    gh workflow run "$wf" --repo "$REPO" "$@" >/dev/null 2>&1 \
-        || die "could not dispatch ${wf} (is gh authenticated for ${REPO}?)"
-
-    printf '%s%s%s dispatched, waiting for the run to appear' "$C_BOLD" "$label" "$C_RESET"
-
-    if [[ "$baseline_ok" -eq 0 ]]; then
-        echo ""
-        # No baseline means no difference can be computed, ever — polling
-        # would not add information. The dispatch request was accepted, so
-        # this is the unknown answer, not a failure: saying rc 1 here would
-        # invite a re-run of something that may be under way.
-        printf '%sthe run list could not be read when the dispatch went out — there is nothing to compare against, so this run cannot be singled out%s\n' \
-            "$C_YELLOW" "$C_RESET"
-        echo "  check the latest runs yourself: https://github.com/${REPO}/actions"
-        echo "  the dispatch went out — look yourself before doing anything else"
-        return 3
+    # The attribution token is checked BEFORE the dispatch, and a missing one
+    # refuses the dispatch outright. Why fail here rather than dispatch and
+    # report unknown later: without a token there is no way to show which run
+    # is ours, and the fallback would then match EVERY title — `contains("")`
+    # is true for any string — so it would claim the first run in the window
+    # and report ITS conclusion (the 2026-09-27 review reproduced exactly this:
+    # a foreign run's success printed as ours, rc 0). The token is a
+    # PRECONDITION of a safe dispatch, so the check belongs before it; a
+    # dispatch that goes out without one has already lost the information the
+    # caller needs.
+    #
+    # rc 1, not 3: this is a definite refusal, not an unknown outcome. Nothing
+    # was dispatched, nothing can be under way, and a re-run after fixing the
+    # cause is safe — "I did not do it, here is why" is the failure answer, not
+    # the third one it would be if a run might be in flight.
+    nonce="$(refresh_new_nonce)"
+    # Accepted shapes: 16 hex (the urandom path) or the dashed
+    # timestamp-pid-RANDOM fallback — both are [0-9a-f-] and well over 12
+    # chars. Anything else (empty, a broken/renamed function, a value with
+    # shell or jq metacharacters) is refused. Length matters as well as
+    # charset: an empty value is the failure mode this guard exists for, and
+    # a stub returning one or two characters could collide with a real title.
+    if [[ -z "$nonce" || ! "$nonce" =~ ^[0-9a-f-]+$ || "${#nonce}" -lt 12 ]]; then
+        # Two lines, both on stderr, matching this file's own `mlp: ` prefix
+        # convention. rc 1 below (a definite refusal, not the rc 3 unknown):
+        # nothing was dispatched, nothing can be under way, and re-running
+        # after fixing the cause is safe.
+        echo "mlp: no usable attribution nonce (refresh_new_nonce returned '${nonce}') — refusing to dispatch ${wf}" >&2
+        echo "mlp: without a token the run cannot be identified, and the fallback would match every run; nothing was dispatched" >&2
+        return 1
     fi
 
+    out="$(gh workflow run "$wf" --repo "$REPO" -f nonce="$nonce" "$@" 2>/dev/null)" \
+        || die "could not dispatch ${wf} (is gh authenticated for ${REPO}?)"
+
+    printf '%s%s%s dispatched' "$C_BOLD" "$label" "$C_RESET"
+
+    # Channel 1: the URL gh prints is the run API just created FOR THIS CALL.
+    # Accept only a line that is exactly the run URL — gh also prints other
+    # prose in some versions, and a loose match could pick up an unrelated
+    # number. The pattern allows any scheme/host/path shape (GHES), not
+    # just github.com.
+    run_id="$(printf '%s\n' "$out" | sed -n \
+        's#^[a-zA-Z][a-zA-Z0-9+.-]*://[^/[:space:]]*/[^/[:space:]]*/[^/[:space:]]*/actions/runs/\([0-9][0-9]*\)$#\1#p' \
+        | head -n 1)"
+    if [[ -n "$run_id" ]]; then
+        echo ", run ${run_id}"
+        echo ""
+        echo "  https://github.com/${REPO}/actions/runs/${run_id}"
+        echo ""
+        wf_follow "$run_id"
+        return $?
+    fi
+
+    # Channel 2: no URL was reported, so ask the run list which run carries
+    # our nonce (the workflows' run-name interpolates it into displayTitle).
+    printf ' (no run id reported — looking for our nonce in the run list)'
     run_id=""
+    read_ok=0
     for i in $(seq 1 20); do
         sleep 3
-        after="$(gh run list --workflow="$wf" --repo "$REPO" --limit 30 \
-                   --json databaseId --jq '.[].databaseId' 2>/dev/null)"
+        # Read the whole window in one call and pick our title locally in
+        # gh's --jq (gojq on real gh, jq in the offline fakes — contains()
+        # and // exist in both). The nonce was minted by us and its charset
+        # is [0-9a-f-], so interpolating it into that double-quoted jq
+        # string cannot break out of it; a caller-supplied value must never
+        # be passed here.
+        row="$(gh run list --workflow="$wf" --repo "$REPO" --limit 50 \
+            --json databaseId,status,displayTitle \
+            --jq '[.[] | select((.displayTitle // "") | contains("'"${nonce}"'"))] | first // empty | "\(.databaseId // 0)"' \
+            2>/dev/null)"
         if [[ $? -ne 0 ]]; then
-            # A failed read observed nothing, so it must not enter the
-            # difference: an empty "after" would otherwise make every entry
-            # of the baseline look new (or, in a one-entry baseline, look
-            # like one new run). Record that the latest observation is
-            # dark and keep waiting.
-            last_read_ok=0
+            # A failed read observed nothing and must not be read into the
+            # answer: keep waiting rather than concluding "not there". How
+            # many reads actually succeeded is remembered for the closing
+            # message: "we never managed to look" and "we looked and the
+            # nonce was not there" are different unknowns for the operator.
             printf '.'
             continue
         fi
-        last_read_ok=1
-        new_ids="$(comm -13 <(printf '%s\n' "$before" | sort) \
-                            <(printf '%s\n' "$after" | sort) | grep . || true)"
-        count="$(printf '%s\n' "$new_ids" | grep -c . || true)"
-        case "$count" in ''|*[!0-9]*) count=0 ;; esac
-        if [[ "$count" -eq 1 ]]; then
-            run_id="$(printf '%s\n' "$new_ids" | head -n 1)"
-            break
-        fi
-        if [[ "$count" -gt 1 ]]; then
-            ambiguous=1
+        read_ok=$((read_ok + 1))
+        if [[ -n "$row" ]]; then
+            run_id="$row"
             break
         fi
         printf '.'
     done
     echo ""
 
-    if [[ "$ambiguous" -eq 1 ]]; then
-        # More than one new run appeared, so at most one of them could be
-        # the dispatched one — and there is no way to tell which. Do not
-        # pick one and do not follow it. For a destructive rotate this
-        # distinction is the whole point: reporting this as "failed"
-        # invites a hasty re-run of something that may be replacing the
-        # live Gateway right now, and reporting it as "succeeded" would be
-        # a guess. rc 3 is the third answer, and the caller must keep it.
-        printf '%smore than one new run appeared — cannot tell which one is ours, or whether ours has appeared yet%s\n' \
-            "$C_YELLOW" "$C_RESET"
-        printf '%s\n' "$new_ids" | while IFS= read -r rid; do
-            [[ -n "$rid" ]] || continue
-            echo "  https://github.com/${REPO}/actions/runs/${rid}"
-        done
-        echo "  the dispatch request was accepted — our run may not be in that list yet; look yourself before doing anything else"
+    if [[ -z "$run_id" ]]; then
+        # Two different unknowns, two different sentences. "We could not
+        # read the run list" is not "we read it and the nonce was not
+        # there": the first says our observation failed; the second says
+        # the title channel found nothing (run-name not expanded into
+        # displayTitle, or the run fell out of the 50-entry window). Both
+        # are rc 3 and neither may be folded into success or failure — but
+        # an operator debugging one must not be sent after the other.
+        if [[ "$read_ok" -gt 0 ]]; then
+            printf '%scould not identify our run: the run list was read (%s time(s)) but no run carries this dispatch nonce (%s) — run-name was not expanded into displayTitle, or the run fell out of the window%s\n' \
+                "$C_YELLOW" "$read_ok" "$nonce" "$C_RESET"
+        else
+            printf '%scould not identify our run: the run list could not be read at any point during the wait — the dispatch went out, but nothing was observed%s\n' \
+                "$C_YELLOW" "$C_RESET"
+        fi
+        echo "  check the latest runs yourself: https://github.com/${REPO}/actions"
+        echo "  the dispatch went out — look yourself before doing anything else"
         return 3
     fi
 
-    if [[ -z "$run_id" ]]; then
-        # Timed out. Which answer this is depends on whether the wait ended
-        # with a clean look: the last read is what the verdict has to rest
-        # on, and a failed one is "we did not observe", never "no run
-        # exists" — the same fold this function exists to prevent, in the
-        # direction that hurts a destructive rotate (rc 1 reads as "nothing
-        # happened", inviting a re-run while a run may be replacing the
-        # live Gateway).
-        if [[ "$last_read_ok" -eq 0 ]]; then
-            printf '%sthe last read of the run list failed, so the wait ended without a clean look — no run was observed, which is unknown, not absent%s\n' \
-                "$C_YELLOW" "$C_RESET"
-            echo "  check the latest runs yourself: https://github.com/${REPO}/actions"
-            echo "  the dispatch went out — look yourself before doing anything else"
-            return 3
-        fi
-        die "the run never appeared — check https://github.com/${REPO}/actions"
-    fi
-
+    # One confirmation read, so a run id can never be mis-parsed silently:
+    # the id came from OUR nonce filter already, but printing the title back
+    # makes the attribution auditable in the log (and catches a
+    # title-collision bug before it reaches wf_follow's verdict).
+    title="$(gh run view "$run_id" --repo "$REPO" --json displayTitle \
+        --jq 'if type == "array" then .[0].displayTitle else .displayTitle end' 2>/dev/null || true)"
     echo "  https://github.com/${REPO}/actions/runs/${run_id}"
+    [[ -n "$title" ]] && echo "  title: ${title}"
     echo ""
     wf_follow "$run_id"
 }

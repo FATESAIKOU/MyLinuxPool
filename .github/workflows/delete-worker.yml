@@ -15,6 +15,20 @@ on:
       name:
         description: Worker name (from Create Worker's output). Either this or port.
         required: false
+      nonce:
+        description: 'Optional correlation token from the dispatcher. mlp passes an unpredictable value here so it can recognize its own run in a frequently-dispatched workflow. UI and hand dispatches leave it empty.'
+        required: false
+        default: ''
+        type: string
+
+# Lets a dispatcher recognize its own run: mlp's wf_dispatch passes an
+# unpredictable nonce as `nonce` and, when the run id gh prints is not
+# available, finds its run by matching displayTitle for it. UI and hand
+# dispatches pass nothing and keep the plain title (plus a trailing space).
+# One mechanism for create/delete/rotate; the fourth workflow with the
+# same shape is refresh-authorized-keys.yml (see ops-scripts/mlp wf_dispatch
+# for why the refresh waiter still leads with the title channel).
+run-name: Delete Worker ${{ inputs.nonce }}
 
 permissions:
   contents: read

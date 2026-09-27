@@ -35,6 +35,19 @@ on:
         required: false
         type: boolean
         default: true
+      nonce:
+        description: 'Optional correlation token from the dispatcher. mlp passes an unpredictable value here so it can recognize its own run. This is the ONLY reason this input exists: dry_run is a boolean and cannot identify one run (two dry runs in the same minute would be indistinguishable). UI and hand dispatches leave it empty.'
+        required: false
+        default: ''
+        type: string
+
+# Lets a dispatcher recognize its own run: mlp's wf_dispatch passes an
+# unpredictable nonce as `nonce` and, when the run id gh prints is not
+# available, finds its run by matching displayTitle for it. The other
+# inputs (dry_run and the Linode plan fields) cannot serve this purpose —
+# they are not unique per dispatch. UI and hand dispatches pass nothing
+# and keep the plain title (plus a trailing space).
+run-name: Rotate Gateway ${{ inputs.nonce }}
 
 concurrency:
   group: rotate-gateway
