@@ -39,6 +39,6 @@
 ## 4. 封關
 
 - [x] 4.1 已知限制總表 → `known-limitations.md`
-- [ ] 4.2 E1：把本輪發現寫進 MyBrain，開 PR 給使用者 review
-- [ ] 4.3 打掃：隊員的 `/tmp` 暫存、worktree、docker image
-- [ ] 4.4 本 change 的 tasks 全部勾完後 commit；是否 archive 由使用者決定
+- [x] 4.2 E1：把本輪發現寫進 MyBrain，開 PR 給使用者 review（FATESAIKOU/MyBrain#146）
+- [x] 4.3 打掃：隊員標「可刪」的 `/tmp` 暫存已刪、無殘留 worktree／容器（`~/testAI/tmpshare-*` 三個驗證副本無機密檔，留給使用者決定）
+- [x] 4.4 本 change 的 tasks 全部勾完後 commit；是否 archive 由使用者決定
