@@ -5,7 +5,7 @@ Root
 ├── profiles/<role>/<name>/     角色設定，明確列出要載入哪些 unit
 ├── shared-configs/<unit>/      服務／工具的分發單位（自帶 install.sh 與 tests/）
 ├── scripts/                    業務邏輯，不依賴 GitHub Actions
-├── ops-scripts/                人手動跑的東西（register-provider、mlp、verify-profile、register-client、preflight、pool-residue）
+├── ops-scripts/                人手動跑的東西（register-provider、register-repair-host、mlp、verify-profile、register-client、preflight、pool-residue）
 │
 ├── .github/workflows/          薄殼：只做 GitHub 專屬的事，其餘呼叫 scripts/
 ├── docs/                       文件
@@ -193,6 +193,12 @@ profiles/provider/no-sudo/profile.json    # 沒有 sudo：fh-proxy，sudoers_rul
 有沒有落地，所以 `--no-sudo` 機器缺 sudoers 規則不會被誤判成落差——它本來
 就沒被宣告要有。
 
+**第三種：`profiles/provider/repair/`（家人維修承載機，issue #6）**——這台不在自己身上跑
+`register-provider.sh`，也不跑 `pool-sync`，所以 `shared_config` 是空陣列；它的一切由
+`ops-scripts/register-repair-host` 在 Mac 上渲染成 cloud-init 開機資料。多出的兩個欄位
+`login_user`（VM 裡唯一的登入使用者，也是 `NODE_<NAME>.hops` 指向的使用者）與
+`user_data_template`（同目錄的 cloud-config 模板，佔位符是 `@@NAME@@` 形狀）只給那支指令讀。
+
 ### `profiles/worker/<name>/`
 
 ```
@@ -256,6 +262,7 @@ function library，可以 `source` 進來直接測，不需要真機。
 - `register-provider.sh`（原 `provider/register.sh`）
 - `mlp`（原 `bin/mlp`）
 - `register-client`：把「這台機器」註冊成 client，`mlp register client` 轉呼叫它
+- `register-repair-host`：在 Mac 上替一台家人維修承載機登錄（寫 `NODE_<NAME>`、觸發 refresh、產出 cloud-init NoCloud 開機資料）；模板在 `profiles/provider/repair/`
 - `verify-profile`：把某台機器的實際狀態與它的 profile 宣告對照，見 §6
 - `preflight`：推 master 前在本機跑一次的靜態檢查（引用的檔案真的存在嗎）
 - `pool-residue.sh`：池側殘骸的唯讀快照，列容器／`POOL_WORKERS`／Gateway 的

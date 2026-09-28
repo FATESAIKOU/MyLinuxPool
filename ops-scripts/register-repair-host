@@ -1,0 +1,551 @@
+#!/usr/bin/env bash
+# ops-scripts/register-repair-host — register a family repair host from the
+# owner's Mac (issue #6; openspec/changes/family-repair-host design D1/D4/D5/D8,
+# spec "登錄全部在使用者的 Mac 上完成").
+#
+#   register-repair-host --name <name> --gateway-port <2220-2299>
+#                        --login-key <login-public-key-file>
+#                        --output-dir <dir> [--no-iso]
+#
+# The family's VM never touches GitHub and nobody configures anything on the
+# family side, so everything register-provider.sh does ON a node that can be
+# done from here is done here, and the rest is baked into boot data:
+#   1. refuse before writing anything: port outside 2220-2299, a port another
+#      NODE_* already uses (the machine is named), an existing NODE_<NAME>
+#   2. mint the tunnel key pair — ON THIS MAC. That is design D4's deliberate
+#      exception to "a private key never leaves the machine that made it": the
+#      key's destination is the VM, and the family side can run nothing. The
+#      private half is written ONLY into --output-dir (and the seed built
+#      there), never into $HOME or a temp dir elsewhere.
+#   3. render the cloud-init NoCloud seed (user-data + meta-data, plus a
+#      seed.iso when an ISO tool exists) from profiles/provider/repair/, and
+#      refuse if the result contains anything that looks like a GitHub token
+#      (D5, generator half)
+#   4. write NODE_<NAME> in ONE `gh variable set`: role provider,
+#      capabilities {}, no power, hops to the VM's login user via the Gateway,
+#      tunnel_public_key
+#   5. dispatch refresh-authorized-keys and wait for OUR run
+#      (scripts/lib/refresh-wait.sh), so the Gateway authorizes the new key
+#
+# Exit codes: 0 done; 1 refused or failed (nothing written to GitHub unless
+# the message says so); 2 bad arguments; 3 NODE_<NAME> and the seed are
+# written but the refresh was not confirmed (the Gateway picks the key up on
+# the next refresh — dispatch one before the family boots).
+#
+# Needs: gh (logged in, or GH_TOKEN in the environment — gh reads it itself;
+# this script never passes a token anywhere), jq, ssh-keygen, base64. Repo is
+# POOL_REPO, default FATESAIKOU/MyLinuxPool (same knob as register-client).
+#
+# Limitations (honest list):
+# * The seed does NOT bring a tunnel up yet. It creates the login user,
+#   installs the tunnel key, locks sshd to loopback + keys and writes
+#   /etc/mlp/tunnel.env; pool-tunnel, its unit, the VM-side token guard, the
+#   D2 fetch/report and the backoff are task 5 (the template marks where).
+# * POOL_GATEWAY_HOST in the seed is a placeholder (gateway-ip-set-at-launch
+#   .invalid): the Gateway IP changes on every rotate and is supplied at boot
+#   by the D2 channel (task 5).
+# * NODE_GATEWAY missing or without tunnel_user: the seed gets placeholders
+#   for the Gateway user/port and a WARN, not a refusal (see read_gateway).
+# * The port check reads the NODE_* list once; two registrations racing for
+#   the same port can both pass (no lock exists on repo variables).
+# * The output dir holds a private key in THREE forms (id_tunnel, user-data,
+#   seed.iso). Treat the whole directory as a secret and delete it once the
+#   seed is packaged. The ISO tool may use its own temp files — not audited.
+# * The token guard matches GitHub's token prefixes and the literal values of
+#   the GH_*/GITHUB_* token variables in this environment; an encoded or
+#   unprefixed token would pass.
+# * NODE_<NAME> keeps key_secret SSH_KEY_ACTIONS in hops (same shape as every
+#   other NODE_*), but the VM only authorizes the --login-key, so Actions
+#   cannot log in there — by design (D8), nothing in Actions needs to.
+# * The NODE_<NAME> fields are built here, not by a function shared with
+#   register-provider.sh (D4 asked for one): register-provider.sh runs from
+#   a temp clone and its tests load step5 without one, so moving step 5 into
+#   scripts/lib/ would change what it depends on. Keep both shapes in step
+#   by hand until that is solved: see build_node_json.
+
+set -euo pipefail
+umask 077
+
+# Resolve this script's REAL location, following symlinks, so it can be
+# linked into a directory on PATH (`ln -s .../ops-scripts/mlp <dir on PATH>`).
+# Both $0 and BASH_SOURCE name the LINK, not the target, so dirname on
+# either lands in the link's directory and every repo-relative path below
+# becomes wrong — the symptom is "scripts/lib/ssh.sh: No such file".
+# `readlink` without -f is used deliberately: -f is GNU-only.
+#
+# This block is duplicated in every ops-script because it has to run
+# BEFORE the script knows where the repo is — there is nothing to source
+# yet. test-script-self-location.sh asserts the copies stay identical.
+_mlp_self="${BASH_SOURCE[0]:-$0}"
+while [ -L "$_mlp_self" ]; do
+    _mlp_dir="$(cd -P "$(dirname "$_mlp_self")" && pwd)"
+    _mlp_self="$(readlink "$_mlp_self")"
+    case "$_mlp_self" in /*) ;; *) _mlp_self="${_mlp_dir}/${_mlp_self}" ;; esac
+done
+SCRIPT_DIR="$(cd -P "$(dirname "$_mlp_self")" && pwd)"
+unset _mlp_self _mlp_dir
+
+REPO="${POOL_REPO:-FATESAIKOU/MyLinuxPool}"
+REPO_ROOT="$(cd -P "${SCRIPT_DIR}/.." && pwd)"
+PROFILE_DIR="${REPO_ROOT}/profiles/provider/repair"
+TUNNEL_IDENTITY="${REPO_ROOT}/shared-configs/pool-runtime/files/tunnel-identity.sh"
+REFRESH_WAIT="${REPO_ROOT}/scripts/lib/refresh-wait.sh"
+
+# The provider port band (docs/ARCHITECTURE.md, NODE_GATEWAY.ports.provider).
+# Ports are picked by hand — there is no allocator for providers.
+PORT_MIN=2220
+PORT_MAX=2299
+
+# Placeholders written into the seed when a value is not known here. Each is
+# chosen to FAIL where it lands rather than dial somewhere wrong: .invalid
+# never resolves (RFC 2606), and pool-tunnel rejects a non-numeric
+# POOL_GATEWAY_SSH_PORT instead of dialing.
+GATEWAY_HOST_PLACEHOLDER="gateway-ip-set-at-launch.invalid"
+GATEWAY_USER_PLACEHOLDER="gateway-user-unknown"
+GATEWAY_SSH_PORT_PLACEHOLDER="gateway-ssh-port-unknown"
+
+log() {
+    local level="$1"; shift
+    local ts
+    ts="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    if [[ "$level" == "INFO" ]]; then
+        printf '[%s] %s %s\n' "$ts" "$level" "$*"
+    else
+        printf '[%s] %s %s\n' "$ts" "$level" "$*" >&2
+    fi
+}
+
+usage() {
+    cat >&2 <<'EOF'
+usage: register-repair-host --name <name> --gateway-port <port>
+                            --login-key <login-public-key-file> --output-dir <dir>
+                            [--no-iso]
+  --name          node name, lowercase [a-z0-9-] (becomes NODE_<NAME>)
+  --gateway-port  provider port on the Gateway, 2220-2299, not used by any NODE_*
+  --login-key     the PUBLIC key you will log in to the VM with (e.g. ~/.ssh/id_mlp.pub)
+  --output-dir    where the seed goes; it will hold the tunnel PRIVATE key
+  --no-iso        write user-data/meta-data only, skip building seed.iso
+EOF
+}
+
+NAME=""
+PORT=""
+LOGIN_KEY=""
+OUTDIR=""
+BUILD_ISO=1
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --name)         [[ $# -ge 2 ]] || { usage; exit 2; }; NAME="$2"; shift 2 ;;
+        --gateway-port) [[ $# -ge 2 ]] || { usage; exit 2; }; PORT="$2"; shift 2 ;;
+        --login-key)    [[ $# -ge 2 ]] || { usage; exit 2; }; LOGIN_KEY="$2"; shift 2 ;;
+        --output-dir)   [[ $# -ge 2 ]] || { usage; exit 2; }; OUTDIR="$2"; shift 2 ;;
+        --no-iso)       BUILD_ISO=0; shift ;;
+        -h|--help)      usage; exit 0 ;;
+        *)              log ERROR "unknown argument: $1"; usage; exit 2 ;;
+    esac
+done
+
+if [[ -z "$NAME" || -z "$PORT" || -z "$LOGIN_KEY" || -z "$OUTDIR" ]]; then
+    usage
+    exit 2
+fi
+
+# ---- local validation (no network, nothing written) -------------------------
+
+# The name ends up in a variable name, a hostname and the seed's YAML, so it
+# gets the strictest charset of the three.
+if ! [[ "$NAME" =~ ^[a-z0-9]+(-[a-z0-9]+)*$ ]]; then
+    log ERROR "--name must be lowercase [a-z0-9] words joined by '-', got '${NAME}'"
+    exit 2
+fi
+VAR_NAME="NODE_$(printf '%s' "$NAME" | tr '[:lower:]' '[:upper:]' | tr '-' '_')"
+if [[ "$VAR_NAME" == "NODE_GATEWAY" ]]; then
+    log ERROR "--name '${NAME}' would be NODE_GATEWAY — that is the Gateway itself"
+    exit 2
+fi
+
+# No leading zero: bash arithmetic reads 0-prefixed digits as octal, and a
+# port written two ways is two ports to the string compare below.
+# The length cap keeps absurdly long digit strings out of bash arithmetic,
+# which would wrap them silently.
+if ! [[ "$PORT" =~ ^[1-9][0-9]{0,4}$ ]] || (( PORT < PORT_MIN || PORT > PORT_MAX )); then
+    log ERROR "--gateway-port must be an integer ${PORT_MIN}-${PORT_MAX} (the provider band), got '${PORT}'"
+    exit 2
+fi
+
+for tool in gh jq ssh-keygen base64; do
+    command -v "$tool" >/dev/null 2>&1 || { log ERROR "${tool} not found on PATH"; exit 1; }
+done
+for f in "$REFRESH_WAIT" "$TUNNEL_IDENTITY" "${PROFILE_DIR}/profile.json"; do
+    [[ -f "$f" ]] || { log ERROR "${f} missing — run this from a complete checkout"; exit 1; }
+done
+
+# read_login_pubkey <file> — sets LOGIN_PUBKEY to "type blob [comment]".
+#   Exactly one public-key line. A private key is refused by name: pointing
+#   --login-key at the wrong half would bake a private key into the seed.
+#   The comment is cut to a safe charset because the line lands in YAML.
+read_login_pubkey() {
+    local f="$1" content nlines type blob comment
+    if [[ ! -f "$f" || ! -r "$f" ]]; then
+        log ERROR "--login-key ${f}: not a readable file"
+        return 1
+    fi
+    content="$(tr -d '\r' < "$f")"
+    if [[ "$content" == *"PRIVATE KEY"* ]]; then
+        log ERROR "--login-key ${f} is a PRIVATE key — pass the .pub file"
+        return 1
+    fi
+    nlines="$(printf '%s\n' "$content" | grep -c . || true)"
+    if [[ "$nlines" != "1" ]]; then
+        log ERROR "--login-key ${f} must hold exactly one public key line (found ${nlines})"
+        return 1
+    fi
+    read -r type blob comment <<< "$content" || true
+    case "$type" in
+        ssh-ed25519|ssh-rsa|ecdsa-sha2-*|sk-ssh-ed25519@openssh.com|sk-ecdsa-sha2-nistp256@openssh.com) ;;
+        *) log ERROR "--login-key ${f}: '${type}' is not an ssh public key type"; return 1 ;;
+    esac
+    if ! [[ "$blob" =~ ^[A-Za-z0-9+/]+=*$ ]] || ! ssh-keygen -l -f "$f" >/dev/null 2>&1; then
+        log ERROR "--login-key ${f}: not a valid ssh public key"
+        return 1
+    fi
+    comment="$(printf '%s' "${comment:-}" | sed 's/[^A-Za-z0-9@._+-]/-/g')"
+    LOGIN_PUBKEY="${type} ${blob}${comment:+ ${comment}}"
+    LOGIN_BLOB="$blob"
+}
+LOGIN_PUBKEY=""
+LOGIN_BLOB=""
+read_login_pubkey "$LOGIN_KEY" || exit 2
+
+# An output dir that already holds ANOTHER host's seed is refused: writing
+# over it would destroy that host's only copy of its tunnel private key while
+# its NODE_* still names the matching public key. The same name is allowed —
+# its NODE_<NAME> is gone (checked below), so the old key is already dead.
+if [[ -f "${OUTDIR}/meta-data" ]]; then
+    prev_host="$(sed -n 's/^local-hostname:[[:space:]]*//p' "${OUTDIR}/meta-data" | head -1)"
+    if [[ -n "$prev_host" && "$prev_host" != "$NAME" ]]; then
+        log ERROR "--output-dir ${OUTDIR} already holds the seed for '${prev_host}' — use an empty directory"
+        exit 1
+    fi
+fi
+
+# The profile declares the login user and the template; this script only
+# renders them.
+LOGIN_USER="$(jq -r '.login_user // empty' "${PROFILE_DIR}/profile.json")"
+TEMPLATE_NAME="$(jq -r '.user_data_template // empty' "${PROFILE_DIR}/profile.json")"
+if ! [[ "$LOGIN_USER" =~ ^[a-z_][a-z0-9_-]*$ ]] || [[ -z "$TEMPLATE_NAME" || ! -f "${PROFILE_DIR}/${TEMPLATE_NAME}" ]]; then
+    log ERROR "${PROFILE_DIR}/profile.json must declare login_user and an existing user_data_template"
+    exit 1
+fi
+TEMPLATE="${PROFILE_DIR}/${TEMPLATE_NAME}"
+
+# Where the VM keeps its tunnel key: tunnel-identity.sh is the ONE definition
+# of that path (RUNBOOK §7.12), so ask it, with HOME set to the VM user's.
+VM_TUNNEL_KEY="$(HOME="/home/${LOGIN_USER}" bash -c '. "$1" >/dev/null 2>&1; printf "%s" "${TUNNEL_KEY:-}"' _ "$TUNNEL_IDENTITY")"
+if ! [[ "$VM_TUNNEL_KEY" =~ ^/home/${LOGIN_USER}/[A-Za-z0-9._/-]+$ ]]; then
+    log ERROR "could not derive the VM's tunnel key path from ${TUNNEL_IDENTITY} (got '${VM_TUNNEL_KEY}')"
+    exit 1
+fi
+KEY_FILE_NAME="$(basename "$VM_TUNNEL_KEY")"
+
+# shellcheck source=../scripts/lib/refresh-wait.sh
+. "$REFRESH_WAIT"
+
+# ---- GitHub reads: refuse before any write ----------------------------------
+
+# One listing answers all three questions (exists? port taken? Gateway?),
+# and it must SUCCEED: a failed or empty listing is "cannot tell", never
+# "nothing is there". The path carries no ?per_page= on purpose — --paginate
+# follows the Link headers for any page size.
+if ! listing="$(gh api "repos/${REPO}/actions/variables" --paginate \
+        --jq '.variables[] | select(.name | startswith("NODE_")) | {name: .name, value: .value} | @json' 2>/dev/null)"; then
+    log ERROR "could not list ${REPO}'s repo variables — cannot check for an existing ${VAR_NAME} or a port conflict"
+    exit 1
+fi
+if ! NODES="$(printf '%s\n' "$listing" | jq -s -c '[.[] | {var: .name, v: (try (.value | fromjson) catch null)}]' 2>/dev/null)" \
+    || [[ "$(printf '%s' "$NODES" | jq 'length')" -eq 0 ]]; then
+    log ERROR "the variable listing held no NODE_* at all — refusing to call port ${PORT} free on an empty list"
+    exit 1
+fi
+
+if printf '%s' "$NODES" | jq -e --arg vn "$VAR_NAME" --arg n "$NAME" \
+        'any(.[]; .var == $vn or ((.v | type) == "object" and .v.name == $n))' >/dev/null; then
+    log ERROR "${VAR_NAME} (node '${NAME}') already exists — refusing to overwrite a live machine"
+    log ERROR "to re-register it, delete ${VAR_NAME} first (that also revokes its tunnel key on the next refresh)"
+    exit 1
+fi
+
+unreadable="$(printf '%s' "$NODES" | jq -r '[.[] | select((.v | type) != "object") | .var] | join(", ")')"
+if [[ -n "$unreadable" ]]; then
+    log ERROR "cannot read these NODE_* as JSON, so their ports are unknown: ${unreadable} — fix them before registering"
+    exit 1
+fi
+
+taken_by="$(printf '%s' "$NODES" | jq -r --arg p "$PORT" '
+    [.[] | select(any((.v.gateway_port, .v.hops[]?.port); (. // null | tostring) == $p))
+         | (.v.name // .var)] | unique | join(", ")')"
+if [[ -n "$taken_by" ]]; then
+    log ERROR "port ${PORT} is already used by ${taken_by} — pick another port in ${PORT_MIN}-${PORT_MAX}"
+    exit 1
+fi
+
+# read_gateway — GW_TUNNEL_USER and GW_SSH_PORT for the seed's env file.
+#   NODE_GATEWAY.port is the Gateway's SSH port (2100 today); absent means 22,
+#   the same rule pool-tunnel/pool-resolve apply. tunnel_user has no default
+#   anywhere in the pool, so a missing one becomes a placeholder.
+#   A missing NODE_GATEWAY is a WARN, not a refusal: the owner may be
+#   registering while the Gateway is between rotates, and task 5's launch
+#   channel can still supply these. The seed then will not dial until they
+#   are filled — the placeholders make sure it fails instead of guessing.
+read_gateway() {
+    local gw
+    gw="$(printf '%s' "$NODES" | jq -c '[.[] | select(.var == "NODE_GATEWAY") | .v] | first // empty')"
+    GW_TUNNEL_USER="$GATEWAY_USER_PLACEHOLDER"
+    GW_SSH_PORT="$GATEWAY_SSH_PORT_PLACEHOLDER"
+    if [[ -z "$gw" ]]; then
+        log WARN "NODE_GATEWAY not found — the seed gets placeholders for the Gateway user and SSH port and will not dial until they are set"
+        return 0
+    fi
+    local u p
+    u="$(printf '%s' "$gw" | jq -r '.tunnel_user // empty')"
+    p="$(printf '%s' "$gw" | jq -r '.port // 22')"
+    if [[ "$u" =~ ^[a-z_][a-z0-9_-]*$ ]]; then
+        GW_TUNNEL_USER="$u"
+    else
+        log WARN "NODE_GATEWAY.tunnel_user missing or odd ('${u}') — the seed gets a placeholder for it"
+    fi
+    if [[ "$p" =~ ^[1-9][0-9]*$ ]] && (( p <= 65535 )); then
+        GW_SSH_PORT="$p"
+    else
+        log WARN "NODE_GATEWAY.port is not a port ('${p}') — the seed gets a placeholder for it"
+    fi
+}
+GW_TUNNEL_USER=""
+GW_SSH_PORT=""
+read_gateway
+
+# ---- build everything locally, inside the output dir ------------------------
+
+mkdir -p "$OUTDIR"
+OUTDIR="$(cd -P "$OUTDIR" && pwd)"
+# Staging lives INSIDE the output dir so the private key never exists
+# anywhere else, not even for a moment in $TMPDIR.
+STAGE="$(mktemp -d "${OUTDIR}/.register-repair-host.XXXXXX")"
+# The trap keeps the real exit status: on bash 3.2 an EXIT trap's own last
+# command otherwise becomes the script's status (see register-provider.sh
+# step 6.5).
+trap '_rc=$?; rm -rf "$STAGE"; exit "$_rc"' EXIT
+trap 'exit 130' INT TERM
+
+if ! ssh-keygen -q -t ed25519 -N "" -C "mlp-tunnel-${NAME}" -f "${STAGE}/${KEY_FILE_NAME}" >/dev/null 2>&1; then
+    log ERROR "ssh-keygen could not generate the tunnel key"
+    exit 1
+fi
+TUNNEL_PUB="$(tr -d '\r\n' < "${STAGE}/${KEY_FILE_NAME}.pub")"
+if [[ "$(printf '%s' "$TUNNEL_PUB" | awk '{print $2}')" == "$LOGIN_BLOB" ]]; then
+    # Cannot happen with a fresh key; checked because the two keys have
+    # opposite blast radii (Gateway tunnel vs VM login) and must never merge.
+    log ERROR "the tunnel key equals the login key — refusing"
+    exit 1
+fi
+TUNNEL_PRIV_B64="$(base64 < "${STAGE}/${KEY_FILE_NAME}" | tr -d '\n')"
+
+# render_token <text> <TOKEN> <value> — every @@TOKEN@@ replaced by value.
+#   Prefix/suffix removal only, no ${x//pat/rep}: bash 5.2's
+#   patsub_replacement turns '&' in a replacement into the matched text, and
+#   bash 3.2 does not; this way both shells produce the same bytes.
+render_token() {
+    local text="$1" tok="@@${2}@@" val="$3" out=""
+    while [[ "$text" == *"$tok"* ]]; do
+        out="${out}${text%%"$tok"*}${val}"
+        text="${text#*"$tok"}"
+    done
+    printf '%s' "${out}${text}"
+}
+
+rendered="$(cat "$TEMPLATE")"
+rendered="$(render_token "$rendered" LOGIN_USER "$LOGIN_USER")"
+rendered="$(render_token "$rendered" LOGIN_PUBKEY "$LOGIN_PUBKEY")"
+rendered="$(render_token "$rendered" NODE_NAME "$NAME")"
+rendered="$(render_token "$rendered" PROVIDER_PORT "$PORT")"
+rendered="$(render_token "$rendered" GATEWAY_TUNNEL_USER "$GW_TUNNEL_USER")"
+rendered="$(render_token "$rendered" GATEWAY_SSH_PORT "$GW_SSH_PORT")"
+rendered="$(render_token "$rendered" GATEWAY_HOST "$GATEWAY_HOST_PLACEHOLDER")"
+rendered="$(render_token "$rendered" TUNNEL_KEY_PATH "$VM_TUNNEL_KEY")"
+rendered="$(render_token "$rendered" TUNNEL_PRIVATE_KEY_B64 "$TUNNEL_PRIV_B64")"
+if [[ "$rendered" =~ @@[A-Z_]+@@ ]]; then
+    log ERROR "${TEMPLATE} has a placeholder this script does not fill (${BASH_REMATCH[0]}) — template and generator are out of step"
+    exit 1
+fi
+printf '%s\n' "$rendered" > "${STAGE}/user-data"
+
+# instance-id changes on every build: cloud-init runs its per-instance
+# modules again only when the id changes, so a rebuilt seed (new key) handed
+# to an existing VM would otherwise be silently ignored.
+{
+    printf 'instance-id: mlp-repair-%s-%s\n' "$NAME" "$(date -u +%Y%m%d%H%M%S)"
+    printf 'local-hostname: %s\n' "$NAME"
+} > "${STAGE}/meta-data"
+
+# token_guard <file>... — D5, generator half: non-zero if any file holds
+#   something that looks like a GitHub token or the value of a token variable
+#   in this environment. Names the file, never the match. Values are compared
+#   in-shell, never passed as an argument (argv is visible in ps).
+token_guard() {
+    local f content v val hit=0
+    local re='(gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,})'
+    for f in "$@"; do
+        content="$(cat "$f")"
+        if [[ "$content" =~ $re ]]; then
+            log ERROR "${f##*/} contains something shaped like a GitHub token"
+            hit=1
+        fi
+        for v in GH_TOKEN GH_POOL_TOKEN GITHUB_TOKEN GH_ENTERPRISE_TOKEN GITHUB_ENTERPRISE_TOKEN; do
+            val="${!v:-}"
+            if [[ "${#val}" -ge 8 && "$content" == *"$val"* ]]; then
+                log ERROR "${f##*/} contains the value of \$${v}"
+                hit=1
+            fi
+        done
+    done
+    return "$hit"
+}
+# Positive control: prove the pattern matches on THIS shell's regex engine
+# before trusting a clean scan (bash 3.2 and 5.x use the platform's regcomp).
+# The canary is assembled at run time so no token-shaped literal sits in the
+# source.
+printf 'x %s x\n' "gh""p_$(printf '%036d' 0)" > "${STAGE}/.canary"
+if token_guard "${STAGE}/.canary" 2>/dev/null; then
+    log ERROR "the token guard cannot see a canary token on this shell — refusing to trust a clean scan"
+    exit 1
+fi
+rm -f "${STAGE}/.canary"
+if ! token_guard "${STAGE}/user-data" "${STAGE}/meta-data"; then
+    log ERROR "refusing to produce boot data that carries a GitHub token (spec: 維修承載機不持有 GitHub 權杖)"
+    exit 1
+fi
+
+# Optional sanity parse: a malformed user-data makes cloud-init skip the whole
+# file on the VM, which nobody would see until the family is waiting.
+if command -v python3 >/dev/null 2>&1 && python3 -c 'import yaml' >/dev/null 2>&1; then
+    if ! python3 -c 'import sys,yaml; d=yaml.safe_load(open(sys.argv[1])); sys.exit(0 if isinstance(d, dict) else 1)' \
+            "${STAGE}/user-data" >/dev/null 2>&1; then
+        log ERROR "rendered user-data is not valid YAML — not writing it"
+        exit 1
+    fi
+fi
+
+# build_seed_iso <dir-with-user-data-and-meta-data> <iso> — NoCloud wants
+#   volume label "cidata". hdiutil is the Mac's own (it built the spike's
+#   seed); genisoimage/mkisofs/xorriso cover Linux. No tool = skipped with a
+#   message, because user-data/meta-data alone are still the boot data.
+SEED_ISO_STATE="skipped (--no-iso)"
+build_seed_iso() {
+    local src="$1" iso="$2"
+    rm -f "$iso"
+    if command -v hdiutil >/dev/null 2>&1; then
+        hdiutil makehybrid -quiet -iso -joliet -default-volume-name cidata -o "$iso" "$src" >/dev/null 2>&1
+    elif command -v genisoimage >/dev/null 2>&1; then
+        genisoimage -quiet -output "$iso" -volid cidata -joliet -rock "$src/user-data" "$src/meta-data" >/dev/null 2>&1
+    elif command -v mkisofs >/dev/null 2>&1; then
+        mkisofs -quiet -output "$iso" -volid cidata -joliet -rock "$src/user-data" "$src/meta-data" >/dev/null 2>&1
+    elif command -v xorriso >/dev/null 2>&1; then
+        xorriso -as mkisofs -quiet -output "$iso" -volid cidata -joliet -rock "$src/user-data" "$src/meta-data" >/dev/null 2>&1
+    else
+        return 10
+    fi
+}
+if [[ "$BUILD_ISO" -eq 1 ]]; then
+    mkdir "${STAGE}/iso-src"
+    cp "${STAGE}/user-data" "${STAGE}/meta-data" "${STAGE}/iso-src/"
+    iso_rc=0
+    build_seed_iso "${STAGE}/iso-src" "${STAGE}/seed.iso" || iso_rc=$?
+    if [[ "$iso_rc" -eq 0 && -s "${STAGE}/seed.iso" ]]; then
+        SEED_ISO_STATE="${OUTDIR}/seed.iso"
+    elif [[ "$iso_rc" -eq 10 ]]; then
+        SEED_ISO_STATE="skipped: no ISO tool (hdiutil/genisoimage/mkisofs/xorriso)"
+        log WARN "no ISO tool found — wrote user-data/meta-data only; build a NoCloud ISO (volume label cidata) from them yourself"
+    else
+        SEED_ISO_STATE="skipped: ISO tool failed (rc ${iso_rc})"
+        log WARN "building seed.iso failed (rc ${iso_rc}) — user-data/meta-data are still written"
+        rm -f "${STAGE}/seed.iso"
+    fi
+    rm -rf "${STAGE}/iso-src"
+fi
+
+# build_node_json — NODE_<NAME> for a repair host.
+#   Same connectivity shape register-provider.sh's step5_register_var writes
+#   for every provider (name/role/user/key_secret/gateway_port/hops; the
+#   Gateway hop then 127.0.0.1:<port> as the node's login user). Only the
+#   parts that differ are the point of a repair host: capabilities {} (no
+#   worker-host, so create-worker refuses it — D6), no power (nothing can
+#   wake or shut it), and tunnel_public_key written in the SAME set, because
+#   its private half exists only in this seed. If you change the hops shape
+#   there, change it here — no shared function covers both yet (see header).
+build_node_json() {
+    jq -n \
+        --arg name "$NAME" \
+        --arg user "$LOGIN_USER" \
+        --arg key_secret "SSH_KEY_ACTIONS" \
+        --argjson gateway_port "$PORT" \
+        --arg tk "$TUNNEL_PUB" \
+        '{
+            name: $name,
+            role: "provider",
+            user: $user,
+            key_secret: $key_secret,
+            gateway_port: $gateway_port,
+            hops: [{via: "gateway"},
+                   {host: "127.0.0.1", port: $gateway_port, user: $user, key_secret: $key_secret}],
+            capabilities: {},
+            tunnel_public_key: $tk,
+            registered_with: "register-repair-host"
+        }'
+}
+NODE_JSON="$(build_node_json)"
+
+# Everything local is ready: move it into place, THEN touch GitHub. If the
+# write below fails, the seed is removed again — its key was never published,
+# so keeping it would only leave a seed that can never connect.
+# A seed.iso left by an earlier build carries the OLD key: never let it sit
+# next to a new user-data it does not match.
+if [[ -f "${OUTDIR}/seed.iso" && ! -f "${STAGE}/seed.iso" ]]; then
+    rm -f "${OUTDIR}/seed.iso"
+fi
+for f in user-data meta-data "${KEY_FILE_NAME}" "${KEY_FILE_NAME}.pub" seed.iso; do
+    if [[ -f "${STAGE}/${f}" ]]; then mv -f "${STAGE}/${f}" "${OUTDIR}/${f}"; fi
+done
+
+# ---- GitHub writes -----------------------------------------------------------
+
+# The value goes on stdin, never --body (argv is visible in ps; and old gh
+# 2.45 has no --body-file).
+if ! printf '%s' "$NODE_JSON" | gh variable set "$VAR_NAME" --repo "$REPO" >/dev/null; then
+    log ERROR "could not write ${VAR_NAME} — removing the seed from ${OUTDIR} (its key was never published)"
+    for f in user-data meta-data "${KEY_FILE_NAME}" "${KEY_FILE_NAME}.pub" seed.iso; do
+        rm -f "${OUTDIR:?}/${f}"
+    done
+    exit 1
+fi
+log INFO "wrote ${VAR_NAME} (role provider, capabilities {}, gateway_port ${PORT}, login user ${LOGIN_USER})"
+
+# Wait for OUR refresh run (nonce-matched, scripts/lib/refresh-wait.sh), so
+# "done" means the Gateway authorizes the new tunnel key.
+refresh_ok=1
+GH_REPO="$REPO" dispatch_refresh_and_wait 300 || refresh_ok=0
+
+echo
+echo "register-repair-host: ${NAME}"
+echo "  NODE var           ${VAR_NAME} written (gateway_port ${PORT})"
+echo "  boot data          ${OUTDIR}/user-data, ${OUTDIR}/meta-data"
+echo "  seed ISO           ${SEED_ISO_STATE}"
+echo "  tunnel key         ${OUTDIR}/${KEY_FILE_NAME} (PRIVATE — also inside user-data and any seed ISO; treat ${OUTDIR} as a secret)"
+echo "  Gateway in seed    user ${GW_TUNNEL_USER}, ssh port ${GW_SSH_PORT}, host ${GATEWAY_HOST_PLACEHOLDER} (IP comes at launch)"
+echo "  not in this seed   pool-tunnel + its unit, VM token guard, D2 fetch/report, backoff (task 5)"
+if [[ "$refresh_ok" -eq 1 ]]; then
+    echo "  refresh            confirmed — the Gateway authorizes the tunnel key"
+    exit 0
+fi
+log ERROR "refresh not confirmed — ${VAR_NAME} and the seed ARE written; dispatch refresh-authorized-keys and check it succeeds before the family boots"
+exit 3

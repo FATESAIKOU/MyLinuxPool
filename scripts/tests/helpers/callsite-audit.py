@@ -62,7 +62,7 @@ import sys
 
 CODE_EXT = (".sh", ".yml", ".yaml")
 CODE_BASENAMES = ("mlp", "preflight", "register-client", "verify-profile",
-                  "register-provider.sh", "pool-residue")
+                  "register-provider.sh", "pool-residue", "register-repair-host")
 MARKER_WORDS = ("consumer", "caller", "call site", "called by", "used by",
                 "who calls", "sources this")
 

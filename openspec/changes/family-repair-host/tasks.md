@@ -15,19 +15,19 @@
 
 - [x] 2.1 test（`test-pool-tunnel-static-port.sh`，現碼紅 1b／1c／4）：行為測試：靜態模式帶 port → ssh 用那個 port；不帶 → 維持 22（對現碼紅在第一條）
 - [x] 2.2 impl（haiku 子代理；報告不可信，由 review 獨立驗收）：加選填環境變數
-- [ ] 2.3 review：獨立驗收；commit
+- [x] 2.3 review：獨立驗收（`OUT-review-repair-t2t3.md`，找到前導零／超大數字與測試缺口 → 已修並補測試）；commit
 
 ## 3. create-worker 的 capability 閘門（D6）
 
 - [x] 3.1 PM：確認三台現役 provider 都宣告了 `worker-host`（唯讀，2026-09-28：fh-l、fh-proxy、fh-proxy-asus 皆有）
 - [x] 3.2 test（`test-create-worker-capability-gate.sh`，現碼紅 2a／2b／3；實作時要一起更新 `test-provider-validation.sh` 的 fixture）：指名沒有 `worker-host` 的 provider → 在寫入任何狀態之前失敗（對現碼紅）
-- [ ] 3.3 impl（haiku 子代理，同上）✓；3.4 review；commit
+- [x] 3.3 impl（haiku 子代理）；3.4 review（讀取失敗時訊息誤導、jq 1.7 語法 → 已修）；commit
 
 ## 4. Mac 端登錄（D4、D5 的前半）
 
 - [x] 4.1 test（`test-register-repair-host.sh`，定義介面 `--name/--gateway-port/--login-key/--output-dir`；兩種丟棄式實作皆 20/0）：登錄指令的行為測試（寫出的 `NODE_<NAME>` 形狀、port 衝突拒絕、開機資料不含權杖、含權杖的輸入被拒）
-- [ ] 4.2 impl：抽出 `register-provider` 寫 `NODE_<NAME>` 的共用函式；新登錄指令；開機資料產生器
-- [ ] 4.3 review：獨立驗收（含 register-provider 行為不變）；commit
+- [x] 4.2 impl（子代理，`OUT-impl-repair-t4.md`）：新登錄指令；開機資料產生器（模板在 `profiles/provider/repair/`）。**共用函式沒抽**（register-provider 是單檔執行，抽出會打壞兩支既有測試），改用 parity 比對；待補：refresh-wait 呼叫端清單、fixture 補 NODE_GATEWAY
+- [ ] 4.3 review：獨立驗收（`OUT-review-repair-t4.md`：實作過；測試側四項待補——§7 同名檢查假綠、Gateway 值無斷言、callsite 清單、parity 守衛 → 子代理以 test 角色補）；commit
 
 ## 5. VM 端（D5 的後半、D7、D8）
 
