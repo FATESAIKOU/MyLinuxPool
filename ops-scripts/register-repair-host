@@ -20,7 +20,11 @@
 #   3. render the cloud-init NoCloud seed (user-data + meta-data, plus a
 #      seed.iso when an ISO tool exists) from profiles/provider/repair/, and
 #      refuse if the result contains anything that looks like a GitHub token
-#      (D5, generator half)
+#      (D5, generator half). The seed carries the VM-side tools from THIS
+#      checkout: pool-tunnel + tunnel-identity.sh (shared-configs) and the
+#      four repair-* scripts next to the template (token guard, D2
+#      fetch/report, the D7-paced launcher) — this script refuses before any
+#      of that if the checkout is missing one of the six
 #   4. write NODE_<NAME> in ONE `gh variable set`: role provider,
 #      capabilities {}, no power, hops to the VM's login user via the Gateway,
 #      tunnel_public_key
@@ -37,13 +41,21 @@
 # POOL_REPO, default FATESAIKOU/MyLinuxPool (same knob as register-client).
 #
 # Limitations (honest list):
-# * The seed does NOT bring a tunnel up yet. It creates the login user,
-#   installs the tunnel key, locks sshd to loopback + keys and writes
-#   /etc/mlp/tunnel.env; pool-tunnel, its unit, the VM-side token guard, the
-#   D2 fetch/report and the backoff are task 5 (the template marks where).
 # * POOL_GATEWAY_HOST in the seed is a placeholder (gateway-ip-set-at-launch
 #   .invalid): the Gateway IP changes on every rotate and is supplied at boot
-#   by the D2 channel (task 5).
+#   by the D2 channel (repair-gateway-fetch asks the Windows launcher).
+# * A VM-side tool missing from this checkout is a hard refusal, not a WARN:
+#   this script exits non-zero before it writes NODE_<NAME> or produces a
+#   seed at all, naming every missing file. This seed goes to a family
+#   member's machine that may not boot for the first time for weeks — a
+#   half-toolset seed handed out today would only be discovered as a failed
+#   systemd unit on their VM, with nobody there able to rebuild it. Refusing
+#   at build time, while the operator is still at the checkout that can fix
+#   it, is cheaper than that. (An earlier version of this script embedded a
+#   stub that exited 78 in place of a missing file and only WARNed; that
+#   stub path is gone.)
+# * The tools are embedded as they are in the working tree, committed or
+#   not — nothing checks that the checkout is clean.
 # * NODE_GATEWAY missing or without tunnel_user: the seed gets placeholders
 #   for the Gateway user/port and a WARN, not a refusal (see read_gateway).
 # * The port check reads the NODE_* list once; two registrations racing for
@@ -89,6 +101,7 @@ REPO="${POOL_REPO:-FATESAIKOU/MyLinuxPool}"
 REPO_ROOT="$(cd -P "${SCRIPT_DIR}/.." && pwd)"
 PROFILE_DIR="${REPO_ROOT}/profiles/provider/repair"
 TUNNEL_IDENTITY="${REPO_ROOT}/shared-configs/pool-runtime/files/tunnel-identity.sh"
+POOL_TUNNEL="${REPO_ROOT}/shared-configs/pool-runtime/files/pool-tunnel"
 REFRESH_WAIT="${REPO_ROOT}/scripts/lib/refresh-wait.sh"
 
 # The provider port band (docs/ARCHITECTURE.md, NODE_GATEWAY.ports.provider).
@@ -351,6 +364,49 @@ if [[ "$(printf '%s' "$TUNNEL_PUB" | awk '{print $2}')" == "$LOGIN_BLOB" ]]; the
 fi
 TUNNEL_PRIV_B64="$(base64 < "${STAGE}/${KEY_FILE_NAME}" | tr -d '\n')"
 
+# The VM-side tools the seed carries, one "<TEMPLATE TOKEN> <file>" per
+# line (the path is the rest of the line, so a checkout path with spaces
+# is fine). The template stages each under /usr/local/lib/mlp-repair/ and
+# its runcmd installs them into the login user's ~/.mylinuxpool/bin/.
+# tunnel-identity.sh was already required above (TUNNEL_IDENTITY, checked
+# near the top), so it always passes the loop below too; listing it here
+# keeps embedding uniform (one loop, one render pass) rather than a special
+# case for the one file this script happened to need earlier for itself.
+EMBEDS="EMBED_POOL_TUNNEL_B64 ${POOL_TUNNEL}
+EMBED_TUNNEL_IDENTITY_B64 ${TUNNEL_IDENTITY}
+EMBED_REPAIR_TOKEN_GUARD_B64 ${PROFILE_DIR}/repair-token-guard
+EMBED_REPAIR_GATEWAY_FETCH_B64 ${PROFILE_DIR}/repair-gateway-fetch
+EMBED_REPAIR_GATEWAY_REPORT_B64 ${PROFILE_DIR}/repair-gateway-report
+EMBED_REPAIR_TUNNEL_LAUNCH_B64 ${PROFILE_DIR}/repair-tunnel-launch"
+
+# embed_b64 <file> — the file as one line of base64 (no line breaks, so it
+#   drops into `content:` without touching the YAML). Every file named in
+#   $EMBEDS is checked in the loop below BEFORE this is ever called, so by
+#   the time embed_b64 runs the file is known to exist and be readable.
+embed_b64() {
+    base64 < "$1" | tr -d '\n'
+}
+# Refuse now, in this loop, if any embedded file is missing or unreadable —
+# before anything is rendered, before a seed touches disk, before GitHub is
+# written. This seed goes to a family member's machine that may not boot
+# for the first time for weeks; a half-toolset seed built today would only
+# surface as a failed systemd unit on their VM, long after the operator
+# (and this checkout) are gone. Naming the gap here, while the checkout can
+# still be fixed, beats that. Collect every miss (not just the first) so
+# one refusal message covers the whole checkout.
+_embed_missing=""
+while read -r _tok _path; do
+    [[ -n "$_tok" ]] || continue
+    if [[ ! -f "$_path" || ! -r "$_path" ]]; then
+        log ERROR "${_path} is missing or unreadable — this checkout cannot build a repair-host seed"
+        _embed_missing="${_embed_missing}${_embed_missing:+, }${_path##*/}"
+    fi
+done <<< "$EMBEDS"
+if [[ -n "$_embed_missing" ]]; then
+    log ERROR "refusing to build a repair-host seed with a missing VM-side tool: ${_embed_missing} — rebuild from a complete checkout"
+    exit 1
+fi
+
 # render_token <text> <TOKEN> <value> — every @@TOKEN@@ replaced by value.
 #   Prefix/suffix removal only, no ${x//pat/rep}: bash 5.2's
 #   patsub_replacement turns '&' in a replacement into the matched text, and
@@ -374,6 +430,10 @@ rendered="$(render_token "$rendered" GATEWAY_SSH_PORT "$GW_SSH_PORT")"
 rendered="$(render_token "$rendered" GATEWAY_HOST "$GATEWAY_HOST_PLACEHOLDER")"
 rendered="$(render_token "$rendered" TUNNEL_KEY_PATH "$VM_TUNNEL_KEY")"
 rendered="$(render_token "$rendered" TUNNEL_PRIVATE_KEY_B64 "$TUNNEL_PRIV_B64")"
+while read -r _tok _path; do
+    [[ -n "$_tok" ]] || continue
+    rendered="$(render_token "$rendered" "$_tok" "$(embed_b64 "$_path")")"
+done <<< "$EMBEDS"
 if [[ "$rendered" =~ @@[A-Z_]+@@ ]]; then
     log ERROR "${TEMPLATE} has a placeholder this script does not fill (${BASH_REMATCH[0]}) — template and generator are out of step"
     exit 1
@@ -542,7 +602,7 @@ echo "  boot data          ${OUTDIR}/user-data, ${OUTDIR}/meta-data"
 echo "  seed ISO           ${SEED_ISO_STATE}"
 echo "  tunnel key         ${OUTDIR}/${KEY_FILE_NAME} (PRIVATE — also inside user-data and any seed ISO; treat ${OUTDIR} as a secret)"
 echo "  Gateway in seed    user ${GW_TUNNEL_USER}, ssh port ${GW_SSH_PORT}, host ${GATEWAY_HOST_PLACEHOLDER} (IP comes at launch)"
-echo "  not in this seed   pool-tunnel + its unit, VM token guard, D2 fetch/report, backoff (task 5)"
+echo "  VM tools           pool-tunnel, tunnel-identity.sh, repair-token-guard, repair-gateway-fetch/-report, repair-tunnel-launch"
 if [[ "$refresh_ok" -eq 1 ]]; then
     echo "  refresh            confirmed — the Gateway authorizes the tunnel key"
     exit 0

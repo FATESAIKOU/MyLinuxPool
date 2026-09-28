@@ -27,13 +27,13 @@
 
 - [x] 4.1 test（`test-register-repair-host.sh`，定義介面 `--name/--gateway-port/--login-key/--output-dir`；兩種丟棄式實作皆 20/0）：登錄指令的行為測試（寫出的 `NODE_<NAME>` 形狀、port 衝突拒絕、開機資料不含權杖、含權杖的輸入被拒）
 - [x] 4.2 impl（子代理，`OUT-impl-repair-t4.md`）：新登錄指令；開機資料產生器（模板在 `profiles/provider/repair/`）。**共用函式沒抽**（register-provider 是單檔執行，抽出會打壞兩支既有測試），改用 parity 比對；待補：refresh-wait 呼叫端清單、fixture 補 NODE_GATEWAY
-- [ ] 4.3 review：獨立驗收（`OUT-review-repair-t4.md`：實作過；測試側四項待補——§7 同名檢查假綠、Gateway 值無斷言、callsite 清單、parity 守衛 → 子代理以 test 角色補）；commit
+- [x] 4.3 review：獨立驗收（`OUT-review-repair-t4.md`：實作過；測試側四項待補——§7 同名檢查假綠、Gateway 值無斷言、callsite 清單、parity 守衛 → 子代理以 test 角色補）；commit
 
 ## 5. VM 端（D5 的後半、D7、D8）
 
-- [ ] 5.1 test：權杖守衛（有權杖檔或 `GH_*` 變數 → 不啟動）、重試節奏（連續被拒時 10 分鐘內的嘗試不到 5 次）
-- [ ] 5.2 impl：維修承載機的 profile、unit、sshd 設定（只聽 loopback、只收金鑰）、cloud-init 範本
-- [ ] 5.3 review：獨立驗收；commit
+- [x] 5.1 test（DeepSeek 兩輪無產出 → sonnet 子代理接手；`test-repair-host-vm.sh`，現碼紅 12 條、檔頭定義四支腳本與兩個 unit 的介面）：權杖守衛（有權杖檔或 `GH_*` 變數 → 不啟動）、重試節奏（連續被拒時 10 分鐘內的嘗試不到 5 次）
+- [x] 5.2 impl（Claude 子代理，`OUT-impl-repair-t5.md`）：四支 VM 端腳本、兩個 system unit、開機資料自帶 pool-tunnel；缺嵌入檔時打包直接拒絕
+- [x] 5.3 review（`OUT-review-repair-t5.md`，含真 cloud-init 容器驗 defer 與 runcmd 順序）：defer 斷言弱點已修；commit
 
 ## 6. Windows 啟動器（D2 定案後）
 

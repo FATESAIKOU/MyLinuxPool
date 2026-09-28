@@ -266,6 +266,22 @@ cp "$REPO_ROOT/profiles/provider/repair/user-data.tmpl" "$INJ_REPO/profiles/prov
 cp "$REPO_ROOT/scripts/lib/refresh-wait.sh" "$INJ_REPO/scripts/lib/"
 cp "$REPO_ROOT/shared-configs/pool-runtime/files/tunnel-identity.sh" \
     "$INJ_REPO/shared-configs/pool-runtime/files/"
+# register-repair-host also embeds pool-tunnel (same shared-configs directory
+# as tunnel-identity.sh) and four profiles/provider/repair/repair-* scripts
+# ($EMBEDS below) — without these the mutant run below fails before it ever
+# gets to compare hops shapes (register-repair-host now refuses on a missing
+# embed target), which would misreport as a harness problem instead of
+# proving the hops-shape guard.
+cp "$REPO_ROOT/shared-configs/pool-runtime/files/pool-tunnel" \
+    "$INJ_REPO/shared-configs/pool-runtime/files/"
+cp "$REPO_ROOT/profiles/provider/repair/repair-token-guard" \
+    "$INJ_REPO/profiles/provider/repair/"
+cp "$REPO_ROOT/profiles/provider/repair/repair-gateway-fetch" \
+    "$INJ_REPO/profiles/provider/repair/"
+cp "$REPO_ROOT/profiles/provider/repair/repair-gateway-report" \
+    "$INJ_REPO/profiles/provider/repair/"
+cp "$REPO_ROOT/profiles/provider/repair/repair-tunnel-launch" \
+    "$INJ_REPO/profiles/provider/repair/"
 INJ_RH="$INJ_REPO/ops-scripts/register-repair-host"
 python3 - "$REPO_ROOT/$RH" "$INJ_RH" <<'PY'
 import sys
