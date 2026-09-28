@@ -109,6 +109,21 @@ jobs:
             exit 1
           fi
 
+          # Validate that the provider has declared worker-host capability.
+          # Providers must actively declare the capabilities they offer; an
+          # empty or missing capabilities field means this node does not host
+          # workers (design D6).
+          provider_var="NODE_$(printf '%s' "$provider" | tr '[:lower:]-' '[:upper:]_')"
+          # A failed read is not the same as "not declared": say which one it was.
+          if ! provider_config="$(gh api "repos/${GH_REPO}/actions/variables/${provider_var}" --jq .value 2>/dev/null)"; then
+            echo "::error::could not read ${provider_var} for provider '${provider}' (GitHub API read failed); cannot check its 'worker-host' capability"
+            exit 1
+          fi
+          if ! jq -e '.capabilities // {} | has("worker-host")' <<<"$provider_config" >/dev/null 2>&1; then
+            echo "::error::provider '${provider}' does not declare the 'worker-host' capability and cannot host workers"
+            exit 1
+          fi
+
       - name: Validate image profile
         shell: bash
         run: |

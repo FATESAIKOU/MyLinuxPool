@@ -28,15 +28,17 @@
 
 **D1. VM 用 Ubuntu cloud image ＋ cloud-init NoCloud 開機資料，不在 Mac 上建整份映像。**
 Mac（Apple Silicon）跑不了 x86 的 VirtualBox，所以不能在本機用 Packer 建映像再匯出。改成：映像用官方的 Ubuntu cloud image（amd64），每台家人電腦的差異全部放進一份 NoCloud 開機資料（seed ISO）。內容包括隧道私鑰、登入公鑰、節點名稱、provider port、`pool-tunnel` 腳本與 systemd unit。開機資料在 Mac 上就能產生，只要檔案工具，不需要跑 VM。
-前提要先驗：cloud image 在沒有網路安裝套件的情況下，就能跑起 `pool-tunnel`（它需要的是 bash 和 ssh）。
+spike 已驗（2026-09-29）：noble amd64 cloud image 只給 NoCloud seed、沒有 `packages:`，在 VirtualBox NAT 下約 35 秒接上隧道；映像已內建 bash、openssh、jq、netcat、curl、python3（沒有 bzip2）。實作要注意：
+- Ubuntu 24.04 的 sshd 是 socket activation：首次開機時 `ListenAddress` 生效得比 cloud-init 寫設定早，sshd 會先聽 `0.0.0.0:22` 約 30 秒，`runcmd` 要 `systemctl daemon-reload && systemctl restart ssh.socket`（NAT 沒有 port forward，這段時間外面也連不到）
+- 屬於 cloud-init 建立的使用者的檔案要 `write_files … defer: true`
+- unit 用 system unit 加 `User=`，比 user unit 加 linger 在 cloud-init 裡簡單
+- 家人的區網若剛好是 `10.0.2.0/24`，會跟 VirtualBox NAT 的預設網段撞，要能用 `--natnet1` 換
 替代方案：Packer 或 Vagrant 建整份映像（否決，Mac 上做不到）；WSL2（否決，Win10 上的 WSL2 無法單獨成為一台被登入的機器，行為也跟 VM 不同）。
 
-**D2. 啟動器和 VM 之間怎麼傳 Gateway IP 與連線狀態：先做 spike 再定。**
-候選有三個，spike 要在一台 Win10 上實測：
-- VirtualBox guest property：需要 VM 裡有 Guest Additions，cloud image 沒有
-- 每次啟動時重建一份小的設定 ISO：PowerShell 可以透過 Windows 內建的 IMAPI2 COM 產生
-- VM 經 NAT 的 `10.0.2.2` 向啟動器在 `127.0.0.1` 上開的小服務取值、回報狀態
-選擇的標準依序是：不需要系統管理員權限、零額外安裝、能雙向傳（啟動器需要知道隧道有沒有接上，才能顯示 spec 要求的「連不上」訊息）。
+**D2. 啟動器和 VM 之間用 HTTP：啟動器在 `127.0.0.1` 上開一個小服務，VM 經 NAT 的 `10.0.2.2` 連過去。**（2026-09-29 spike 定案，`OUT-spike-repair.md`）
+VM 從這個服務取得 Gateway IP，並把隧道狀態回報給它（啟動器用來顯示「連不上」的訊息）。實測結果：在非系統管理員的 token 下，`http://127.0.0.1:<port>/` 的 HttpListener 不需要 URL ACL；VirtualBox NAT 會把 `10.0.2.2` 轉到主機的 loopback；兩端都只用內建工具（PowerShell 5.1／.NET、映像自帶的 curl）。啟動器建 VM 時要**明確**設 `--nat-localhostreachable1 on`，不依賴預設值；固定 port 要有備案（撞埠時換下一個）。
+另外保留**序列埠寫檔**（`--uart-mode1 file`）當診斷通道，讓啟動器看得到 VM 的開機紀錄。
+替代方案：(a) VirtualBox guest property——可行也是雙向，雲映像的核心已帶 vboxguest 驅動，但 VM 裡要放一份跟 VirtualBox 版本綁在一起的 `VBoxControl`，列為備案；(b) 每次啟動重做一張設定 ISO（IMAPI2，不用系統管理員）——只能單向，否決。
 
 **D3. `pool-tunnel` 的靜態模式加一個選填的 SSH port 環境變數（例如 `POOL_GATEWAY_SSH_PORT`）。**
 沒給時維持現在的行為（22），所以既有呼叫端（worker 的退路）不受影響。維修承載機的開機資料寫入 2100。家人只輸入 IP，不用輸入 port。
@@ -66,6 +68,8 @@ Mac（Apple Silicon）跑不了 x86 的 VirtualBox，所以不能在本機用 Pa
 - [家人電腦裡的隧道私鑰外洩 → 對方拿到 Gateway 上 `sshproxy` 的 shell，也能監聽任意 port] → 使用者知情後決定本輪不收窄；寫進 known limitations，之後要收窄全池時一併處理
 - [AI 能在家人的網路裡執行指令] → 使用者決定；MyAiEntry 會把它列成「承載機，未宣告能力清單」
 - [Gateway rotate 後 IP 會變，VM 只能 `accept-new` 新的 host key] → 家人重新輸入 IP，啟動器顯示看得懂的訊息；`accept-new` 的風險是第一次連線時可能連到假冒的 Gateway，但對方最多拿到一個指向 VM sshd 的轉發，登入仍要使用者的金鑰
+- [以一般使用者（非系統管理員）身分執行 `VBoxManage` 沒有實證] → spike 在提權的 ssh session 裡做，模擬一般使用者的 token 又被 VirtualBox COM 拒絕（`E_ACCESSDENIED`，是模擬方法的限制）。三種 D2 方案都要用 `VBoxManage`，所以**真機驗收一定要在桌面 session、非提權的狀態下跑一次**；文件要提醒家人不要「以系統管理員身分」開 VirtualBox（提權與非提權的 VirtualBox 行程彼此連不上）
+- [`restrict`＋`permitlisten` 擋不住遠端執行指令] → spike 在 Win32-OpenSSH 上實測；OpenSSH 的語意相同。日後若要收窄隧道金鑰，光靠 permitlisten 不夠，而 `pool-tunnel` 的健康檢查與 state 抓取都要在遠端執行指令，也不能直接加 `command=`
 - [Windows 那一端在 Mac 上測不了] → 啟動器只做靜態檢查與單元測試；D2 的 spike 和最終驗收都要一台真的 Win10，**需要使用者安排**
 - [家人的電腦已經開了 Hyper-V，VirtualBox 會退到比較慢的模式] → 寫進操作文件
 - [D6 可能擋掉現役的 provider] → 實作前先查三台現役 provider 的 capabilities
@@ -78,5 +82,4 @@ Mac（Apple Silicon）跑不了 x86 的 VirtualBox，所以不能在本機用 Pa
 
 ## Open Questions
 
-- D2 的傳遞方式：spike 決定，不影響 specs
 - VirtualBox 安裝檔要不要跟啟動器一起打包，還是請家人另外下載（授權與檔案大小）：spike 時一起確認

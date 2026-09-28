@@ -7,25 +7,25 @@
 
 ## 1. 可行性 spike（不改 repo）
 
-- [ ] 1.1 impl：Ubuntu cloud image（amd64）只靠 NoCloud 開機資料、不從網路裝套件，就能跑起 `pool-tunnel` 靜態模式的 unit。先在 Mac 上用 QEMU 驗 cloud-init 的內容（arm64 原生或 amd64 模擬）
-- [ ] 1.2 impl＋使用者：在 Win10 上比較 D2 的三種傳遞方式，選一個；同時確認 VirtualBox 的安裝與打包方式
-- [ ] 1.3 PM：依 spike 結果更新 design.md 的 D1／D2，給使用者看
+- [x] 1.1 impl（Claude 子代理，`OUT-spike-repair.md`）：可行。Ubuntu cloud image（amd64）只靠 NoCloud 開機資料、不從網路裝套件，就能跑起 `pool-tunnel` 靜態模式的 unit。先在 Mac 上用 QEMU 驗 cloud-init 的內容（arm64 原生或 amd64 模擬）
+- [x] 1.2 impl（同上，在 fh-l 的 Win11 上）：D2 三種都實測可行，選 (c) HTTP 經 10.0.2.2；非系統管理員跑 VBoxManage 未證（要在桌面 session 驗）
+- [x] 1.3 PM：依 spike 結果更新 design.md 的 D1／D2 與 Risks（給使用者看）
 
 ## 2. pool-tunnel 靜態模式的 SSH port（D3）
 
-- [ ] 2.1 test：行為測試：靜態模式帶 port → ssh 用那個 port；不帶 → 維持 22（對現碼紅在第一條）
-- [ ] 2.2 impl：加選填環境變數
+- [x] 2.1 test（`test-pool-tunnel-static-port.sh`，現碼紅 1b／1c／4）：行為測試：靜態模式帶 port → ssh 用那個 port；不帶 → 維持 22（對現碼紅在第一條）
+- [x] 2.2 impl（haiku 子代理；報告不可信，由 review 獨立驗收）：加選填環境變數
 - [ ] 2.3 review：獨立驗收；commit
 
 ## 3. create-worker 的 capability 閘門（D6）
 
-- [ ] 3.1 PM：確認三台現役 provider 都宣告了 `worker-host`（唯讀）
-- [ ] 3.2 test：指名沒有 `worker-host` 的 provider → 在寫入任何狀態之前失敗（對現碼紅）
-- [ ] 3.3 impl；3.4 review；commit
+- [x] 3.1 PM：確認三台現役 provider 都宣告了 `worker-host`（唯讀，2026-09-28：fh-l、fh-proxy、fh-proxy-asus 皆有）
+- [x] 3.2 test（`test-create-worker-capability-gate.sh`，現碼紅 2a／2b／3；實作時要一起更新 `test-provider-validation.sh` 的 fixture）：指名沒有 `worker-host` 的 provider → 在寫入任何狀態之前失敗（對現碼紅）
+- [ ] 3.3 impl（haiku 子代理，同上）✓；3.4 review；commit
 
 ## 4. Mac 端登錄（D4、D5 的前半）
 
-- [ ] 4.1 test：登錄指令的行為測試（寫出的 `NODE_<NAME>` 形狀、port 衝突拒絕、開機資料不含權杖、含權杖的輸入被拒）
+- [x] 4.1 test（`test-register-repair-host.sh`，定義介面 `--name/--gateway-port/--login-key/--output-dir`；兩種丟棄式實作皆 20/0）：登錄指令的行為測試（寫出的 `NODE_<NAME>` 形狀、port 衝突拒絕、開機資料不含權杖、含權杖的輸入被拒）
 - [ ] 4.2 impl：抽出 `register-provider` 寫 `NODE_<NAME>` 的共用函式；新登錄指令；開機資料產生器
 - [ ] 4.3 review：獨立驗收（含 register-provider 行為不變）；commit
 
