@@ -47,11 +47,19 @@
 
 ## 8. 真機驗收
 
-- [ ] 8.1 在 Mac 上登錄一台真的維修承載機（挑一個沒被佔用的 provider port）
-- [ ] 8.2 在 Win10 上首次安裝、雙擊啟動、從 Gateway 登入 VM、從 VM 連到那個網路的路由器
-- [ ] 8.3 從同一個區網的另一台裝置連 VM 的 22 port → 連不上
-- [ ] 8.4 關掉狀態視窗 → VM 關機、Gateway 上那個 port 消失
-- [ ] 8.5 `mlp ls`／`mlp state` 正常；指名它建 worker 被拒
+- [x] 8.1 登錄 `fam-test`（NODE_FAM_TEST，埠 2240），refresh run 36465401724 成功（`OUT-live-repair.md`）
+- [x] 8.2 在 fh-l 的 **Win11** 上以 VirtualBox 開 VM（啟動器以臨時 PowerShell 服務模擬），約 21 秒 tunnel=up；從 Mac 經 Gateway 登入 VM；VM 連 192.168.0.1 回 200。**未驗**：桌面 session、真啟動器、雙擊、Win10
+- [x] 8.3 從同一區網的 Mac 連不到 VM 的 sshd
+- [~] 8.4 以 acpipowerbutton 關機 → 6 秒內關機、回報 tunnel=down、Gateway 上 2240 消失（「關視窗即關機」要等啟動器）
+- [~] 8.5 `mlp ls` up ✓；分支上的 create-worker 在 Validate inputs 拒絕 fam-test、零寫入 ✓；**`mlp state` 報 only in master: fam-test**（登錄時沒推 state 快取）✗
+
+## 8b. 真機驗收找到的問題（待使用者裁決）
+
+- [ ] 8b.1 VM 只信任專用登入金鑰 → `mlp ssh fam-test`（用 `~/.ssh/id_mlp`）與 MyAiEntry（AI）都登不進：要不要把使用者已登錄的 client 公鑰（CLIENT_*）也放進 VM
+- [ ] 8b.2 登錄後 `mlp state` 不一致：登錄指令要不要順便推 state 快取
+- [ ] 8b.3 Windows 上 seed.iso 權限繼承 `C:\`（本機任何使用者讀得到隧道私鑰）→ 啟動器安裝時鎖資料夾權限（併入 6.1）
+- [ ] 8b.4 `repair` 帳號沒有 root（sudo 要密碼、密碼鎖住）：要不要給 NOPASSWD sudo（AI 也會拿到）
+- [ ] 8b.5 Gateway host key：目前每次開機清 known_hosts（每次 accept-new）；要不要「先釘、不符退回」
 
 ## 9. 收尾
 
