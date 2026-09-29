@@ -62,6 +62,21 @@
 # 那行 → 必須紅且指名）。「紅證明有病」與「綠證明沒病」不能是同一條斷言在同一個
 # 版本下同時成立——§1 釘後者，2a 釘前者。
 #
+# ---- 2026-09-29 修的兩個既有缺陷（使用者裁示在本分支一起修）----------------
+#
+# 1. **這支測試自己的 FAIL 不算數。** must_red_naming／must_green 只 printf
+#    `FAIL`、return 1，沒有呼叫 bad()／injfail——畫面上兩行 FAIL，摘要行與
+#    exit code 卻是綠（`passed 3 / failed 0`、exit 0）。CI 只看 exit code，
+#    所以那兩條守衛等於不存在。修法：失敗分別計入 fail／injfail（成功計數點
+#    不動），走既有的 exit 路徑。證據：拿掉修 2 後重跑，同一份程式現在會回
+#    `passed 3 / failed 3`、rc 3（OUT-test-callsite-guard-fix.md §3a）。
+# 2. **審計把 workflow 的 description: 文字當成呼叫。**
+#    `.github/workflows/refresh-authorized-keys.yml` 的 input `description:`
+#    裡有一句含 `dispatch_refresh_and_wait` 的說明，被文字掃描當成呼叫端，
+#    報 `undeclared-callsite`（2026-09-27 `12d3a2b` 起；一直沒被發現，正是
+#    因為缺陷 1 讓 §1a 的紅不算數）。修法在 helper：YAML 只掃 `run:` 純量的
+#    內容（2e 釘「run: 裡的呼叫仍抓到」、2g 釘「description: 裡的文字不抓」）。
+#
 # 全離線：不連網、不連池子。所有注入都在 $SANDBOX 的整樹複本上做，不碰真的檔案。
 # bash 3.2 相容。
 #
@@ -100,16 +115,27 @@ tar -cf - --exclude='.git' . 2>/dev/null | (cd "$TREE" && tar -xf - 2>/dev/null)
 audit() { python3 "$TREE/$HELPER" "$TREE" "$@"; }
 
 # 斷言：跑審計，必須紅，且輸出必須指名 needle
+# 2026-09-29 修：這兩個 helper 原先只 `printf FAIL` 就 return 1，**沒有把失敗
+# 算進計數**——畫面上有 FAIL，摘要行與 exit code 卻是綠（CI 只看 exit code，
+# 那些守衛等於不存在）。現在失敗會分別計入 injfail／fail，走既有的 exit 路徑。
+# 計數語意（維持原本的成功計數點，只補上失敗）：
+#   * 成功：must_red_naming 由呼叫端 `&& inj_ok` 記 injpass；must_green 的成功
+#     與以前一樣不計數（§1a／复位那兩條本來就不在 passed 裡，形狀不變）。
+#   * 失敗：must_red_naming → injfail；must_green → fail。
+#     （2g 是 must_green，所以它的失敗走 fail 而不是 injfail——語意上是「這條
+#     守衛斷言不成立」，兩者都進 exit code。）
 must_red_naming() {   # must_red_naming <標籤> <needle> [更多 needle…]
     local label="$1"; shift
     local out rc n
     out="$(audit 2>&1)"; rc=$?
     if [[ $rc -eq 0 ]]; then
+        injfail=$((injfail+1))
         printf '  FAIL  %s\n        預期紅，實際綠（輸出 [%s]）\n' "$label" "$(printf '%s' "$out" | tr '\n' ' ' | head -c 200)"
         return 1
     fi
     for n in "$@"; do
         if ! printf '%s' "$out" | grep -qF "$n"; then
+            injfail=$((injfail+1))
             printf '  FAIL  %s\n        紅了但沒有指名「%s」（輸出 [%s]）\n' "$label" "$n" \
                 "$(printf '%s' "$out" | tr '\n' ' ' | head -c 300)"
             return 1
@@ -122,6 +148,7 @@ must_green() {   # must_green <標籤>
     local label="$1" out rc
     out="$(audit 2>&1)"; rc=$?
     if [[ $rc -ne 0 ]]; then
+        fail=$((fail+1))
         printf '  FAIL  %s\n        預期綠，實際紅：[%s]\n' "$label" "$(printf '%s' "$out" | tr '\n' ' ' | head -c 300)"
         return 1
     fi
@@ -134,7 +161,7 @@ ok "0a. helper 與被審計的檔案都在（helper ${HELPER}／主體 ${SUBJ}�
 
 echo
 echo "=== 1. 現況：檔頭與掃描一致 → 綠 ==="
-must_green "1a. 工作樹現況 → 綠（檔頭列的三項與掃描到的三處呼叫端一致）"
+must_green "1a. 工作樹現況 → 綠（檔頭列的呼叫端與掃描到的一致）"
 
 echo
 echo "=== 2. 注入：證明紅與綠都不是偶然 ==="
@@ -258,7 +285,34 @@ if [[ $? -ne 0 ]]; then
 else
     must_red_naming "2e. workflow run: 區塊裡的呼叫也會被抓到" \
         "undeclared-callsite .github/workflows/delete-worker.yml" \
-        && inj_ok "2e. workflow 裡的呼叫端被掃到——CI 路徑不會漏"
+        && inj_ok "2e. workflow 裡的呼叫端被掃到——CI 路徑不會漏（修 2 沒有放掉真呼叫）"
+fi
+
+# 2g：**純量資料裡的函式名不是呼叫**（2026-09-29 修 2 的正對照）。
+#     把同一個函式名放進 `description:`（workflow input 的說明文字）→
+#     審計必須**不**紅。這是修 2 的兩面之一：2e 證明 run: 裡的呼叫仍被抓到，
+#     2g 證明 description: 裡的文字不再被當成呼叫。少了這條，修 2 可能只是
+#     把整份 YAML 排除掉——那樣 2e 也會紅，看不出差別。
+reset_subject
+python3 - "$TREE/.github/workflows/delete-worker.yml" <<'PY'
+import sys
+p = sys.argv[1]
+s = open(p, encoding="utf-8").read()
+old = "      port:\n        description: Worker's Gateway port (from Create Worker's output). Either this or name.\n"
+assert s.count(old) == 1, "description needle count != 1: %d" % s.count(old)
+s = s.replace(old, old +
+              "      doc_only:\n"
+              "        description: 'Documentation: dispatch_refresh_and_wait is described here.'\n"
+              "        required: false\n"
+              "        default: ''\n"
+              "        type: string\n", 1)
+open(p, "w", encoding="utf-8").write(s)
+PY
+if [[ $? -ne 0 ]]; then
+    inj_bad "2g. 注入腳本失敗（workflow 形狀變了）——harness 問題"
+else
+    must_green "2g. 函式名寫在 description:（資料）→ 不紅（修 2：純量資料不是呼叫）" \
+        && inj_ok "2g. description 裡的函式名不再誤報——修 2 只排資料，沒排真呼叫（2e 對照）"
 fi
 
 # 2f：**解析器壞掉不會長得像真實的不一致。**
