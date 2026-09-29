@@ -35,14 +35,42 @@
 #      被真正驗過（review OUT-review-repair-t4.md 發現 1）。§7a2 另外斷言拒絕
 #      訊息是同名檢查的那句（"already exists"），不是 output-dir 守衛的
 #      （"already holds the seed for"）。
+#   8. **CLIENT_* 公鑰進 VM 的登入授權**（2026-09-29 使用者決定，tasks 8b.1）：
+#      在 Mac 上產生開機資料的當下，把所有已登錄的 client 公鑰（GitHub
+#      variables CLIENT_*，值形狀照真 API：{"name","public_key","added_at"}）
+#      抓下來，連同原本的 --login-key 一起放進 VM 的登入授權。不自動更新；
+#      要更新就重新產生開機資料。VM 上依然不能有任何 GitHub 權杖。
+#      * 沒有任何 CLIENT_* → **拒絕**（rc 非 0、訊息提及 CLIENT_、零次
+#        variable set、輸出目錄不產出任何檔案）。理由（跟 design 精神對齊）：
+#        這個決定存在的目的正是「已登錄的 client 都能登入」；沒有 CLIENT_*
+#        時若靜默只放 --login-key，等於無聲退回 8b.1 的問題
+#        （OUT-live-repair.md §8b.1），而且開機資料沒有 launch-time 通道能
+#        事後補金鑰（更新只能重做 seed）——最早也唯一能攔的時機就是登錄
+#        當下。寧可出貨時就說清楚。
+#      * 某一筆 CLIENT_* 的 public_key 形狀壞掉 → 略過那一筆、警告點名該
+#        變數，其餘金鑰照常放進授權；整份授權不因此失敗。
+#      * 這些之後，開機資料仍然不含任何 GitHub 權杖（§8c 在含 CLIENT 公鑰
+#        的那一輪再掃一次；§4 是同一性質的既有覆蓋）。
+#   9. **CLIENT_* 的兩個補強**（2026-09-29 PM 裁定，review
+#      OUT-review-repair-clientkeys-sudo.md §3 發現 1、2）：
+#      * 某一筆 CLIENT_* 的**值根本不是 JSON** → **略過那一筆並警告**（跟
+#        「公鑰格式壞掉就略過」一致），指令照常成功、其他 CLIENT 公鑰都在、
+#        訊息點名那一筆的**變數名**（值不是 JSON 時沒有內層 name 可取，變數名
+#        是唯一識別）。**不可整個崩潰**：現碼走無 guard 的 jq 賦值，
+#        set -euo pipefail 下 rc=5、沒有訊息、沒有檔案（§9a 對現碼紅）。
+#      * **排除 `CLIENT_ACTIONS`**（GitHub Actions 的金鑰）：放進去會讓能跑
+#        workflow 的東西都能進家人的網路；使用者要的是「他平常的金鑰＋AI」。
+#        開機資料裡不得有它的公鑰，其他都在（§9b 對現碼紅——現碼 filter 是
+#        裸的 startswith("CLIENT_")，會納入）。
 #
 # 正對照（量到 0 不算證據）：
 #   * 假 gh 確實被呼叫（§1b）；
 #   * 權杖掃描器先在一個故意塞了假權杖的檔案上證明看得見（§4a）；
-#   * ssh-keygen -y 的配對驗證在正例上先證明會配對（§1h 的 derived 非空）。
+#   * ssh-keygen -y 的配對驗證在正例上先證明會配對（§1h 的 derived 非空）；
+#   * CLIENT_* fixture 先證明假 gh 真的吐得出來（§8a0），再拿它的 blob 斷言。
 #
 # 這支測試檔本身沒有注入框架（不像 test-capability-flags.sh／
-# test-callsite-lists.sh）；§7 與 §1i/§1j 的紅／綠對照改在 impl 外的一份
+# test-callsite-lists.sh）；§7、§1i/§1j 與 §8 的紅／綠對照改在 impl 外的一份
 # scratch 複本上手動做一次，證據記在交件報告，不是本檔的斷言。
 #
 # ---- 這支測試看不到什麼（誠實記在這裡）------------------------------------
@@ -56,6 +84,20 @@
 #   的權限與 race 不在這裡。
 # * 金鑰生成用真 ssh-keygen（假的不會發現 -f/-N 寫錯）；產物全在沙盒。
 # * 名稱字元規範、金鑰檔不存在、輸出目錄不可寫等邊界不在本輪（工單 1–7）。
+# * §8 只驗「公鑰有沒有進開機資料」（blob 命中）；不驗它落在 user-data 的
+#   哪個 YAML 欄位、也不驗 sshd 真的接受它（雲端解析與登入測試是真機驗收
+#   的事）。CLIENT 公鑰的「壞掉」只涵蓋 public_key 不是公鑰的形狀；整個
+#   CLIENT_* 變數的 JSON 壞掉屬 refresh-authkeys 的既有涵蓋。
+# * §9 的「值不是 JSON」只涵蓋「完全解析不了」（jq parse error）。合法 JSON
+#   但形狀不是 CONTRACT 物件（例如 `[1,2]`、`"str"`、`{}`）的行為不在本節：
+#   它們沒有 `.name`／`.public_key`，實作可能略過（與 §9a 同路徑）也可能
+#   另判——本輪依 PM 裁定只釘「不是 JSON → 略過並警告」。§9b 的排除只驗
+#   `CLIENT_ACTIONS` 一個名字；其他 Actions 相關的金鑰（`CLIENT_ACTIONS_*`
+#   前綴之類）目前不存在於契約，沒有斷言。
+# * §9 只驗「指令照常成功、其他金鑰在、警告點名」；不驗警告的格式（級別、
+#   引號、欄位順序），只驗它含那一筆的變數名。
+# * §8 的「沒有 CLIENT_*」決定（拒絕 vs 只放 --login-key）是檔頭寫明的
+#   契約；impl 若刻意選另一條，要同步改本檔。
 #
 # 全離線；bash 3.2＋5.x。
 # Run: scripts/tests/test-register-repair-host.sh
@@ -97,6 +139,48 @@ NODE_VAR_1='{"name":"family-old","role":"provider","gateway_port":2250,"capabili
 NODE_VAR_GW='{"name":"gateway","role":"gateway","ip":"203.0.113.9","user":"fatesaikou","tunnel_user":"sshproxy","port":2100,"key_secret":"SSH_KEY_ACTIONS"}'
 printf '%s\n%s\n%s\n' "$NODE_VAR_0" "$NODE_VAR_1" "$NODE_VAR_GW" > "$SANDBOX/node-vars.txt"
 
+# CLIENT_* fixtures：兩個正常的已登錄 client。金鑰是真的 ed25519 blob（用
+# ssh-keygen 產，跟 LOGIN_KEY 同一套真工具），值形狀照 register-client 寫的
+# CONTRACT 物件（{name, public_key, added_at}，.value 是 JSON 字串）。
+# 放在 fixture 檔（$SANDBOX/client-vars.txt），假 gh 讀同一份；§8 的「沒有
+# CLIENT_*」案例用一份空的 fixture 檔，不重寫假 gh。
+CLIENT_KEY_A="$SANDBOX/client_a"
+CLIENT_KEY_B="$SANDBOX/client_b"
+ssh-keygen -t ed25519 -N "" -C "client-a-test" -f "$CLIENT_KEY_A" >/dev/null 2>&1
+ssh-keygen -t ed25519 -N "" -C "client-b-test" -f "$CLIENT_KEY_B" >/dev/null 2>&1
+CLIENT_A_PUB="$(tr -d '\r\n' < "$CLIENT_KEY_A.pub")"
+CLIENT_B_PUB="$(tr -d '\r\n' < "$CLIENT_KEY_B.pub")"
+CLIENT_A_BLOB="$(printf '%s' "$CLIENT_A_PUB" | awk '{print $2}')"
+CLIENT_B_BLOB="$(printf '%s' "$CLIENT_B_PUB" | awk '{print $2}')"
+CLIENT_VAR_A="$(jq -n -c --arg pk "$CLIENT_A_PUB" '{name:"laptop", public_key:$pk, added_at:"2026-09-20T00:00:00Z"}')"
+CLIENT_VAR_B="$(jq -n -c --arg pk "$CLIENT_B_PUB" '{name:"phone", public_key:$pk, added_at:"2026-09-21T00:00:00Z"}')"
+# 第三筆是「公鑰格式壞掉」：形狀是合法的 CONTRACT 物件（name/public_key/added_at），
+# 只有 public_key 內容不是公鑰。只放在 §8c 專用的 fixture 裡（預設 fixture
+# 保持乾淨兩筆，§1 等既有章節不受影響）。§8c 驗它被略過（警告點名）而不是讓
+# 整份授權壞掉。
+CLIENT_VAR_BAD="$(jq -n -c '{name:"badkey", public_key:"not-a-valid-ssh-public-key", added_at:"2026-09-22T00:00:00Z"}')"
+printf '%s\n%s\n' "$CLIENT_VAR_A" "$CLIENT_VAR_B" > "$SANDBOX/client-vars.txt"
+printf '%s\n%s\n%s\n' "$CLIENT_VAR_A" "$CLIENT_VAR_B" "$CLIENT_VAR_BAD" > "$SANDBOX/client-vars-bad.txt"
+: > "$SANDBOX/client-vars-empty.txt"
+
+# §9 專用 fixtures。
+# §9a：一筆正常（laptop）＋一筆「值根本不是 JSON」。假的真 API 形狀是
+# {name:"CLIENT_BROKEN", value:"not-json-at-all"}——值不是 JSON 字串、也不
+# 是任何 JSON。fixture 用 "<VARNAME><TAB><raw value>" 這個附加格式表達
+# （假 gh 的 _envelope 認 TAB；既有 fixture 不受影響），因為一般格式是
+# 「值是 JSON、變數名由內層 .name 推導」，推導不了非 JSON 的行。變數名仍
+# 以 CLIENT_ 開頭——實作自己的 jq 濾鏡就是 select(startswith("CLIENT_"))，
+# 名字不對它根本不會被讀到，那就不是這條要測的東西。
+printf '%s\n%s\n' "$CLIENT_VAR_A" "$(printf 'CLIENT_BROKEN\tnot-json-at-all')" > "$SANDBOX/client-vars-nonjson.txt"
+# §9b：一筆正常（laptop）＋ CLIENT_ACTIONS（形狀照真的：值是合法 CONTRACT
+# 物件、公鑰是另一把真 ed25519）。它的公鑰 blob 用來斷言「不在開機資料裡」。
+CLIENT_KEY_ACTIONS="$SANDBOX/client_actions"
+ssh-keygen -t ed25519 -N "" -C "client-actions-test" -f "$CLIENT_KEY_ACTIONS" >/dev/null 2>&1
+CLIENT_ACTIONS_PUB="$(tr -d '\r\n' < "$CLIENT_KEY_ACTIONS.pub")"
+CLIENT_ACTIONS_BLOB="$(printf '%s' "$CLIENT_ACTIONS_PUB" | awk '{print $2}')"
+CLIENT_VAR_ACTIONS="$(jq -n -c --arg pk "$CLIENT_ACTIONS_PUB" '{name:"actions", public_key:$pk, added_at:"2026-09-23T00:00:00Z"}')"
+printf '%s\n%s\n' "$CLIENT_VAR_A" "$CLIENT_VAR_ACTIONS" > "$SANDBOX/client-vars-actions.txt"
+
 # ---- 假 gh：記 argv、stdin 落檔；api 讀 fixtures；支援 refresh 等待迴圈 ------
 cat > "$SHIMS/gh" <<'FAKE'
 #!/usr/bin/env bash
@@ -112,11 +196,26 @@ _emit() {
     else printf '%s\n' "$1"; fi
 }
 _envelope() {
-    jq -n --rawfile vars "${NODE_VARS_FILE:-/dev/null}" '
-        {total_count: ($vars | split("\n") | map(select(length>0)) | length),
-         variables: ($vars | split("\n") | map(select(length>0))
-                     | map(. as $v | ($v | fromjson | .name | ascii_upcase | gsub("-"; "_")) as $n
-                            | {name: ("NODE_" + $n), value: $v}))}'
+    # 一次列出的內容同時含 NODE_* 與 CLIENT_*，讓實作用哪一種 --jq 濾鏡
+    # （startswith("NODE_")／startswith("CLIENT_")／全部）都由它自己決定；
+    # fixture 少了哪一族都會讓正確的實作誤紅（那是假 gh 的缺口）。
+    #
+    # 兩行程式：一行 fixture 若是 "<VARNAME><TAB><raw>"，直接產生
+    # {name:$VARNAME, value:$raw}——給「值根本不是 JSON」的 CLIENT_* 用
+    # （正常的 fixture 行是 CONTRACT JSON，變數名由內層 .name 推導）。
+    jq -n --rawfile nvars "${NODE_VARS_FILE:-/dev/null}" \
+          --rawfile cvars "${CLIENT_VARS_FILE:-/dev/null}" '
+        def vars($s): $s | split("\n") | map(select(length>0));
+        def mk($prefix): vars(.) | map(
+            . as $v
+            | ($v | split("\t")) as $parts
+            | if ($parts | length) > 1
+              then {name: ($parts[0]), value: ($parts[1:] | join("\t"))}
+              else {name: ($prefix + ($v | fromjson | .name | ascii_upcase | gsub("-"; "_"))),
+                    value: $v}
+              end);
+        {total_count: ((vars($nvars) | length) + (vars($cvars) | length)),
+         variables: (($nvars | mk("NODE_")) + ($cvars | mk("CLIENT_")))}'
 }
 case "${1:-}" in
   api)
@@ -178,7 +277,12 @@ LOGIN_BLOB="$(awk '{print $2}' "$LOGIN_KEY.pub")"
 # ---- 執行受測指令 ------------------------------------------------------------
 NAME="repair-1"
 PORT="2255"
+# CLIENT_VARS_FILE 可覆寫（§8 的沒有 CLIENT_*／壞掉案例）；空＝用預設 fixture。
+CLIENT_VARS_FILE=""
 # run_subject <home>：清紀錄再跑一次。rc→SUBJ_RC、輸出→SUBJ_OUT。
+#   CLIENT_VARS_FILE 可覆寫（§8 的「沒有 CLIENT_*」案例）；預設是有兩筆的
+#   fixture。輸出目錄不自動清（呼叫端自己決定——§7 需要乾淨目錄、§8d 需要
+#   空目錄，其他節沿用同一個）。
 run_subject() {
     local home="$1"
     : > "$SANDBOX/gh.log"
@@ -197,6 +301,7 @@ run_subject() {
         GH_SET_FILE="$SANDBOX/gh-set.json" \
         GH_DISPATCH_ARGS="$SANDBOX/gh-dispatch-args" \
         NODE_VARS_FILE="$SANDBOX/node-vars.txt" \
+        CLIENT_VARS_FILE="${CLIENT_VARS_FILE:-$SANDBOX/client-vars.txt}" \
         POOL_REFRESH_POLL_INTERVAL=0 \
         TMPDIR="$SANDBOX" \
         bash "$REPO_ROOT/$SUBJECT" \
@@ -450,6 +555,209 @@ else
     bad "7a. ${SUBJECT} 不存在——無法驗證（預期紅）"
     bad "7a2. ${SUBJECT} 不存在——無法驗證（預期紅）"
     bad "7b. ${SUBJECT} 不存在——無法驗證（預期紅）"
+fi
+
+echo "=== 8. CLIENT_* 公鑰進 VM 的登入授權（2026-09-29 決定，tasks 8b.1） ==="
+# 8a：有 CLIENT_*（laptop／phone 兩筆真 ed25519）→ 兩筆的公鑰 blob 都要在
+# 開機資料裡，連同 --login-key 的 blob。
+if [[ -f "$REPO_ROOT/$SUBJECT" ]]; then
+    rm -rf "$OUTDIR"; mkdir -p "$OUTDIR"
+    run_subject "$HOME_DIR"
+    # 8a0 正對照：假 gh 真的吐得出 CLIENT_* 的 public_key（不然 8a 的
+    # 「找不到 blob」可能是 fixture 沒進假 gh，不是實作沒放）。做法：直接
+    # 用同一份 fixture 驅動假 gh 的 api，比對它回傳的 CLIENT_ 條目數。
+    fake_clients="$(env -i PATH="$SHIMS:/usr/bin:/bin" HOME="$HOME_DIR" \
+        NODE_VARS_FILE="$SANDBOX/node-vars.txt" \
+        CLIENT_VARS_FILE="${SANDBOX}/client-vars.txt" \
+        "$SHIMS/gh" api repos/x/y/actions/variables \
+        --jq '[.variables[] | select(.name | startswith("CLIENT_"))] | length' 2>/dev/null)"
+    if [[ "${fake_clients:-0}" -ge 2 ]]; then
+        ok "8a0. 正對照：假 gh 吐出 ${fake_clients} 筆 CLIENT_*（fixture 真的在資料源裡）"
+    else
+        bad "8a0（正對照失敗）：假 gh 只吐出 ${fake_clients:-0} 筆 CLIENT_*——8a 不可信"
+    fi
+    if [[ "$SUBJ_RC" -eq 0 ]]; then
+        ok "8a1. 有 CLIENT_* 時登錄成功（rc 0）"
+    else
+        bad "8a1. 有 CLIENT_* 時登錄失敗（rc=${SUBJ_RC}）：$(printf '%s' "$SUBJ_OUT" | tail -2 | tr '\n' ' ')"
+    fi
+    if out_matches "$CLIENT_A_BLOB"; then
+        ok "8a2. 開機資料含 CLIENT laptop 的公鑰"
+    else
+        bad "8a2. 開機資料缺 CLIENT laptop 的公鑰（blob [${CLIENT_A_BLOB:0:24}]…）——已登錄的 client 會登不進 VM（8b.1）"
+    fi
+    if out_matches "$CLIENT_B_BLOB"; then
+        ok "8a3. 開機資料含 CLIENT phone 的公鑰"
+    else
+        bad "8a3. 開機資料缺 CLIENT phone 的公鑰（blob [${CLIENT_B_BLOB:0:24}]…）"
+    fi
+    if out_matches "$LOGIN_BLOB"; then
+        ok "8a4. --login-key 仍然在（原本的行為沒有被 CLIENT_* 取代）"
+    else
+        bad "8a4. --login-key 不見了（blob [${LOGIN_BLOB:0:24}]…）——CLIENT_* 是加進去，不是換掉"
+    fi
+
+    # 8b：沒有任何 CLIENT_* → 拒絕（檔頭的決定：寧可出貨時就說清楚）。
+    #     用空的 CLIENT fixture；輸出目錄用全新的（不讓 §8c/§4 的殘檔混淆）。
+    saved_client="$CLIENT_VARS_FILE"
+    CLIENT_VARS_FILE="$SANDBOX/client-vars-empty.txt"
+    saved_outdir="$OUTDIR"; NO_CLIENTS_DIR="$SANDBOX/boot-no-clients"
+    OUTDIR="$NO_CLIENTS_DIR"; rm -rf "$OUTDIR"; mkdir -p "$OUTDIR"
+    run_subject "$HOME_DIR"
+    OUTDIR="$saved_outdir"; CLIENT_VARS_FILE="$saved_client"
+    if [[ "$SUBJ_RC" -ne 0 ]]; then
+        ok "8b1. 沒有任何 CLIENT_* → rc ${SUBJ_RC}（非 0，拒絕）"
+    else
+        bad "8b1. 沒有 CLIENT_* 卻接受了（rc=0）——靜默退回只放 --login-key，正是 8b.1 的問題"
+    fi
+    if printf '%s' "$SUBJ_OUT" | grep -qF 'CLIENT_'; then
+        ok "8b2. 拒絕訊息提及 CLIENT_（說明原因）"
+    else
+        bad "8b2. 拒絕訊息沒提 CLIENT_（out [$(printf '%s' "$SUBJ_OUT" | tr '\n' '|' | head -c 200)]）"
+    fi
+    if [[ "$(varset_count)" -eq 0 ]]; then
+        ok "8b3. 拒絕時零次 variable set（沒有寫入任何狀態）"
+    else
+        bad "8b3. 拒絕時仍送了 $(varset_count) 次 variable set"
+    fi
+    # 掃**那個當次的空目錄**（不是還原後的 OUTDIR——那是別的章節的殘檔）。
+    no_clients_files="$(find "$NO_CLIENTS_DIR" -type f 2>/dev/null | head -n 5 | tr '\n' ' ')"
+    if [[ -z "$no_clients_files" ]]; then
+        ok "8b4. 拒絕時那個輸出目錄不產出任何檔案（連 seed 都不留）"
+    else
+        bad "8b4. 拒絕時輸出目錄仍有檔案（[${no_clients_files}]）"
+    fi
+
+    # 8c：壞掉的那一筆略過並警告，其餘照放；整份授權不壞。
+    saved_client="$CLIENT_VARS_FILE"
+    CLIENT_VARS_FILE="$SANDBOX/client-vars-bad.txt"
+    saved_outdir="$OUTDIR"; OUTDIR="$SANDBOX/boot-bad-client"; rm -rf "$OUTDIR"; mkdir -p "$OUTDIR"
+    run_subject "$HOME_DIR"
+    OUTDIR="$saved_outdir"; CLIENT_VARS_FILE="$saved_client"
+    if [[ "$SUBJ_RC" -eq 0 ]]; then
+        ok "8c1. 有一筆 CLIENT_* 公鑰壞掉時仍成功（rc 0，不讓整份授權壞掉）"
+    else
+        bad "8c1. 壞掉一筆 CLIENT_* 就整個失敗（rc=${SUBJ_RC}）：$(printf '%s' "$SUBJ_OUT" | tail -2 | tr '\n' ' ')"
+    fi
+    if out_matches "$CLIENT_A_BLOB" && out_matches "$CLIENT_B_BLOB"; then
+        ok "8c2. 好的兩筆（laptop／phone）照常放進授權"
+    else
+        bad "8c2. 好的一筆或多筆沒進授權——壞的那筆不該拖垮其餘"
+    fi
+    # 8c3：警告必須**點名壞掉的那一筆**（fixture 的 name 是 badkey → 變數
+    # CLIENT_BADKEY）。只認寬鬆的 warn／skip 會誤綠：Linux 容器沒有
+    # hdiutil 時，seed ISO 的 WARN 訊息也含 "warn" 字樣（2026-09-29 實測，
+    # bash 5 容器假綠）；要讓斷言只可能來自對那一筆的警告。
+    if printf '%s' "$SUBJ_OUT" | grep -qi 'badkey'; then
+        ok "8c3. 有警告且點名壞掉的那筆（badkey／CLIENT_BADKEY）"
+    else
+        bad "8c3. 沒有看到對壞掉那筆的警告（要求訊息含 badkey；out [$(printf '%s' "$SUBJ_OUT" | tr '\n' '|' | head -c 200)]）"
+    fi
+
+    # 8d：含 CLIENT_* 的那一輪，開機資料仍不得出現任何權杖（spec 的硬要求；
+    #     §4 已掃過一次，這裡在「多了 CLIENT 公鑰」的輸出新鮮重掃一次）。
+    leaked2=""
+    for needle in "ghp_FAKE_ENVTOKEN_VALUE_0001" "ghp_FAKE_POOLTOKEN_VALUE_0002"; do
+        out_matches "$needle" && leaked2="${leaked2}${needle} "
+    done
+    if [[ -z "$leaked2" ]]; then
+        ok "8d. 含 CLIENT_* 的這一輪，開機資料仍無任何權杖值"
+    else
+        bad "8d. 含 CLIENT_* 的開機資料洩漏權杖（${leaked2}）"
+    fi
+else
+    for id in 8a0 8a1 8a2 8a3 8a4 8b1 8b2 8b3 8b4 8c1 8c2 8c3 8d; do
+        bad "${id}. ${SUBJECT} 不存在——無法驗證（預期紅）"
+    done
+fi
+
+echo "=== 9. CLIENT_* 的兩個補強（2026-09-29 PM 裁定；review §3 發現 1、2） ==="
+if [[ -f "$REPO_ROOT/$SUBJECT" ]]; then
+    # 9a：一筆值是合法 CONTRACT、一筆值根本不是 JSON（BROKEN）。
+    #     預期：指令成功、laptop 的金鑰在、訊息點名 BROKEN，不得崩潰。
+    saved_client="$CLIENT_VARS_FILE"
+    CLIENT_VARS_FILE="$SANDBOX/client-vars-nonjson.txt"
+    saved_outdir="$OUTDIR"; NONJSON_DIR="$SANDBOX/boot-nonjson"
+    OUTDIR="$NONJSON_DIR"; rm -rf "$OUTDIR"; mkdir -p "$OUTDIR"
+    run_subject "$HOME_DIR"
+    OUTDIR="$saved_outdir"; CLIENT_VARS_FILE="$saved_client"
+    # 掃**那個當次的目錄**（不是還原後的 OUTDIR——那是別的章節的殘檔）。
+    nonjson_matches() {
+        local f
+        for f in $(find "$NONJSON_DIR" -type f 2>/dev/null); do
+            grep -qF -- "$1" "$f" 2>/dev/null && return 0
+        done
+        return 1
+    }
+    # 9a0 正對照：假 gh 真的吐出那筆非 JSON 的值（不然 9a 是空測）。
+    # 直接驅動假 gh，看 CLIENT_BROKEN 的 value 是不是原樣。
+    broken_val="$(env -i PATH="$SHIMS:/usr/bin:/bin" HOME="$HOME_DIR" \
+        NODE_VARS_FILE="$SANDBOX/node-vars.txt" \
+        CLIENT_VARS_FILE="$SANDBOX/client-vars-nonjson.txt" \
+        "$SHIMS/gh" api repos/x/y/actions/variables \
+        --jq '.variables[] | select(.name == "CLIENT_BROKEN") | .value' 2>/dev/null)"
+    if [[ "$broken_val" == "not-json-at-all" ]]; then
+        ok "9a0. 正對照：假 gh 吐出那筆非 JSON 的值（CLIENT_BROKEN=not-json-at-all）"
+    else
+        bad "9a0（正對照失敗）：假 gh 沒有吐出非 JSON fixture（got [${broken_val:-<empty>}]）——9a 不可信"
+    fi
+    if [[ "$SUBJ_RC" -eq 0 ]]; then
+        ok "9a1. 一筆 CLIENT_* 值不是 JSON → 指令照常成功（rc 0，不崩潰）"
+    else
+        bad "9a1. 一筆值不是 JSON 就整個崩潰（rc=${SUBJ_RC}）——現在是無訊息死亡（review 發現 1）"
+    fi
+    if nonjson_matches "$CLIENT_A_BLOB"; then
+        ok "9a2. 好的那筆（laptop）公鑰仍在開機資料裡"
+    else
+        bad "9a2. 好的那筆公鑰不見了——非 JSON 的那筆不該拖垮其餘"
+    fi
+    if printf '%s' "$SUBJ_OUT" | grep -qF 'CLIENT_BROKEN'; then
+        ok "9a3. 警告點名非 JSON 的那一筆（CLIENT_BROKEN；值非 JSON 時識別只剩變數名）"
+    else
+        bad "9a3. 沒有點名非 JSON 的那一筆（要求訊息含 CLIENT_BROKEN；out [$(printf '%s' "$SUBJ_OUT" | tr '\n' '|' | head -c 200)]）"
+    fi
+
+    # 9b：CLIENT_LAPTOP ＋ CLIENT_ACTIONS → actions 的公鑰不得進開機資料，
+    #     laptop 的要在（排除的是 Actions，不是整批）。
+    saved_client="$CLIENT_VARS_FILE"
+    CLIENT_VARS_FILE="$SANDBOX/client-vars-actions.txt"
+    saved_outdir="$OUTDIR"; ACTIONS_DIR="$SANDBOX/boot-actions"
+    OUTDIR="$ACTIONS_DIR"; rm -rf "$OUTDIR"; mkdir -p "$OUTDIR"
+    run_subject "$HOME_DIR"
+    OUTDIR="$saved_outdir"; CLIENT_VARS_FILE="$saved_client"
+    actions_matches() {
+        local f
+        for f in $(find "$ACTIONS_DIR" -type f 2>/dev/null); do
+            grep -qF -- "$1" "$f" 2>/dev/null && return 0
+        done
+        return 1
+    }
+    if [[ "$SUBJ_RC" -eq 0 ]]; then
+        ok "9b1. 有 CLIENT_ACTIONS 時登錄照常成功（rc 0）"
+    else
+        bad "9b1. 有 CLIENT_ACTIONS 時登錄失敗（rc=${SUBJ_RC}）：$(printf '%s' "$SUBJ_OUT" | tail -2 | tr '\n' ' ')"
+    fi
+    if actions_matches "$CLIENT_A_BLOB"; then
+        ok "9b2. 一般 client（laptop）的公鑰仍在"
+    else
+        bad "9b2. 一般 client 的公鑰不見了——排除動作不該掃到別人"
+    fi
+    if ! actions_matches "$CLIENT_ACTIONS_BLOB"; then
+        ok "9b3. CLIENT_ACTIONS 的公鑰不在開機資料裡（Actions 不登入維修承載機）"
+    else
+        bad "9b3. CLIENT_ACTIONS 的公鑰出現在開機資料裡——能跑 workflow 的東西就能進家人的網路（review 發現 2）"
+    fi
+    # 9b4：Actions 的**整行**（type blob comment）也不該出現——blob 斷言是
+    #      權威，這條釘住「連註解形式都沒有」。
+    if ! actions_matches "$CLIENT_ACTIONS_PUB"; then
+        ok "9b4. CLIENT_ACTIONS 的整行（type blob comment）都不在開機資料裡"
+    else
+        bad "9b4. CLIENT_ACTIONS 的行仍出現在開機資料裡"
+    fi
+else
+    for id in 9a0 9a1 9a2 9a3 9b1 9b2 9b3 9b4; do
+        bad "${id}. ${SUBJECT} 不存在——無法驗證（預期紅）"
+    done
 fi
 
 echo

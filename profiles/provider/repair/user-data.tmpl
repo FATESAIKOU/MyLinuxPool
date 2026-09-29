@@ -43,16 +43,21 @@
 package_update: false
 package_upgrade: false
 
-# The one login user. Its only way in is the owner's public key below (D8:
-# pre-seeded; revoking it means editing authorized_keys after logging in, or
-# building a new seed). No password exists, so password login cannot be
-# turned on by accident later.
+# The login user. Its way in is the owner's public keys below: the --login-key
+# given at registration plus every CLIENT_* client key known at that moment
+# (2026-09-29 decision, tasks 8b.1 — so the owner's other machines and the AI
+# entry can all log in). This is a SNAPSHOT: the seed is static, nothing
+# fetches new keys at boot, so adding or rotating a client means building a
+# new seed (re-run register-repair-host) and rebooting the VM on it.
+# Revoking one key means editing authorized_keys after logging in, or the
+# same rebuild. No password exists, so password login cannot be turned on by
+# accident later.
 users:
   - name: @@LOGIN_USER@@
     shell: /bin/bash
     lock_passwd: true
     ssh_authorized_keys:
-      - "@@LOGIN_PUBKEY@@"
+      @@LOGIN_PUBKEYS_YAML@@
 ssh_pwauth: false
 disable_root: true
 
@@ -72,6 +77,20 @@ write_files:
       PubkeyAuthentication yes
       AuthenticationMethods publickey
       PermitRootLogin no
+
+  # Passwordless sudo for the login user ONLY (2026-09-29 decision, tasks
+  # 8b.4: the live acceptance found `repair` with no root — sudo asked for a
+  # password that is locked, so changing network settings or capturing
+  # packets during a repair was impossible). The principal is @@LOGIN_USER@@
+  # and nothing else (the generator renders it to the profile's login_user):
+  # a bare ALL would hand passwordless root to any present or future local
+  # account. Mode 0440 root-owned, the mode sudo requires (sudo ignores the
+  # file otherwise, loudly).
+  - path: /etc/sudoers.d/90-mlp-repair
+    owner: root:root
+    permissions: '0440'
+    content: |
+      @@LOGIN_USER@@ ALL=(ALL) NOPASSWD: ALL
 
   # Static-mode inputs for pool-tunnel (POOL_GATEWAY_HOST/USER/PORT all set
   # = no pool-resolve, no GitHub; POOL_GATEWAY_SSH_PORT is design D3).

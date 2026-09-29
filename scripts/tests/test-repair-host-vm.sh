@@ -28,6 +28,15 @@
 #   /home/@@LOGIN_USER@@/.mylinuxpool/bin/repair-gateway-report NEW — D2 回報半
 #   /home/@@LOGIN_USER@@/.mylinuxpool/bin/repair-tunnel-launch  NEW — D5 守門 + D7 重試節奏
 #
+# sudo（2026-09-29 使用者決定，tasks 8b.4）：`repair` 帳號要免密碼 sudo。
+# 做法：user-data.tmpl 的 write_files 加一個 /etc/sudoers.d/ 底下的檔案
+# （路徑名由 impl 決定；本測試只認前綴 /etc/sudoers.d/），內容是一條
+# NOPASSWD 規則，principal **只給登入使用者**（@@LOGIN_USER@@，渲染後是
+# profile.json 的 login_user="repair"）——不是 ALL、不是群組、不是別的帳號。
+# 背景（OUT-live-repair.md 意外 6）：live 驗收時 repair 沒有 root，
+# sudo 要密碼而密碼是鎖住的，維修時改網路設定／抓封包都做不到。
+# 這一節驗的就是模板（對現碼紅：模板還沒有任何 sudo 設定）。
+#
 # systemd（**system unit 加 User=**，不是 repo 給一般 provider 用的 user unit
 # 加 linger——這是 spike 定案的做法，OUT-spike-repair.md §2「unit 是 system
 # unit 加 User=repair，比 user unit 加 linger 在 cloud-init 裡簡單」）：
@@ -186,6 +195,11 @@
 #   * token 掃描（guard）只認檔案存在與否、環境變數是否非空；不掃「權杖被
 #     編碼或藏在其他檔案」——這跟 register-repair-host 自己那半的已知限制
 #     （t4 報告 §5）是同一種洞，寫在這裡是因為 VM 這半也一樣。
+#   * sudo 那一節（1h/1h2）只驗模板裡「有沒有一條 principal 為
+#     @@LOGIN_USER@@ 的 NOPASSWD 規則」；不驗 visudo 的語法（那是部署時
+#     cloud-init／sudo 自己的事）、不驗檔案的權限位（0440 等）與 owner、
+#     也不驗規則的指令範圍（ALL=(ALL) vs 收窄的 Cmnd 清單）——使用者的
+#     決定原文是「給免密碼 sudo」，範圍留給 impl。
 #
 # 全離線：ssh/curl/sleep 走 PATH shim；不連網、不開 VM；bash 3.2 相容。
 # Run: scripts/tests/test-repair-host-vm.sh
@@ -352,6 +366,49 @@ prop_new_scripts_referenced() {
     && grep -q '.mylinuxpool/bin/repair-tunnel-launch' "$1" 2>/dev/null
 }
 
+# ---- sudo 的性質（2026-09-29 決定，tasks 8b.4） -----------------------------
+# 只認 write_files 裡一個 path 以 /etc/sudoers.d/ 開頭的檔案，並且它的
+# content 區塊（縮排比 path 那行深、到下一個 - path: 或頂層 key 為止）含一條
+# NOPASSWD 規則、principal 是 @@LOGIN_USER@@（渲染後 repair）。
+# 不看具體檔名（impl 決定），不看註解裡的說明——只認實際寫進去的 content。
+# 為什麼要「只給該帳號」：sudoers 的 principal 若寫成 ALL，等於任何本機
+# 使用者（或未來任何被建立的帳號）都有免密碼 root；NOPASSWD 的 blast radius
+# 必須跟「這一個登入使用者」對齐（AI 也會用這個帳號，這是使用者的知情決定）。
+prop_sudoers_nopasswd() {
+    awk '
+        BEGIN { insudo = 0; seen = 0; nopass = 0 }
+        /^[[:space:]]*-[[:space:]]*path:[[:space:]]*\/etc\/sudoers\.d\// {
+            insudo = 1; seen = 1
+            # path 行本身也算這個區塊的一部分
+        }
+        /^[[:space:]]*-[[:space:]]*path:/ && $0 !~ /\/etc\/sudoers\.d\// { insudo = 0 }
+        /^[^[:space:]]/ { insudo = 0 }
+        insudo && /NOPASSWD/ { nopass = 1 }
+        END { exit (seen && nopass) ? 0 : 1 }
+    ' "$1" 2>/dev/null
+}
+# principal 只給登入使用者：sudoers 區塊裡的規則行（含 NOPASSWD 的那些），
+# 行首第一個欄位（principal）必須是 @@LOGIN_USER@@，且不得出現 principal 為
+# 裸 ALL 的 NOPASSWD 規則。`@@LOGIN_USER@@ ALL=(ALL) NOPASSWD: ALL` 合法
+# （principal 就是那一個使用者）；`ALL ALL=(ALL) NOPASSWD: ALL` 是要擋的
+# 形狀（任何本機帳號都能免密碼 root，例如未來多開一個低權限帳號）。
+prop_sudoers_login_user_only() {
+    awk '
+        BEGIN { insudo = 0; seen = 0; userline = 0; bad_all = 0 }
+        /^[[:space:]]*-[[:space:]]*path:[[:space:]]*\/etc\/sudoers\.d\// { insudo = 1; seen = 1 }
+        /^[[:space:]]*-[[:space:]]*path:/ && $0 !~ /\/etc\/sudoers\.d\// { insudo = 0 }
+        /^[^[:space:]]/ { insudo = 0 }
+        insudo && /NOPASSWD/ {
+            line = $0
+            sub(/^[[:space:]]+/, "", line)
+            sub(/[[:space:]].*$/, "", line)
+            if (line == "@@LOGIN_USER@@") userline = 1
+            if (line == "ALL") bad_all = 1
+        }
+        END { exit (seen && userline && !bad_all) ? 0 : 1 }
+    ' "$1" 2>/dev/null
+}
+
 echo "=== 0. 先決條件 ==="
 if [[ -f "$REPO_ROOT/$PTUNNEL" ]]; then
     ok "0a. ${PTUNNEL} 存在（§5 回歸的對象）"
@@ -383,8 +440,12 @@ if [[ -f "$TMPL_PATH" ]]; then
         || bad "1e. 模板還沒有 system unit + User=——task 5 尚未落地（預期紅）"
     prop_new_scripts_referenced "$TMPL_PATH" && ok "1g. 模板引用了四支新腳本的安裝路徑" \
         || bad "1g. 模板還沒引用 repair-token-guard/-gateway-fetch/-gateway-report/-tunnel-launch——task 5 尚未落地（預期紅）"
+    prop_sudoers_nopasswd "$TMPL_PATH" && ok "1h. 模板有 /etc/sudoers.d/ 的 NOPASSWD sudo 規則（2026-09-29 決定）" \
+        || bad "1h. 模板沒有任何 /etc/sudoers.d/ 的 NOPASSWD 規則——repair 帳號在 VM 上沒有 root（8b.4，預期紅）"
+    prop_sudoers_login_user_only "$TMPL_PATH" && ok "1h2. sudo 規則的 principal 只給登入使用者，不是 ALL" \
+        || bad "1h2. sudo 規則的 principal 不是只有 @@LOGIN_USER@@（出現裸 ALL？）——blast radius 要對齐一個帳號（預期紅）"
 else
-    for id in 1a 1b 1c 1d 1e 1f 1g 1g0; do bad "${id}. ${TEMPLATE} 不存在——無法驗證"; done
+    for id in 1a 1b 1c 1d 1e 1f 1g 1g0 1h 1h2; do bad "${id}. ${TEMPLATE} 不存在——無法驗證"; done
 fi
 
 echo "--- 1x. 注入：對模板複本動刀，證明上面的比對真的在看內容 ---"
@@ -426,6 +487,25 @@ elif mode == "listen-any":
     src = src.replace("ListenAddress 127.0.0.1", "ListenAddress 0.0.0.0", 1)
 elif mode == "add-sync":
     src += "\n# injected for test-repair-host-vm.sh\nruncmd_extra: [ systemctl, enable, --now, pool-sync.timer ]\n"
+elif mode == "sudo-all":
+    # 把 sudoers 規則的 principal 改成 ALL（模擬「不只有該帳號」的退化：
+    # 任何本機帳號都能免密碼 root）。只動 sudoers 區塊裡的主體欄位。
+    lines = src.splitlines(keepends=True)
+    outs = []
+    insudo = False
+    for l in lines:
+        if re.match(r'^[ \t]*-[ \t]*path:[ \t]*/etc/sudoers\.d/', l):
+            insudo = True
+        elif re.match(r'^[ \t]*-[ \t]*path:', l) or re.match(r'^[^ \t]', l):
+            insudo = False
+        if insudo and re.match(r'^[ \t]*@@LOGIN_USER@@[ \t]', l):
+            l = re.sub(r'^([ \t]*)@@LOGIN_USER@@', r'\1ALL', l, count=1)
+        outs.append(l)
+    new = "".join(outs)
+    assert new != src, "no sudoers principal line to change"
+    src = new
+else:
+    raise SystemExit("unknown mode " + mode)
 sys.stdout.write(src)
 PY
 }
@@ -448,10 +528,22 @@ if [[ -f "$TMPL_PATH" ]]; then
     else
         inj_bad "1x. 加了 pool-sync 啟用後 1f 仍綠（$(cat "$SANDBOX/mk3.err" 2>/dev/null)）"
     fi
+    # sudo-all：只有當模板已有一行 principal 是 @@LOGIN_USER@@ 的 sudo 規則
+    # 才注入（現碼還沒有，注入會以 mk 失敗收場——那是預期，以 inj_skip 記）。
+    if grep -qE '^[[:space:]]*@@LOGIN_USER@@[[:space:]]' "$TMPL_PATH" 2>/dev/null; then
+        m4="$SANDBOX/tmpl-sudo-all.tmpl"; mk_mutant "sudo-all" > "$m4" 2>"$SANDBOX/mk4.err"
+        if [[ -s "$m4" ]] && ! prop_sudoers_login_user_only "$m4"; then
+            inj_ok "1x. principal 改成 ALL 後 1h2 會紅"
+        else
+            inj_bad "1x. principal 改成 ALL 後 1h2 仍綠（$(cat "$SANDBOX/mk4.err" 2>/dev/null)）"
+        fi
+    else
+        inj_skip "1x. 模板還沒有 NOPASSWD 規則（1h/1h2 現碼本身就是紅）；等 impl 落地後這個注入才有刀可動"
+    fi
 else
     inj_skip "1x. 模板不存在，無法動刀"
 fi
-inj_skip "1e/1g. 這兩項現碼本身就是紅（task 5 還沒加），紅本身就是證據，不需要另外注入（同 test-register-repair-host.sh 對 §7 的處理）"
+inj_skip "1e/1g. 兩項在 task 5 落地後已綠（見上）；注入 1x 的三個模板突變各自對應 1d/1b/1f。1h/1h2 的注入（sudo-all）在模板出現 NOPASSWD 規則後才會執行，理由見該處。"
 
 echo
 echo "=== 2. 權杖守衛（D5 後半） ==="

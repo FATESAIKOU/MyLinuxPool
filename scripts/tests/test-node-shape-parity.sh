@@ -115,11 +115,18 @@ _emit() {
     else printf '%s\n' "$1"; fi
 }
 _envelope() {
-    jq -n --rawfile vars "${NODE_VARS_FILE:-/dev/null}" '
-        {total_count: ($vars | split("\n") | map(select(length>0)) | length),
-         variables: ($vars | split("\n") | map(select(length>0))
-                     | map(. as $v | ($v | fromjson | .name | ascii_upcase | gsub("-"; "_")) as $n
-                            | {name: ("NODE_" + $n), value: $v}))}'
+    # register-repair-host 同時讀 NODE_* 與 CLIENT_*（後者是 VM 登入授權的
+    # 快照；零可用 CLIENT_* 會拒絕），所以這裡兩個 fixture 都要服務——少了
+    # CLIENT_*，§1b 與 §5 的注入會死在「no usable CLIENT_*」而不是要驗的形狀
+    # 比對上（那是假 gh 的缺口，不是被測物的錯；見 OUT-test-repair-clientkeys-sudo.md §5）。
+    jq -n --rawfile nvars "${NODE_VARS_FILE:-/dev/null}" \
+          --rawfile cvars "${CLIENT_VARS_FILE:-/dev/null}" '
+        def vars($s): $s | split("\n") | map(select(length>0));
+        def mk($prefix): vars(.) | map(. as $v
+            | ($v | fromjson | .name | ascii_upcase | gsub("-"; "_")) as $n
+            | {name: ($prefix + $n), value: $v});
+        {total_count: ((vars($nvars) | length) + (vars($cvars) | length)),
+         variables: (($nvars | mk("NODE_")) + ($cvars | mk("CLIENT_")))}'
 }
 case "${1:-}" in
   api)
@@ -195,6 +202,12 @@ fi
 # ---- register-repair-host：真檔完整流程，真 ssh-keygen 產登入金鑰。
 LOGIN_KEY="$SANDBOX/login_key"
 ssh-keygen -t ed25519 -N "" -C "parity-test" -f "$LOGIN_KEY" >/dev/null 2>&1
+# CLIENT_* fixture（一筆真 ed25519，值形狀照 register-client 的 CONTRACT 物件；
+# register-repair-host 沒有可用 CLIENT_* 會拒絕，見上 _envelope 的註解）。
+PARITY_CLIENT_KEY="$SANDBOX/parity_client_key"
+ssh-keygen -t ed25519 -N "" -C "parity-client-test" -f "$PARITY_CLIENT_KEY" >/dev/null 2>&1
+PARITY_CLIENT_PUB="$(tr -d '\r\n' < "$PARITY_CLIENT_KEY.pub")"
+jq -n -c --arg pk "$PARITY_CLIENT_PUB" '{name:"parity-client", public_key:$pk, added_at:"2026-09-29T00:00:00Z"}' > "$SANDBOX/client-vars.txt"
 NODE_OTHER='{"name":"other","role":"provider","gateway_port":2299,"capabilities":{}}'
 printf '%s\n' "$NODE_OTHER" > "$SANDBOX/rh-vars.txt"
 RH_OUTDIR="$SANDBOX/rh-boot"
@@ -210,6 +223,7 @@ RH_OUT="$(env -i \
     GH_SET_FILE="$RH_SET" \
     GH_DISPATCH_ARGS="$SANDBOX/rh-dispatch-args" \
     NODE_VARS_FILE="$SANDBOX/rh-vars.txt" \
+    CLIENT_VARS_FILE="$SANDBOX/client-vars.txt" \
     POOL_REFRESH_POLL_INTERVAL=0 \
     TMPDIR="$SANDBOX" \
     bash "$REPO_ROOT/$RH" \
@@ -315,6 +329,7 @@ else
             GH_SET_FILE="$INJ_SET" \
             GH_DISPATCH_ARGS="$SANDBOX/rh-inj-dispatch-args" \
             NODE_VARS_FILE="$SANDBOX/rh-vars.txt" \
+            CLIENT_VARS_FILE="$SANDBOX/client-vars.txt" \
             POOL_REFRESH_POLL_INTERVAL=0 \
             TMPDIR="$SANDBOX" \
             bash "$INJ_RH" \

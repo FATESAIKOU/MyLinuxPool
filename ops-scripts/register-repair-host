@@ -31,6 +31,23 @@
 #   5. dispatch refresh-authorized-keys and wait for OUR run
 #      (scripts/lib/refresh-wait.sh), so the Gateway authorizes the new key
 #
+# Login keys (2026-09-29 decision, tasks 8b.1): the VM's authorized_keys gets
+# the --login-key PLUS every CLIENT_* client public key listed in the repo at
+# THIS moment, EXCEPT CLIENT_ACTIONS (2026-09-29 PM ruling, least privilege:
+# nothing that runs Actions workflows ever needs to log in to a family VM,
+# so its key stays out of the family's network). That list is a SNAPSHOT
+# baked into the seed — the VM never fetches keys by itself (it must not
+# touch GitHub at all), so a client added, rotated or removed later takes
+# effect only in a rebuilt seed (re-run this command and reboot the VM on
+# it). Zero usable CLIENT_* keys is a refusal, not a silent fallback to
+# --login-key alone: the whole point of the decision is "every registered
+# client can log in", and boot data has no launch-time channel that could add
+# a key later — registration is the only interception point. A CLIENT_*
+# entry whose value is not JSON at all, or whose public_key is malformed, is
+# skipped with a WARN naming its variable; either never fails the whole
+# registration (and never kills the script under `set -e` — see
+# collect_client_keys).
+#
 # Exit codes: 0 done; 1 refused or failed (nothing written to GitHub unless
 # the message says so); 2 bad arguments; 3 NODE_<NAME> and the seed are
 # written but the refresh was not confirmed (the Gateway picks the key up on
@@ -41,6 +58,9 @@
 # POOL_REPO, default FATESAIKOU/MyLinuxPool (same knob as register-client).
 #
 # Limitations (honest list):
+# * The login keys are a snapshot (see above): a client added after this run
+#   cannot reach an already-built seed. Re-run to rebuild; the old seed keeps
+#   working with its old key set until replaced.
 # * POOL_GATEWAY_HOST in the seed is a placeholder (gateway-ip-set-at-launch
 #   .invalid): the Gateway IP changes on every rotate and is supplied at boot
 #   by the D2 channel (repair-gateway-fetch asks the Windows launcher).
@@ -338,6 +358,27 @@ GW_TUNNEL_USER=""
 GW_SSH_PORT=""
 read_gateway
 
+# ---- CLIENT_* login keys: fetch the list (network), validate later ---------
+# The listing is fetched HERE, before anything is written: a failed or empty
+# listing is "cannot tell", never "no clients" (same rule as the NODE_*
+# listing above). Validation against ssh-keygen needs temp files, so it runs
+# after STAGE exists; a refusal there still leaves zero files behind because
+# the EXIT trap removes STAGE and nothing is moved into OUTDIR before GitHub
+# is written.
+#
+# CLIENT_ACTIONS is excluded by name in the filter below (2026-09-29 PM
+# ruling, least privilege): it is the key that lets GitHub Actions workflows
+# in, and no workflow ever needs to log in to a family repair host. Letting
+# it into the VM would put "whatever runs Actions" inside the family's
+# network — the exact opposite of what the repair host is for. If a future
+# workflow genuinely needs repair-host access, that is a new decision, not a
+# filter removal.
+if ! CLIENT_LISTING="$(gh api "repos/${REPO}/actions/variables" --paginate \
+        --jq '.variables[] | select(.name | startswith("CLIENT_")) | select(.name != "CLIENT_ACTIONS") | {name: .name, value: .value} | @json' 2>/dev/null)"; then
+    log ERROR "could not list ${REPO}'s CLIENT_* repo variables — cannot snapshot the login keys"
+    exit 1
+fi
+
 # ---- build everything locally, inside the output dir ------------------------
 
 mkdir -p "$OUTDIR"
@@ -363,6 +404,90 @@ if [[ "$(printf '%s' "$TUNNEL_PUB" | awk '{print $2}')" == "$LOGIN_BLOB" ]]; the
     exit 1
 fi
 TUNNEL_PRIV_B64="$(base64 < "${STAGE}/${KEY_FILE_NAME}" | tr -d '\n')"
+
+# validate_client_pubkey <public-key-line> — echoes the cleaned
+# "type blob comment" line, rc 0; rc 1 when malformed. Same shape rules as
+# read_login_pubkey above (known type, base64 blob, ssh-keygen agrees it is
+# a key); a private key or a multi-line value is malformed too.
+validate_client_pubkey() {
+    local _line _type _blob _comment _tmp
+    _line="$(printf '%s' "$1" | tr -d '\r')"
+    case "$_line" in *"PRIVATE KEY"*) return 1 ;; esac
+    if [[ "$(printf '%s\n' "$_line" | grep -c . || true)" != "1" ]]; then
+        return 1
+    fi
+    read -r _type _blob _comment <<< "$_line" || true
+    case "$_type" in
+        ssh-ed25519|ssh-rsa|ecdsa-sha2-*|sk-ssh-ed25519@openssh.com|sk-ecdsa-sha2-nistp256@openssh.com) ;;
+        *) return 1 ;;
+    esac
+    if ! [[ "$_blob" =~ ^[A-Za-z0-9+/]+=*$ ]]; then
+        return 1
+    fi
+    _tmp="${STAGE}/.client-key-check"
+    printf '%s\n' "$_line" > "$_tmp"
+    if ! ssh-keygen -l -f "$_tmp" >/dev/null 2>&1; then
+        rm -f "$_tmp"
+        return 1
+    fi
+    rm -f "$_tmp"
+    _comment="$(printf '%s' "${_comment:-}" | sed 's/[^A-Za-z0-9@._+-]/-/g')"
+    printf '%s' "${_type} ${_blob}${_comment:+ ${_comment}}"
+    return 0
+}
+
+# collect_client_keys — LOGIN_PUBKEYS_YAML becomes the YAML list items for
+# the template's ssh_authorized_keys: --login-key first, then every usable
+# CLIENT_* key (the snapshot from the header, minus CLIENT_ACTIONS which the
+# listing filter already removed). Each of the four jq reads below is guarded:
+# a value that is not JSON at all (or a listing line that is not JSON) must
+# skip THIS entry with a WARN naming its variable — never kill the whole run.
+# The reason is `set -euo pipefail`: a bare `x=$(... | jq ...)` on unparsable
+# input exits the script with rc 5 and no message (review finding), taking
+# down every good key with it. A JSON value of the wrong shape (no .name or
+# .public_key) falls through to validate_client_pubkey's malformed path with
+# the same WARN shape. Zero usable keys is a refusal — before anything is
+# rendered, moved or written (the EXIT trap removes STAGE, so the output dir
+# stays empty).
+CLIENT_GOOD=0
+CLIENT_SKIPPED=""
+LOGIN_PUBKEYS_YAML="- \"${LOGIN_PUBKEY}\""
+while read -r _cline; do
+    [[ -n "$_cline" ]] || continue
+    if ! _cvar="$(printf '%s' "$_cline" | jq -r '.name // empty' 2>/dev/null)" || [[ -z "$_cvar" ]]; then
+        log WARN "a CLIENT_* listing entry is not readable (not JSON or nameless) — skipping it"
+        CLIENT_SKIPPED="${CLIENT_SKIPPED}${CLIENT_SKIPPED:+, }?"
+        continue
+    fi
+    if ! _cval="$(printf '%s' "$_cline" | jq -r '.value // empty' 2>/dev/null)" || [[ -z "$_cval" ]]; then
+        log WARN "${_cvar}: listing entry has no value — skipping this entry"
+        CLIENT_SKIPPED="${CLIENT_SKIPPED}${CLIENT_SKIPPED:+, }${_cvar}"
+        continue
+    fi
+    if ! _cname="$(printf '%s' "$_cval" | jq -r '.name // empty' 2>/dev/null)"; then
+        log WARN "${_cvar}: value is not valid JSON — skipping this entry"
+        CLIENT_SKIPPED="${CLIENT_SKIPPED}${CLIENT_SKIPPED:+, }${_cvar}"
+        continue
+    fi
+    if ! _cpk="$(printf '%s' "$_cval" | jq -r '.public_key // empty' 2>/dev/null)"; then
+        log WARN "${_cvar}: value is not valid JSON — skipping this entry"
+        CLIENT_SKIPPED="${CLIENT_SKIPPED}${CLIENT_SKIPPED:+, }${_cvar}"
+        continue
+    fi
+    if _clean="$(validate_client_pubkey "$_cpk")" && [[ -n "$_clean" ]]; then
+        LOGIN_PUBKEYS_YAML="${LOGIN_PUBKEYS_YAML}
+      - \"${_clean}\""
+        CLIENT_GOOD=$((CLIENT_GOOD+1))
+    else
+        log WARN "${_cvar:-CLIENT_?} (client '${_cname:-unknown}'): public_key is not a valid ssh public key — skipping this entry"
+        CLIENT_SKIPPED="${CLIENT_SKIPPED}${CLIENT_SKIPPED:+, }${_cvar:-?}"
+    fi
+done <<< "$CLIENT_LISTING"
+if [[ "$CLIENT_GOOD" -eq 0 ]]; then
+    log ERROR "no usable CLIENT_* public keys found (skipped ${CLIENT_SKIPPED:-none listed}) — refusing to build boot data whose VM only admits --login-key; register a client first (see ops-scripts/register-client)"
+    exit 1
+fi
+log INFO "login keys: --login-key plus ${CLIENT_GOOD} CLIENT_* snapshot key(s)${CLIENT_SKIPPED:+ (skipped: ${CLIENT_SKIPPED})}"
 
 # The VM-side tools the seed carries, one "<TEMPLATE TOKEN> <file>" per
 # line (the path is the rest of the line, so a checkout path with spaces
@@ -422,7 +547,11 @@ render_token() {
 
 rendered="$(cat "$TEMPLATE")"
 rendered="$(render_token "$rendered" LOGIN_USER "$LOGIN_USER")"
-rendered="$(render_token "$rendered" LOGIN_PUBKEY "$LOGIN_PUBKEY")"
+# The authorized_keys list: --login-key first, then the CLIENT_* snapshot
+# (collect_client_keys above). Multi-line on purpose — render_token only does
+# prefix/suffix removal, so newlines and '&' in key material pass through
+# byte-identical on bash 3.2 and 5.x alike.
+rendered="$(render_token "$rendered" LOGIN_PUBKEYS_YAML "$LOGIN_PUBKEYS_YAML")"
 rendered="$(render_token "$rendered" NODE_NAME "$NAME")"
 rendered="$(render_token "$rendered" PROVIDER_PORT "$PORT")"
 rendered="$(render_token "$rendered" GATEWAY_TUNNEL_USER "$GW_TUNNEL_USER")"
@@ -602,6 +731,7 @@ echo "  boot data          ${OUTDIR}/user-data, ${OUTDIR}/meta-data"
 echo "  seed ISO           ${SEED_ISO_STATE}"
 echo "  tunnel key         ${OUTDIR}/${KEY_FILE_NAME} (PRIVATE — also inside user-data and any seed ISO; treat ${OUTDIR} as a secret)"
 echo "  Gateway in seed    user ${GW_TUNNEL_USER}, ssh port ${GW_SSH_PORT}, host ${GATEWAY_HOST_PLACEHOLDER} (IP comes at launch)"
+echo "  login keys         --login-key plus ${CLIENT_GOOD} CLIENT_* (snapshot at build time; re-run to update)"
 echo "  VM tools           pool-tunnel, tunnel-identity.sh, repair-token-guard, repair-gateway-fetch/-report, repair-tunnel-launch"
 if [[ "$refresh_ok" -eq 1 ]]; then
     echo "  refresh            confirmed — the Gateway authorizes the tunnel key"
