@@ -145,6 +145,7 @@ probe_want() {
         register-client) printf '%s' "usage: register-client" ;;
         pool-residue.sh) printf '%s' "usage: pool-residue" ;;
         register-repair-host) printf '%s' "usage: register-repair-host" ;;
+        package-repair-host) printf '%s' "usage: package-repair-host" ;;
         verify-profile)  printf '%s' "usage: verify-profile" ;;
         preflight)       printf '%s' "preflight:" ;;
     esac

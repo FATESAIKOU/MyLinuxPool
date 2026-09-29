@@ -1,0 +1,319 @@
+#!/usr/bin/env bash
+# ops-scripts/package-repair-host — pack a family repair host handoff bundle
+# on the owner's Mac (issue #6; openspec/changes/family-repair-host tasks 6.1,
+# proposal "ops-scripts/ 下的登錄與打包指令").
+#
+#   package-repair-host --name <name> --seed-dir <dir> --out <dir>
+#                       --image-sha256 <sha256> [--image-url <url>]
+#                       [--contact-name <name>] [--vbox-version <v>]
+#                       [--vbox-build <b>] [--vbox-sha256 <sha>]
+#                       [--include-image --image-file <f>]
+#
+#   --vbox-version  default 7.2.20; --vbox-build default 175154 (together they
+#                   name the installer; only this pair has been exercised —
+#                   anything else is untested, the install-time SHA check is
+#                   the only guard)
+#
+# The bundle is what the family double-clicks: Install-RepairHost.ps1 (run
+# once, one UAC), Start-RepairLauncher.ps1 (every time after), the
+# register-repair-host seed (user-data/meta-data/seed.iso — holds the tunnel
+# PRIVATE key), repair-config.json (node/vm names, D2 port, contact name, the
+# pinned image + VirtualBox URLs and their SHA256), MANIFEST.sha256 and a
+# 5-line README-FAMILY.txt.
+#
+# Why the ~600MB cloud image is NOT in the bundle by default: the family gets
+# this over chat or email, where 600MB does not fit; the image keeps getting
+# security rebuilds, so a copy frozen in a bundle goes stale while looking
+# fine; and both download sources are stable versioned URLs. The installer
+# downloads it ONCE on the family machine and refuses anything whose SHA256
+# does not match the value pinned here. --include-image embeds a local copy
+# for USB handoffs (the installer still checks its SHA256 before use).
+#
+# Why --image-sha256 has NO default: cloud-images' "current" moves with every
+# rebuild, so a baked-in hash silently rots. The operator copies today's hash
+# out of the official SHA256SUMS at pack time — this script prints that URL
+# in its report (see the bottom) so nobody has to guess where it lives.
+# Same for --vbox-sha256 (the SHA256SUMS next to the installer).
+# Only VirtualBox 7.2.20 build 175154 has actually been exercised here; other
+# --vbox-version/--vbox-build combinations only change the URL/filename, they
+# are not verified by this script beyond the SHA check at install time.
+#
+# Exit codes: 0 packed; 1 refused or failed (nothing written); 2 bad args.
+#
+# Needs: jq, shasum (or sha256sum). Never touches GitHub, never needs a VM.
+#
+# Limitations (honest list):
+# * The whole bundle is a SECRET (seed.iso + user-data hold the tunnel
+#   private key). The script says so on stdout, but cannot enforce how the
+#   operator sends it — chat history keeps a copy.
+# * File contents are embedded/copied as they are in the working tree,
+#   committed or not — nothing checks the checkout is clean.
+# * No signature: the family cannot tell a tampered bundle from a real one
+#   except by the channel it arrives on. repair-config.json + MANIFEST let
+#   the OWNER re-verify, not the family.
+# * Adding this file needs a one-line probe registration in
+#   scripts/tests/test-script-self-location.sh (probe_args/probe_want);
+#   that test file belongs to the test role, so it is reported, not edited
+#   here.
+
+set -euo pipefail
+
+# Resolve this script's REAL location, following symlinks, so it can be
+# linked into a directory on PATH (`ln -s .../ops-scripts/mlp <dir on PATH>`).
+# Both $0 and BASH_SOURCE name the LINK, not the target, so dirname on
+# either lands in the link's directory and every repo-relative path below
+# becomes wrong — the symptom is "scripts/lib/ssh.sh: No such file".
+# `readlink` without -f is used deliberately: -f is GNU-only.
+#
+# This block is duplicated in every ops-script because it has to run
+# BEFORE the script knows where the repo is — there is nothing to source
+# yet. test-script-self-location.sh asserts the copies stay identical.
+_mlp_self="${BASH_SOURCE[0]:-$0}"
+while [ -L "$_mlp_self" ]; do
+    _mlp_dir="$(cd -P "$(dirname "$_mlp_self")" && pwd)"
+    _mlp_self="$(readlink "$_mlp_self")"
+    case "$_mlp_self" in /*) ;; *) _mlp_self="${_mlp_dir}/${_mlp_self}" ;; esac
+done
+SCRIPT_DIR="$(cd -P "$(dirname "$_mlp_self")" && pwd)"
+unset _mlp_self _mlp_dir
+
+REPO_ROOT="$(cd -P "${SCRIPT_DIR}/.." && pwd)"
+PROFILE_DIR="${REPO_ROOT}/profiles/provider/repair"
+
+log() {
+    local level="$1"; shift
+    local ts
+    ts="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    if [[ "$level" == "INFO" ]]; then
+        printf '[%s] %s %s\n' "$ts" "$level" "$*"
+    else
+        printf '[%s] %s %s\n' "$ts" "$level" "$*" >&2
+    fi
+}
+
+usage() {
+    cat >&2 <<'EOF'
+usage: package-repair-host --name <name> --seed-dir <dir> --out <dir>
+                           --image-sha256 <sha256> [--image-url <url>]
+                           [--contact-name <name>] [--vbox-version <v>]
+                           [--vbox-build <b>] [--vbox-sha256 <sha>]
+                           [--include-image --image-file <f>]
+  --name          node name, lowercase [a-z0-9-] (must match the seed's host)
+  --seed-dir      register-repair-host --output-dir for this node
+                  (needs user-data, meta-data, seed.iso)
+  --out           bundle directory to create (must not exist yet)
+  --image-sha256  TODAY's SHA256 of the cloud image, copied from the
+                  official SHA256SUMS (no default — it rots, see header;
+                  the URL is printed in the packing report below)
+  --image-url     default https://cloud-images.ubuntu.com/noble/current/noble-server-cloudimg-amd64.vmdk
+                  (--image-file content must match this file when included)
+  --contact-name  who the family asks for a new IP (default: the owner's name
+                  as configured; shown in the "連不上" message)
+  --vbox-version  default 7.2.20; --vbox-build default 175154 (together they
+                  name the installer; only this pair has been exercised)
+  --vbox-sha256   default the official hash of VirtualBox-<v>-<b>-Win.exe
+  --include-image embed --image-file into the bundle (USB handoff)
+EOF
+}
+
+NAME=""
+SEED_DIR=""
+OUT=""
+IMAGE_SHA=""
+IMAGE_URL="https://cloud-images.ubuntu.com/noble/current/noble-server-cloudimg-amd64.vmdk"
+CONTACT="使用者"
+VBOX_V="7.2.20"
+VBOX_BUILD="175154"
+VBOX_SHA="a81777d2b36380ce042a29e9c554cf032eb46a793f62e3cc82e7411e535c2c26"
+INCLUDE_IMAGE=0
+IMAGE_FILE=""
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --name)         [[ $# -ge 2 ]] || { usage; exit 2; }; NAME="$2"; shift 2 ;;
+        --seed-dir)     [[ $# -ge 2 ]] || { usage; exit 2; }; SEED_DIR="$2"; shift 2 ;;
+        --out)          [[ $# -ge 2 ]] || { usage; exit 2; }; OUT="$2"; shift 2 ;;
+        --image-sha256) [[ $# -ge 2 ]] || { usage; exit 2; }; IMAGE_SHA="$2"; shift 2 ;;
+        --image-url)    [[ $# -ge 2 ]] || { usage; exit 2; }; IMAGE_URL="$2"; shift 2 ;;
+        --contact-name) [[ $# -ge 2 ]] || { usage; exit 2; }; CONTACT="$2"; shift 2 ;;
+        --vbox-version) [[ $# -ge 2 ]] || { usage; exit 2; }; VBOX_V="$2"; shift 2 ;;
+        --vbox-build)   [[ $# -ge 2 ]] || { usage; exit 2; }; VBOX_BUILD="$2"; shift 2 ;;
+        --vbox-sha256)  [[ $# -ge 2 ]] || { usage; exit 2; }; VBOX_SHA="$2"; shift 2 ;;
+        --include-image) INCLUDE_IMAGE=1; shift ;;
+        --image-file)   [[ $# -ge 2 ]] || { usage; exit 2; }; IMAGE_FILE="$2"; shift 2 ;;
+        -h|--help)      usage; exit 0 ;;
+        *)              log ERROR "unknown argument: $1"; usage; exit 2 ;;
+    esac
+done
+
+if [[ -z "$NAME" || -z "$SEED_DIR" || -z "$OUT" || -z "$IMAGE_SHA" ]]; then
+    usage
+    exit 2
+fi
+
+# ---- local validation (nothing written yet) -----------------------------------
+if ! [[ "$NAME" =~ ^[a-z0-9]+(-[a-z0-9]+)*$ ]]; then
+    log ERROR "--name must be lowercase [a-z0-9] words joined by '-', got '${NAME}'"
+    exit 2
+fi
+if ! [[ "$IMAGE_SHA" =~ ^[0-9a-fA-F]{64}$ ]]; then
+    log ERROR "--image-sha256 must be 64 hex chars"
+    exit 2
+fi
+if ! [[ "$VBOX_SHA" =~ ^[0-9a-fA-F]{64}$ ]]; then
+    log ERROR "--vbox-sha256 must be 64 hex chars"
+    exit 2
+fi
+if ! [[ "$VBOX_V" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || ! [[ "$VBOX_BUILD" =~ ^[0-9]+$ ]]; then
+    log ERROR "--vbox-version must look like 7.2.20 and --vbox-build like 175154 (they name the installer file)"
+    exit 2
+fi
+for tool in jq; do
+    command -v "$tool" >/dev/null 2>&1 || { log ERROR "${tool} not found on PATH"; exit 1; }
+done
+if command -v shasum >/dev/null 2>&1; then
+    SHA_CMD="shasum -a 256"
+elif command -v sha256sum >/dev/null 2>&1; then
+    SHA_CMD="sha256sum"
+else
+    log ERROR "neither shasum nor sha256sum found on PATH"
+    exit 1
+fi
+for f in "${PROFILE_DIR}/Install-RepairHost.ps1" "${PROFILE_DIR}/Start-RepairLauncher.ps1"; do
+    [[ -f "$f" ]] || { log ERROR "${f} missing — run this from a complete checkout"; exit 1; }
+done
+
+# The seed is the register-repair-host output for THIS node: user-data +
+# meta-data are mandatory; seed.iso is mandatory too (the VM boots from it —
+# a --no-iso seed cannot be handed to the family, fail here, not there).
+for f in user-data meta-data seed.iso; do
+    [[ -f "${SEED_DIR}/${f}" && -s "${SEED_DIR}/${f}" ]] || {
+        log ERROR "--seed-dir ${SEED_DIR} lacks a non-empty ${f} — build the seed first (register-repair-host)"
+        exit 1
+    }
+done
+# The seed must be for this node: meta-data's local-hostname is what
+# cloud-init will call the VM. A wrong seed would boot someone else's key.
+seed_host="$(sed -n 's/^local-hostname:[[:space:]]*//p' "${SEED_DIR}/meta-data" | head -1)"
+if [[ "$seed_host" != "$NAME" ]]; then
+    log ERROR "--seed-dir holds the seed for '${seed_host}', not '${NAME}' — refusing to pack a mismatched seed"
+    exit 1
+fi
+# user-data must render clean (no leftover @@TOKEN@@): an unfilled template
+# makes cloud-init skip the whole file on the VM, silently. The class covers
+# digits too (e.g. @@EMBED_POOL_TUNNEL_B64@@) — [A-Z_] alone would miss those
+# and wave a half-rendered seed through.
+if grep -q '@@[A-Z0-9_][A-Z0-9_]*@@' "${SEED_DIR}/user-data"; then
+    log ERROR "--seed-dir/user-data still has an unfilled @@TOKEN@@ — rebuild the seed"
+    exit 1
+fi
+
+if [[ -e "$OUT" ]]; then
+    log ERROR "--out ${OUT} already exists — refusing to merge into it (delete it or pick another dir)"
+    exit 1
+fi
+
+IMAGE_BASENAME="$(basename "$IMAGE_URL")"
+if [[ "$INCLUDE_IMAGE" -eq 1 ]]; then
+    # The bundled copy is named after the ACTUAL file, not the URL: the name
+    # is what the installer looks for (config.image.file), so a URL whose
+    # basename does not match the file must not silently rename it.
+    IMAGE_BASENAME="$(basename "$IMAGE_FILE")"
+    [[ -n "$IMAGE_FILE" ]] || { log ERROR "--include-image needs --image-file <local image>"; exit 2; }
+    [[ -f "$IMAGE_FILE" ]] || { log ERROR "--image-file ${IMAGE_FILE}: not a file"; exit 1; }
+    got="$($SHA_CMD "$IMAGE_FILE" | awk '{print $1}')"
+    if [[ "$(printf '%s' "$got" | tr 'A-F' 'a-f')" != "$(printf '%s' "$IMAGE_SHA" | tr 'A-F' 'a-f')" ]]; then
+        log ERROR "--image-file SHA256 mismatch (got ${got}) — not embedding a wrong image"
+        exit 1
+    fi
+fi
+
+# ---- build ----------------------------------------------------------------------
+VM_NAME="mlp-repair-${NAME}"
+VBOX_EXE="VirtualBox-${VBOX_V}-${VBOX_BUILD}-Win.exe"
+VBOX_URL="https://download.virtualbox.org/virtualbox/${VBOX_V}/${VBOX_EXE}"
+
+mkdir -p "$OUT/seed"
+cp "${PROFILE_DIR}/Install-RepairHost.ps1" "${PROFILE_DIR}/Start-RepairLauncher.ps1" "$OUT/"
+cp "${SEED_DIR}/user-data" "${SEED_DIR}/meta-data" "${SEED_DIR}/seed.iso" "$OUT/seed/"
+if [[ "$INCLUDE_IMAGE" -eq 1 ]]; then
+    cp "$IMAGE_FILE" "$OUT/${IMAGE_BASENAME}"
+fi
+
+# repair-config.json: everything the two .ps1 need without asking the family.
+# Contact/image/vbox values are pinned at PACK time, so the installer checks
+# against today's known-good, not against whatever the network says later.
+jq -n \
+    --arg node "$NAME" \
+    --arg vm "$VM_NAME" \
+    --argjson d2port 18080 \
+    --argjson downto 300 \
+    --arg contact "$CONTACT" \
+    --arg imgfile "$IMAGE_BASENAME" \
+    --arg imgurl "$IMAGE_URL" \
+    --arg imgsha "$IMAGE_SHA" \
+    --arg vboxv "$VBOX_V" \
+    --arg vboxexe "$VBOX_EXE" \
+    --arg vboxurl "$VBOX_URL" \
+    --arg vboxsha "$VBOX_SHA" \
+    '{nodeName: $node, vmName: $vm, d2Port: $d2port, downTimeoutSec: $downto,
+      contactName: $contact,
+      image: {file: $imgfile, url: $imgurl, sha256: $imgsha},
+      vbox: {version: $vboxv, installer: $vboxexe, url: $vboxurl, sha256: $vboxsha}}' \
+    > "$OUT/repair-config.json"
+# BOM first: the contact name is usually Chinese, and PowerShell 5.1's
+# Get-Content without -Encoding decodes as ANSI (a live failure: installer
+# died parsing the config). The .ps1 readers ask for UTF8 explicitly, which
+# is BOM-aware, but the BOM also keeps Notepad on the family machine from
+# showing mojibake if anyone opens the file by hand.
+_bom_tmp="${OUT}/.repair-config.bom"
+printf '\xef\xbb\xbf' | cat - "$OUT/repair-config.json" > "$_bom_tmp"
+mv -f "$_bom_tmp" "$OUT/repair-config.json"
+
+cat > "$OUT/README-FAMILY.txt" <<EOF
+維修連線（給家人的三行）：
+1. 點兩下 Install-RepairHost.ps1，跳出詢問按「是」（只問這一次），等它說「安裝完成」。
+2. 之後每次：在桌面點兩下「維修連線 (${NAME})」，輸入對方給你的 IP，按確定。
+3. 出現「維修連線中」的視窗就放著不要關；修好或不想修時，把視窗關掉就斷線了。
+連不上（等很久還是顯示連不上）就向 ${CONTACT} 再要一次新的 IP。
+EOF
+
+# MANIFEST.sha256 covers every file but itself, so the owner can re-verify a
+# bundle that came back (or sat in chat history) before handing it out again.
+# The file list is built in a variable first: an empty ${...:+...} expansion
+# would still pass one empty argv to shasum ("No such file"), so the image
+# entry is appended only when it is really there.
+MANIFEST_FILES="Install-RepairHost.ps1 Start-RepairLauncher.ps1 repair-config.json README-FAMILY.txt seed/user-data seed/meta-data seed/seed.iso"
+if [[ "$INCLUDE_IMAGE" -eq 1 ]]; then
+    MANIFEST_FILES="${MANIFEST_FILES} ${IMAGE_BASENAME}"
+fi
+(
+    cd "$OUT"
+    # shellcheck disable=SC2086
+    if command -v shasum >/dev/null 2>&1; then
+        shasum -a 256 ${MANIFEST_FILES} > MANIFEST.sha256
+    else
+        sha256sum ${MANIFEST_FILES} > MANIFEST.sha256
+    fi
+)
+
+# ---- report -----------------------------------------------------------------------
+# The whole bundle is a secret (tunnel private key inside), so the directory
+# itself is locked to the owner — the threat is not the local disk (it
+# travels over chat/mail) but a shared machine it gets unpacked on.
+chmod 700 "$OUT"
+echo
+echo "package-repair-host: ${NAME}"
+echo "  bundle             ${OUT}/ (mode 700 — secret, do not unpack on a shared machine)"
+echo "  vm                 ${VM_NAME} (data dir on Windows: %LOCALAPPDATA%\\MyLinuxPool\\${NAME})"
+echo "  seed               from ${SEED_DIR} (host ${seed_host})"
+echo "  image              ${IMAGE_BASENAME} ($(if [[ "$INCLUDE_IMAGE" -eq 1 ]]; then echo "INCLUDED"; else echo "download at install, SHA pinned"; fi))"
+echo "  image sha256       ${IMAGE_SHA}"
+echo "  image SHA256SUMS   https://cloud-images.ubuntu.com/noble/current/SHA256SUMS (today's ${IMAGE_BASENAME} hash lives here)"
+echo "  virtualbox         ${VBOX_V} build ${VBOX_BUILD} (download at install if missing, SHA pinned)"
+echo "  vbox listing       https://download.virtualbox.org/virtualbox/${VBOX_V}/ (its SHA256SUMS must match --vbox-sha256)"
+echo "  contact            ${CONTACT}"
+log WARN "this bundle holds a tunnel PRIVATE key (seed/seed.iso, seed/user-data) — send it as a secret, delete it from chat history if you can"
+if [[ "$INCLUDE_IMAGE" -eq 0 ]]; then
+    echo "  family needs      network on install day (one ~600MB download + ~100MB VirtualBox if missing)"
+fi
