@@ -504,3 +504,4 @@ scp installer.sh host:/tmp/ && cat crypto_key | ssh host 'bash /tmp/installer.sh
 | [`docs/LAYOUT.md`](docs/LAYOUT.md) | 目錄結構契約、unit 與 profile 的格式 |
 | [`docs/REQ.md`](docs/REQ.md) | 原始需求 |
 | [`docs/AUDIT.md`](docs/AUDIT.md) | provider 宿主機稽核的覆蓋範圍與盲區 |
+| [`docs/REPAIR-HOST.md`](docs/REPAIR-HOST.md) | 家人維修承載機：登錄、打包、家人步驟、連入、rotate、撤銷 |

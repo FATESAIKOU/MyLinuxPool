@@ -64,7 +64,7 @@ $ErrorActionPreference = 'Stop'
 
 function Write-Log([string]$m) {
     $line = '{0} {1}' -f (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ'), $m
-    if ($script:InstallLog -ne '') { Add-Content -Path $script:InstallLog -Value $line }
+    if ($script:InstallLog -ne '') { Add-Content -Path $script:InstallLog -Value $line -Encoding UTF8 }
     Write-Host $line
 }
 

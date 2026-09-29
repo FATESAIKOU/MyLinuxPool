@@ -80,7 +80,7 @@ $IPV4_PATTERN = '^(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])\.(25[0-5]|2[0-4]
 
 function Write-Log([string]$m) {
     $line = '{0} {1}' -f (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ'), $m
-    Add-Content -Path (Join-Path $script:DataDir 'launcher.log') -Value $line
+    Add-Content -Path (Join-Path $script:DataDir 'launcher.log') -Value $line -Encoding UTF8
     Write-Host $line
 }
 
@@ -233,7 +233,7 @@ $ListenerBlock = {
     $ErrorActionPreference = 'Stop'
     function L([string]$m) {
         $line = '{0} {1}' -f (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ'), $m
-        Add-Content -Path $LogFile -Value $line
+        Add-Content -Path $LogFile -Value $line -Encoding UTF8
     }
     function Save-State([string]$last, [string]$lastUtc, [string]$fetchUtc, [int]$fetches) {
         $content = "SERVED_IP={0}`r`nLAST_STATE={1}`r`nLAST_STATE_UTC={2}`r`nLAST_FETCH_UTC={3}`r`nFETCH_COUNT={4}`r`n" -f $ServeIp, $last, $lastUtc, $fetchUtc, $fetches
