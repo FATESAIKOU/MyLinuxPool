@@ -9,7 +9,7 @@
 #   而現行 Gateway 的 SSH 在 2100（NODE_GATEWAY.port；docs/ARCHITECTURE.md:41）。
 #   靜態模式對現在的 Gateway 會連 22、永遠連不上，症狀是「一直重試」。
 #
-# 設計裁示（openspec/changes/family-repair-host/design.md D3）：
+# 設計裁示（openspec/changes/archive/2026-10-01-family-repair-host/design.md D3）：
 #   靜態模式加一個選填環境變數 POOL_GATEWAY_SSH_PORT；沒給 → 行為與現在
 #   相同（22），所以 worker 的既有退路不受影響。
 #

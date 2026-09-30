@@ -7,7 +7,7 @@
 家人家裡的區網（例如路由器管理頁面）。**家人那台電腦裡沒有任何 GitHub
 權杖**——Mac 側也只放一把隧道私鑰，不放任何能動整座池的權杖。
 
-規劃與契約在 `openspec/changes/family-repair-host/`
+規劃與契約在 `openspec/changes/archive/2026-10-01-family-repair-host/`
 （proposal／`specs/repair-host/spec.md`／design／tasks）。
 本文件只寫操作；為什麼這樣設計去看那裡。
 
@@ -177,7 +177,7 @@ Remove-Item -Recurse -Force "$env:LOCALAPPDATA\MyLinuxPool\repair-host"
 
 ## 9. 已知限制與風險
 
-完整追蹤在 `openspec/changes/family-repair-host/`
+完整追蹤在 `openspec/changes/archive/2026-10-01-family-repair-host/`
 （`known-limitations.md`；本節是操作側的版本，兩邊要對得上）：
 
 - **共用隧道金鑰外洩影響全家**（使用者知情決定不收窄）：任何一位家人的電腦

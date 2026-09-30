@@ -9,7 +9,7 @@
 #   跑容器，直到某一步才炸——**那時池側已被寫入**（埠被佔、映像被建、
 #   POOL_WORKERS 被寫）。正確行為是在**寫入任何狀態之前**就拒絕。
 #
-# 設計裁示（openspec/changes/family-repair-host/design.md D6）：閘門放在
+# 設計裁示（openspec/changes/archive/2026-10-01-family-repair-host/design.md D6）：閘門放在
 #   現有「role == provider 且名字在清單」那一步（Validate inputs），
 #   沒有宣告 worker-host 就失敗並說明原因。spec（repair-host/spec.md
 #   「不承載 worker 是機制，不是慣例」）要求「在寫入任何狀態之前」。

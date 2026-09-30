@@ -1,5 +1,5 @@
 ﻿# Install-RepairHost.ps1 — one-time install of a family repair host on Windows
-# (openspec/changes/family-repair-host, tasks 6.1; fixes OUT-live-repair.md §6).
+# (openspec/changes/archive/2026-10-01-family-repair-host, tasks 6.1; fixes OUT-live-repair.md §6).
 #
 # Run ONCE via Install.cmd in the bundle the owner hands over (double-click
 # the .cmd — double-clicking this .ps1 itself only opens an editor). It
