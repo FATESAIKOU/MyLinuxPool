@@ -118,6 +118,41 @@
 # green — this is how OUT-test-ephemeral-mlp.md's green/injection proof
 # was produced; that copy is NEVER this repo's ops-scripts/mlp.
 #
+# ---- Live finding: /home/sshproxy/repair/ is 750 sshproxy:sshproxy -----
+# Real-Gateway verification found mlp's remote scan runs as the operator's
+# own Gateway user (GW_USER), which cannot read a 750 sshproxy:sshproxy
+# directory — every host was showing "?" in practice, not because of any
+# nameplate-content bug, but because the nameplate READ itself was always
+# failing permission-denied. PM decision: read the nameplates with
+# `sudo -n` (non-interactive; the pool already assumes this user has
+# passwordless sudo — refresh installs authorized_keys via sudo), inside
+# the SAME single remote command already used for the listener+nameplate
+# scan (no new round trip, no new ControlMaster open — item 5 still
+# holds). Concretely: `ss -tln` needs no privilege and stays outside any
+# sudo wrapper (listeners must keep working even when sudo is broken);
+# only the read of /home/sshproxy/repair/* is wrapped in `sudo -n`.
+#
+# WIRE MARKER (defined here for whoever implements this — does not exist
+# in ops-scripts/mlp yet): if the `sudo -n` invocation fails (non-zero, or
+# sudo's own "a password is required" text), the remote command must not
+# let that failure text leak into the nameplate stream (same framing
+# hazard as must-fix 1) — instead it emits exactly one line,
+# "REPAIR-SCAN-SUDO-FAIL", as the ENTIRE content of the nameplate block
+# (between the anchored REPAIR-SCAN-N and REPAIR-SCAN-END markers), and
+# nothing else. gather_repair_targets, seeing that sentinel, must: (a)
+# print exactly ONE loud line to stderr containing both "sudo" and
+# "nameplate" (wording otherwise free), (b) still emit one row per real
+# (127.0.0.1, in-range) listener — same as any other unreadable/invalid
+# nameplate, name "?" — (c) never die: `mlp ls` still exits 0 (same
+# "loud but ls still succeeds" contract as Definition 1's missing-range
+# case). Known gap this doesn't try to close: a hostile nameplate file
+# whose own (whole, validated) content happened to equal exactly
+# "REPAIR-SCAN-SUDO-FAIL" would falsely trigger this path — accepted as
+# out of scope for this ticket (must-fix 1's whole-content validation
+# already makes that string invalid as a NAME anyway, so at worst it is
+# indistinguishable from "some listener's nameplate was invalid", not a
+# new escalation).
+#
 # ---- LIMITATIONS (see also OUT-test-ephemeral-mlp.md) ------------------
 #   * "up" is scan-time-listener-observed only, no banner probe — a
 #     repair host mid-boot (listener not yet up) is invisible, matching
@@ -1098,6 +1133,80 @@ if [[ "$got" == "real-one"$'\t'"2521"$'\t'"up" ]]; then
     inj_ok "8e-inj. an address-family-filtered mutant shows exactly the 1 real row — 8e (which wants exactly 1) would go green against a real fix"
 else
     inj_bad "8e-inj. mutant produced unexpected [$got]"
+fi
+
+# ==========================================================================
+# §9: live finding — /home/sshproxy/repair/ is 750 sshproxy:sshproxy, so
+# reading nameplates needs `sudo -n` (see header for the wire contract).
+echo "=== 9. live: sudo -n to read nameplates (750 sshproxy:sshproxy) ==="
+
+# 9a. The remote command that fetches listeners+nameplates must itself
+# invoke `sudo -n` against the nameplate directory — in the SAME line
+# ARGV_LOG records for the scan (proves it rides the one existing remote
+# command, never a second round trip), and the scan must still be exactly
+# ONE remote command overall (SCAN_LOG count == 1, same property §5c
+# already checks, re-verified here because adding sudo is exactly the
+# kind of change that tempts a "just run a quick sudo check first" EXTRA
+# round trip).
+printf 'REPAIR-SCAN-L\nLISTEN 0 128 127.0.0.1:2560 0.0.0.0:*\nREPAIR-SCAN-N\n2560 clean-host\nREPAIR-SCAN-END\n' > "$SANDBOX/sudo-ok.txt"
+run_ls "$GW_JSON_OK" "$SANDBOX/sudo-ok.txt" "$SANDBOX/ls9a.out" "$SANDBOX/ls9a.err"
+sudo_scan_line="$(grep -F 'REPAIR-SCAN-L' "$SANDBOX/argv.log" 2>/dev/null || true)"
+if [[ -z "$sudo_scan_line" ]]; then
+    bad "9a. could not find the scan's remote-command line in argv.log at all — harness or scan marker changed"
+elif ! printf '%s' "$sudo_scan_line" | grep -qF 'sudo -n'; then
+    bad "9a. the scan's remote command does not invoke 'sudo -n' anywhere (command: $sudo_scan_line) — nameplates are read as the operator's own Gateway user, which the live 750 sshproxy:sshproxy directory refuses"
+elif ! printf '%s' "$sudo_scan_line" | grep -qF '/home/sshproxy/repair'; then
+    bad "9a. 'sudo -n' appears in the remote command but not obviously applied to /home/sshproxy/repair (command: $sudo_scan_line)"
+else
+    ok "9a. the listener+nameplate scan's remote command invokes 'sudo -n' against /home/sshproxy/repair, in the same command"
+fi
+scancount9a="$(wc -l < "$SANDBOX/scan.log" 2>/dev/null | tr -d ' ')"
+if [[ "$scancount9a" == "1" ]]; then
+    ok "9a-onecall. adding sudo did not turn the scan into a second remote command (still exactly 1, same as §5c)"
+else
+    bad "9a-onecall. scan ran $scancount9a remote commands (want 1) — sudo was added as a SEPARATE round trip instead of inside the existing one"
+fi
+if grep -qE '^ +clean-host +2560 +up$' "$SANDBOX/ls9a.out"; then
+    ok "9a-sanity. a normal clean nameplate still resolves through whatever sudo wrapping now exists"
+else
+    bad "9a-sanity. clean-host/2560 missing from ls output (got: $(grep '2560' "$SANDBOX/ls9a.out" || echo '<absent>')) — sudo wrapping broke the ordinary case"
+fi
+
+# 9b. sudo -n failure: the WIRE MARKER (header) is "REPAIR-SCAN-SUDO-FAIL"
+# as the entire nameplate block. Must not silently show success; must
+# warn loudly, still list the real listener as "?", and still exit 0.
+printf 'REPAIR-SCAN-L\nLISTEN 0 128 127.0.0.1:2561 0.0.0.0:*\nREPAIR-SCAN-N\nREPAIR-SCAN-SUDO-FAIL\nREPAIR-SCAN-END\n' > "$SANDBOX/sudo-fail.txt"
+run_ls "$GW_JSON_OK" "$SANDBOX/sudo-fail.txt" "$SANDBOX/ls9b.out" "$SANDBOX/ls9b.err"
+rc=$?
+if [[ $rc -ne 0 ]]; then
+    bad "9b. mlp ls exit=$rc on a sudo-failure fixture (want 0 — listeners are still real and listable, only names are unreadable)"
+else
+    ok "9b-rc. mlp ls exits 0 even when sudo -n failed"
+fi
+if grep -qE '^ +\? +2561 +up$' "$SANDBOX/ls9b.out"; then
+    ok "9b-listed. the real listener (2561) is still shown, as ? (not silently dropped, not left showing a stale/wrong name)"
+else
+    bad "9b-listed. listener 2561 is not shown as ? (row: $(grep '2561' "$SANDBOX/ls9b.out" || echo '<absent>')) — a sudo failure must not remove a real listener from the list"
+fi
+if grep -qi 'sudo' "$SANDBOX/ls9b.err" && grep -qi 'nameplate' "$SANDBOX/ls9b.err"; then
+    ok "9b-warn. a loud stderr line mentions both sudo and nameplates"
+else
+    bad "9b-warn. no loud stderr warning naming sudo+nameplates (err=[$(cat "$SANDBOX/ls9b.err")]) — a sudo failure is currently indistinguishable from '?' meaning something else entirely, e.g. an ordinary invalid nameplate"
+fi
+
+# INJECTION for §9: a mutant gather_repair_targets that recognizes the
+# sentinel and warns, proving 9b-warn is load-bearing (not satisfied by
+# e.g. any non-empty stderr).
+got="$(MLP_FILE="$MLP_FILE" HOME="$SANDBOX/home" PATH="$SANDBOX/shims:$PATH" \
+    bash -c '
+        source "$MLP_FILE" >/dev/null 2>&1
+        gather_repair_targets() { echo "mlp: sudo -n failed reading repair nameplates" >&2; printf "?\t2561\tup\n"; }
+        gather_repair_targets
+    ' 2>"$SANDBOX/inj9.err")"
+if grep -qi 'sudo' "$SANDBOX/inj9.err" && grep -qi 'nameplate' "$SANDBOX/inj9.err" && [[ "$got" == "?"$'\t'"2561"$'\t'"up" ]]; then
+    inj_ok "9b-inj. a mutant that DOES warn+list-as-? produces exactly what 9b wants — proves 9b isn't satisfied by mere chance"
+else
+    inj_bad "9b-inj. mutant produced unexpected stderr=[$(cat "$SANDBOX/inj9.err")] stdout=[$got]"
 fi
 
 echo

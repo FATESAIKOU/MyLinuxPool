@@ -439,7 +439,15 @@ gather_repair_targets() {
         return 0
     fi
 
-    remote_cmd='printf "REPAIR-SCAN-L\n"; ss -tln 2>/dev/null; printf "REPAIR-SCAN-N\n"; for f in /home/sshproxy/repair/*; do [ -f "$f" ] || continue; printf "%s %s\n" "$(basename "$f")" "$(cat "$f" 2>/dev/null)"; done; printf "REPAIR-SCAN-END\n"'
+    # Live finding: /home/sshproxy/repair/ is 750 sshproxy:sshproxy, so the
+    # nameplate read runs under `sudo -n` (the pool already assumes this
+    # user has passwordless sudo — refresh installs authorized_keys via
+    # sudo). `ss -tln` needs no privilege and stays outside sudo, so a
+    # broken sudo never hides listeners, only names. If sudo itself fails,
+    # the block carries exactly one line, REPAIR-SCAN-SUDO-FAIL, and nothing
+    # else (sudo's own stderr is discarded so its "password required" text
+    # cannot leak into the nameplate stream).
+    remote_cmd='printf "REPAIR-SCAN-L\n"; ss -tln 2>/dev/null; printf "REPAIR-SCAN-N\n"; sudo -n sh -c "for f in /home/sshproxy/repair/*; do [ -f \"\$f\" ] || continue; printf \"%s %s\n\" \"\$(basename \"\$f\")\" \"\$(cat \"\$f\" 2>/dev/null)\"; done" 2>/dev/null || printf "REPAIR-SCAN-SUDO-FAIL\n"; printf "REPAIR-SCAN-END\n"'
     out="$(gw_run "$remote_cmd")"
 
     # Nameplate content is HOSTILE input (anyone holding the shared tunnel
@@ -467,6 +475,15 @@ gather_repair_targets() {
     nameplate_block="${out#*REPAIR-SCAN-N$'\n'}"
     nameplate_block="${nameplate_block%$'\n'REPAIR-SCAN-END*}"
 
+    # Live finding (750 sshproxy:sshproxy): when `sudo -n` fails, the block
+    # above carries exactly one line, REPAIR-SCAN-SUDO-FAIL, and nothing
+    # else. Warn loudly (once), then fall through with an empty block —
+    # every real listener is still listed as "?", and this function still
+    # exits 0 (a deaf nameplate directory must never hide a live tunnel).
+    if [[ "$nameplate_block" == "REPAIR-SCAN-SUDO-FAIL" ]]; then
+        printf 'mlp: sudo -n failed reading Gateway repair nameplates — showing listeners without names\n' >&2
+        nameplate_block=""
+    fi
     while IFS= read -r line; do
         case "$line" in
             LISTEN*) : ;;

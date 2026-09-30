@@ -212,6 +212,15 @@ write_files:
       [Service]
       Type=simple
       User=@@LOGIN_USER@@
+      # KillMode=mixed, not the default control-group: on stop, SIGTERM
+      # must go to the launch script ALONE, while the ssh master it manages
+      # stays alive until on_stop explicitly tears it down. With
+      # control-group (the default), the master dies in the same instant as
+      # the trap fires, and the nametag_remove ssh in on_stop finds no
+      # master to multiplex onto — its fallback connection then races
+      # a dying network, and the tag leaks (measured live: tag present
+      # after a clean ACPI shutdown, no new sshproxy session in auth.log).
+      KillMode=mixed
       EnvironmentFile=/etc/mlp/tunnel.env
       EnvironmentFile=-/run/mlp/gateway.env
       Environment=MLP_GATEWAY_ENV_FILE=/run/mlp/gateway.env

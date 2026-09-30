@@ -306,8 +306,12 @@ apply_repair_name() {
     [[ -n "$name" ]] || return 1
     [[ "$name" =~ $NAME_CHECK ]] || return 1
     [[ "$name" == "$LAST_APPLIED_NAME" ]] && return 0
+    # sudo -n: hostnamectl needs privilege (polkit refuses an unprivileged
+    # caller with "Interactive authentication required"); repair has
+    # NOPASSWD sudo. -n so a broken sudoers fails fast instead of hanging
+    # on a password prompt nobody will answer.
     bin="${MLP_REPAIR_HOSTNAME_BIN:-hostnamectl}"
-    if "$bin" set-hostname "$name" >/dev/null 2>&1; then
+    if sudo -n "$bin" set-hostname "$name" >/dev/null 2>&1; then
         LAST_APPLIED_NAME="$name"
         return 0
     fi

@@ -468,6 +468,23 @@ exit 0
 FAKE
 chmod +x "$SHIMS/hostnamectl"
 
+# ---- 假 sudo：記 argv（§10 用；真機發現 repair 帳號跑 hostnamectl 會
+# 「Interactive authentication required」，修法是 sudo -n）。FAKE_SUDO_MODE=
+# fail 時模擬非互動模式下密碼要求失敗（exit 1，不往下 exec，證明「sudo 失敗
+# 不能擋撥號」）；預設（ok 或未設）剝掉 -n 之後真的 exec 剩下的指令，讓底下
+# 的假 hostnamectl 也留下記錄，證明整條鏈路真的接起來，不只是 sudo 被叫到。
+cat > "$SHIMS/sudo" <<'FAKE'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "${SUDO_LOG:-/dev/null}"
+if [[ "${FAKE_SUDO_MODE:-ok}" == "fail" ]]; then
+    echo "sudo: a password is required" >&2
+    exit 1
+fi
+[[ "$1" == "-n" ]] && shift
+exec "$@"
+FAKE
+chmod +x "$SHIMS/sudo"
+
 # count_max_window <timestamps-file> <window-seconds>
 #   印出「任何一個長度 window-seconds 的視窗內，最多落了幾個時間戳」。
 #   [t, t+window] 兩端都算在內（跟 fail2ban 的「10 分鐘內」同一種算法：寧可
@@ -523,11 +540,67 @@ prop_tunnel_unit_system_user() {
     grep -q '/etc/systemd/system/mlp-tunnel-repair.service' "$1" 2>/dev/null \
     && grep -q 'User=@@LOGIN_USER@@' "$1" 2>/dev/null
 }
+# ---- 本輪新增（工單 test-live-vm-fixes；真機 ACPI 關機時名牌沒被刪掉）-----
+# 真機驗收發現：正常關機時 Gateway 上的名牌沒被刪掉，因為隧道 unit 的
+# stop 還沒跑，網路就先斷了。systemd 的停止順序是啟動順序的反向：一個
+# unit 若 After=network-online.target（比網路晚起），關機時就會比網路早停
+# （網路留到最後才收）。修法方向：mlp-tunnel-repair.service 自己的
+# [Unit] 區塊要同時有 `Wants=network-online.target` 與
+# `After=network-online.target`（不能只有其中一個，也不能只掛在
+# mlp-d2-fetch.service 那個 unit 上——那個 unit 是 oneshot，起完就結束，
+# 它的 Wants/After 對隧道 unit 的停止順序沒有幫助）。用同一種「先找
+# path: 那行、往下掃到下一個 path: 或頂層 key 為止」的區塊定位法，只認
+# **隧道 unit** 自己那個區塊裡的兩行，不被 mlp-d2-fetch.service 那邊本來
+# 就有的同名字串誤判成綠。
+prop_tunnel_unit_network_ordering() {
+    awk '
+        BEGIN { inunit = 0; seen = 0; wants = 0; after = 0 }
+        /^[[:space:]]*-[[:space:]]*path:[[:space:]]*\/etc\/systemd\/system\/mlp-tunnel-repair\.service[[:space:]]*$/ {
+            inunit = 1; seen = 1; next
+        }
+        /^[[:space:]]*-[[:space:]]*path:/ && $0 !~ /mlp-tunnel-repair\.service/ { inunit = 0 }
+        /^[^[:space:]]/ { inunit = 0 }
+        inunit && /^[[:space:]]*Wants=/ && /network-online\.target/ { wants = 1 }
+        inunit && /^[[:space:]]*After=/ && /network-online\.target/ { after = 1 }
+        END { exit (seen && wants && after) ? 0 : 1 }
+    ' "$1" 2>/dev/null
+}
 prop_new_scripts_referenced() {
     grep -q '.mylinuxpool/bin/repair-token-guard' "$1" 2>/dev/null \
     && grep -q '.mylinuxpool/bin/repair-gateway-fetch' "$1" 2>/dev/null \
     && grep -q '.mylinuxpool/bin/repair-gateway-report' "$1" 2>/dev/null \
     && grep -q '.mylinuxpool/bin/repair-tunnel-launch' "$1" 2>/dev/null
+}
+# ---- 本輪新增（工單 test-live-vm-fixes 追加：KillMode=mixed）--------------
+# 真機再次驗收找到名牌洩漏的真正根因：systemd 預設 KillMode=control-group
+# 會把 ssh master 跟 launch script 一起 SIGTERM，on_stop 的 trap 觸發時
+# master 已經死了，nametag_remove 沒有 ControlMaster 可以多工，退路連線又
+# 跟正在斷的網路搶時間，名牌就這樣漏刪（真機量到：ACPI 關機後名牌還在，
+# auth.log 沒有新的 sshproxy session）。修法已經在工作樹裡：
+# mlp-tunnel-repair.service 自己的 [Service] 區塊要有 `KillMode=mixed`
+# （只送 SIGTERM 給主行程，ssh master 留到 on_stop 自己收）。review 說「拿掉
+# 這行不會讓任何測試變紅」——這條就是補那個洞。用跟 1k 同一種「先找
+# path: 那行、往下掃到下一個 path: 或頂層 key 為止」的區塊定位法，只認
+# **隧道 unit** 自己那個區塊裡的這一行，不被別的 unit（如果將來哪個 unit
+# 也剛好寫了 KillMode=mixed）誤判成綠；也不接受同區塊出現別的 KillMode 值
+# （例如 KillMode=process 或 none）當作合格——`Wants=`/`After=` 用「有沒有
+# 提到」就夠，但 KillMode 是個單值旗標，值不對等於沒修。
+prop_tunnel_unit_killmode_mixed() {
+    awk '
+        BEGIN { inunit = 0; seen = 0; km = "" }
+        /^[[:space:]]*-[[:space:]]*path:[[:space:]]*\/etc\/systemd\/system\/mlp-tunnel-repair\.service[[:space:]]*$/ {
+            inunit = 1; seen = 1; next
+        }
+        /^[[:space:]]*-[[:space:]]*path:/ && $0 !~ /mlp-tunnel-repair\.service/ { inunit = 0 }
+        /^[^[:space:]]/ { inunit = 0 }
+        inunit && /^[[:space:]]*KillMode[[:space:]]*=/ {
+            line = $0
+            sub(/^[[:space:]]*KillMode[[:space:]]*=[[:space:]]*/, "", line)
+            sub(/[[:space:]]*$/, "", line)
+            km = line
+        }
+        END { exit (seen && km == "mixed") ? 0 : 1 }
+    ' "$1" 2>/dev/null
 }
 
 # ---- sudo 的性質（2026-09-29 決定，tasks 8b.4） -----------------------------
@@ -629,8 +702,14 @@ if [[ -f "$TMPL_PATH" ]]; then
     else
         bad "1j. 模板還是單一 @@PROVIDER_PORT@@，或沒有段的 placeholder——port 應該是段，不寫死一個值（預期紅）"
     fi
+    prop_tunnel_unit_network_ordering "$TMPL_PATH" \
+        && ok "1k. 隧道 unit 自己的 [Unit] 區塊同時有 Wants=／After=network-online.target（真機發現：ACPI 關機時網路比隧道早斷，名牌沒被刪；systemd 反向停止順序要靠這兩行）" \
+        || bad "1k. 隧道 unit 自己的 [Unit] 區塊沒有同時具備 Wants=／After=network-online.target——關機時網路可能比隧道先斷，名牌刪不掉"
+    prop_tunnel_unit_killmode_mixed "$TMPL_PATH" \
+        && ok "1l. 隧道 unit 自己的 [Service] 區塊有 KillMode=mixed（真機發現的真正根因：control-group 預設會把 ssh master 跟 launch script 一起殺掉，on_stop 沒有 master 可以刪名牌）" \
+        || bad "1l. 隧道 unit 的 [Service] 區塊沒有 KillMode=mixed（或值不對）——關機時 ssh master 會被跟主行程一起殺掉，名牌刪不掉"
 else
-    for id in 1a 1b 1c 1d 1e 1f 1g 1g0 1h 1h2 1i 1j; do bad "${id}. ${TEMPLATE} 不存在——無法驗證"; done
+    for id in 1a 1b 1c 1d 1e 1f 1g 1g0 1h 1h2 1i 1j 1k 1l; do bad "${id}. ${TEMPLATE} 不存在——無法驗證"; done
 fi
 
 echo "--- 1x. 注入：對模板複本動刀，證明上面的比對真的在看內容 ---"
@@ -672,6 +751,55 @@ elif mode == "listen-any":
     src = src.replace("ListenAddress 127.0.0.1", "ListenAddress 0.0.0.0", 1)
 elif mode == "add-sync":
     src += "\n# injected for test-repair-host-vm.sh\nruncmd_extra: [ systemctl, enable, --now, pool-sync.timer ]\n"
+elif mode == "no-network-ordering":
+    # 只動隧道 unit（mlp-tunnel-repair.service）自己那個區塊的 Wants=/After=
+    # 那兩行，把 network-online.target 從裡面拿掉（d2-fetch 那個 unit的同名
+    # 字串留著不動——這樣如果斷言誤看了別的 unit，這個注入不會讓它翻紅，可以
+    # 抓出「掃描範圍抓錯」這種假綠）。
+    lines = src.splitlines(keepends=True)
+    path_idxs = [i for i, l in enumerate(lines) if re.match(r'^[ \t]*-[ \t]*path:', l)]
+    unit_j = None
+    for j, i in enumerate(path_idxs):
+        if "mlp-tunnel-repair.service" in lines[i]:
+            unit_j = j
+            break
+    assert unit_j is not None, "mlp-tunnel-repair.service block not found"
+    start = path_idxs[unit_j]
+    end = path_idxs[unit_j + 1] if unit_j + 1 < len(path_idxs) else len(lines)
+    block = lines[start:end]
+    changed = False
+    for k, l in enumerate(block):
+        if re.match(r'^[ \t]*Wants=.*network-online\.target', l) or re.match(r'^[ \t]*After=.*network-online\.target', l):
+            block[k] = re.sub(r'\s*network-online\.target', '', l, count=1)
+            changed = True
+    assert changed, "no Wants=/After= network-online.target line to strip in the tunnel unit block"
+    lines[start:end] = block
+    src = "".join(lines)
+elif mode == "no-killmode":
+    # 拿掉隧道 unit 自己 [Service] 區塊裡的 KillMode=mixed 那一行（同一種
+    # 「先找 path: 再掃到下一個 path: 或頂層 key 為止」的區塊定位，不動別的
+    # unit——模板目前只有這一個 unit 有 KillMode，但用同一套區塊掃法保持
+    # 跟 no-network-ordering 一致，也不怕以後別的 unit 也長出一行同名設定）。
+    lines = src.splitlines(keepends=True)
+    path_idxs = [i for i, l in enumerate(lines) if re.match(r'^[ \t]*-[ \t]*path:', l)]
+    unit_j = None
+    for j, i in enumerate(path_idxs):
+        if "mlp-tunnel-repair.service" in lines[i]:
+            unit_j = j
+            break
+    assert unit_j is not None, "mlp-tunnel-repair.service block not found"
+    start = path_idxs[unit_j]
+    end = path_idxs[unit_j + 1] if unit_j + 1 < len(path_idxs) else len(lines)
+    block = lines[start:end]
+    removed = False
+    for k, l in enumerate(block):
+        if re.match(r'^[ \t]*KillMode[ \t]*=', l):
+            del block[k]
+            removed = True
+            break
+    assert removed, "no KillMode= line to remove in the tunnel unit block"
+    lines[start:end] = block
+    src = "".join(lines)
 elif mode == "sudo-all":
     # 把 sudoers 規則的 principal 改成 ALL（模擬「不只有該帳號」的退化：
     # 任何本機帳號都能免密碼 root）。只動 sudoers 區塊裡的主體欄位。
@@ -713,6 +841,18 @@ if [[ -f "$TMPL_PATH" ]]; then
     else
         inj_bad "1x. 加了 pool-sync 啟用後 1f 仍綠（$(cat "$SANDBOX/mk3.err" 2>/dev/null)）"
     fi
+    m5="$SANDBOX/tmpl-no-network-ordering.tmpl"; mk_mutant "no-network-ordering" > "$m5" 2>"$SANDBOX/mk5.err"
+    if [[ -s "$m5" ]] && ! prop_tunnel_unit_network_ordering "$m5"; then
+        inj_ok "1x. 拿掉隧道 unit 的 Wants=/After=network-online.target 後 1k 會紅"
+    else
+        inj_bad "1x. 拿掉隧道 unit 的 network-online.target 後 1k 仍綠——注入沒生效或斷言掃錯區塊（$(cat "$SANDBOX/mk5.err" 2>/dev/null)）"
+    fi
+    m6="$SANDBOX/tmpl-no-killmode.tmpl"; mk_mutant "no-killmode" > "$m6" 2>"$SANDBOX/mk6.err"
+    if [[ -s "$m6" ]] && ! prop_tunnel_unit_killmode_mixed "$m6"; then
+        inj_ok "1x. 拿掉隧道 unit 的 KillMode=mixed 後 1l 會紅"
+    else
+        inj_bad "1x. 拿掉隧道 unit 的 KillMode=mixed 後 1l 仍綠——注入沒生效或斷言掃錯區塊（$(cat "$SANDBOX/mk6.err" 2>/dev/null)）"
+    fi
     # sudo-all：只有當模板已有一行 principal 是 @@LOGIN_USER@@ 的 sudo 規則
     # 才注入（現碼還沒有，注入會以 mk 失敗收場——那是預期，以 inj_skip 記）。
     if grep -qE '^[[:space:]]*@@LOGIN_USER@@[[:space:]]' "$TMPL_PATH" 2>/dev/null; then
@@ -728,7 +868,7 @@ if [[ -f "$TMPL_PATH" ]]; then
 else
     inj_skip "1x. 模板不存在，無法動刀"
 fi
-inj_skip "1e/1g. 兩項在 task 5 落地後已綠（見上）；注入 1x 的三個模板突變各自對應 1d/1b/1f。1h/1h2 的注入（sudo-all）在模板出現 NOPASSWD 規則後才會執行，理由見該處。"
+inj_skip "1e/1g. 兩項在 task 5 落地後已綠（見上）；注入 1x 的模板突變各自對應 1d/1b/1f/1k/1l。1h/1h2 的注入（sudo-all）在模板出現 NOPASSWD 規則後才會執行，理由見該處。"
 inj_skip "1i/1j. 現碼本身就是紅（模板還沒換掉 @@NODE_NAME@@／@@PROVIDER_PORT@@）；本輪沒有對這兩項做正向注入——落地後只是『拿掉 port 段字串』這種平凡的字串比對，跟 1e/1g 同一類，價值有限"
 
 echo
@@ -1061,26 +1201,30 @@ if [[ ! -x "$LAUNCH_BIN" ]]; then
     for id in 6a 6b 6c; do bad "${id}. ${LAUNCH} 不存在——本測試定義它的行為（預期紅）"; done
 else
     run_launch_loop() {
-        # run_launch_loop <label> <gwenv-content-or-empty> [port-range|NONE]
+        # run_launch_loop <label> <gwenv-content-or-empty> [port-range|NONE] [sudo-mode]
         #   跑一小段模擬時間（用假時鐘，絕不真的 sleep），把 gateway.env 先塞
         #   成 <gwenv-content>（空字串＝完全沒有這個檔），FAKE_D2_MODE=down
         #   讓即時的 fetch 一律失敗、不會覆寫我塞的內容。第三個參數是
         #   POOL_GATEWAY_PORT_RANGE 的值，預設 2400,2499；傳字面 NONE 表示
-        #   完全不設這個環境變數（§8i 用來驗證「讀不到段就拒絕」）。結果記到
-        #   RL_DIALS／RL_FIRST_SLEEP／RL_DOWN／RL_HOSTCALL 四個全域變數。
-        local label="$1" content="$2" prange="${3:-2400,2499}"
+        #   完全不設這個環境變數（§8i 用來驗證「讀不到段就拒絕」）。第四個
+        #   參數是 FAKE_SUDO_MODE（預設 ok；§10c 傳 fail，驗證 sudo 失敗不會
+        #   擋撥號）。結果記到 RL_DIALS／RL_FIRST_SLEEP／RL_DOWN／RL_HOSTCALL／
+        #   RL_SUDOCALL 五個全域變數。
+        local label="$1" content="$2" prange="${3:-2400,2499}" sudo_mode="${4:-ok}"
         local gwenv="$SANDBOX/gwenv-${label}.env"
         local sshlog="$SANDBOX/ssh-${label}.log" sleeplog="$SANDBOX/sleep-${label}.log"
         local curllog="$SANDBOX/curl-${label}.log" hostlog="$SANDBOX/hostnamectl-${label}.log"
+        local sudolog="$SANDBOX/sudo-${label}.log"
         local clock="$SANDBOX/clock-${label}"
         if [[ -n "$content" ]]; then printf '%s\n' "$content" > "$gwenv"; else rm -f "$gwenv"; fi
-        : > "$sshlog"; : > "$sleeplog"; : > "$curllog"; : > "$hostlog"; printf '0\n' > "$clock"
+        : > "$sshlog"; : > "$sleeplog"; : > "$curllog"; : > "$hostlog"; : > "$sudolog"; printf '0\n' > "$clock"
         local runenv=(
             PATH="$SHIMS:/usr/bin:/bin" HOME="$HOME_DIR"
             SSH_LOG="$sshlog" MLP_TEST_SLEEP_LOG="$sleeplog"
             MLP_TEST_CLOCK="$clock" MLP_TEST_CLOCK_CAP=100
             MLP_TEST_SSH_STDERR="Could not resolve hostname gateway-ip-set-at-launch.invalid: Name or service not known"
             CURL_LOG="$curllog" FAKE_D2_MODE=down HOSTNAMECTL_LOG="$hostlog"
+            SUDO_LOG="$sudolog" FAKE_SUDO_MODE="$sudo_mode"
             MLP_GATEWAY_ENV_FILE="$gwenv"
             MLP_REPAIR_POOL_TUNNEL_BIN="$REPO_ROOT/$PTUNNEL"
             POOL_NODE_NAME=repair-test POOL_GATEWAY_PORT=2255
@@ -1098,6 +1242,7 @@ else
         RL_FIRST_SLEEP="$(grep -v '^1$' "$sleeplog" 2>/dev/null | head -n 1)"; [[ -z "$RL_FIRST_SLEEP" ]] && RL_FIRST_SLEEP=-1
         RL_DOWN="$(grep -c 'tunnel=down' "$curllog" 2>/dev/null | tr -d '[:space:]')"; [[ -z "$RL_DOWN" ]] && RL_DOWN=0
         RL_HOSTCALL="$(wc -l < "$hostlog" 2>/dev/null | tr -d '[:space:]')"; [[ -z "$RL_HOSTCALL" ]] && RL_HOSTCALL=0
+        RL_SUDOCALL="$(wc -l < "$sudolog" 2>/dev/null | tr -d '[:space:]')"; [[ -z "$RL_SUDOCALL" ]] && RL_SUDOCALL=0
     }
 
     # 6a：從來沒有 gateway.env（模擬 D2 從沒回過答案）
@@ -1319,6 +1464,76 @@ else
     fi
 fi
 inj_skip "9. nametag_write／nametag_remove 現碼不存在，沒有原始碼可以動刀；本節只驗這兩個函式單獨呼叫時組出的 ssh 遠端指令，不驗主迴圈在『接上／換 port／SIGTERM』三個時間點真的有呼叫它們（見檔頭限制）"
+
+echo "=== 10. hostname 要用 sudo -n（真機發現 polkit 拒絕，見下方註解） ==="
+# 真機（fh-l Windows 上的 VM）live 驗收發現：apply_repair_name 目前用
+# 「$bin set-hostname $name」直接呼叫（bin 預設 hostnamectl，可用
+# MLP_REPAIR_HOSTNAME_BIN 覆寫），跑在無 root 的 repair 帳號下會被 polkit
+# 拒絕（"Interactive authentication required"），hostname 永遠不會被改。
+# repair 帳號有 8b.4 決定的 NOPASSWD sudo，修法方向是改成
+# `sudo -n "$bin" set-hostname "$name"`：-n 是非互動旗標，密碼要求會直接
+# 失敗（exit 非 0）而不是掛住等輸入——這在無人值守的 systemd 服務裡是必要的
+# （掛住＝隧道也起不來）。
+#
+# 本節的斷言不綁死「sudo」這個字面一定要出現在 apply_repair_name 的原始碼
+# 裡（那是實作細節）；用一個放在 PATH 上、會記錄 argv 並且真的 exec 下去的
+# 假 sudo（同 ssh/curl/sleep/hostnamectl 的慣例）來量「這個外部指令有沒有
+# 被呼叫、有沒有帶 -n、有沒有真的把 hostnamectl 接下去」。這樣不管 impl
+# 怎麼組裝這行呼叫，只要底層真的透過 `sudo -n ...` 執行，這裡就量得到。
+BODY_HOSTNAME_SUDO="$SANDBOX/body-hostname-sudo.sh"
+cat > "$BODY_HOSTNAME_SUDO" <<'BODY'
+if ! declare -F apply_repair_name >/dev/null 2>&1; then
+    echo "MISSING:apply_repair_name"
+    exit 0
+fi
+echo "GUARD_OK"
+printf 'POOL_GATEWAY_HOST=198.51.100.7\nREPAIR_NAME=mom-pc\n' > "$MLP_GATEWAY_ENV_FILE"
+apply_repair_name "mom-pc" 2>/dev/null
+echo "DONE"
+BODY
+
+: > "$SANDBOX/sudo-src.log"
+run_src "$BODY_HOSTNAME_SUDO" MLP_GATEWAY_ENV_FILE="$SANDBOX/gwenv-src10.env" \
+    SUDO_LOG="$SANDBOX/sudo-src.log" FAKE_SUDO_MODE=ok \
+    POOL_NODE_NAME=repair-test POOL_GATEWAY_PORT=2255 POOL_GATEWAY_USER=sshproxy \
+    POOL_GATEWAY_SSH_PORT=2100 POOL_GATEWAY_HOST=gateway-ip-set-at-launch.invalid
+
+if printf '%s' "$SRC_OUT" | grep -q '^MISSING:'; then
+    for id in 10a 10a0; do bad "${id}. $(printf '%s' "$SRC_OUT" | grep '^MISSING:')——apply_repair_name 不存在（預期紅）"; done
+elif ! printf '%s' "$SRC_OUT" | grep -q '^GUARD_OK$'; then
+    for id in 10a 10a0; do bad "${id}. source ${LAUNCH} 沒能安全返回——SRC_OUT=[${SRC_OUT}]"; done
+else
+    sudo_line="$(grep -i 'hostnamectl\|set-hostname' "$SANDBOX/sudo-src.log" 2>/dev/null | tail -n 1)"
+    if [[ -n "$sudo_line" ]]; then
+        ok "10a0. 正對照：假 sudo 真的被呼叫（argv 提到 hostnamectl／set-hostname）"
+        if printf '%s' "$sudo_line" | grep -qE '^-n[[:space:]]' && printf '%s' "$sudo_line" | grep -q 'set-hostname mom-pc'; then
+            ok "10a. hostname 是透過 sudo -n 執行（argv 開頭是 -n，帶 set-hostname mom-pc）"
+        else
+            bad "10a. sudo 有被呼叫，但沒有帶 -n，或參數不對（argv [${sudo_line}]）——真機上會卡在互動式密碼提示或用錯旗標"
+        fi
+        if grep -q 'set-hostname mom-pc' "$SANDBOX/hostnamectl-src.log" 2>/dev/null; then
+            ok "10a1. sudo 真的把呼叫 exec 給底下的 hostnamectl（不是只記 log 沒放行）"
+        else
+            bad "10a1. 假 sudo 被叫到，但底下的 hostnamectl 沒有真的被 exec（log [$(cat "$SANDBOX/hostnamectl-src.log" 2>/dev/null)]）"
+        fi
+    else
+        bad "10a0（正對照失敗）：假 sudo 完全沒被呼叫——現碼還是直接呼叫 hostnamectl，沒有經過 sudo（預期紅；真機上這就是「Interactive authentication required」的原因）"
+    fi
+fi
+
+echo "--- 10b. sudo 失敗（非互動模式密碼要求）不能擋撥號 ---"
+run_launch_loop "10b" $'POOL_GATEWAY_HOST=198.51.100.7\nREPAIR_NAME=mom-pc' 2400,2499 fail
+if [[ "$RL_DIALS" -ge 1 ]]; then
+    ok "10b. sudo -n 失敗（模擬密碼被要求、非互動模式直接拒絕）時，撥號照常進行（量到 ${RL_DIALS} 次）——hostname 設不設是裝飾性的，不能擋隧道"
+else
+    bad "10b. sudo 失敗時完全沒有撥號——hostname 失敗把隧道也一起卡住了（真機上會整台維修機連不上）"
+fi
+if grep -qi 'password is required\|sudo' "$SANDBOX/sudo-10b.log" 2>/dev/null; then
+    ok "10b0. 正對照：假 sudo 在這一輪真的被呼叫且真的回報失敗"
+else
+    inj_skip "10b0. 現碼還沒有呼叫 sudo，這個正對照量不到（跟 10a0 紅是同一個原因）"
+fi
+inj_skip "10. apply_repair_name 目前沒有呼叫 sudo，沒有『拿掉 -n』或『拿掉 sudo』這種刀可以動；10a/10a0 對現碼的紅本身就是量測結果。10b 不管現碼有沒有 sudo 都應該綠（apply_repair_name 的回傳值本來就不擋撥號），這裡量到的是既有行為沒有因為這輪新斷言而被誤判。"
 
 echo
 printf 'passed %d / failed %d / injection-pass %d / injection-fail %d\n' \
