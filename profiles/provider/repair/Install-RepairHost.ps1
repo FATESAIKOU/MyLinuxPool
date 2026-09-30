@@ -1,7 +1,8 @@
 ﻿# Install-RepairHost.ps1 — one-time install of a family repair host on Windows
 # (openspec/changes/family-repair-host, tasks 6.1; fixes OUT-live-repair.md §6).
 #
-# Run ONCE by double-clicking it inside the bundle the owner hands over. It
+# Run ONCE via Install.cmd in the bundle the owner hands over (double-click
+# the .cmd — double-clicking this .ps1 itself only opens an editor). It
 # asks UAC for elevation a single time ("UAC 按一次「是」"), then:
 #   1. makes sure VirtualBox is installed (pinned version, SHA256-verified
 #      download when missing),

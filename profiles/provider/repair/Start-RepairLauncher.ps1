@@ -1,7 +1,7 @@
 ﻿# Start-RepairLauncher.ps1 — family repair host launcher (openspec/changes/
 # family-repair-host, design D2, spec "家人只要點兩下" + "失敗時家人看得懂該做什麼").
 #
-# Double-clicked by the family AFTER Install-RepairHost.ps1 has run once.
+# Double-clicked by the family AFTER Install.cmd has run once.
 # Must run as the normal user, NEVER elevated (design Risks: an elevated and a
 # non-elevated VirtualBox cannot see each other's VMs, so an elevated launch
 # would not find the installed VM).

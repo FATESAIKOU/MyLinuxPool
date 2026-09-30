@@ -14,8 +14,10 @@
 #                   anything else is untested, the install-time SHA check is
 #                   the only guard)
 #
-# The bundle is what the family double-clicks: Install-RepairHost.ps1 (run
-# once, one UAC), Start-RepairLauncher.ps1 (every time after), the
+# The bundle is what the family double-clicks: Install.cmd (the double-click
+# entry — plain .ps1 double-click opens an editor and Restricted policy
+# blocks it, tasks 8d.3), Install-RepairHost.ps1 (run once, one UAC),
+# Start-RepairLauncher.ps1 (every time after), the
 # register-repair-host seed (user-data/meta-data/seed.iso — holds the tunnel
 # PRIVATE key), repair-config.json (node/vm names, D2 port, contact name, the
 # pinned image + VirtualBox URLs and their SHA256), MANIFEST.sha256 and a
@@ -179,7 +181,7 @@ else
     log ERROR "neither shasum nor sha256sum found on PATH"
     exit 1
 fi
-for f in "${PROFILE_DIR}/Install-RepairHost.ps1" "${PROFILE_DIR}/Start-RepairLauncher.ps1"; do
+for f in "${PROFILE_DIR}/Install.cmd" "${PROFILE_DIR}/Install-RepairHost.ps1" "${PROFILE_DIR}/Start-RepairLauncher.ps1"; do
     [[ -f "$f" ]] || { log ERROR "${f} missing — run this from a complete checkout"; exit 1; }
 done
 
@@ -234,7 +236,7 @@ VBOX_EXE="VirtualBox-${VBOX_V}-${VBOX_BUILD}-Win.exe"
 VBOX_URL="https://download.virtualbox.org/virtualbox/${VBOX_V}/${VBOX_EXE}"
 
 mkdir -p "$OUT/seed"
-cp "${PROFILE_DIR}/Install-RepairHost.ps1" "${PROFILE_DIR}/Start-RepairLauncher.ps1" "$OUT/"
+cp "${PROFILE_DIR}/Install.cmd" "${PROFILE_DIR}/Install-RepairHost.ps1" "${PROFILE_DIR}/Start-RepairLauncher.ps1" "$OUT/"
 cp "${SEED_DIR}/user-data" "${SEED_DIR}/meta-data" "${SEED_DIR}/seed.iso" "$OUT/seed/"
 if [[ "$INCLUDE_IMAGE" -eq 1 ]]; then
     cp "$IMAGE_FILE" "$OUT/${IMAGE_BASENAME}"
@@ -272,7 +274,7 @@ mv -f "$_bom_tmp" "$OUT/repair-config.json"
 
 cat > "$OUT/README-FAMILY.txt" <<EOF
 維修連線（給家人的三行）：
-1. 點兩下 Install-RepairHost.ps1，跳出詢問按「是」（只問這一次），等它說「安裝完成」。
+1. 點兩下 Install.cmd（不是那個 .ps1——直接點 .ps1 只會打開編輯器，不會安裝），跳出詢問按「是」（只問這一次），等它說「安裝完成」（原來的視窗會停著等你按任意鍵關掉）。
 2. 之後每次：在桌面點兩下「維修連線 (${NAME})」，輸入對方給你的 IP，按確定。
 3. 出現「維修連線中」的視窗就放著不要關；修好或不想修時，把視窗關掉就斷線了。
 連不上（等很久還是顯示連不上）就向 ${CONTACT} 再要一次新的 IP。
@@ -283,7 +285,7 @@ EOF
 # The file list is built in a variable first: an empty ${...:+...} expansion
 # would still pass one empty argv to shasum ("No such file"), so the image
 # entry is appended only when it is really there.
-MANIFEST_FILES="Install-RepairHost.ps1 Start-RepairLauncher.ps1 repair-config.json README-FAMILY.txt seed/user-data seed/meta-data seed/seed.iso"
+MANIFEST_FILES="Install.cmd Install-RepairHost.ps1 Start-RepairLauncher.ps1 repair-config.json README-FAMILY.txt seed/user-data seed/meta-data seed/seed.iso"
 if [[ "$INCLUDE_IMAGE" -eq 1 ]]; then
     MANIFEST_FILES="${MANIFEST_FILES} ${IMAGE_BASENAME}"
 fi

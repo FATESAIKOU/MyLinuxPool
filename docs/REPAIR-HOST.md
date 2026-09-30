@@ -63,7 +63,7 @@ bash ops-scripts/package-repair-host --name <名字> --seed-dir <上面的 seed 
   抄當日 `noble-server-cloudimg-amd64.vmdk` 那行的 hash（`current` 會動，
   寫死的 hash 會爛掉）。映像本身約 600MB，**不安裝包**——安裝當天在家人
   電腦上下載一次並驗 SHA（裝不起來的，見 §3 的失敗分支）。
-- 包裡有什麼：`Install-RepairHost.ps1`（首次安裝）、
+- 包裡有什麼：`Install.cmd`（雙擊入口，家人點這個；直接點 `.ps1` 只會打開編輯器）、`Install-RepairHost.ps1`（首次安裝）、
   `Start-RepairLauncher.ps1`（之後每次）、`repair-config.json`（節點／VM 名、
   D2 埠、聯絡人、映像與 VirtualBox 的 URL＋SHA——**無機密**）、`seed/`
   （開機資料）、`MANIFEST.sha256`、`README-FAMILY.txt`（給家人的三行）。
@@ -75,10 +75,10 @@ bash ops-scripts/package-repair-host --name <名字> --seed-dir <上面的 seed 
 先轉告三件事：全程只需要在「跳出詢問」時按是／輸入 IP，不要自己開
 VirtualBox；不要用「以系統管理員身分執行」；修好之前不要關機拔線。
 
-**第一次**（解開包，點兩下 `Install-RepairHost.ps1`）：
+**第一次**（解開包，點兩下 `Install.cmd`——**不是那個 `.ps1`**，直接點它只會打開編輯器，不會安裝）：
 
 1. 跳出詢問按「是」（只問這一次，裝 VirtualBox＋建 VM 要管理員）。
-2. 看到「安裝完成」就好。以後都在桌面點「維修連線 (…)」。
+2. 看到「安裝完成」就好（原來的黑視窗會停著等按任意鍵，叫他按一下關掉）。以後都在桌面點「維修連線 (…)」。
 
 **之後每次**（點桌面「維修連線 (…)」）：
 
