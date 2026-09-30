@@ -23,6 +23,12 @@
 #   4-6.  refresh_collect_tunnel_keys
 #   7-9.  refresh_build_install_cmd (atomic / --sudo / idempotent)
 #   10-12. end-to-end: collect -> assemble; self-lock guard; injection
+#   R1-R4. 事故迴歸（refresh 側的 sshproxy 清單）
+#   13. REPAIR_TUNNEL_PUBKEY（共用跳板公鑰，design D9）：refresh 路
+#       （collect → rotate_assemble_sshproxy_keys → 安裝指令）含它；
+#       不存在 → 照常；值不是合法公鑰 → 大聲失敗、無輸出；換新值 → 舊的
+#       不在。對現碼紅：collector 還不認識這個變數（工單 10.1 的 test）。
+#       鏈級斷言（collect→assemble）：不綁驗證寫在哪一層。
 #
 # bash 3.2 compatible on purpose (macOS ships 3.2).
 # Run: scripts/tests/test-refresh-authkeys.sh
@@ -86,6 +92,13 @@ NODE_GATEWAY_OBJ='{"name":"gateway","role":"gateway","tunnel_public_key":"ssh-ed
 STR_FH_L="$(str_value "$NODE_FH_L_OBJ")"
 STR_FH_PROXY="$(str_value "$NODE_FH_PROXY_OBJ")"
 STR_GW="$(str_value "$NODE_GATEWAY_OBJ")"
+
+# REPAIR_TUNNEL_PUBKEY（design D9）：**單行公鑰、不是 JSON**——fixture 的
+# value 就是那一行原文（不加 fromjson 的跳脫，照真 var 的形狀）。
+REPAIR_KEY="ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFIXTUREREPAIRSHARED repair-shared"
+REPAIR_KEY_OLD="ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFIXTUREREPAIRPREV repair-shared-prev"
+# 合法 JSON 物件（CLIENT_* 的形狀）但不是公鑰 → 驗證必須拒絕。
+REPAIR_KEY_NOT_A_KEY='{"name":"not-a-key"}'
 
 # VARS_SHAPE_OBJECT: {"total_count":N,"variables":[...]} — value as JSON string
 VARS_SHAPE_OBJECT="$(jq -n \
@@ -351,6 +364,116 @@ authkeys_assemble \"\$1\" \"\$2\"
         printf '  inj ok    %s\n' "注入後 assemble 回 0 且有輸出——第 11 條會紅（自鎖防線被拿掉）"
     else
         bad "注入後 assemble 仍失敗/無輸出——注入沒生效（harness 問題）"
+    fi
+fi
+
+# ---------------------------------------------------------------------------
+# 13. REPAIR_TUNNEL_PUBKEY（共用跳板公鑰，design D9）——refresh 這條路
+#
+# 工單 10.1 的 test 半（對現碼紅）：collector 還不認識這個變數。
+# 斷言在**鏈級**做（collect → rotate_assemble_sshproxy_keys）：介面只說
+# 「收錄寫在 refresh 與 rotate 共用的組裝路徑」，驗證寫在 collector 或
+# assemble 都可能，測試不綁層。
+#
+# 注意（recon §2.2 的命名約束）：這條路對**任何 NODE_* 值不是 JSON 物件**
+# 會整批硬失敗（:99-107）。REPAIR_TUNNEL_PUBKEY 不走 NODE_ 前綴，所以它的
+# 非 JSON 值必須是**新**的獨立分支；不能把它命名成 NODE_ 開頭。
+# ---------------------------------------------------------------------------
+echo "── 13. REPAIR_TUNNEL_PUBKEY：refresh 側的共用跳板公鑰 ──"
+if ! declare -F refresh_collect_tunnel_keys >/dev/null 2>&1 \
+   || ! declare -F rotate_assemble_sshproxy_keys >/dev/null 2>&1; then
+    bad "13. 缺 refresh_collect_tunnel_keys 或 rotate_assemble_sshproxy_keys，無法驗證"
+else
+    # refresh 鏈（fixture：vars 有兩個 NODE_* provider + 一把修復公鑰；
+    # workers 有一把）＝ 實際 workflow 的呼叫形狀。
+    refresh_chain() {   # <vars-json> → stdout = assemble 後清單；rc 同步
+        local vars="$1" t
+        t="$(refresh_collect_tunnel_keys "$vars" "$POOL_WORKERS_JSON" </dev/null 2>/dev/null)" || return $?
+        rotate_assemble_sshproxy_keys "$t" </dev/null 2>/dev/null
+    }
+    # 13.0 正對照：沒有 REPAIR_TUNNEL_PUBKEY 的舊鏈在現碼上照常組出來，
+    #      否則後面的「含它」斷言可能因為鏈本身壞掉而假過。
+    OUT="$(refresh_chain "$VARS_SHAPE_OBJECT")"; RC=$?
+    if [[ $RC -eq 0 ]] && printf '%s\n' "$OUT" | grep -qF "$TUNNEL_1" \
+       && printf '%s\n' "$OUT" | grep -qF "$TUNNEL_W"; then
+        ok "13a. 正對照：無修復公鑰時鏈照常（provider 與 worker 鑰在）"
+    else
+        bad "13a. 正對照失敗：舊鏈組不出來（rc=$RC, out=[${OUT:0:200}]）——13c/13d 不可信"
+    fi
+
+    # 13b：變數不存在 → 輸出**不含**任何修復公鑰（照常）。
+    if ! printf '%s\n' "$OUT" | grep -qF "$REPAIR_KEY"; then
+        ok "13b. REPAIR_TUNNEL_PUBKEY 不存在 → 清單不含它（照常）"
+    else
+        bad "13b. 無變數時清單竟含修復公鑰（out=[${OUT:0:200}]）"
+    fi
+
+    # 13c：有合法值 → 清單含它（provider/worker 鑰也還在）。
+    VARS_WITH_REPAIR="$(printf '%s' "$VARS_SHAPE_OBJECT" | jq -c \
+        --arg rk "$REPAIR_KEY" '.total_count = 7
+         | .variables += [{name:"REPAIR_TUNNEL_PUBKEY", value:$rk}]')"
+    OUT="$(refresh_chain "$VARS_WITH_REPAIR")"; RC=$?
+    if [[ $RC -eq 0 ]] && printf '%s\n' "$OUT" | grep -qF "$REPAIR_KEY"; then
+        ok "13c. 有 REPAIR_TUNNEL_PUBKEY → sshproxy 清單含共用跳板公鑰"
+    else
+        bad "13c. 清單缺共用跳板公鑰（rc=$RC, out=[${OUT:0:200}]）——全家跳板撥不進來"
+    fi
+    if printf '%s\n' "$OUT" | grep -qF "$TUNNEL_1" \
+       && printf '%s\n' "$OUT" | grep -qF "$TUNNEL_W"; then
+        ok "13d. 加入共用鑰後原本的 provider/worker 鑰仍在（是聯集，不是取代）"
+    else
+        bad "13d. 共用鑰排掉了原來的鑰（out=[${OUT:0:200}]）"
+    fi
+
+    # 13e：值不是合法公鑰（這裡用合法 JSON 物件——最貼近現實的壞法）→
+    #      大聲失敗、無輸出。與 CLIENT_ACTIONS 的自鎖防線同等級。
+    VARS_BAD_REPAIR="$(printf '%s' "$VARS_SHAPE_OBJECT" | jq -c \
+        --arg rk "$REPAIR_KEY_NOT_A_KEY" '.total_count = 7
+         | .variables += [{name:"REPAIR_TUNNEL_PUBKEY", value:$rk}]')"
+    OUT="$(refresh_chain "$VARS_BAD_REPAIR" 2>"$ERRF")"; RC=$?
+    if [[ $RC -ne 0 && -z "$OUT" ]]; then
+        ok "13e. 值不是合法公鑰 → 鏈中止、非 0、無輸出（不安裝半套清單）"
+    else
+        bad "13e. 壞值的修復公鑰被接受了（rc=$RC, out=[${OUT:0:200}]）——靜默漏掉＝全家失聯的形狀"
+    fi
+
+    # 13f：換新值 → 舊的不在（refresh 是整份覆蓋，不是聯集）。
+    #      **由 13f0 的正對照把關**：舊值在舊 var 下進得了清單，13f 才有
+    #      資訊量；否則現碼（兩種都不收）會讓 13f 空轉成綠。
+    VARS_PREV="$(printf '%s' "$VARS_SHAPE_OBJECT" | jq -c \
+        --arg rk "$REPAIR_KEY_OLD" '.total_count = 7
+         | .variables += [{name:"REPAIR_TUNNEL_PUBKEY", value:$rk}]')"
+    OUT_PREV="$(refresh_chain "$VARS_PREV")"
+    if printf '%s\n' "$OUT_PREV" | grep -qF "$REPAIR_KEY_OLD"; then
+        ok "13f0. 正對照：舊值在舊 var 下確實進得了清單（換值斷言不是空轉）"
+        OUT="$(refresh_chain "$VARS_WITH_REPAIR")"
+        if ! printf '%s\n' "$OUT" | grep -qF "$REPAIR_KEY_OLD"; then
+            ok "13f. 換新值後清單不含舊值（整份覆蓋，舊鑰隨下一次 refresh 失效）"
+        else
+            bad "13f. 舊值仍在清單裡（out=[${OUT:0:200}]）"
+        fi
+    else
+        bad "13f0. 正對照失敗：單獨的舊值進不了清單——13f 不可信（rc/out=[${OUT_PREV:0:120}]）"
+        bad "13f. 前置不成立（修復公鑰根本沒被收），換值行為無從驗證"
+    fi
+
+    # 13g：安裝指令層——共用鑰真的會落到 Gateway 的 sshproxy 檔。
+    #      這條把「收錄」釘到 refresh_build_install_cmd 的輸出（workflow
+    #      用它把內容寫上 Gateway），與 workflow 的資料流同形狀。
+    #      指令是「內容 base64 → 指令字串再 base64」，所以要解兩層。
+    if declare -F refresh_build_install_cmd >/dev/null 2>&1; then
+        CMD_B64="$(refresh_build_install_cmd "/home/sshproxy/.ssh/authorized_keys" "$OUT" --sudo </dev/null 2>/dev/null)"
+        DECODED="$(printf '%s' "$CMD_B64" | base64 -d 2>/dev/null || true)"
+        # 第二層：解出 printf '%s' '<inner-b64>' | base64 -d 裡的那段內容。
+        INNER="$(printf '%s' "$DECODED" | sed -n "s/.*printf '%s' '\([A-Za-z0-9+/=]*\)' | base64 -d.*/\1/p" | head -1)"
+        CONTENT="$(printf '%s' "$INNER" | base64 -d 2>/dev/null || true)"
+        if printf '%s' "$CONTENT" | grep -qF "$REPAIR_KEY"; then
+            ok "13g. 安裝指令的內容含修復公鑰（collect→assemble→install 全程）"
+        else
+            bad "13g. 安裝指令不含修復公鑰（inner len=${#INNER}, content [${CONTENT:0:150}]）"
+        fi
+    else
+        bad "13g. refresh_build_install_cmd 未定義，無法驗證安裝層"
     fi
 fi
 

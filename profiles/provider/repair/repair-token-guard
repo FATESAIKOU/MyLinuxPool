@@ -1,0 +1,103 @@
+#!/usr/bin/env bash
+# repair-token-guard — VM side of design D5 (openspec/changes/archive/2026-10-01-family-repair-host):
+# a family repair host must never hold a GitHub token (spec "維修承載機不持有
+# GitHub 權杖"). repair-tunnel-launch runs this before it dials anything, and
+# a refusal means the tunnel does not start at all.
+#
+#   repair-token-guard            (no arguments)
+#
+# Exit 0 = nothing found, go ahead. Exit 1 = something found; one stderr line
+# per finding, naming the file or variable and never printing its value.
+#
+# Why the VM needs its own guard when the seed generator already scans
+# (register-repair-host, D5 first half): the generator only sees what it
+# writes. Anyone who later logs in to this VM — the owner, or the AI that
+# MyAiEntry lets run commands here — can drop a token in by hand, and a
+# token on a machine in someone else's house controls the whole pool.
+#
+# What counts as "a token is here":
+#   * ${HOME}/.mylinuxpool/gh_token exists (the path pool-sync/pool-resolve
+#     use on a regular provider), whatever it contains — an empty file today
+#     is a filled one tomorrow
+#   * gh's own login file exists (${XDG_CONFIG_HOME:-~/.config}/gh/hosts.yml):
+#     on a headless VM `gh auth login` has no keyring and writes the token
+#     there in plain text
+#   * GH_TOKEN / GH_POOL_TOKEN / GITHUB_TOKEN / GH_ENTERPRISE_TOKEN /
+#     GITHUB_ENTERPRISE_TOKEN, or any other exported GH_*TOKEN / GITHUB_*TOKEN,
+#     is non-empty
+#   * any exported variable, whatever its name, holds a value shaped like a
+#     GitHub token (ghp_/gho_/ghu_/ghs_/ghr_ prefix, or github_pat_) — same
+#     pattern the generator uses
+#
+# Limitations (honest list):
+#   * Only this user's HOME and this process's environment are looked at.
+#     A token in root's home, in another user's files, in ~/.git-credentials,
+#     in a random file, or encoded (base64, split) is not seen.
+#   * A token that is not GitHub-prefixed and sits under a variable name
+#     outside the GH_*/GITHUB_* family passes.
+#   * It runs when the tunnel starts. A token that appears while the tunnel
+#     is already up is caught at the next start (next VM boot or restart),
+#     not immediately.
+#   * bash 3.2 compatible because the tests run it on the owner's Mac; the
+#     VM itself has bash 5.
+set -uo pipefail
+
+TOKEN_FILE="${HOME}/.mylinuxpool/gh_token"
+GH_HOSTS_FILE="${XDG_CONFIG_HOME:-${HOME}/.config}/gh/hosts.yml"
+TOKEN_VALUE_RE='(gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,})'
+NAME_RE='^(GH|GITHUB)_([A-Z0-9_]*_)?TOKEN$'
+
+found=0
+refuse() {
+    printf 'repair-token-guard: refusing to start the tunnel — %s (a family repair host must hold no GitHub token)\n' "$1" >&2
+    found=1
+}
+
+# Positive control: prove both patterns match on THIS shell's regex engine
+# before trusting a clean scan (same reason as the generator's canary). A
+# pattern that silently matches nothing would wave every token through, so
+# that case fails closed. The canary is built at run time so no
+# token-shaped literal sits in this file.
+canary="gh""p_$(printf '%036d' 0)"
+if ! [[ "$canary" =~ $TOKEN_VALUE_RE ]] || ! [[ "GH_X_TOKEN" =~ $NAME_RE ]]; then
+    refuse "the token patterns do not match a canary on this shell, so a clean scan cannot be trusted"
+fi
+unset canary
+
+# -e, not -f: a directory or a dangling symlink named gh_token is just as
+# much "someone put a token here" as a regular file.
+if [[ -e "$TOKEN_FILE" || -L "$TOKEN_FILE" ]]; then
+    refuse "GitHub token file ${TOKEN_FILE} exists"
+fi
+if [[ -e "$GH_HOSTS_FILE" || -L "$GH_HOSTS_FILE" ]]; then
+    refuse "gh is logged in on this VM (${GH_HOSTS_FILE} exists and may hold a token)"
+fi
+
+# Names: the fixed list first (what the generator checks), then every
+# exported name in the same family. compgen is a bash builtin in 3.2 and 5;
+# if it is missing the fixed list still runs.
+names="GH_TOKEN GH_POOL_TOKEN GITHUB_TOKEN GH_ENTERPRISE_TOKEN GITHUB_ENTERPRISE_TOKEN"
+exported="$(compgen -e 2>/dev/null || true)"
+for n in $exported; do
+    [[ "$n" =~ $NAME_RE ]] && names="${names} ${n}"
+done
+seen=" "
+for n in $names; do
+    case "$seen" in *" ${n} "*) continue ;; esac
+    seen="${seen}${n} "
+    if [[ -n "${!n:-}" ]]; then
+        refuse "environment variable ${n} holds a GitHub token"
+    fi
+done
+
+# Values: a token under an unrelated name. The value is only matched
+# in-shell and never printed.
+for n in $exported; do
+    case "$seen" in *" ${n} "*) continue ;; esac
+    v="${!n:-}"
+    if [[ -n "$v" && "$v" =~ $TOKEN_VALUE_RE ]]; then
+        refuse "environment variable ${n} holds something shaped like a GitHub token"
+    fi
+done
+
+exit "$found"

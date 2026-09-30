@@ -74,8 +74,8 @@ fi
 FAKE_GH_VARIABLES="$SANDBOX/variables.json"
 cat > "$FAKE_GH_VARIABLES" <<'JSON'
 {"variables":[
- {"name":"NODE_FH_L","value":"{\"name\":\"fh-l\",\"role\":\"provider\"}"},
- {"name":"NODE_FH_PROXY","value":"{\"name\":\"fh-proxy\",\"role\":\"provider\"}"},
+ {"name":"NODE_FH_L","value":"{\"name\":\"fh-l\",\"role\":\"provider\",\"capabilities\":{\"worker-host\":{\"runtime\":\"docker\"}}}"},
+ {"name":"NODE_FH_PROXY","value":"{\"name\":\"fh-proxy\",\"role\":\"provider\",\"capabilities\":{\"worker-host\":{\"runtime\":\"docker\"}}}"},
  {"name":"NODE_GATEWAY","value":"{\"name\":\"gateway\",\"role\":\"gateway\"}"},
  {"name":"POOL_WORKERS","value":"[]"}
 ]}
@@ -87,12 +87,28 @@ if [[ "${FAKE_GH_MODE:-ok}" == "fail" ]]; then
     echo "gh: HTTP 503 Service Unavailable" >&2
     exit 1
 fi
-filter=""; prev=""
+filter=""; var_name=""
 for a in "$@"; do
-    [[ "$prev" == "--jq" ]] && filter="$a"
+    # Extract the jq filter after --jq
+    if [[ "${prev:-}" == "--jq" ]]; then
+        filter="$a"
+    fi
+    # Extract variable name from paths like "repos/owner/repo/actions/variables/NODE_FH_L"
+    if [[ "$a" == */actions/variables/* && "$a" != "--"* ]]; then
+        var_name="${a##*/variables/}"
+    fi
     prev="$a"
 done
-if [[ -n "$filter" ]]; then
+
+# If querying a specific variable, extract it from the full list
+if [[ -n "$var_name" ]]; then
+    data="$(jq --arg name "$var_name" '.variables[] | select(.name == $name) | {name: .name, value: .value}' "$FAKE_GH_VARIABLES" 2>/dev/null)"
+    if [[ -n "$filter" ]]; then
+        jq -r "$filter" <<<"$data"
+    else
+        jq '.' <<<"$data"
+    fi
+elif [[ -n "$filter" ]]; then
     jq -r "$filter" "$FAKE_GH_VARIABLES"
 else
     cat "$FAKE_GH_VARIABLES"

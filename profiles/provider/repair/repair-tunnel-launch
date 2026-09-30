@@ -1,0 +1,508 @@
+#!/usr/bin/env bash
+# repair-tunnel-launch — ExecStart of mlp-tunnel-repair.service on a family
+# repair host (openspec/changes/archive/2026-10-01-family-repair-host, design D5 second half,
+# D2, D7).
+#
+#   repair-tunnel-launch          (no arguments)
+#
+# Reads POOL_GATEWAY_USER / POOL_GATEWAY_SSH_PORT (static seed values),
+# POOL_GATEWAY_PORT_RANGE="min,max" (the repair segment, boot data), and
+# /run/mlp/gateway.env (POOL_GATEWAY_HOST + REPAIR_NAME from the launcher,
+# re-read every round). POOL_NODE_NAME is deliberately NEVER a name source.
+#
+# What it does, in order:
+#   0. Refuse unless POOL_GATEWAY_PORT_RANGE parses as min<max (no fallback).
+#   1. repair-token-guard (same directory). A refusal ends here with exit 78
+#      and pool-tunnel is never run: design D5, "a token on the VM = the
+#      tunnel does not start, and the reason is logged". 78 is listed in the
+#      unit's RestartPreventExitStatus=, so systemd leaves the unit failed
+#      instead of retrying — a loud stop, visible in `systemctl status`.
+#   2. Dial with `pool-tunnel --once`, the unmodified shared-configs copy,
+#      on the current round's port (starts at the segment's min). pool-tunnel's
+#      own supervisor loop (backoff 2,4,8,16,30,30,...) is NOT
+#      used here, because that rhythm is exactly what gets a rejected key
+#      banned by fail2ban (design Context: "about a minute"); every dial goes
+#      through the rhythm below instead. Other nodes are untouched: D7 lives
+#      only in this file.
+#   3. Before each dial, ask the launcher again (repair-gateway-fetch) and
+#      take the Gateway IP from /run/mlp/gateway.env when it has one. The
+#      unit's EnvironmentFile= only reads that file once, at start; asking
+#      again means a launcher that came up late, or a family member who
+#      typed a new IP after a rotate, takes effect without a VM reboot.
+#      WITHOUT a valid answer (IPv4 + valid REPAIR_NAME) this round dials
+#      NOTHING — it reports down and fast-retries (PM ruling; the old
+#      "dial the placeholder" rule is gone).
+#   4. Tunnel up: set the VM hostname to REPAIR_NAME (once per name), write
+#      the Gateway nameplate, report `up` (repair-gateway-report), then
+#      watch it with pool-tunnel's own control_alive/health_check (sourced,
+#      so there is one definition of the socket path and of "healthy").
+#      When it dies, remove the nameplate, report `down`, wait a little,
+#      and dial again through the same rhythm.
+#   5. Dial failures classify three ways: `remote port forwarding failed`
+#      (logged in, port taken) moves to the next port of the segment,
+#      wrapping to min; auth rejections never move ports and keep the D7
+#      310 s rhythm; anything else retries fast on the same port.
+#
+# ---- Gateway nameplate (interface §5) ------------------------------------
+# After a dial succeeds, /home/sshproxy/repair/<port> on the Gateway is
+# overwritten with one line holding this VM's name, over the tunnel's own
+# ControlMaster (no new handshake while it is alive; an authenticated
+# fallback otherwise). On reconnect the old tag is removed first, then the
+# new one written; on SIGTERM/systemd stop the current tag is removed
+# before the master goes down. The tag is display-only (`mlp` shows it;
+# the listener is the fact) — every call is best-effort and never fails
+# a dial or a shutdown.
+#
+# ---- D7: the retry rhythm -----------------------------------------------
+# fail2ban on the Gateway runs Ubuntu's defaults: 5 failures inside 10
+# minutes (findtime 600 s) ban the source IP for 10 minutes. The family's
+# whole house sits behind that one IP.
+#
+#   * A failed dial where ssh reached the Gateway's sshd and did not get in
+#     — "Permission denied", "Too many authentication failures", and ANY
+#     failure this script cannot positively identify as "never reached
+#     sshd" — is treated as one that fail2ban may count. The next dial waits
+#     REJECT_INTERVAL = 310 s. Two such dials are therefore always more than
+#     300 s apart, so any 600 s window holds at most 2 of them. That keeps
+#     under 5 even if fail2ban counted each rejected connection twice (sshd
+#     can log more than one matching line per connection, depending on
+#     fail2ban's filter mode and sshd's LogLevel). Cost: after a rejection,
+#     the next try is 5 minutes away.
+#   * A failure that never reached sshd (DNS, connection refused/timed out,
+#     no route) cannot be counted by fail2ban — sshd never saw it. Those
+#     retry quickly: 10, 20, 40, 60, 60, ... s, so a network that comes back
+#     is used within a minute. "remote port forwarding failed" is in this
+#     class too: it happens AFTER a successful login (the Gateway still
+#     holds the previous session's port), so it is not an auth failure.
+#   * The first dial after start is immediate. systemd restarts this unit
+#     only on a crash, after RestartSec=310, so a restart cannot squeeze two
+#     counted dials closer than the rhythm allows either.
+#
+# ---- Host keys -----------------------------------------------------------
+# Static mode has no Gateway host key to pin (it comes from NODE_GATEWAY,
+# which this VM cannot read), so pool-tunnel falls back to accept-new against
+# its private known_hosts. Linode recycles addresses across rotates
+# (pool-tunnel's start_master comment, RUNBOOK §7.8): a later Gateway on an
+# IP this VM saw before would present a different key, ssh would refuse it
+# forever, and nobody could log in to fix it — the tunnel IS the way in.
+# So that file is cleared once per start (= per VM boot): every boot is a
+# trust-on-first-use. The risk is the one design already accepted for
+# accept-new (Risks: an impostor at first connection gets a forward to the
+# VM's loopback sshd; logging in still needs the owner's key).
+#
+# Limitations (honest list):
+#   * "Reached sshd or not" is decided from the text ssh prints (through
+#     pool-tunnel's log). A new OpenSSH wording for a network failure lands
+#     in the slow class (safe, only slower); a new wording for an auth
+#     failure that happens to contain one of the network phrases would land
+#     in the fast class.
+#   * The 310 s assumes fail2ban's defaults (maxretry 5, findtime 10m). A
+#     Gateway with a stricter jail (e.g. recidive, or maxretry 3) is not
+#     covered.
+#   * Only dials made by THIS process are paced. Someone logged in to the VM
+#     running pool-tunnel or ssh to the Gateway by hand is not.
+#   * The watch loop checks every WATCH_INTERVAL (10 s) and needs
+#     pool-tunnel's UNHEALTHY_THRESHOLD misses in a row before it rebuilds,
+#     so a dead tunnel can take ~30 s to notice (ServerAliveInterval in the
+#     master usually notices first).
+#   * The known_hosts reset above trades host-key pinning for "never lock
+#     ourselves out after a rotate"; see the paragraph above.
+#   * Tested with a fake ssh/curl/sleep and a virtual clock
+#     (scripts/tests/test-repair-host-vm.sh); the real timing under systemd,
+#     real sshd messages and real fail2ban are only verified on a real VM
+#     (tasks 8).
+#   * bash 3.2 compatible because the tests run it on the owner's Mac; the
+#     VM itself has bash 5.
+set -uo pipefail
+
+SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
+GUARD="${SELF_DIR}/repair-token-guard"
+FETCH="${SELF_DIR}/repair-gateway-fetch"
+REPORT="${SELF_DIR}/repair-gateway-report"
+GATEWAY_ENV_FILE="${MLP_GATEWAY_ENV_FILE:-/run/mlp/gateway.env}"
+
+# pool-tunnel: an explicit path (tests), else the copy installed next to
+# this script (the seed puts both in ~/.mylinuxpool/bin), else PATH.
+PTUNNEL="${MLP_REPAIR_POOL_TUNNEL_BIN:-}"
+if [[ -z "$PTUNNEL" ]]; then
+    if [[ -f "${SELF_DIR}/pool-tunnel" ]]; then
+        PTUNNEL="${SELF_DIR}/pool-tunnel"
+    else
+        PTUNNEL="$(command -v pool-tunnel 2>/dev/null || true)"
+    fi
+fi
+
+REJECT_INTERVAL=310
+QUICK_MIN=10
+QUICK_MAX=60
+WATCH_INTERVAL=10
+# A session shorter than this does not reset the quick backoff, so a tunnel
+# that comes up and drops straight away cannot spin.
+STABLE_SESSION=60
+EX_CONFIG=78
+
+# ssh's own words for "the Gateway's sshd saw us and said no". Checked
+# before the network list below, so a message carrying both is slow.
+REJECTED_RE='Permission denied|Too many authentication failures'
+# "Reached sshd and logged in, but the port is taken" — the ONLY failure
+# that moves to the next port (interface §6). Split out of NOT_COUNTED_RE
+# below so the port-switch has its own name and its own test.
+FORWARD_RE='remote port forwarding failed'
+# Failures that never reached sshd: fast retry, same port (a dead network
+# is not evidence the port is taken).
+NETWORK_RE='Could not resolve hostname|Name or service not known|Temporary failure in name resolution|Connection refused|Connection timed out|Operation timed out|Network is unreachable|No route to host|could not resolve connection info'
+
+say() {
+    printf '[%s] repair-tunnel-launch: %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*" >&2
+}
+
+report() {
+    [[ -x "$REPORT" ]] || return 0
+    "$REPORT" "$1" >/dev/null 2>&1 || true
+}
+
+# ---- 1. D5: no token, or no tunnel ----------------------------------------
+# A missing guard is a refusal too: "could not check" must never read as
+# "checked, clean".
+if [[ ! -x "$GUARD" ]]; then
+    say "the token guard ${GUARD} is missing or not executable — refusing to start the tunnel"
+    report down
+    exit "$EX_CONFIG"
+fi
+if ! "$GUARD"; then
+    say "the token guard refused (reason above) — the tunnel stays down until the token is removed and the unit is restarted"
+    report down
+    exit "$EX_CONFIG"
+fi
+
+if [[ -z "$PTUNNEL" || ! -f "$PTUNNEL" ]]; then
+    say "pool-tunnel not found (looked at MLP_REPAIR_POOL_TUNNEL_BIN, ${SELF_DIR}/pool-tunnel and PATH)"
+    report down
+    exit "$EX_CONFIG"
+fi
+
+# Sourcing runs none of pool-tunnel's main (it guards on BASH_SOURCE); it
+# gives us STATE_DIR, RUN_DIR, CTL, KNOWN_HOSTS_FILE, HEALTH_TIMEOUT,
+# UNHEALTHY_THRESHOLD and control_alive/health_check/teardown_master — the
+# same definitions the dialing copy uses.
+# shellcheck source=../../../shared-configs/pool-runtime/files/pool-tunnel
+source "$PTUNNEL"
+
+on_stop() {
+    say "stopping: closing the tunnel"
+    if [[ -n "${tagged_port:-}" ]]; then
+        nametag_remove "$tagged_port" || true
+    fi
+    teardown_master
+    report down
+    exit 0
+}
+trap on_stop TERM INT
+
+# clear_master — make sure no ControlMaster of ours is alive before a dial.
+#   This is not tidiness: when `pool-tunnel --once` finds a live master it
+#   skips the dial and runs its OWN supervisor loop for good — the fast
+#   2..30 s rebuild rhythm D7 exists to avoid, plus a drift check that asks
+#   pool-resolve (GitHub), because static mode is only switched on by the
+#   dial path it skipped. Seen with the fake ssh while writing this file.
+#   teardown_master asks through the socket; pkill catches a master whose
+#   socket file is already gone (it would otherwise keep holding the
+#   Gateway port and make every new dial fail with "remote port forwarding
+#   failed"). The pattern is our own socket path, for our own uid only.
+clear_master() {
+    teardown_master
+    pkill -u "$(id -u)" -f -- "-M -S ${CTL}" >/dev/null 2>&1 || true
+}
+
+mkdir -p "$RUN_DIR" 2>/dev/null || true
+# See "Host keys" in the header.
+rm -f "$KNOWN_HOSTS_FILE"
+
+# refresh_gateway_host — step 3 in the header. The fetch validates what it
+# writes; this only re-checks the charset before exporting it to ssh.
+refresh_gateway_host() {
+    local line v
+    [[ -x "$FETCH" ]] && "$FETCH" || true
+    [[ -r "$GATEWAY_ENV_FILE" ]] || return 0
+    line="$(grep -m 1 '^POOL_GATEWAY_HOST=' "$GATEWAY_ENV_FILE" 2>/dev/null || true)"
+    v="${line#POOL_GATEWAY_HOST=}"
+    [[ -n "$v" && "$v" =~ ^[0-9.]+$ ]] || return 0
+    if [[ "$v" != "${POOL_GATEWAY_HOST:-}" ]]; then
+        say "Gateway address ${POOL_GATEWAY_HOST:-<unset>} -> ${v} (from ${GATEWAY_ENV_FILE})"
+    fi
+    POOL_GATEWAY_HOST="$v"
+    export POOL_GATEWAY_HOST
+}
+
+# watch_tunnel — step 4. Returns when the master is gone or has failed
+# UNHEALTHY_THRESHOLD health checks in a row (and has been torn down).
+watch_tunnel() {
+    local misses=0
+    # health_check reads these globals from the sourced pool-tunnel.
+    GW_IP="${POOL_GATEWAY_HOST:-}"
+    GW_USER="${POOL_GATEWAY_USER:-}"
+    MY_PORT="${POOL_GATEWAY_PORT:-}"
+    while :; do
+        sleep "$WATCH_INTERVAL"
+        if ! control_alive; then
+            say "the tunnel's ControlMaster is gone"
+            rm -f "$CTL"
+            return 0
+        fi
+        if health_check; then
+            misses=0
+        else
+            misses=$((misses + 1))
+            say "health check failed (${misses}/${UNHEALTHY_THRESHOLD})"
+            if (( misses >= UNHEALTHY_THRESHOLD )); then
+                teardown_master
+                return 0
+            fi
+        fi
+    done
+}
+
+# Validation patterns for gateway.env (same strictness as
+# repair-gateway-fetch, which wrote the file — parse here, don't source
+# it: the content is only as trustworthy as the last fetch).
+_OCT='(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])'
+IPV4_CHECK="^${_OCT}\\.${_OCT}\\.${_OCT}\\.${_OCT}\$"
+# Same hostname-label rule as the launcher side (interface item 3). bash
+# has no \z; values read from the file contain no trailing newline, so $
+# and \z agree here.
+NAME_CHECK='^[a-z]([a-z0-9-]{0,30}[a-z0-9])?$'
+
+# gateway_env_value <KEY> — value of the first matching line in
+# gateway.env, or nothing (rc 1). Never sources the file.
+gateway_env_value() {
+    local key="${1:-}" f="${GATEWAY_ENV_FILE:-}" line=""
+    [[ -n "$f" && -r "$f" ]] || return 1
+    line="$(grep -m 1 "^${key}=" "$f" 2>/dev/null || true)"
+    [[ -n "$line" ]] || return 1
+    printf '%s' "${line#*=}"
+}
+
+# has_valid_gateway — gateway.env currently holds a valid IPv4 AND a
+# valid repair name. Either missing or malformed means "do not dial".
+has_valid_gateway() {
+    local ip="" name=""
+    ip="$(gateway_env_value POOL_GATEWAY_HOST)" || return 1
+    name="$(gateway_env_value REPAIR_NAME)" || return 1
+    [[ -n "$ip" ]] && [[ "$ip" =~ $IPV4_CHECK ]] || return 1
+    [[ -n "$name" ]] && [[ "$name" =~ $NAME_CHECK ]] || return 1
+    return 0
+}
+
+# Last name handed to hostnamectl (memory only, not a file — a reboot
+# re-applies once, idempotent and harmless).
+LAST_APPLIED_NAME=""
+
+# apply_repair_name <name> — set the VM hostname. The ONLY source is the
+# argument (which the caller read from gateway.env); POOL_NODE_NAME is
+# deliberately never consulted (PM ruling: it is a static seed value, not
+# the D2 path). Same name twice = one call (deduped in memory).
+apply_repair_name() {
+    local name="${1:-}" bin=""
+    [[ -n "$name" ]] || return 1
+    [[ "$name" =~ $NAME_CHECK ]] || return 1
+    [[ "$name" == "$LAST_APPLIED_NAME" ]] && return 0
+    # sudo -n: hostnamectl needs privilege (polkit refuses an unprivileged
+    # caller with "Interactive authentication required"); repair has
+    # NOPASSWD sudo. -n so a broken sudoers fails fast instead of hanging
+    # on a password prompt nobody will answer.
+    bin="${MLP_REPAIR_HOSTNAME_BIN:-hostnamectl}"
+    if sudo -n "$bin" set-hostname "$name" >/dev/null 2>&1; then
+        LAST_APPLIED_NAME="$name"
+        return 0
+    fi
+    return 1
+}
+
+# parse_port_range — POOL_GATEWAY_PORT_RANGE="min,max" (boot data, copied
+# from NODE_GATEWAY.ports.repair at pack time) into RANGE_MIN/RANGE_MAX.
+# Missing, malformed, or min>=max refuses: with no segment there is nothing
+# honest to dial (interface §2: no baked-in fallback).
+RANGE_MIN=""
+RANGE_MAX=""
+parse_port_range() {
+    local r="${POOL_GATEWAY_PORT_RANGE:-}"
+    RANGE_MIN="${r%%,*}"
+    RANGE_MAX="${r##*,}"
+    [[ "$r" == *","* ]] || return 1
+    [[ "$RANGE_MIN" =~ ^[0-9]+$ && "$RANGE_MAX" =~ ^[0-9]+$ ]] || return 1
+    (( 10#$RANGE_MIN >= 1 && 10#$RANGE_MAX <= 65535 && 10#$RANGE_MIN < 10#$RANGE_MAX )) || return 1
+    return 0
+}
+
+# next_port <cur> <min> <max> — the next port to try (wraps min..max).
+next_port() {
+    local cur="${1:-}" min="${2:-}" max="${3:-}"
+    if (( 10#$cur >= 10#$max )); then
+        printf '%s\n' "$min"
+    else
+        printf '%s\n' "$((10#$cur + 1))"
+    fi
+}
+
+# classify_dial_failure <ssh-stderr-text> — counted (sshd saw us and said
+# no: never switch ports, D7 rhythm), forward (logged in but the port is
+# taken: switch ports, fast retry), or other (never reached sshd and not a
+# forward failure: fast retry, same port). Unknown text fails closed toward
+# counted: a failure this script cannot positively identify as
+# "never reached sshd" is treated as one fail2ban may count (D7).
+classify_dial_failure() {
+    local text="${1:-}"
+    if printf '%s' "$text" | grep -qE "$REJECTED_RE"; then
+        printf 'counted\n'
+    elif printf '%s' "$text" | grep -qE "$FORWARD_RE"; then
+        printf 'forward\n'
+    elif printf '%s' "$text" | grep -qE "$NETWORK_RE"; then
+        printf 'other\n'
+    else
+        printf 'counted\n'
+    fi
+}
+
+# Tunnel key for nametag fallback connections: same derivation as the
+# template (tunnel-identity.sh, HOME = the VM user). Empty when unknown —
+# multiplexed calls never need it at all.
+TUNNEL_KEY_FILE=""
+if [[ -f "${SELF_DIR}/tunnel-identity.sh" ]]; then
+    TUNNEL_KEY_FILE="$(HOME="${HOME:-/home/repair}" bash -c '. "$1" >/dev/null 2>&1; printf "%s" "${TUNNEL_KEY:-}"' _ "${SELF_DIR}/tunnel-identity.sh" 2>/dev/null || true)"
+fi
+
+# nametag_write <port> <name> — overwrite /home/sshproxy/repair/<port>
+# with one line holding the name, over the tunnel's own ControlMaster
+# (-S, like health_check — no new handshake while the master is alive;
+# a plain authenticated fallback otherwise). Best-effort: callers add
+# `|| true`; the tag is display-only, never load-bearing.
+nametag_write() {
+    local port="${1:-}" name="${2:-}"
+    [[ "$port" =~ ^[0-9]+$ ]] || return 1
+    [[ -n "$name" ]] && [[ "$name" =~ $NAME_CHECK ]] || return 1
+    [[ -n "${CTL:-}" && -n "${POOL_GATEWAY_USER:-}" && -n "${POOL_GATEWAY_HOST:-}" ]] || return 1
+    local -a ncmd
+    ncmd=(ssh -S "$CTL" -o BatchMode=yes -o ConnectTimeout=10)
+    [[ -n "$TUNNEL_KEY_FILE" ]] && ncmd+=(-i "$TUNNEL_KEY_FILE")
+    ncmd+=(-o StrictHostKeyChecking=accept-new -o UserKnownHostsFile="${KNOWN_HOSTS_FILE:-/dev/null}")
+    ncmd+=("${POOL_GATEWAY_USER}@${POOL_GATEWAY_HOST}"
+        "mkdir -p /home/sshproxy/repair && printf '%s\n' '${name}' > '/home/sshproxy/repair/${port}'")
+    "${ncmd[@]}" >/dev/null 2>&1
+}
+
+# nametag_remove <port> — delete that port's tag (same channel as write).
+nametag_remove() {
+    local port="${1:-}"
+    [[ "$port" =~ ^[0-9]+$ ]] || return 1
+    [[ -n "${CTL:-}" && -n "${POOL_GATEWAY_USER:-}" && -n "${POOL_GATEWAY_HOST:-}" ]] || return 1
+    local -a ncmd
+    ncmd=(ssh -S "$CTL" -o BatchMode=yes -o ConnectTimeout=10)
+    [[ -n "$TUNNEL_KEY_FILE" ]] && ncmd+=(-i "$TUNNEL_KEY_FILE")
+    ncmd+=(-o StrictHostKeyChecking=accept-new -o UserKnownHostsFile="${KNOWN_HOSTS_FILE:-/dev/null}")
+    ncmd+=("${POOL_GATEWAY_USER}@${POOL_GATEWAY_HOST}"
+        "rm -f '/home/sshproxy/repair/${port}'")
+    "${ncmd[@]}" >/dev/null 2>&1
+}
+
+# main — the dial loop. Runs ONLY when this file is executed directly (see
+# the BASH_SOURCE guard at the bottom, same shape as pool-tunnel): sourcing
+# it defines the functions above and returns, so tests can call
+# classify_dial_failure / next_port / has_valid_gateway / apply_repair_name /
+# nametag_write / nametag_remove without running the loop.
+main() {
+    parse_port_range || {
+        say "POOL_GATEWAY_PORT_RANGE is missing or malformed (want min,max with min<max) — refusing to dial without a segment"
+        report down
+        exit "$EX_CONFIG"
+    }
+    local cur_port="$RANGE_MIN" name="" rc=0 class="" out="" dial_text=""
+    local quick="$QUICK_MIN" started=0 tagged_port=""
+    while :; do
+        clear_master
+        refresh_gateway_host
+
+        # No valid answer, no dial (PM ruling): report down and fast-retry.
+        # This replaces the old "dial the .invalid placeholder" rule.
+        if ! has_valid_gateway; then
+            report down
+            say "no valid gateway answer yet (need POOL_GATEWAY_HOST + REPAIR_NAME in ${GATEWAY_ENV_FILE}) — waiting ${quick}s, dialing nothing"
+            sleep "$quick"
+            quick=$(( quick * 2 > QUICK_MAX ? QUICK_MAX : quick * 2 ))
+            continue
+        fi
+        name="$(gateway_env_value REPAIR_NAME)"
+        apply_repair_name "$name" || say "hostname not applied this round (cosmetic only)"
+        # This round's port, published where pool-tunnel (static mode) and
+        # watch_tunnel both read it.
+        POOL_GATEWAY_PORT="$cur_port"
+        export POOL_GATEWAY_PORT
+
+        out="$(mktemp "${STATE_DIR}/.launch.XXXXXX" 2>/dev/null)" || out=""
+        if [[ -n "$out" ]]; then
+            bash "$PTUNNEL" --once >"$out" 2>&1
+            rc=$?
+            cat "$out" >&2
+        else
+            # Without a capture file there is no way to tell a rejection from
+            # a network failure, so the result is treated as a rejection below.
+            bash "$PTUNNEL" --once 1>&2
+            rc=$?
+        fi
+
+        if [[ $rc -eq 0 ]]; then
+            [[ -n "$out" ]] && rm -f "$out"
+            if nametag_write "$cur_port" "$name"; then
+                tagged_port="$cur_port"
+            else
+                tagged_port=""
+                say "nametag not written (display only)"
+            fi
+            say "tunnel up (${POOL_GATEWAY_USER:-?}@${POOL_GATEWAY_HOST:-?}:${POOL_GATEWAY_SSH_PORT:-22}, gateway port ${POOL_GATEWAY_PORT:-?})"
+            report up
+            started="$(date +%s)"
+            watch_tunnel
+            # Back down, on this port or another: remove what was actually
+            # written (tracked, not the search cursor — the cursor may have
+            # moved past it on failed dials); the next success writes anew.
+            if [[ -n "$tagged_port" ]]; then
+                nametag_remove "$tagged_port" || say "nametag not removed (display only)"
+                tagged_port=""
+            fi
+            report down
+            if (( $(date +%s) - started >= STABLE_SESSION )); then
+                quick="$QUICK_MIN"
+            fi
+            say "tunnel down — dialing again in ${quick}s"
+            sleep "$quick"
+            quick=$(( quick * 2 > QUICK_MAX ? QUICK_MAX : quick * 2 ))
+            continue
+        fi
+
+        class="counted"
+        if [[ -n "$out" ]]; then
+            dial_text="$(cat "$out" 2>/dev/null || true)"
+            class="$(classify_dial_failure "$dial_text")"
+            rm -f "$out"
+        fi
+        report down
+
+        if [[ "$class" == "counted" ]]; then
+            say "dial failed in a way the Gateway's fail2ban may count (pool-tunnel rc ${rc}) — next try in ${REJECT_INTERVAL}s (D7: at most 2 such tries per 10 minutes)"
+            sleep "$REJECT_INTERVAL"
+            quick="$QUICK_MIN"
+        elif [[ "$class" == "forward" ]]; then
+            cur_port="$(next_port "$cur_port" "$RANGE_MIN" "$RANGE_MAX")"
+            say "remote port forwarding failed on the tried port — trying next port ${cur_port} in ${quick}s"
+            sleep "$quick"
+            quick=$(( quick * 2 > QUICK_MAX ? QUICK_MAX : quick * 2 ))
+        else
+            say "dial failed before reaching the Gateway's sshd (pool-tunnel rc ${rc}) — next try in ${quick}s"
+            sleep "$quick"
+            quick=$(( quick * 2 > QUICK_MAX ? QUICK_MAX : quick * 2 ))
+        fi
+    done
+}
+
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+    main "$@"
+fi

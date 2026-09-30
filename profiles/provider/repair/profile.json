@@ -1,0 +1,10 @@
+{
+  "name": "repair",
+  "role": "provider",
+  "shared_config": [],
+  "systemd_user_services": [],
+  "linger": false,
+  "sudoers_rules": [],
+  "login_user": "repair",
+  "user_data_template": "user-data.tmpl"
+}

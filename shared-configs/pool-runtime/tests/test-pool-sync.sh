@@ -316,6 +316,39 @@ check_no_restart() {
 }
 
 # ---------------------------------------------------------------------------
+# 可攜性 helpers（GNU/BSD 旗標不同；這支測試要在 macOS bash 3.2 與
+# ubuntu bash 5.x 兩邊跑——2026-09-30 的 docker 閘門就是被這兩個工具的
+# 平台差異咬到）。
+# ---------------------------------------------------------------------------
+
+# file_mtime <path> — mtime（epoch 秒）。
+#   **不能**寫成 `stat -f %m … || stat -c %Y …`：GNU coreutils 的
+#   `stat -f` 是 --file-system（不是「format」），會把整份檔案系統資訊
+#   （含每次寫入都會變的 free blocks）印到 stdout，並以非 0 結束——於是
+#   `||` 把真時間戳「接在垃圾的後面」一起 captured 回來，比較的是會漂移
+#   的偽值，不是 mtime（2026-09-30 在 ubuntu:24.04 實測）。先探測
+#   （stdout 丟掉、只信 rc）再取值，GNU 先、BSD 退路。
+file_mtime() {
+    if stat -c %Y "$1" >/dev/null 2>&1; then
+        stat -c %Y "$1"
+    else
+        stat -f %m "$1" 2>/dev/null
+    fi
+}
+
+# file_sha256 <path> — 內容指紋（hex）。
+#   shasum 是 macOS 內建（perl 附帶），最小 ubuntu 映像沒有；sha256sum 是
+#   coreutils。回傳空字串＝量不到——呼叫端必須把「空」當量測失敗，不可
+#   當成「沒變」（空比空是假綠）。
+file_sha256() {
+    if command -v shasum >/dev/null 2>&1; then
+        shasum -a 256 "$1" 2>/dev/null | awk '{print $1}'
+    else
+        sha256sum "$1" 2>/dev/null | awk '{print $1}'
+    fi
+}
+
+# ---------------------------------------------------------------------------
 # Fixture HOME + fixture repo.
 # ---------------------------------------------------------------------------
 reset_home() {
@@ -863,12 +896,16 @@ GIT_MODE="ok"; GH_MODE="ok"
 : > "$SANDBOX/check-rc"; : > "$SANDBOX/install-rc"
 GH_VALUE='{"name":"testnode","role":"provider","registered_with":"register-provider.sh"}'
 write_clients "$AUB_KEY_A" "$AUB_KEY_B" "$AUB_ACTIONS"
-MTIME_BEFORE="$(stat -f %m "$AUTHKEYS_FILE" 2>/dev/null || stat -c %Y "$AUTHKEYS_FILE" 2>/dev/null)"
+MTIME_BEFORE="$(file_mtime "$AUTHKEYS_FILE")"
 sleep 1
 run_sync
-MTIME_AFTER="$(stat -f %m "$AUTHKEYS_FILE" 2>/dev/null || stat -c %Y "$AUTHKEYS_FILE" 2>/dev/null)"
+MTIME_AFTER="$(file_mtime "$AUTHKEYS_FILE")"
 if [[ "$RAN" -ne 1 ]]; then
     fail_line "A3. 內容正確 → 不重寫（被測物沒有真的執行，無從證明）"
+elif [[ -z "$MTIME_BEFORE" || -z "$MTIME_AFTER" ]]; then
+    # 拿不到時間戳＝無從證明「沒重寫」——必須紅，不能空比空。
+    # （舊寫法在 GNU stat 下正是死在這裡：capture 到的是檔案系統資訊。）
+    fail_line "A3. 無法取得 mtime（before=[${MTIME_BEFORE}] after=[${MTIME_AFTER}]）——不可當作沒重寫"
 elif [[ "$MTIME_BEFORE" == "$MTIME_AFTER" ]]; then
     ok_line "A3. 內容已正確 → 沒有重寫（mtime 不變）"
 else
@@ -1069,9 +1106,11 @@ TUNNEL_PUB_FILE="$SANDBOX/home/.ssh/id_tunnel.pub"
 
 # 記下私鑰的內容指紋。用 sha256 而非 mtime：同一秒內重產會讓 mtime 看起來
 # 沒變，那個假陰性會讓 Q2（不該重產）與 Q-Inj1（該重產）都誤判。
+# file_sha256 的 shasum/sha256sum 雙路是因為最小 ubuntu 映像沒有 shasum
+# （2026-09-30 docker 實測：Q2/Q-Inj1 因「指紋取不到」紅）。
 tunnel_fingerprint() {
     if [[ -f "$TUNNEL_KEY_FILE" ]]; then
-        shasum -a 256 "$TUNNEL_KEY_FILE" 2>/dev/null | awk '{print $1}'
+        file_sha256 "$TUNNEL_KEY_FILE"
     fi
 }
 tunnel_key_perm() {
@@ -1281,11 +1320,29 @@ fi
 cat > "$FAKE_SSH_BIN" <<'FAKE_TUNNEL_SSH'
 #!/usr/bin/env bash
 printf '%s\n' "$*" >> "${FAKE_SSH_LOG:?}"
-# ControlMaster 就緒探測（ssh -S <ctl> -O check）與其他 -O 操作：
-# 回報成功，讓 start_master 直接完成、--once 立刻退出。
+# 主命令（-M）才會建立 master；marker 代表「master 活著」。
+# Q10 的忠實性（2026-09-30，GNU bash 5 的紅）：沒有帶任何 -i 的主命令
+# ＝沒有任何可用身分。真的 ssh 在這種情況會認證失敗、立刻結束；舊版假
+# ssh 對主命令一律「睡 30 秒後成功」，而且 -O check 無條件成功，於是
+# 「產品沒有提供身分」被讀成「產品成功連上」，Q10 把假貨的成功當成
+# 「id_pool 退路未移除」。這裡讓無身分的主命令立刻失敗、且不建 marker；
+# -O check 只在 marker 存在（＝曾有帶 -i 的主命令活著）時成功。產品若
+# 哪天真的重新提供 -i id_pool，-M 會帶 -i → marker → 成功，Q10 照樣紅。
+marker="${FAKE_SSH_LOG:?}.master"
 case "$*" in
-    *"-O check"*|*"-O exit"*) exit 0 ;;
+    *"-O check"*) [[ -f "$marker" ]] && exit 0; exit 1 ;;
+    *"-O exit"*)  rm -f "$marker"; exit 0 ;;
 esac
+is_master=0; has_i=0; prev=""
+for a in "$@"; do
+    [[ "$prev" == "-i" ]] && has_i=1
+    [[ "$a" == "-M" ]] && is_master=1
+    prev="$a"
+done
+if [[ "$is_master" -eq 1 && "$has_i" -eq 0 ]]; then
+    exit 255
+fi
+[[ "$is_master" -eq 1 ]] && : > "$marker"
 # 主命令（-N -R ...）背景執行後被 kill：撐住直到被砍，避免被誤判為
 # 「ControlMaster exited during setup」。
 sleep 30
@@ -1298,6 +1355,7 @@ chmod +x "$FAKE_SSH_BIN"
 run_tunnel() {
     local home="$1"
     : > "$SANDBOX/ssh.log"
+    rm -f "$SANDBOX/ssh.log.master"   # 假 ssh 的 master marker：每輪從乾淨狀態開始
     TUNNEL_RC=0
     if [[ ! -f "$POOL_TUNNEL_SH" ]]; then
         TUNNEL_RC=127

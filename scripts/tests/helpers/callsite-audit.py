@@ -28,6 +28,7 @@ SCOPE —— 「實際呼叫端」的涵蓋範圍（這一節是判準的一部�
   * 命令位置的呼叫：允許前置的環境賦值（`GH_REPO="$REPO" dispatch_… 300`）
     與行內接續。**間接呼叫算**（呼叫被包在另一個函式裡，例如
     create-worker.sh 的 create_worker_dispatch_refresh_and_wait 只是薄包裝）。
+  * **YAML 檔只掃 `run:` 的內容，不掃其他字串值**（2026-09-29 修，見下）。
   * 排除：定義那一行、註解（整行 # 開頭，或引號外的行尾 # 之後）、以及檔案
     自己宣告清單的那幾行（否則宣告會算成一個呼叫端）。
   * 名字邊界用「前後不可為 [A-Za-z0-9_]」，所以
@@ -38,6 +39,37 @@ SCOPE —— 「實際呼叫端」的涵蓋範圍（這一節是判準的一部�
     - `command "$fn"`、陣列展開等 Indirect 形式掃不到。
     - 被 `#` 開頭但其實在 here-doc 裡的字串會被當註解（方向是漏報，不是誤報）。
     這三條都是朝「少數到」的方向，與本判準要抓的「文件多算／少算」同一個方向。
+
+YAML_SCOPE —— 為什麼 .yml 只掃 run:（2026-09-29，兩處既有缺陷之一）：
+  真線：`.github/workflows/refresh-authorized-keys.yml` 的 `workflow_dispatch`
+  input `description:` 裡有一句說明文字提到 `dispatch_refresh_and_wait`
+  （2026-09-27 `12d3a2b` 加的），被文字掃描當成一次呼叫，審計因此報
+  `undeclared-callsite .github/workflows/refresh-authorized-keys.yml`——
+  但那是**給人讀的描述**，不是呼叫。同一類誤報的溫床還有 `name:`、`if:`、
+  `run-name:`、`env` 值、`with:` 參數等所有 YAML 純量裡的字串。
+  **最小、且最不會漏抓真呼叫**的做法是：辨識出 YAML 裡 `run:` 這個 key 的
+  純量內容（`run: |`／`run: |-`／`run: >` 區塊，或 `run: <單行>`），只把那些
+  行交給呼叫掃描；同一份檔案的其他行不掃（連註解區塊也不用特殊處理——YAML 的
+  `#` 註解本來就不在 run: 區塊內時語意上不執行）。理由：
+    - 真呼叫**只能**發生在 `run:` 裡（composite action 的 `run:` 亦然；
+      `uses:` 走另一條路，不執行 shell）。掃 run: 不會少抓任何真呼叫。
+    - `description:`／`name:`／`if:` 等純量是**資料**，不可能執行——把它們
+      排除是語意正確，不是放水。
+    - 比「排除 description: 一行」更不會漏：後者只擋住今天這一個 key，明天
+      有人把函式名寫進 `name:` 或 `with:` 照樣誤報。
+  形狀（實測這份 repo 的 49 處 run: 只有兩種：`run: |` 與 `run: <單行>`；
+  `>-` 折疊式一併支援——YAML 上三種都是合法純量）。解析器刻意不依賴 PyYAML
+  （helper 目前零相依，且行號定位需要保留原文；PyYAML 能解析但不能可靠地回
+  原始行號）。縮排判準沿用 YAML 區塊純量的規則：`run:` 之後縮排更深的行屬於
+  它，遇到縮排 <= run: 那一行的行就結束。單行 `run: cmd` 直接看該行。
+  已知形狀限制（都朝漏報、不朝誤報）：
+    - 引號跨行的純量（`run: "a\n b"`）不支援——這份 repo 沒有。
+    - **純量內的假 `run:` 字面不會誤判**：任何 key 的區塊純量（含
+      `description: |` 裡舉例的「run: |」）整段按 YAML 語意吃掉，區塊內容不再
+      被當成 key 掃（2026-09-29 的單趟設計；見上）。
+  **防漏抓的證據**：test 的 2e 注入把呼叫放進某個 workflow 的 `run: |`
+  區塊（`test-callsite-lists.sh`），修後仍必須紅（工單要求 (c)）；另加一個
+  對照——把同一個呼叫放進 `description:`，必須**不**紅（新斷言 2g）。
 
 DECL_FORMAT —— 被承認的宣告格式（唯一的一種，因為 repo 裡只有一種）：
     # <任何話> Consumers ... call <FUNC>:          ← 宣告的引出行
@@ -62,7 +94,7 @@ import sys
 
 CODE_EXT = (".sh", ".yml", ".yaml")
 CODE_BASENAMES = ("mlp", "preflight", "register-client", "verify-profile",
-                  "register-provider.sh", "pool-residue")
+                  "register-provider.sh", "pool-residue", "setup-repair-key")
 MARKER_WORDS = ("consumer", "caller", "call site", "called by", "used by",
                 "who calls", "sources this")
 
@@ -217,6 +249,60 @@ def find_declarations(path, lines):
 # --verbose 印出來，而每一條 MISMATCH 的訊息裡也會說明掃描範圍。
 SCAN_EXCLUDE_PREFIX = ("scripts/tests/",)
 
+# YAML 檔只掃 `run:` 純量的內容（見 YAML_SCOPE 的理由）。回傳 {行號: 內容}
+# （1-based，含該行的原始文字）。
+# 單趟掃描，**對所有 key 的區塊純量都有意識**：任何 key 的 `|`／`>` 區塊內容
+# 都按 YAML 語意整段吃掉（不是 key 行），只有 key 叫 run 的那些行算程式。
+# 這樣 `description: |` 裡一段「範例 YAML」就算含 `run: |` 字面，也不會被當成
+# 真的 run 區塊（2026-09-29 的修正，見 YAML_SCOPE）。
+KEY_ANY = re.compile(r'^(\s*)(?:-\s+)?([A-Za-z_][A-Za-z0-9_-]*):(.*)$')
+BLOCK_MARKERS = ("|", "|-", "|+", ">", ">-", ">+")
+
+
+def yaml_run_lines(lines):
+    """YAML 檔裡屬於 `run:` 純量的行。
+
+    * 任一 key 的區塊純量（`key: |`／`>-`…）：其後縮排比 key 行深的行都是
+      它的內容（空行也算，維持行號連續），遇到縮排 <= key 的行即結束。
+      key 是 `run` → 收進結果；其他 key → 整段略過（那是資料）。
+    * `run: <單行>`：只有那一行（含行內內容）。
+    * 其他行不算。這排除了 `description:`／`name:`／`if:`／`run-name:`／
+      `env:` 值／`with:` 參數等**資料**——那些不可能執行，把函式名寫在裡面
+      不該被當成呼叫（2026-09-29 的誤報成因）。
+    """
+    out = {}
+    i = 0
+    n = len(lines)
+    while i < n:
+        m = KEY_ANY.match(lines[i])
+        if not m:
+            i += 1
+            continue
+        key_indent = len(m.group(1))
+        key = m.group(2)
+        rest = m.group(3).strip()
+        first = rest.split()[0] if rest.split() else ""
+        if first in BLOCK_MARKERS:
+            i += 1
+            while i < n:
+                l = lines[i]
+                if not l.strip():
+                    if key == "run":
+                        out[i + 1] = l
+                    i += 1
+                    continue
+                ind = len(l) - len(l.lstrip(" "))
+                if ind <= key_indent:
+                    break
+                if key == "run":
+                    out[i + 1] = l
+                i += 1
+            continue
+        if key == "run" and rest:
+            out[i + 1] = lines[i]
+        i += 1
+    return out
+
 
 def scan_callsites(root, files, name, declaring_file):
     """回傳 (實際呼叫端, 被範圍排除而沒算的呼叫端)。"""
@@ -229,6 +315,18 @@ def scan_callsites(root, files, name, declaring_file):
         try:
             lines = open(os.path.join(root, rel), encoding="utf-8").read().split("\n")
         except (OSError, UnicodeDecodeError):
+            continue
+        # YAML：只把 run: 純量的行當程式看（2026-09-29，見 YAML_SCOPE）。
+        if rel.endswith((".yml", ".yaml")):
+            for ln, line in yaml_run_lines(lines).items():
+                code = strip_comment(line)
+                if not code.strip():
+                    continue
+                if rx.search(code):
+                    if rel.startswith(SCAN_EXCLUDE_PREFIX):
+                        excluded.add(rel)
+                    else:
+                        hits.add(rel)
             continue
         in_header = True
         for ln, line in enumerate(lines, 1):

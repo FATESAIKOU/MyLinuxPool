@@ -1,0 +1,645 @@
+#!/usr/bin/env bash
+# ops-scripts/package-repair-host — pack the ONE shared family repair host
+# bundle on the owner's Mac (issue #6; openspec/changes/archive/2026-10-01-family-repair-host
+# tasks 6.1/D13, EPHEMERAL-INTERFACE.md §7).
+#
+#   package-repair-host --key-dir <dir> --out <dir> --image-sha256 <sha256>
+#                       [--image-url <url>] [--contact-name <name>]
+#                       [--vbox-version <v>] [--vbox-build <b>]
+#                       [--vbox-sha256 <sha>]
+#                       [--include-image --image-file <f>]
+#
+# One bundle for the whole family: it holds NOTHING per-PC (no --name, no
+# --seed-dir). The shared tunnel private key comes from setup-repair-key's
+# --key-dir; the login keys are a CLIENT_* snapshot (minus CLIENT_ACTIONS);
+# the repair port segment and the Gateway SSH port come from NODE_GATEWAY.
+# Per-PC values (the repair name, the picked port) are supplied at runtime:
+# the name by the launcher (design D12), the port picked on the VM (D10).
+#
+#   --vbox-version  default 7.2.20; --vbox-build default 175154 (together they
+#                   name the installer; only this pair has been exercised —
+#                   anything else is untested, the install-time SHA check is
+#                   the only guard)
+#
+# The bundle is what the family double-clicks: Install.cmd (the double-click
+# entry), Install-RepairHost.ps1 (run once, one UAC),
+# Start-RepairLauncher.ps1 (every time after), repair-config.json (fixed
+# vmName, the repair port segment, the Gateway SSH port, contact name, the
+# pinned image + VirtualBox URLs and their SHA256 — no family names),
+# user-data (with the shared tunnel private key + CLIENT snapshot keys),
+# meta-data (FIXED instance-id/hostname), seed.iso,
+# MANIFEST.sha256 and README-FAMILY.txt.
+#
+# Why --image-sha256 has NO default: cloud-images' "current" moves with every
+# rebuild, so a baked-in hash silently rots. The operator copies today's hash
+# out of the official SHA256SUMS at pack time — this script prints that URL
+# in its report (see the bottom) so nobody has to guess where it lives.
+# Same for --vbox-sha256 (the SHA256SUMS next to the installer).
+# Only VirtualBox 7.2.20 build 175154 has actually been exercised here; other
+# --vbox-version/--vbox-build combinations only change the URL/filename, they
+# are not verified by this script beyond the SHA check at install time.
+#
+# Why the ~600MB cloud image is NOT in the bundle by default: the family gets
+# this over chat or email, where 600MB does not fit; the image keeps getting
+# security rebuilds, so a copy frozen in a bundle goes stale while looking
+# fine; and both download sources are stable versioned URLs. The installer
+# downloads it ONCE on the family machine and refuses anything whose SHA256
+# does not match the value pinned here. --include-image embeds a local copy
+# for USB handoffs (the installer still checks its SHA256 before use).
+#
+# Why user-data and meta-data are byte-stable across runs: the meta-data
+# instance-id is a FIXED string (not a timestamp), so rebuilding the same
+# inputs yields the same bytes for these two files — "which bundle did the
+# family get" stays answerable for the boot data. This promise covers ONLY
+# these two files: seed.iso carries ISO timestamps and MANIFEST covers it,
+# so whole-bundle bytes differ run to run by construction.
+#
+# Exit codes: 0 packed; 1 refused or failed (nothing written); 2 bad args.
+#
+# Needs: jq, gh, ssh-keygen, base64. Reads GitHub (CLIENT_* snapshot,
+# NODE_GATEWAY), never writes any GitHub var, never dispatches.
+#
+# Limitations (honest list):
+# * The whole bundle is a SECRET (seed.iso + user-data hold the tunnel
+#   private key). The script says so on stdout, but cannot enforce how the
+#   operator sends it — chat history keeps a copy.
+# * No signature: the family cannot tell a tampered bundle from a real one
+#   except by the channel it arrives on. repair-config.json + MANIFEST let
+#   the OWNER re-verify, not the family.
+# * POOL_NODE_NAME in tunnel.env is a fixed shared string and the repair
+#   port segment (POOL_GATEWAY_PORT_RANGE) is fixed in the seed; the per-PC
+#   name arrives over D2 at boot and the exact port is picked at runtime by
+#   the VM side (another ticket owns the dial loop).
+# * Adding this file needs a one-line probe registration in
+#   scripts/tests/test-script-self-location.sh (probe_args/probe_want);
+#   that test file belongs to the test role, so it is reported, not edited
+#   here.
+
+set -euo pipefail
+
+# Resolve this script's REAL location, following symlinks, so it can be
+# linked into a directory on PATH (`ln -s .../ops-scripts/mlp <dir on PATH>`).
+# Both $0 and BASH_SOURCE name the LINK, not the target, so dirname on
+# either lands in the link's directory and every repo-relative path below
+# becomes wrong — the symptom is "scripts/lib/ssh.sh: No such file".
+# `readlink` without -f is used deliberately: -f is GNU-only.
+#
+# This block is duplicated in every ops-script because it has to run
+# BEFORE the script knows where the repo is — there is nothing to source
+# yet. test-script-self-location.sh asserts the copies stay identical.
+_mlp_self="${BASH_SOURCE[0]:-$0}"
+while [ -L "$_mlp_self" ]; do
+    _mlp_dir="$(cd -P "$(dirname "$_mlp_self")" && pwd)"
+    _mlp_self="$(readlink "$_mlp_self")"
+    case "$_mlp_self" in /*) ;; *) _mlp_self="${_mlp_dir}/${_mlp_self}" ;; esac
+done
+SCRIPT_DIR="$(cd -P "$(dirname "$_mlp_self")" && pwd)"
+unset _mlp_self _mlp_dir
+
+REPO="${POOL_REPO:-FATESAIKOU/MyLinuxPool}"
+REPO_ROOT="$(cd -P "${SCRIPT_DIR}/.." && pwd)"
+PROFILE_DIR="${REPO_ROOT}/profiles/provider/repair"
+
+# Shared values (not per-PC — the whole point of one bundle).
+SHARED_HOSTNAME="mlp-repair-host"
+SHARED_INSTANCE_ID="mlp-repair-shared"
+GATEWAY_HOST_PLACEHOLDER="gateway-ip-set-at-launch.invalid"
+
+log() {
+    local level="$1"; shift
+    local ts=""
+    ts="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    if [[ "$level" == "INFO" ]]; then
+        printf '[%s] %s %s\n' "$ts" "$level" "$*"
+    else
+        printf '[%s] %s %s\n' "$ts" "$level" "$*" >&2
+    fi
+}
+
+usage() {
+    cat >&2 <<'EOF'
+usage: package-repair-host --key-dir <dir> --out <dir> --image-sha256 <sha256>
+                           [--image-url <url>] [--contact-name <name>]
+                           [--vbox-version <v>] [--vbox-build <b>]
+                           [--vbox-sha256 <sha>]
+                           [--include-image --image-file <f>]
+  --key-dir      setup-repair-key --key-dir holding id_tunnel (shared key)
+  --out          bundle directory to create (must not exist yet)
+  --image-sha256 TODAY's SHA256 of the cloud image, copied from the
+                 official SHA256SUMS (no default — it rots, see header;
+                 the URL is printed in the packing report below)
+  --image-url     default https://cloud-images.ubuntu.com/noble/current/noble-server-cloudimg-amd64.vmdk
+                 (--image-file content must match this file when included)
+  --contact-name  who the family asks for a new IP (default: the owner's name
+                 as configured; shown in the "連不上" message)
+  --vbox-version  default 7.2.20; --vbox-build default 175154 (together they
+                 name the installer; only this pair has been exercised)
+  --vbox-sha256   default the official hash of VirtualBox-<v>-<b>-Win.exe
+  --include-image embed --image-file into the bundle (USB handoff)
+EOF
+}
+
+KEY_DIR=""
+OUT=""
+IMAGE_SHA=""
+IMAGE_URL="https://cloud-images.ubuntu.com/noble/current/noble-server-cloudimg-amd64.vmdk"
+CONTACT="使用者"
+VBOX_V="7.2.20"
+VBOX_BUILD="175154"
+VBOX_SHA="a81777d2b36380ce042a29e9c554cf032eb46a793f62e3cc82e7411e535c2c26"
+INCLUDE_IMAGE=0
+IMAGE_FILE=""
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --key-dir)      [[ $# -ge 2 ]] || { usage; exit 2; }; KEY_DIR="$2"; shift 2 ;;
+        --out)          [[ $# -ge 2 ]] || { usage; exit 2; }; OUT="$2"; shift 2 ;;
+        --image-sha256) [[ $# -ge 2 ]] || { usage; exit 2; }; IMAGE_SHA="$2"; shift 2 ;;
+        --image-url)    [[ $# -ge 2 ]] || { usage; exit 2; }; IMAGE_URL="$2"; shift 2 ;;
+        --contact-name) [[ $# -ge 2 ]] || { usage; exit 2; }; CONTACT="$2"; shift 2 ;;
+        --vbox-version) [[ $# -ge 2 ]] || { usage; exit 2; }; VBOX_V="$2"; shift 2 ;;
+        --vbox-build)   [[ $# -ge 2 ]] || { usage; exit 2; }; VBOX_BUILD="$2"; shift 2 ;;
+        --vbox-sha256)  [[ $# -ge 2 ]] || { usage; exit 2; }; VBOX_SHA="$2"; shift 2 ;;
+        --include-image) INCLUDE_IMAGE=1; shift ;;
+        --image-file)   [[ $# -ge 2 ]] || { usage; exit 2; }; IMAGE_FILE="$2"; shift 2 ;;
+        -h|--help)      usage; exit 0 ;;
+        *)              log ERROR "unknown argument: $1"; usage; exit 2 ;;
+    esac
+done
+
+if [[ -z "$KEY_DIR" || -z "$OUT" || -z "$IMAGE_SHA" ]]; then
+    usage
+    exit 2
+fi
+
+# ---- local validation (nothing written yet) -----------------------------------
+if ! [[ "$IMAGE_SHA" =~ ^[0-9a-fA-F]{64}$ ]]; then
+    log ERROR "--image-sha256 must be 64 hex chars"
+    exit 2
+fi
+if ! [[ "$VBOX_SHA" =~ ^[0-9a-fA-F]{64}$ ]]; then
+    log ERROR "--vbox-sha256 must be 64 hex chars"
+    exit 2
+fi
+if ! [[ "$VBOX_V" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || ! [[ "$VBOX_BUILD" =~ ^[0-9]+$ ]]; then
+    log ERROR "--vbox-version must look like 7.2.20 and --vbox-build like 175154 (they name the installer file)"
+    exit 2
+fi
+for tool in jq gh ssh-keygen base64; do
+    command -v "$tool" >/dev/null 2>&1 || { log ERROR "${tool} not found on PATH"; exit 1; }
+done
+for f in "${PROFILE_DIR}/Install.cmd" "${PROFILE_DIR}/Install-RepairHost.ps1" "${PROFILE_DIR}/Start-RepairLauncher.ps1" "${PROFILE_DIR}/profile.json"; do
+    [[ -f "$f" ]] || { log ERROR "${f} missing — run this from a complete checkout"; exit 1; }
+done
+
+# The shared tunnel private key must exist BEFORE anything is written: a
+# bundle without it boots a VM that can never dial in.
+if [[ ! -f "${KEY_DIR}/id_tunnel" || ! -s "${KEY_DIR}/id_tunnel" ]]; then
+    log ERROR "--key-dir ${KEY_DIR} has no id_tunnel private key (missing shared tunnel key) — run ops-scripts/setup-repair-key first"
+    exit 1
+fi
+if ! grep -q "PRIVATE KEY" "${KEY_DIR}/id_tunnel" 2>/dev/null; then
+    log ERROR "--key-dir ${KEY_DIR}/id_tunnel does not look like a private key — refusing to bake the wrong half into a bundle"
+    exit 1
+fi
+
+if [[ -e "$OUT" ]]; then
+    log ERROR "--out ${OUT} already exists — refusing to merge into it (delete it or pick another dir)"
+    exit 1
+fi
+
+IMAGE_BASENAME="$(basename "$IMAGE_URL")"
+if [[ "$INCLUDE_IMAGE" -eq 1 ]]; then
+    # The bundled copy is named after the ACTUAL file, not the URL: the name
+    # is what the installer looks for (config.image.file), so a URL whose
+    # basename does not match the file must not silently rename it.
+    IMAGE_BASENAME="$(basename "$IMAGE_FILE")"
+    [[ -n "$IMAGE_FILE" ]] || { log ERROR "--include-image needs --image-file <local image>"; exit 2; }
+    [[ -f "$IMAGE_FILE" ]] || { log ERROR "--image-file ${IMAGE_FILE}: not a file"; exit 1; }
+    got=""
+    if command -v shasum >/dev/null 2>&1; then
+        got="$(shasum -a 256 "$IMAGE_FILE" | awk '{print $1}')"
+    else
+        got="$(sha256sum "$IMAGE_FILE" | awk '{print $1}')"
+    fi
+    if [[ "$(printf '%s' "$got" | tr 'A-F' 'a-f')" != "$(printf '%s' "$IMAGE_SHA" | tr 'A-F' 'a-f')" ]]; then
+        log ERROR "--image-file SHA256 mismatch (got ${got}) — not embedding a wrong image"
+        exit 1
+    fi
+fi
+
+# ---- GitHub reads: refuse before any write ------------------------------------
+# One listing answers both questions (Gateway? clients?). It must SUCCEED:
+# a failed listing is "cannot tell", never "no clients" or "no Gateway".
+# The path carries no ?per_page= on purpose — --paginate follows the Link
+# headers for any page size.
+if ! VARS_RAW="$(gh api "repos/${REPO}/actions/variables" --paginate 2>/dev/null)"; then
+    log ERROR "could not list ${REPO}'s repo variables — cannot snapshot the login keys or read NODE_GATEWAY"
+    exit 1
+fi
+
+# read_gateway — GW_TUNNEL_USER, GW_SSH_PORT and the repair port segment
+# for the seed's env file and the config. NODE_GATEWAY.port is the
+# Gateway's SSH port (2100 today); absent means 22, the same rule
+# pool-tunnel/pool-resolve apply. ports.repair has NO fallback (interface
+# §2: unreadable means refuse loudly, never a baked-in constant).
+# tunnel_user has no default anywhere in the pool.
+GW_JSON="$(printf '%s' "$VARS_RAW" | jq -c '[.variables[]? | select(.name == "NODE_GATEWAY") | .value | (try fromjson catch null)] | first // empty' 2>/dev/null)"
+if [[ -z "$GW_JSON" ]]; then
+    log ERROR "NODE_GATEWAY not found or unreadable — cannot build an honest bundle without the Gateway's SSH port and repair segment"
+    exit 1
+fi
+GW_TUNNEL_USER="$(printf '%s' "$GW_JSON" | jq -r '.tunnel_user // empty' 2>/dev/null)"
+GW_SSH_PORT="$(printf '%s' "$GW_JSON" | jq -r '.port // 22' 2>/dev/null)"
+REPAIR_LO="$(printf '%s' "$GW_JSON" | jq -r '.ports.repair[0] // empty' 2>/dev/null)"
+REPAIR_HI="$(printf '%s' "$GW_JSON" | jq -r '.ports.repair[1] // empty' 2>/dev/null)"
+if ! [[ "$GW_TUNNEL_USER" =~ ^[a-z_][a-z0-9_-]*$ ]]; then
+    log ERROR "NODE_GATEWAY.tunnel_user missing or odd — refusing to build a seed that cannot dial"
+    exit 1
+fi
+if ! [[ "$GW_SSH_PORT" =~ ^[1-9][0-9]*$ ]] || (( GW_SSH_PORT > 65535 )); then
+    log ERROR "NODE_GATEWAY.port is not a port ('${GW_SSH_PORT}') — refusing to build a seed that cannot dial"
+    exit 1
+fi
+if ! [[ "$REPAIR_LO" =~ ^[1-9][0-9]*$ ]] || ! [[ "$REPAIR_HI" =~ ^[1-9][0-9]*$ ]] || (( REPAIR_LO > REPAIR_HI )); then
+    log ERROR "NODE_GATEWAY.ports.repair is not a usable segment — refusing to guess one (interface: unreadable means refuse, never a fallback)"
+    exit 1
+fi
+log INFO "gateway: user ${GW_TUNNEL_USER}, ssh port ${GW_SSH_PORT}, repair segment ${REPAIR_LO}-${REPAIR_HI}"
+
+# The profile declares the login user and the template; this script only
+# renders them.
+LOGIN_USER="$(jq -r '.login_user // empty' "${PROFILE_DIR}/profile.json")"
+TEMPLATE_NAME="$(jq -r '.user_data_template // empty' "${PROFILE_DIR}/profile.json")"
+if ! [[ "$LOGIN_USER" =~ ^[a-z_][a-z0-9_-]*$ ]] || [[ -z "$TEMPLATE_NAME" || ! -f "${PROFILE_DIR}/${TEMPLATE_NAME}" ]]; then
+    log ERROR "${PROFILE_DIR}/profile.json must declare login_user and an existing user_data_template"
+    exit 1
+fi
+TEMPLATE="${PROFILE_DIR}/${TEMPLATE_NAME}"
+
+# Where the VM keeps its tunnel key: tunnel-identity.sh is the ONE definition
+# of that path (RUNBOOK §7.12), so ask it, with HOME set to the VM user's.
+TUNNEL_IDENTITY="${REPO_ROOT}/shared-configs/pool-runtime/files/tunnel-identity.sh"
+[[ -f "$TUNNEL_IDENTITY" ]] || { log ERROR "${TUNNEL_IDENTITY} missing — run this from a complete checkout"; exit 1; }
+VM_TUNNEL_KEY="$(HOME="/home/${LOGIN_USER}" bash -c '. "$1" >/dev/null 2>&1; printf "%s" "${TUNNEL_KEY:-}"' _ "$TUNNEL_IDENTITY")"
+if ! [[ "$VM_TUNNEL_KEY" =~ ^/home/${LOGIN_USER}/[A-Za-z0-9._/-]+$ ]]; then
+    log ERROR "could not derive the VM's tunnel key path from ${TUNNEL_IDENTITY} (got '${VM_TUNNEL_KEY}')"
+    exit 1
+fi
+
+# Everything below builds in a sandbox; $OUT is created only at assembly
+# time, so a refusal never leaves a half-written bundle behind.
+STAGE="$(mktemp -d "${TMPDIR:-/tmp}/package-repair-host.XXXXXX")"
+trap 'rm -rf "$STAGE"' EXIT INT TERM
+
+# validate_client_pubkey <public-key-line> — echoes the cleaned
+# "type blob comment" line, rc 0; rc 1 when malformed (known type, base64
+# blob, ssh-keygen agrees it is a key); a private key or a multi-line
+# value is malformed too.
+validate_client_pubkey() {
+    local _line="" _type="" _blob="" _comment="" _tmp=""
+    _line="$(printf '%s' "$1" | tr -d '\r')"
+    case "$_line" in *"PRIVATE KEY"*) return 1 ;; esac
+    if [[ "$(printf '%s\n' "$_line" | grep -c . || true)" != "1" ]]; then
+        return 1
+    fi
+    read -r _type _blob _comment <<< "$_line" || true
+    case "$_type" in
+        ssh-ed25519|ssh-rsa|ecdsa-sha2-*|sk-ssh-ed25519@openssh.com|sk-ecdsa-sha2-nistp256@openssh.com) ;;
+        *) return 1 ;;
+    esac
+    if ! [[ "$_blob" =~ ^[A-Za-z0-9+/]+=*$ ]]; then
+        return 1
+    fi
+    _tmp="${STAGE}/.client-key-check"
+    printf '%s\n' "$_line" > "$_tmp"
+    if ! ssh-keygen -l -f "$_tmp" >/dev/null 2>&1; then
+        return 1
+    fi
+    _comment="$(printf '%s' "${_comment:-}" | sed 's/[^A-Za-z0-9@._+-]/-/g')"
+    printf '%s' "${_type} ${_blob}${_comment:+ ${_comment}}"
+    return 0
+}
+
+# collect_client_keys — LOGIN_PUBKEYS_YAML becomes the YAML list items for
+# the template's ssh_authorized_keys: every usable CLIENT_* key (the
+# snapshot, minus CLIENT_ACTIONS which the listing filter already removed).
+# Each jq read is guarded: a value that is not JSON at all must skip THIS
+# entry with a WARN naming its variable — never kill the whole run (a bare
+# x=$(... | jq ...) on unparsable input exits the script with rc 5 and no
+# message under set -euo pipefail, taking down every good key with it).
+# Zero usable keys is a refusal — a VM nobody can log into is broken.
+CLIENT_GOOD=0
+CLIENT_SKIPPED=""
+LOGIN_PUBKEYS_YAML=""
+CLIENT_LISTING="$(printf '%s' "$VARS_RAW" | jq -r '.variables[]? | select(.name | startswith("CLIENT_")) | select(.name != "CLIENT_ACTIONS") | {name: .name, value: .value} | @json' 2>/dev/null)" || {
+    log ERROR "could not extract CLIENT_* from the variable listing"
+    exit 1
+}
+while read -r _cline; do
+    [[ -n "$_cline" ]] || continue
+    if ! _cvar="$(printf '%s' "$_cline" | jq -r '.name // empty' 2>/dev/null)" || [[ -z "$_cvar" ]]; then
+        log WARN "a CLIENT_* listing entry is not readable (not JSON or nameless) — skipping it"
+        CLIENT_SKIPPED="${CLIENT_SKIPPED}${CLIENT_SKIPPED:+, }?"
+        continue
+    fi
+    if ! _cval="$(printf '%s' "$_cline" | jq -r '.value // empty' 2>/dev/null)" || [[ -z "$_cval" ]]; then
+        log WARN "${_cvar}: listing entry has no value — skipping this entry"
+        CLIENT_SKIPPED="${CLIENT_SKIPPED}${CLIENT_SKIPPED:+, }${_cvar}"
+        continue
+    fi
+    if ! _cname="$(printf '%s' "$_cval" | jq -r '.name // empty' 2>/dev/null)"; then
+        log WARN "${_cvar}: value is not valid JSON — skipping this entry"
+        CLIENT_SKIPPED="${CLIENT_SKIPPED}${CLIENT_SKIPPED:+, }${_cvar}"
+        continue
+    fi
+    if ! _cpk="$(printf '%s' "$_cval" | jq -r '.public_key // empty' 2>/dev/null)"; then
+        log WARN "${_cvar}: value is not valid JSON — skipping this entry"
+        CLIENT_SKIPPED="${CLIENT_SKIPPED}${CLIENT_SKIPPED:+, }${_cvar}"
+        continue
+    fi
+    if _clean="$(validate_client_pubkey "$_cpk")" && [[ -n "$_clean" ]]; then
+        if [[ -z "$LOGIN_PUBKEYS_YAML" ]]; then
+            LOGIN_PUBKEYS_YAML="- \"${_clean}\""
+        else
+            LOGIN_PUBKEYS_YAML="${LOGIN_PUBKEYS_YAML}
+      - \"${_clean}\""
+        fi
+        CLIENT_GOOD=$((CLIENT_GOOD+1))
+    else
+        log WARN "${_cvar:-CLIENT_?} (client '${_cname:-unknown}'): public_key is not a valid ssh public key — skipping this entry"
+        CLIENT_SKIPPED="${CLIENT_SKIPPED}${CLIENT_SKIPPED:+, }${_cvar:-?}"
+    fi
+done <<< "$CLIENT_LISTING"
+if [[ "$CLIENT_GOOD" -eq 0 ]]; then
+    log ERROR "no usable CLIENT_* public keys found (skipped ${CLIENT_SKIPPED:-none listed}) — refusing to build boot data for a VM nobody can log into"
+    exit 1
+fi
+log INFO "login keys: ${CLIENT_GOOD} CLIENT_* snapshot key(s)${CLIENT_SKIPPED:+ (skipped: ${CLIENT_SKIPPED})}"
+
+TUNNEL_PRIV_B64="$(base64 < "${KEY_DIR}/id_tunnel" | tr -d '\n')"
+if [[ -z "$TUNNEL_PRIV_B64" ]]; then
+    log ERROR "could not read ${KEY_DIR}/id_tunnel"
+    exit 1
+fi
+
+# The VM-side tools the seed carries, one "<TEMPLATE TOKEN> <file>" per
+# line. tunnel-identity.sh was already required above, so it always passes
+# the loop below too; listing it here keeps embedding uniform.
+POOL_TUNNEL="${REPO_ROOT}/shared-configs/pool-runtime/files/pool-tunnel"
+EMBEDS="EMBED_POOL_TUNNEL_B64 ${POOL_TUNNEL}
+EMBED_TUNNEL_IDENTITY_B64 ${TUNNEL_IDENTITY}
+EMBED_REPAIR_TOKEN_GUARD_B64 ${PROFILE_DIR}/repair-token-guard
+EMBED_REPAIR_GATEWAY_FETCH_B64 ${PROFILE_DIR}/repair-gateway-fetch
+EMBED_REPAIR_GATEWAY_REPORT_B64 ${PROFILE_DIR}/repair-gateway-report
+EMBED_REPAIR_TUNNEL_LAUNCH_B64 ${PROFILE_DIR}/repair-tunnel-launch"
+
+# embed_b64 <file> — the file as one line of base64 (no line breaks, so it
+# drops into `content:` without touching the YAML).
+embed_b64() {
+    base64 < "$1" | tr -d '\n'
+}
+# Refuse now if any embedded file is missing or unreadable — before
+# anything is rendered. This seed goes to a family member's machine that
+# may not boot for the first time for weeks; a half-toolset seed built
+# today would only surface as a failed systemd unit on their VM.
+_embed_missing=""
+while read -r _tok _path; do
+    [[ -n "$_tok" ]] || continue
+    if [[ ! -f "$_path" || ! -r "$_path" ]]; then
+        log ERROR "${_path} is missing or unreadable — this checkout cannot build a repair-host bundle"
+        _embed_missing="${_embed_missing}${_embed_missing:+, }${_path##*/}"
+    fi
+done <<< "$EMBEDS"
+if [[ -n "$_embed_missing" ]]; then
+    log ERROR "refusing to build a repair-host bundle with a missing VM-side tool: ${_embed_missing} — rebuild from a complete checkout"
+    exit 1
+fi
+
+# render_token <text> <TOKEN> <value> — every @@TOKEN@@ replaced by value.
+#   Prefix/suffix removal only, no ${x//pat/rep}: bash 5.2's
+#   patsub_replacement turns '&' in a replacement into the matched text, and
+#   bash 3.2 does not; this way both shells produce the same bytes.
+render_token() {
+    local text="$1" tok="@@${2}@@" val="$3" out=""
+    while [[ "$text" == *"$tok"* ]]; do
+        out="${out}${text%%"$tok"*}${val}"
+        text="${text#*"$tok"}"
+    done
+    printf '%s' "${out}${text}"
+}
+
+rendered="$(cat "$TEMPLATE")"
+rendered="$(render_token "$rendered" LOGIN_USER "$LOGIN_USER")"
+# The authorized_keys list: the CLIENT_* snapshot. Multi-line on purpose —
+# render_token only does prefix/suffix removal, so newlines and '&' in key
+# material pass through byte-identical on bash 3.2 and 5.x alike.
+rendered="$(render_token "$rendered" LOGIN_PUBKEYS_YAML "$LOGIN_PUBKEYS_YAML")"
+rendered="$(render_token "$rendered" PROVIDER_PORT_RANGE "${REPAIR_LO},${REPAIR_HI}")"
+rendered="$(render_token "$rendered" GATEWAY_TUNNEL_USER "$GW_TUNNEL_USER")"
+rendered="$(render_token "$rendered" GATEWAY_SSH_PORT "$GW_SSH_PORT")"
+rendered="$(render_token "$rendered" GATEWAY_HOST "$GATEWAY_HOST_PLACEHOLDER")"
+rendered="$(render_token "$rendered" TUNNEL_KEY_PATH "$VM_TUNNEL_KEY")"
+rendered="$(render_token "$rendered" TUNNEL_PRIVATE_KEY_B64 "$TUNNEL_PRIV_B64")"
+while read -r _tok _path; do
+    [[ -n "$_tok" ]] || continue
+    rendered="$(render_token "$rendered" "$_tok" "$(embed_b64 "$_path")")"
+done <<< "$EMBEDS"
+if [[ "$rendered" =~ @@[A-Z_]+@@ ]]; then
+    log ERROR "${TEMPLATE} has a placeholder this script does not fill (${BASH_REMATCH[0]}) — template and generator are out of step"
+    exit 1
+fi
+printf '%s\n' "$rendered" > "${STAGE}/user-data"
+
+# Fixed identity: rebuilds of the same inputs must be byte-identical, so
+# the instance-id carries no timestamp and the hostname is the shared one.
+{
+    printf 'instance-id: %s\n' "$SHARED_INSTANCE_ID"
+    printf 'local-hostname: %s\n' "$SHARED_HOSTNAME"
+} > "${STAGE}/meta-data"
+
+# token_guard <file>... — D5, generator half: non-zero if any file holds
+#   something that looks like a GitHub token or the value of a token variable
+#   in this environment. Names the file, never the match. Values are compared
+#   in-shell, never passed as an argument (argv is visible in ps).
+token_guard() {
+    local f="" content="" v="" val="" hit=0
+    local re='(gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,})'
+    for f in "$@"; do
+        content="$(cat "$f")"
+        if [[ "$content" =~ $re ]]; then
+            log ERROR "${f##*/} contains something shaped like a GitHub token"
+            hit=1
+        fi
+        for v in GH_TOKEN GH_POOL_TOKEN GITHUB_TOKEN GH_ENTERPRISE_TOKEN GITHUB_ENTERPRISE_TOKEN; do
+            val="${!v:-}"
+            if [[ "${#val}" -ge 8 && "$content" == *"$val"* ]]; then
+                log ERROR "${f##*/} contains the value of \$${v}"
+                hit=1
+            fi
+        done
+    done
+    return "$hit"
+}
+# Positive control: prove the pattern matches on THIS shell's regex engine
+# before trusting a clean scan (bash 3.2 and 5.x use the platform's regcomp).
+# The canary is assembled at run time so no token-shaped literal sits in the
+# source.
+printf 'x %s x\n' "gh""p_$(printf '%036d' 0)" > "${STAGE}/.canary"
+if token_guard "${STAGE}/.canary" 2>/dev/null; then
+    log ERROR "the token guard cannot see a canary token on this shell — refusing to trust a clean scan"
+    exit 1
+fi
+rm -f "${STAGE}/.canary"
+if ! token_guard "${STAGE}/user-data" "${STAGE}/meta-data"; then
+    log ERROR "refusing to produce boot data that carries a GitHub token (spec: 維修承載機不持有 GitHub 權杖)"
+    exit 1
+fi
+
+# Optional sanity parse: a malformed user-data makes cloud-init skip the whole
+# file on the VM, which nobody would see until the family is waiting.
+if command -v python3 >/dev/null 2>&1 && python3 -c 'import yaml' >/dev/null 2>&1; then
+    if ! python3 -c 'import sys,yaml; d=yaml.safe_load(open(sys.argv[1])); sys.exit(0 if isinstance(d, dict) else 1)' \
+            "${STAGE}/user-data" >/dev/null 2>&1; then
+        log ERROR "rendered user-data is not valid YAML — not writing it"
+        exit 1
+    fi
+fi
+
+# build_seed_iso <dir-with-user-data-and-meta-data> <iso> — NoCloud wants
+#   volume label "cidata". hdiutil is the Mac's own; genisoimage/mkisofs/
+#   xorriso cover Linux. No tool or a failed build = warn and continue
+#   WITHOUT seed.iso (the installer refuses a bundle without it, loudly,
+#   at install time — better than a half-burned ISO nobody can diagnose).
+build_seed_iso() {
+    local src="$1" iso="$2"
+    rm -f "$iso"
+    if command -v hdiutil >/dev/null 2>&1; then
+        hdiutil makehybrid -quiet -iso -joliet -default-volume-name cidata -o "$iso" "$src" >/dev/null 2>&1
+    elif command -v genisoimage >/dev/null 2>&1; then
+        genisoimage -quiet -output "$iso" -volid cidata -joliet -rock "$src/user-data" "$src/meta-data" >/dev/null 2>&1
+    elif command -v mkisofs >/dev/null 2>&1; then
+        mkisofs -quiet -output "$iso" -volid cidata -joliet -rock "$src/user-data" "$src/meta-data" >/dev/null 2>&1
+    elif command -v xorriso >/dev/null 2>&1; then
+        xorriso -as mkisofs -quiet -output "$iso" -volid cidata -joliet -rock "$src/user-data" "$src/meta-data" >/dev/null 2>&1
+    else
+        return 10
+    fi
+}
+HAVE_ISO=0
+mkdir "${STAGE}/iso-src"
+cp "${STAGE}/user-data" "${STAGE}/meta-data" "${STAGE}/iso-src/"
+iso_rc=0
+build_seed_iso "${STAGE}/iso-src" "${STAGE}/seed.iso" || iso_rc=$?
+if [[ "$iso_rc" -eq 0 && -s "${STAGE}/seed.iso" ]]; then
+    HAVE_ISO=1
+elif [[ "$iso_rc" -eq 10 ]]; then
+    log WARN "no ISO tool found (hdiutil/genisoimage/mkisofs/xorriso) — bundle ships user-data/meta-data without seed.iso; the installer will refuse it until you build the ISO"
+else
+    log WARN "building seed.iso failed (rc ${iso_rc}) — bundle ships user-data/meta-data without seed.iso"
+    rm -f "${STAGE}/seed.iso"
+fi
+rm -rf "${STAGE}/iso-src"
+
+# ---- build --------------------------------------------------------------------
+VM_NAME="mlp-repair-host"
+VBOX_EXE="VirtualBox-${VBOX_V}-${VBOX_BUILD}-Win.exe"
+VBOX_URL="https://download.virtualbox.org/virtualbox/${VBOX_V}/${VBOX_EXE}"
+
+mkdir -p "$OUT"
+cp "${PROFILE_DIR}/Install.cmd" "${PROFILE_DIR}/Install-RepairHost.ps1" "${PROFILE_DIR}/Start-RepairLauncher.ps1" "$OUT/"
+cp "${STAGE}/user-data" "${STAGE}/meta-data" "$OUT/"
+if [[ "$HAVE_ISO" -eq 1 ]]; then
+    cp "${STAGE}/seed.iso" "$OUT/"
+fi
+if [[ "$INCLUDE_IMAGE" -eq 1 ]]; then
+    cp "$IMAGE_FILE" "$OUT/${IMAGE_BASENAME}"
+fi
+
+# repair-config.json: everything the two .ps1 need without asking the family.
+# Contact/image/vbox values are pinned at PACK time, so the installer checks
+# against today's known-good, not against whatever the network says later.
+# vmName is fixed, there is deliberately NO nodeName (one bundle, no PC).
+jq -n \
+    --arg vm "$VM_NAME" \
+    --argjson d2port 18080 \
+    --argjson downto 300 \
+    --arg contact "$CONTACT" \
+    --arg imgfile "$IMAGE_BASENAME" \
+    --arg imgurl "$IMAGE_URL" \
+    --arg imgsha "$IMAGE_SHA" \
+    --arg vboxv "$VBOX_V" \
+    --arg vboxexe "$VBOX_EXE" \
+    --arg vboxurl "$VBOX_URL" \
+    --arg vboxsha "$VBOX_SHA" \
+    --argjson rlo "$REPAIR_LO" \
+    --argjson rhi "$REPAIR_HI" \
+    --argjson gwport "$GW_SSH_PORT" \
+    '{vmName: $vm, d2Port: $d2port, downTimeoutSec: $downto,
+      contactName: $contact,
+      image: {file: $imgfile, url: $imgurl, sha256: $imgsha},
+      vbox: {version: $vboxv, installer: $vboxexe, url: $vboxurl, sha256: $vboxsha},
+      ports: {repair: [$rlo, $rhi]},
+      gatewaySshPort: $gwport}' \
+    > "$OUT/repair-config.json"
+# BOM first: the contact name is usually Chinese, and PowerShell 5.1's
+# Get-Content without -Encoding decodes as ANSI. The .ps1 readers ask for
+# UTF8 explicitly, which is BOM-aware, but the BOM also keeps Notepad on
+# the family machine from showing mojibake if anyone opens the file by hand.
+_bom_tmp="${OUT}/.repair-config.bom"
+printf '\xef\xbb\xbf' | cat - "$OUT/repair-config.json" > "$_bom_tmp"
+mv -f "$_bom_tmp" "$OUT/repair-config.json"
+
+cat > "$OUT/README-FAMILY.txt" <<EOF
+維修連線（給家人的四行）：
+1. 點兩下 Install.cmd（不是那個 .ps1——直接點 .ps1 只會打開編輯器，不會安裝），跳出詢問按「是」（只問這一次），等它說「安裝完成」（原來的視窗會停著等你按任意鍵關掉）。
+2. 之後每次：在桌面點兩下「維修連線」，輸入名字與 IP，按確定。
+3. 出現「維修連線中」的視窗就放著不要關；修好或不想修時，把視窗關掉就斷線了。
+連不上（等很久還是顯示連不上）就向 ${CONTACT} 要新的 IP（名字不用換，它會記住上次的）。
+拿到新的安裝包（換金鑰）時：先關掉「維修連線」的視窗，再點一次 Install.cmd，它會把舊的整台換成新的。
+EOF
+
+# MANIFEST.sha256 covers every file but itself, so the owner can re-verify a
+# bundle that came back (or sat in chat history) before handing it out again.
+MANIFEST_FILES="Install.cmd Install-RepairHost.ps1 Start-RepairLauncher.ps1 repair-config.json README-FAMILY.txt user-data meta-data"
+if [[ "$HAVE_ISO" -eq 1 ]]; then
+    MANIFEST_FILES="${MANIFEST_FILES} seed.iso"
+fi
+if [[ "$INCLUDE_IMAGE" -eq 1 ]]; then
+    MANIFEST_FILES="${MANIFEST_FILES} ${IMAGE_BASENAME}"
+fi
+(
+    cd "$OUT"
+    # shellcheck disable=SC2086
+    if command -v shasum >/dev/null 2>&1; then
+        shasum -a 256 ${MANIFEST_FILES} > MANIFEST.sha256
+    else
+        sha256sum ${MANIFEST_FILES} > MANIFEST.sha256
+    fi
+)
+
+# ---- report ---------------------------------------------------------------------
+# The whole bundle is a secret (tunnel private key inside), so the directory
+# itself is locked to the owner — the threat is not the local disk (it
+# travels over chat/mail) but a shared machine it gets unpacked on.
+chmod 700 "$OUT"
+echo
+echo "package-repair-host: shared bundle (one for the whole family)"
+echo "  bundle             ${OUT}/ (mode 700 — secret, do not unpack on a shared machine)"
+echo "  vm                 ${VM_NAME} (data dir on Windows: %LOCALAPPDATA%\\MyLinuxPool\\repair-host)"
+echo "  tunnel key         from ${KEY_DIR}/id_tunnel (shared)"
+echo "  login keys         ${CLIENT_GOOD} CLIENT_* snapshot key(s)${CLIENT_SKIPPED:+ (skipped: ${CLIENT_SKIPPED})}"
+echo "  gateway            user ${GW_TUNNEL_USER}, ssh port ${GW_SSH_PORT}, repair segment ${REPAIR_LO}-${REPAIR_HI}"
+echo "  image              ${IMAGE_BASENAME} ($(if [[ "$INCLUDE_IMAGE" -eq 1 ]]; then echo "INCLUDED"; else echo "download at install, SHA pinned"; fi))"
+echo "  image sha256       ${IMAGE_SHA}"
+echo "  image SHA256SUMS   https://cloud-images.ubuntu.com/noble/current/SHA256SUMS (today's ${IMAGE_BASENAME} hash lives here)"
+echo "  virtualbox         ${VBOX_V} build ${VBOX_BUILD} (download at install if missing, SHA pinned)"
+echo "  vbox listing       https://download.virtualbox.org/virtualbox/${VBOX_V}/ (its SHA256SUMS must match --vbox-sha256)"
+echo "  contact            ${CONTACT}"
+if [[ "$HAVE_ISO" -eq 0 ]]; then
+    echo "  seed.iso         MISSING (no ISO tool) — installer will refuse this bundle until you build seed.iso from user-data + meta-data"
+fi
+log WARN "this bundle holds a tunnel PRIVATE key (seed.iso, user-data) — send it as a secret, delete it from chat history if you can"
+if [[ "$INCLUDE_IMAGE" -eq 0 ]]; then
+    echo "  family needs      network on install day (one ~600MB download + ~100MB VirtualBox if missing)"
+fi

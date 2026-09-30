@@ -1,0 +1,53 @@
+#!/usr/bin/env bash
+# repair-gateway-report — the "report" half of design D2 (openspec/changes/
+# family-repair-host): tell the Windows launcher whether the tunnel is up.
+#
+#   repair-gateway-report up|down
+#
+# POST http://${MLP_D2_HOST}:${MLP_D2_PORT}/state with the form body
+# `tunnel=up` or `tunnel=down`. The launcher uses it to show the family a
+# message they can act on ("連不上，請向使用者索取新的 IP", spec "失敗時家人
+# 看得懂該做什麼") instead of a window that looks fine while nothing works.
+#
+# Environment: MLP_D2_HOST (default 10.0.2.2), MLP_D2_PORT (default 18080),
+# MLP_D2_TIMEOUT (default 3 seconds) — the same service repair-gateway-fetch
+# asks.
+#
+# Exit 0 for every network outcome (no launcher, timeout, HTTP error): this
+# is a diagnostic side channel, and a report that cannot be delivered must
+# never slow down or fail the tunnel that it reports on. Exit 2 only for a
+# wrong argument, which is a bug in the caller, not a network condition.
+#
+# Limitations (honest list):
+#   * Fire and forget: nothing is retried or queued. A launcher that starts
+#     listening late misses the reports sent before it did; the next state
+#     change (or the next failed attempt, which reports down again) is the
+#     next chance.
+#   * Only up/down. Why it is down (rejected key, wrong IP, no network) is in
+#     the VM's journal, not in the report.
+#   * Unauthenticated, like the fetch: another local program on the family's
+#     machine could post a fake state to the launcher.
+#   * bash 3.2 compatible because the tests run it on the owner's Mac.
+set -uo pipefail
+
+case "${1:-}" in
+    up|down) state="$1" ;;
+    *)
+        echo "usage: repair-gateway-report up|down" >&2
+        exit 2
+        ;;
+esac
+
+D2_HOST="${MLP_D2_HOST:-10.0.2.2}"
+D2_PORT="${MLP_D2_PORT:-18080}"
+D2_TIMEOUT="${MLP_D2_TIMEOUT:-3}"
+# Same shape checks as repair-gateway-fetch; a bad knob means "say nothing",
+# never "post somewhere unexpected".
+[[ "$D2_HOST" =~ ^[A-Za-z0-9][A-Za-z0-9.-]*$ ]] || exit 0
+[[ "$D2_PORT" =~ ^[1-9][0-9]{0,4}$ ]] || exit 0
+[[ "$D2_TIMEOUT" =~ ^[1-9][0-9]{0,2}$ ]] || D2_TIMEOUT=3
+
+# --data makes it a POST with a form body; the body holds nothing secret.
+curl -fsS --noproxy '*' --max-time "$D2_TIMEOUT" -o /dev/null \
+    --data "tunnel=${state}" "http://${D2_HOST}:${D2_PORT}/state" </dev/null >/dev/null 2>&1 || true
+exit 0
