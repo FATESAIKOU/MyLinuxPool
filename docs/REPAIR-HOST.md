@@ -53,6 +53,8 @@ done
 
 ## 2. 打包交給家人
 
+⚠️ **一個包只給一台電腦。**同一個包裡的名字、port 與隧道金鑰是同一組；裝在兩台電腦上同時開的話，先連上的那台佔住 Gateway 的 port，另一台會一直重試，而 `mlp ssh <名字>` 連到哪一台由誰先連上決定，你無法指定。第二位家人（或同一位家人的第二台電腦）要另外跑一次 §1 的登錄，用不同的名字與 port。
+
 ```bash
 bash ops-scripts/package-repair-host --name <名字> --seed-dir <上面的 seed 目錄> \
     --out <bundle 目錄> --image-sha256 <當日 SHA> --contact-name <家人怎麼稱呼你>

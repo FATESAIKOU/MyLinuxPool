@@ -20,6 +20,7 @@
 |---|---|---|
 | 登錄後 `mlp state` 顯示 `only in master: <name>` | 登錄指令不會推送 Gateway 上的 state 快取；下一次 create／delete／rotate 推送時才會一致 | register-provider 也一樣；不影響隧道與登入 |
 | Gateway rotate 後家人要重新輸入 IP | 啟動器在連不上約 5 分鐘後顯示「連不上，請向使用者索取新的 IP」 | 沒有不隨 rotate 改變的名稱（DDNS 已廢） |
+| 同一個安裝包裝在兩台電腦上同時開 | 兩台共用同一個名字、port 與隧道金鑰：先連上的佔住 Gateway 的 port，後開的會一直收到 `remote port forwarding failed` 並每 10～60 秒重試（不會被 fail2ban 封，因為登入本身成功）。`mlp ssh <name>` 連到的是佔著 port 的那一台，無法指定；前一台斷線後，後一台約一分鐘內會接手 | 使用方式是一台電腦一個包（每位家人各自 `register-repair-host`）；沒有機制擋，只寫在文件裡 |
 | 登錄時的 port 檢查沒有鎖 | 兩個人同時登錄同一個 port 都會通過 | 只有使用者一個人會登錄 |
 | 關閉 VM 的路徑 | 按 X、Alt+F4、PowerShell 結束都會送 ACPI 關機；用工作管理員強制結束或斷電則不會，下次啟動會沿用還在跑的 VM | 系統層級的強制終止攔不到 |
 | 重試節奏依賴 fail2ban 的預設值 | 被拒後等 310 秒，任何 10 分鐘內最多 2 次；Gateway 若日後改成更嚴的 fail2ban 設定（例如 recidive、maxretry 3），要重新檢查 | 目前的設定就是預設值 |
