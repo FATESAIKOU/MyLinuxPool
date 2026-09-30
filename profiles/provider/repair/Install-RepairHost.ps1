@@ -6,13 +6,14 @@
 # asks UAC for elevation a single time ("UAC 按一次「是」"), then:
 #   1. makes sure VirtualBox is installed (pinned version, SHA256-verified
 #      download when missing),
-#   2. puts the image + boot data into a FIXED per-user folder and locks that
+#   2. puts the image + boot data into a FIXED per-user folder
+#      (%LOCALAPPDATA%\MyLinuxPool\repair-host) and locks that
 #      folder down,
-#   3. creates the VM (NAT, no port forward, localhostreachable on, serial
-#      log, boot data attached),
-#   4. drops a desktop shortcut for the launcher.
+#   3. creates the VM (named mlp-repair-host; NAT, no port forward,
+#      localhostreachable on, serial log, boot data attached),
+#   4. drops a desktop shortcut ("維修連線") for the launcher.
 #
-# Why %LOCALAPPDATA%\MyLinuxPool\<node> and not C:\mlp-*: the live acceptance
+# Why %LOCALAPPDATA%\MyLinuxPool\repair-host and not C:\mlp-*: the live acceptance
 # left seed.iso under C:\, which inherits C:\Users ReadAndExecute — every
 # local user could read the tunnel private key (OUT-live-repair.md §6 意外 3).
 # A folder under the user's own profile is private by default; the icacls
@@ -53,7 +54,6 @@
 #   * Installer downloads are NOT resumed; a broken download is deleted and
 #     reported, never kept.
 param(
-    [string]$NodeName = "",
     [string]$PackageDir = "",
     [string]$DataDir = "",
     [string]$ImageSource = "",
@@ -106,7 +106,6 @@ if (-not (Test-IsAdmin)) {
     # Re-launch OURSELVES elevated with the same arguments. Quoting is done
     # per-element so a path with spaces survives the round trip.
     $argList = @('-ExecutionPolicy', 'Bypass', '-File', ("`"{0}`"" -f $PSCommandPath))
-    if ($NodeName -ne '') { $argList += @('-NodeName', ("`"{0}`"" -f $NodeName)) }
     if ($PackageDir -ne '') { $argList += @('-PackageDir', ("`"{0}`"" -f $PackageDir)) }
     if ($DataDir -ne '') { $argList += @('-DataDir', ("`"{0}`"" -f $DataDir)) }
     if ($ImageSource -ne '') { $argList += @('-ImageSource', ("`"{0}`"" -f $ImageSource)) }
@@ -140,14 +139,12 @@ if (Test-Path $ConfigPath) {
     Write-Host '找不到 repair-config.json（安裝包不完整）。請向提供安裝包的人反映。'
     exit 1
 }
-if ($NodeName -eq '') { $NodeName = $cfg.nodeName }
-if (($NodeName -eq $null) -or ($NodeName -eq '')) {
-    Write-Host '安裝包沒有寫節點名稱。請向提供安裝包的人反映。'
-    exit 1
-}
-$VmName = $cfg.vmName
-if (($VmName -eq $null) -or ($VmName -eq '')) { $VmName = ("mlp-repair-{0}" -f $NodeName) }
-if ($DataDir -eq '') { $DataDir = Join-Path $env:LOCALAPPDATA ("MyLinuxPool\{0}" -f $NodeName) }
+# No per-node name in this world (EPHEMERAL-INTERFACE.md item 9): one shared
+# bundle for the whole family, installed once per PC. config nodeName/vmName
+# from old per-node bundles are ignored on purpose — the package-repair-host
+# redesign (another ticket) removes them at the source.
+$VmName = 'mlp-repair-host'
+if ($DataDir -eq '') { $DataDir = Join-Path $env:LOCALAPPDATA 'MyLinuxPool\repair-host' }
 # The log file's directory must exist BEFORE the first Write-Log below: with
 # $ErrorActionPreference='Stop', Add-Content into a missing directory throws
 # and the whole install dies on its very first line (review finding — a
@@ -156,7 +153,7 @@ if ($DataDir -eq '') { $DataDir = Join-Path $env:LOCALAPPDATA ("MyLinuxPool\{0}"
 New-Item -ItemType Directory -Path $DataDir -Force | Out-Null
 $script:InstallLog = Join-Path $DataDir 'install.log'
 
-Write-Log ("installing node={0} vm={1} to {2}" -f $NodeName, $VmName, $DataDir)
+Write-Log ("installing vm={0} to {1}" -f $VmName, $DataDir)
 
 # ---- VirtualBox --------------------------------------------------------------------
 function Find-VBoxManage {
@@ -386,7 +383,7 @@ Write-Log 'VM verified: NAT, no forwards, localhostreachable=true, seed attached
 # in launcher.log / launcher-http.log inside the data dir.
 $desktop = [Environment]::GetFolderPath('Desktop')
 $shell = New-Object -ComObject 'WScript.Shell'
-$lnk = $shell.CreateShortcut((Join-Path $desktop ("維修連線 ({0}).lnk" -f $NodeName)))
+$lnk = $shell.CreateShortcut((Join-Path $desktop '維修連線.lnk'))
 $lnk.TargetPath = 'powershell.exe'
 $lnk.Arguments = ('-WindowStyle Hidden -ExecutionPolicy Bypass -File "{0}"' -f (Join-Path $DataDir 'Start-RepairLauncher.ps1'))
 $lnk.WorkingDirectory = $DataDir
@@ -396,6 +393,6 @@ Write-Log ("shortcut on desktop: {0}" -f $lnk.FullName)
 
 Write-Host ''
 Write-Host '安裝完成！'
-Write-Host ("以後要用時，在桌面點兩下「維修連線 ({0})」，輸入 IP 就可以了。" -f $NodeName)
+Write-Host '以後要用時，在桌面點兩下「維修連線」，輸入名字與 IP 就可以了。'
 Write-Host '（維修時會跳出一個「維修連線中」的視窗，關掉它就斷線。）'
 exit 0

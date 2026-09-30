@@ -7,11 +7,13 @@
 # would not find the installed VM).
 #
 # What it does, in order:
-#   1. Asks for the Gateway IP, offering the last one as the default
-#      (stored in gateway-ip.txt next to this script; plain text, not secret).
-#   2. Serves it on http://127.0.0.1:<d2Port>/gw and takes tunnel=up|down
-#      on POST /state — the exact contract repair-gateway-fetch and
-#      repair-gateway-report expect (defaults 10.0.2.2:18080 seen through NAT).
+#   1. Asks for the Gateway IP and this PC's repair name, offering the last
+#      ones as the defaults (stored in gateway-ip.txt / launcher-name.txt
+#      next to this script; plain text, not secret).
+#   2. Serves them on http://127.0.0.1:<d2Port>/gw (two lines: the IP, then
+#      name=<name>) and takes tunnel=up|down on POST /state — the exact
+#      contract repair-gateway-fetch and repair-gateway-report expect
+#      (defaults 10.0.2.2:18080 seen through NAT).
 #   3. Boots the VM headless, shows a "維修連線中，關掉此視窗即中斷" window
 #      whose status follows the VM's reports, and sends acpipowerbutton when
 #      the window closes.
@@ -43,13 +45,13 @@
 # unattended tunnel is worse than an unclean shutdown (ext4 journals).
 #
 # Exit codes: 0 ok (window closed and VM is off, or -NoWindow flow clean);
-#   1 cancelled at the IP prompt or a usage error; 2 VirtualBox/VM missing
+#   1 cancelled at the IP/name prompt or a usage error; 2 VirtualBox/VM missing
 #   (run Install first); 3 D2 port taken; 4 VM failed to start.
 #
 # Limitations (honest list):
 #   * PowerShell 5.1 + .NET WinForms only. No window can appear over ssh
-#     (session 0); use -NoWindow -GatewayIp <ip> -RunSeconds <n> there — it
-#     runs the same listener + boot + shutdown flow without any GUI.
+#     (session 0); use -NoWindow -GatewayIp <ip> -RepairName <name> -RunSeconds <n>
+#     there — it runs the same listener + boot + shutdown flow without any GUI.
 #   * The window cannot tell "wrong IP" from "no network" from "rejected
 #     key": the VM only reports up/down. After downTimeoutSec of never-up the
 #     family is told to ask the owner for a new IP, whatever the cause.
@@ -65,6 +67,7 @@
 #     it — the next launch then finds the VM running and reuses it.
 param(
     [string]$GatewayIp = "",
+    [string]$RepairName = "",
     [switch]$NoWindow,
     [int]$RunSeconds = 0,
     [string]$DataDir = "",
@@ -76,7 +79,23 @@ $ErrorActionPreference = 'Stop'
 # Strict IPv4, byte-identical in spirit to repair-gateway-fetch: four decimal
 # octets 0-255, no leading zeros (glibc reads 010 as octal), so an answer can
 # never smuggle an option ("-oProxyCommand=") or a newline into ssh's argv.
-$IPV4_PATTERN = '^(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])\.(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])\.(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])\.(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])$'
+# Tail is \z for the same trailing-LF reason as the name pattern below.
+$IPV4_PATTERN = '^(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])\.(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])\.(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])\.(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])\z'
+
+# Repair name rule (EPHEMERAL-INTERFACE.md item 3: 1-32 char hostname label).
+# Checked on BOTH ends (here and repair-gateway-fetch); the VM refuses to
+# dial when either line of /gw fails its format, so a bad name can never
+# smuggle an option or a newline into ssh's argv.
+# The tail is \z, not $: .NET `$` also matches before a trailing LF, so
+# "dad-pc`n" would pass with $. The interface text keeps `$` (bash has no
+# \z); on LF-free input the two accept the same language, and every entry
+# point below Trims first, so both ends always agree.
+$REPAIR_NAME_PATTERN = '^[a-z]([a-z0-9-]{0,30}[a-z0-9])?\z'
+
+# Trim parameters up front (same $/LF reason as above; "$x" also turns an
+# explicit $null into "").
+$GatewayIp = "$GatewayIp".Trim()
+$RepairName = "$RepairName".Trim()
 
 function Write-Log([string]$m) {
     $line = '{0} {1}' -f (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ'), $m
@@ -148,11 +167,37 @@ function Prompt-GatewayIp([string]$defaultIp) {
     return $ans
 }
 
+function Test-RepairName([string]$n) {
+    # Interface item 3 (tail \z, see above). Same pattern the VM side
+    # enforces; keep the two in sync (see the Windows got in OUT-*).
+    # -cmatch, not -match: PowerShell -match is case-insensitive, so 'Dad-pc'
+    # would pass here while the VM side (case-sensitive) refuses to dial —
+    # the family would be stuck re-entering a name that can never work.
+    return ($n -cmatch $REPAIR_NAME_PATTERN)
+}
+
+function Prompt-RepairName([string]$defaultName) {
+    # A GUI box for the family; ssh/test callers pass -RepairName instead.
+    $prompt = '請輸入這台電腦的名字（向家人服務的聯絡人索取；小寫英文開頭，後面可加小寫英文、數字或 -，例如 dad-pc）：'
+    try {
+        Add-Type -AssemblyName 'Microsoft.VisualBasic' -ErrorAction Stop
+        $ans = [Microsoft.VisualBasic.Interaction]::InputBox($prompt, '維修連線', $defaultName)
+    } catch {
+        # No GUI (ssh session 0): fall back to the console, same as the IP prompt.
+        if ($defaultName -ne '') { $prompt = '{0} [預設 {1}]：' -f $prompt, $defaultName }
+        else { $prompt = '{0}：' -f $prompt }
+        $ans = Read-Host $prompt
+        if (($ans -eq '') -and ($defaultName -ne '')) { $ans = $defaultName }
+    }
+    return $ans
+}
+
 # ---- resolve locations and config -------------------------------------------
 if ($DataDir -eq '') { $DataDir = $PSScriptRoot }
 $script:DataDir = $DataDir
 $ConfigPath = Join-Path $DataDir 'repair-config.json'
 $IpPath = Join-Path $DataDir 'gateway-ip.txt'
+$NamePath = Join-Path $DataDir 'launcher-name.txt'
 $StatePath = Join-Path $DataDir 'launcher-state.txt'
 $HttpLogPath = Join-Path $DataDir 'launcher-http.log'
 $StopFile = Join-Path $DataDir 'listener-stop.txt'
@@ -164,12 +209,14 @@ if (Test-Path $ConfigPath) {
     try { $cfg = Get-Content -Path $ConfigPath -Raw -Encoding UTF8 | ConvertFrom-Json }
     catch { Write-Host ("repair-config.json 讀不懂（{0}），用內建預設值繼續。" -f $_.Exception.Message) }
 }
-$VmName = 'mlp-repair-vm'
+# Fixed VM name (EPHEMERAL-INTERFACE.md item 9): one shared bundle for the
+# whole family, installed once per PC. The installer builds exactly this
+# name; a cfg.vmName from an old per-node bundle is ignored on purpose.
+$VmName = 'mlp-repair-host'
 $Port = 18080
 $DownTimeoutSec = 300
 $ContactName = '使用者'
 if ($cfg) {
-    if ($cfg.vmName) { $VmName = $cfg.vmName }
     if ($cfg.d2Port) { $Port = [int]$cfg.d2Port }
     if ($cfg.downTimeoutSec) { $DownTimeoutSec = [int]$cfg.downTimeoutSec }
     if ($cfg.contactName) { $ContactName = $cfg.contactName }
@@ -223,20 +270,56 @@ if ($GatewayIp -notmatch $IPV4_PATTERN) {
 Set-Content -Path $IpPath -Value $GatewayIp -Encoding ASCII
 Write-Log ("serving Gateway IP {0} for VM {1}" -f $GatewayIp, $VmName)
 
+# ---- Repair name (ask, defaulting to last time; interface item 3) ------------
+if ($RepairName -eq '') {
+    if ($NoWindow) {
+        # ssh/test mode never prompts: take the remembered name or refuse.
+        $t = (Get-Content -Path $NamePath -TotalCount 1 -ErrorAction SilentlyContinue)
+        if (($t -ne $null) -and (Test-RepairName $t.Trim())) { $RepairName = $t.Trim() }
+        if ($RepairName -eq '') {
+            Write-Host '缺少名字：請加 -RepairName 參數（例如 -RepairName dad-pc），或先正常啟動一次記住名字。這行只有測試會看到，家人點捷徑不會看到。'
+            exit 1
+        }
+    } else {
+        $lastName = ''
+        $t = (Get-Content -Path $NamePath -TotalCount 1 -ErrorAction SilentlyContinue)
+        if (($t -ne $null) -and (Test-RepairName $t.Trim())) { $lastName = $t.Trim() }
+        while ($true) {
+            $RepairName = Prompt-RepairName $lastName
+            if (($RepairName -eq $null) -or ($RepairName.Trim() -eq '')) {
+                Write-Host '已取消（沒有輸入名字）。'
+                exit 1
+            }
+            $RepairName = $RepairName.Trim()
+            if (Test-RepairName $RepairName) { break }
+            $msg = ("「{0}」不能當名字：要用小寫英文開頭，後面只能有小寫英文、數字或 -，共 1 到 32 個字（例如 dad-pc）。請重輸一次。" -f $RepairName)
+            try { Add-Type -AssemblyName 'System.Windows.Forms'; [System.Windows.Forms.MessageBox]::Show($msg, '維修連線') | Out-Null }
+            catch { Write-Host $msg }
+        }
+    }
+}
+if (-not (Test-RepairName $RepairName)) {
+    Write-Host ("「{0}」不能當名字：要用小寫英文開頭，後面只能有小寫英文、數字或 -，共 1 到 32 個字（例如 dad-pc）。" -f $RepairName)
+    exit 1
+}
+Set-Content -Path $NamePath -Value $RepairName -Encoding ASCII
+Write-Log ("repair name {0} for VM {1}" -f $RepairName, $VmName)
+
 # ---- D2 listener job (the launcher side of design D2) -------------------------
 # Self-contained on purpose: a job is a fresh process, it cannot see the
-# parent's functions. Protocol: GET /gw -> the IPv4 as plain text (what
-# repair-gateway-fetch parses); POST /state -> 200 'ok', and tunnel=up|down
+# parent's functions. Protocol: GET /gw -> TWO lines (EPHEMERAL-INTERFACE.md
+# item 4): the IPv4, then `name=<repair name>` (what repair-gateway-fetch
+# parses into gateway.env); POST /state -> 200 'ok', and tunnel=up|down
 # updates the state file (what repair-gateway-report sends). Else 404.
 $ListenerBlock = {
-    param([int]$Port, [string]$ServeIp, [string]$StateFile, [string]$LogFile, [string]$StopFile)
+    param([int]$Port, [string]$ServeIp, [string]$ServeName, [string]$StateFile, [string]$LogFile, [string]$StopFile)
     $ErrorActionPreference = 'Stop'
     function L([string]$m) {
         $line = '{0} {1}' -f (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ'), $m
         Add-Content -Path $LogFile -Value $line -Encoding UTF8
     }
     function Save-State([string]$last, [string]$lastUtc, [string]$fetchUtc, [int]$fetches) {
-        $content = "SERVED_IP={0}`r`nLAST_STATE={1}`r`nLAST_STATE_UTC={2}`r`nLAST_FETCH_UTC={3}`r`nFETCH_COUNT={4}`r`n" -f $ServeIp, $last, $lastUtc, $fetchUtc, $fetches
+        $content = "SERVED_IP={0}`r`nREPAIR_NAME={1}`r`nLAST_STATE={2}`r`nLAST_STATE_UTC={3}`r`nLAST_FETCH_UTC={4}`r`nFETCH_COUNT={5}`r`n" -f $ServeIp, $ServeName, $last, $lastUtc, $fetchUtc, $fetches
         $tmp = "$StateFile.tmp"
         Set-Content -Path $tmp -Value $content -Encoding ASCII
         Move-Item -Path $tmp -Destination $StateFile -Force
@@ -252,7 +335,7 @@ $ListenerBlock = {
     }
     $last = 'none'; $lastUtc = ''; $fetchUtc = ''; $fetches = 0
     Save-State $last $lastUtc $fetchUtc $fetches
-    L ("listening on http://127.0.0.1:{0}/ serving gw={1} pid={2}" -f $Port, $ServeIp, $PID)
+    L ("listening on http://127.0.0.1:{0}/ serving gw={1} name={2} pid={3}" -f $Port, $ServeIp, $ServeName, $PID)
     # A stale stop signal from a previous run must not kill this one.
     Remove-Item -Path $StopFile -Force -ErrorAction SilentlyContinue
     try {
@@ -278,7 +361,7 @@ $ListenerBlock = {
             }
             $code = 404; $out = 'not found'
             if (($rq.HttpMethod -eq 'GET') -and ($rq.Url.AbsolutePath -eq '/gw')) {
-                $code = 200; $out = $ServeIp
+                $code = 200; $out = ("{0}`r`nname={1}" -f $ServeIp, $ServeName)
                 $fetches = $fetches + 1
                 $fetchUtc = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
                 Save-State $last $lastUtc $fetchUtc $fetches
@@ -298,7 +381,7 @@ $ListenerBlock = {
 }
 
 if (Test-Path $StatePath) { Remove-Item -Path $StatePath -Force -ErrorAction SilentlyContinue }
-$job = Start-Job -ScriptBlock $ListenerBlock -ArgumentList $Port, $GatewayIp, $StatePath, $HttpLogPath, $StopFile
+$job = Start-Job -ScriptBlock $ListenerBlock -ArgumentList $Port, $GatewayIp, $RepairName, $StatePath, $HttpLogPath, $StopFile
 Start-Sleep -Seconds 2
 if ($job.State -ne 'Running') {
     # The child died at once — almost always "port in use". Do NOT hop to
@@ -310,14 +393,16 @@ if ($job.State -ne 'Running') {
     Write-Log ("listener failed at once: {0}" -f $reason.Trim())
     exit 3
 }
-# Prove WE serve the right bytes before the VM asks (its parser is strict).
+# Prove WE serve the right bytes before the VM asks (its parser is strict):
+# the same two-line contract the VM parses (interface item 4).
 try {
     $probe = Invoke-WebRequest -Uri ("http://127.0.0.1:{0}/gw" -f $Port) -UseBasicParsing -TimeoutSec 5
-    if ($probe.Content.Trim() -ne $GatewayIp) { throw 'wrong body' }
+    $probeLines = ($probe.Content -split "`r?`n")
+    if (($probeLines.Count -lt 2) -or ($probeLines[0].Trim() -ne $GatewayIp) -or ($probeLines[1].Trim() -ne ("name={0}" -f $RepairName))) { throw 'wrong body' }
 } catch {
     Stop-Job -Job $job -ErrorAction SilentlyContinue
     Remove-Job -Job $job -Force -ErrorAction SilentlyContinue
-    Write-Host ("啟動器自己的檢查沒過（{0} 埠回的不是剛輸入的 IP）。請重試；不行就聯絡「{1}」。" -f $Port, $ContactName)
+    Write-Host ("啟動器自己的檢查沒過（{0} 埠回的不是剛輸入的 IP 與名字）。請重試；不行就聯絡「{1}」。" -f $Port, $ContactName)
     Write-Log ("self-probe failed: {0}" -f $_.Exception.Message)
     exit 3
 }
