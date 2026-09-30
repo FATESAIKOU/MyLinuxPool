@@ -13,6 +13,10 @@
 #      localhostreachable on, serial log, boot data attached),
 #   4. drops a desktop shortcut ("維修連線") for the launcher.
 #
+# Running it AGAIN over an existing mlp-repair-host is not an error: it powers
+# the old machine down cleanly, removes it, and builds a new one. That is the
+# family's whole procedure for a rotated tunnel key (docs/REPAIR-HOST.md §6).
+#
 # Why %LOCALAPPDATA%\MyLinuxPool\repair-host and not C:\mlp-*: the live acceptance
 # left seed.iso under C:\, which inherits C:\Users ReadAndExecute — every
 # local user could read the tunnel private key (OUT-live-repair.md §6 意外 3).
@@ -41,11 +45,19 @@
 #
 # Exit codes: 0 installed; 1 usage/cancel; 2 VirtualBox missing and no
 #   pinned installer configured; 3 image missing or SHA256 mismatch;
-#   4 VM creation/verification failed.
+#   4 VM creation/verification failed (or the old machine could not be
+#   removed cleanly); 5 the launcher window was still open — nothing changed.
+#
+# Re-running over an existing machine RE-INSTALLS it (whole new machine; the
+# VM holds no state worth keeping). That is the supported way to pick up a
+# rotated shared tunnel key: hand the family the new bundle, they double-click
+# Install.cmd again (docs/REPAIR-HOST.md §6). Teardown is deliberately narrow:
+# it unregisters only $VmName and closemediums only media registered under
+# $DataDir, so any other machine on this PC is untouched.
 #
 # Limitations (honest list):
-#   * Re-running over an existing VM refuses (it would orphan the old disk).
-#     Removal is manual: VBoxManage unregistervm <vm> --delete-all.
+#   * The launcher window must be closed first: the installer asks (in
+#     Chinese) and waits up to 60 s rather than killing the family's process.
 #   * Hyper-V coexistence is only WARNed about (VirtualBox falls back to a
 #     slower mode); the install continues.
 #   * The VirtualBox silent install needs network; without network the family
@@ -220,12 +232,153 @@ try {
     }
 } catch { Write-Log 'hypervisor check skipped (bcdedit failed)' }
 
-# Refuse to pave over an existing VM: its VDI holds the old key, deleting it
-# silently would orphan a registered tunnel key.
-$already = Invoke-Native $Vbm @('showvminfo', $VmName, '--machinereadable')
-if ($script:LastNativeRc -eq 0) {
-    Write-Host ("VM「{0}」已經存在，不覆蓋。如果你要重裝，請先在 VirtualBox 裡移除它（或跑：VBoxManage unregistervm {0} --delete-all），再重跑安裝。" -f $VmName)
-    exit 4
+# ---- re-running this script is a SUPPORTED operation: reinstall == whole new machine ----
+# Rotating the shared tunnel key means every family PC re-installs the new bundle
+# (docs/REPAIR-HOST.md §6), and the family's ONLY tool is a double-click on
+# Install.cmd. Refusing here made "換金鑰" need a support phone call, so the
+# design decision (PM) is: re-run = throw the machine away and build a new one.
+# The VM keeps no state anyone wants (PM), so nothing is lost.
+#
+# Two live findings make this more than `unregistervm`; see
+# OUT-impl-live-fixes.md §3.0 and §3.3.
+#
+#   1. A running VM must be shut down CLEANLY. ACPI lets mlp-tunnel-repair's
+#      on_stop run, which is what removes the Gateway nameplate; a bare poweroff
+#      skips it and leaks the nameplate until someone deletes it by hand.
+#   2. `unregistervm --delete` does NOT clear VirtualBox's MEDIA REGISTRY. The
+#      base .vmdk copy and seed.iso sitting under the data dir stay registered
+#      as inaccessible orphans, and the next `clonemedium` then dies with
+#      "UUID {00000000-…} does not match the value {…} stored in the media
+#      registry". So every registered disk/DVD whose Location is under OUR data
+#      dir gets closemedium'd by UUID — and ONLY those: another VM's media (a
+#      fam-test machine, the spike image) must survive this script untouched.
+function Get-VMState([string]$vbm, [string]$vm) {
+    $out = Invoke-Native $vbm @('showvminfo', $vm, '--machinereadable')
+    if ($script:LastNativeRc -ne 0) { return 'missing' }
+    $m = $out | Select-String -Pattern '^VMState="(.*)"' | Select-Object -First 1
+    if ($m) { return $m.Matches[0].Groups[1].Value }
+    return 'unknown'
+}
+
+function Test-D2PortTaken([int]$p) {
+    # "Is the launcher's D2 port held?" — a bind probe, not a guess: the port
+    # can be some other program's, and the message must cover both.
+    $c = New-Object System.Net.Sockets.TcpClient
+    try {
+        $iar = $c.BeginConnect('127.0.0.1', $p, $null, $null)
+        if (-not $iar.AsyncWaitHandle.WaitOne(800)) { return $false }
+        $c.EndConnect($iar)
+        return $true
+    } catch { return $false } finally { $c.Close() }
+}
+
+# Registered media, as (uuid, location) pairs. `VBoxManage list hdds` /
+# `list dvds` print blank-line-separated blocks of `Key: value` lines; the only
+# two keys we need are the UUID (to closemedium it) and the Location (to decide
+# whether it is OURS to touch). A block with no Location is an unattached
+# medium and is skipped by the caller.
+function Get-RegisteredMedia([string]$ListName) {
+    $out = Invoke-Native $Vbm @('list', $ListName)
+    $res = New-Object System.Collections.ArrayList
+    $uuid = ''; $loc = ''
+    foreach ($line in $out) {
+        $s = [string]$line
+        if ($s -match '^UUID:\s+(\S+)') {
+            if ($uuid -ne '') { [void]$res.Add(@{ uuid = $uuid; loc = $loc }) }
+            $uuid = $Matches[1]; $loc = ''
+        } elseif ($s -match '^Location:\s*(.*)$') {
+            $loc = $Matches[1].Trim()
+        }
+    }
+    if ($uuid -ne '') { [void]$res.Add(@{ uuid = $uuid; loc = $loc }) }
+    return $res
+}
+
+$DataRoot = (Resolve-Path -LiteralPath $DataDir).Path.TrimEnd('\') + '\'
+$D2Port = 18080
+if (($cfg.d2Port) -and ([int]$cfg.d2Port -gt 0)) { $D2Port = [int]$cfg.d2Port }
+$ContactName = '維修的人'
+if (($cfg.contactName) -and ($cfg.contactName -ne '')) { $ContactName = $cfg.contactName }
+
+$vmState = Get-VMState $Vbm $VmName
+if ($vmState -ne 'missing') {
+    Write-Host ''
+    Write-Host ("偵測到這台電腦已經裝過維修主機，正在換成新的（{0} 沒有要保留的東西）。" -f $VmName)
+
+    # 1. The launcher owns the D2 port. If its window is open the family is
+    #    mid-repair, so ASK — never kill their process (the ticket's rule).
+    #    Closing the window is also the graceful shutdown path: the launcher's
+    #    exit hook sends ACPI and waits for poweroff.
+    if (Test-D2PortTaken $D2Port) {
+        Write-Host ("請先把「維修連線」的視窗關掉（{0} 埠現在被佔著，那個視窗就是啟動器）。" -f $D2Port)
+        Write-Host '關掉之後這裡會自己繼續；我們不會直接把你的視窗關掉。'
+        $waited = 0
+        while ((Test-D2PortTaken $D2Port) -and ($waited -lt 60)) { Start-Sleep -Seconds 3; $waited += 3 }
+        if (Test-D2PortTaken $D2Port) {
+            Write-Host ''
+            Write-Host ("「維修連線」還開著，重裝取消（什麼都沒改）。請關掉那個視窗再點一次 Install.cmd；" +
+                        "如果 port {0} 是別的程式佔的，請先關掉那個程式。仍然不行就聯絡「{1}」。" -f $D2Port, $ContactName)
+            Write-Log ("reinstall aborted: D2 port {0} still held after {1}s" -f $D2Port, $waited)
+            exit 5
+        }
+        Write-Log ("D2 port {0} released after {1}s" -f $D2Port, $waited)
+    }
+
+    # 2. Clean shutdown, so the Gateway nameplate gets removed. ACPI first (the
+    #    guest's own on_stop does the work), 60 s, then poweroff as a last resort.
+    $vmState = Get-VMState $Vbm $VmName
+    if ($vmState -eq 'running') {
+        Write-Host '正在關閉舊的虛擬機器（會順便把 Gateway 上的名字清掉）…'
+        $null = Invoke-Native $Vbm @('controlvm', $VmName, 'acpipowerbutton')
+        $deadline = (Get-Date).AddSeconds(60)
+        do { Start-Sleep -Seconds 3; $vmState = Get-VMState $Vbm $VmName } while (($vmState -eq 'running') -and ((Get-Date) -lt $deadline))
+        if ($vmState -eq 'running') {
+            Write-Host '它沒有自己關掉，改用強制關機。'
+            Write-Log 'ACPI shutdown timed out after 60s — forcing poweroff'
+            $null = Invoke-Native $Vbm @('controlvm', $VmName, 'poweroff')
+            Start-Sleep -Seconds 5
+            $vmState = Get-VMState $Vbm $VmName
+        } else { Write-Log ("ACPI shutdown done, state={0}" -f $vmState) }
+    }
+
+    # 3. Unregister and delete the machine. --delete removes the media FILES it
+    #    knows about; the registry entries for our data dir's copies survive
+    #    that, which is exactly what step 4 cleans up.
+    Write-Host '正在移除舊的虛擬機器…'
+    $out = Invoke-Native $Vbm @('unregistervm', $VmName, '--delete')
+    $out | ForEach-Object { Write-Log ("unregistervm: {0}" -f $_) }
+    if ($script:LastNativeRc -ne 0) {
+        Write-Host '移除舊的虛擬機器失敗，重裝取消。請聯絡提供安裝包的人。'
+        Write-Log ("unregistervm --delete failed rc={0}" -f $script:LastNativeRc)
+        exit 4
+    }
+
+    # 4. Purge OUR orphan media by UUID. Scoped to this data dir on purpose:
+    #    fam-test's VM and C:\mlp-spike must come out of this byte-identical.
+    foreach ($pair in @(@('hdds', 'disk'), @('dvds', 'dvd'))) {
+        foreach ($m in (Get-RegisteredMedia $pair[0])) {
+            if ($m.loc -eq '') { continue }
+            if (-not $m.loc.StartsWith($DataRoot, [StringComparison]::OrdinalIgnoreCase)) {
+                Write-Log ("SKIP medium {0} — outside data dir: {1}" -f $m.uuid, $m.loc)
+                continue
+            }
+            $o = Invoke-Native $Vbm @('closemedium', $pair[1], $m.uuid)
+            $rc = $script:LastNativeRc
+            if ($rc -ne 0) {
+                Write-Log ("closemedium {0} {1} rc={2} — retrying with --force" -f $pair[1], $m.uuid, $rc)
+                $o = Invoke-Native $Vbm @('closemedium', $pair[1], $m.uuid, '--force')
+                $rc = $script:LastNativeRc
+            }
+            $o | ForEach-Object { Write-Log ("closemedium: {0}" -f $_) }
+            if ($rc -ne 0) {
+                Write-Host ''
+                Write-Host ("清不掉這個資料夾裡殘留的媒體紀錄（{0}，在 {1}），重裝取消。請聯絡「{2}」。" -f $m.uuid, $m.loc, $ContactName)
+                Write-Log ("FAIL: could not closemedium {0} {1} at {2} (rc={3})" -f $pair[1], $m.uuid, $m.loc, $rc)
+                exit 4
+            }
+            Write-Log ("released orphan medium {0} {1} at {2}" -f $pair[1], $m.uuid, $m.loc)
+        }
+    }
 }
 
 # ---- data dir + ACL (the OUT-live-repair.md §6 fix) ---------------------------------

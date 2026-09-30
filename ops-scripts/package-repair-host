@@ -596,6 +596,7 @@ cat > "$OUT/README-FAMILY.txt" <<EOF
 2. 之後每次：在桌面點兩下「維修連線」，輸入名字與 IP，按確定。
 3. 出現「維修連線中」的視窗就放著不要關；修好或不想修時，把視窗關掉就斷線了。
 連不上（等很久還是顯示連不上）就向 ${CONTACT} 要新的 IP（名字不用換，它會記住上次的）。
+拿到新的安裝包（換金鑰）時：先關掉「維修連線」的視窗，再點一次 Install.cmd，它會把舊的整台換成新的。
 EOF
 
 # MANIFEST.sha256 covers every file but itself, so the owner can re-verify a
