@@ -10,10 +10,14 @@
 ## 1. 使用者介面
 
 ```
-mlp fwd add <node> [entryip:]entryport[:targethost:targetport]
+mlp fwd add <node|port> [entryip:]entryport[:targethost:targetport]
 mlp fwd ls
 mlp fwd rm [entryport|bind:entryport]
 ```
+
+`<node>` 是 provider／worker／repair 的**名字**；`<port>` 是一個數字——worker 的
+gateway port，或是落在跳板段內的 repair port（見下面「目標也可以是 repair」）。
+省略 `<node>`／`<port>` 就是走選單挑。
 
 參數是 `ssh -L` 的形狀，省略的部分有預設：
 
@@ -26,6 +30,39 @@ mlp fwd rm [entryport|bind:entryport]
 
 最後一列是重點：`ssh -L` 的 target 本來就在**遠端**解析，所以「節點自己」
 與「節點看得到的第三方主機」是同一條程式碼路徑，不需要為後者多做任何事。
+
+### 目標也可以是 repair（維修跳板）
+
+> 這一節描述的是已實作的行為（`openspec/changes/repair-fwd/`；真機驗收見
+> `OUT-impl-repair-fwd-live.md`）。段內 port 的判定住在 `repair_port_p`，
+> `do_connect` 與 `fwd_add` 各呼叫一次。
+
+跳板段（`ports.repair`）裡的 repair 機器也可以是轉發的目標，三種指定方式：
+
+| 寫法 | 意義 |
+|---|---|
+| `mlp fwd add mom-pc 8080:192.168.0.1:80` | 用**名字**指定那台 repair VM |
+| `mlp fwd add 2401 8080:80` | 用**跳板段內的 port** 指定那台 |
+| `mlp fwd add`（不帶參數） | 選單列出在線的 repair，**選項是它的 port** |
+
+名字與 port 最後都解析到同一件事：那個 port 上此刻在線的 repair VM。第二段
+（`127.0.0.1:<port>`）登入的是 `repair`，與 `mlp ssh` 相同；`targethost:targetport`
+仍在**遠端**解析，所以「轉到 VM 自己」與「經 VM 轉到家人區網上的主機」是同一條
+程式碼路徑。第二段不驗 `known_hosts`，所以 VM 重裝換主機金鑰、不同 VM 輪流用
+同一個 port，都不會讓 fwd 撞到 host key 衝突（只有到 Gateway 那一段才驗）。
+
+選單以 **port** 當選項是刻意的。repair 段裡的名字**不保證唯一**（兩台家人都可以
+把自己的機器叫 `mom-pc`），`?` 則代表名稱讀不到（名牌是 Gateway 上的一個檔案，
+見 `REPAIR-HOST.md` §9）。以 port 當選項，同名的與 `?` 的列都點得到、也不會點錯。
+直接打名字而同時對到多台時，指令**拒絕**並列出各台的 port，不會任選一台。
+
+**不自動跟上。** repair 離線、或重新連線時換了 port，既有轉發就**自然斷掉**——
+`mlp fwd ls` 不再把它顯示為正常（`down` 或不在），使用者要自己重建。這是使用者
+的裁示而不是缺陷，而且它同時是一個保證：fwd 的 master 就是一條通到 VM 的 ssh
+連線，經 Gateway 上的反向轉發；家人的 VM 一斷，Gateway 就收掉那條反向轉發，
+master 也就跟著斷，所以舊的轉發**不可能**改接到之後拿到同一個 port 的另一台機器
+（change `repair-fwd` design D4）。不重新解析名字，正是這個保證的來源——要重新
+解析，就等於放棄它。
 
 一條轉發的身分是 `bind:entryport`，碰撞看的是**重疊**，兩者是多對多——
 「entryport 天然唯一」是設計錯誤。`add` 對同埠的現有每一筆逐一比 bind：
@@ -179,6 +216,8 @@ timeout 3 bash -c 'exec 3<>/dev/tcp/<host>/<port>'
 
 - 開機自動恢復（launchd）
 - 斷線自動重試
+- **repair 換 port 或離線時自動重新解析名字、或把舊的轉發改接到別的機器**
+  （使用者裁示；理由與那個保證見 §1 的 repair 小節）
 - 把埠暴露到 Gateway 或網路上（這是客戶端本機的轉發）
 - 設定檔
 

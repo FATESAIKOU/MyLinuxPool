@@ -117,6 +117,28 @@ interactive_only() {
     [[ -t 0 ]]
 }
 
+# repair_port_p <arg> — is this argument a bare port inside the Gateway's
+# repair segment, i.e. one repair host's listener? ONE definition, called
+# from both dial paths (`do_connect` and `fwd_add`), because they must never
+# disagree about what a number means: the fwd menu hands out repair PORTS
+# (D2), so if `fwd_add` resolved a number differently from `do_connect` the
+# menu would dial `worker@127.0.0.1` on a VM that has no such account.
+#
+# Three conditions, all load-bearing:
+#   * all digits — a name never qualifies, however numeric it looks;
+#   * BOTH bounds non-empty — with `ports.repair` unset we do NOT guess a
+#     range (Definition 1); the caller keeps its old behaviour and a bare
+#     number stays a worker;
+#   * inside [GW_REPAIR_LO, GW_REPAIR_HI] — read from NODE_GATEWAY, never a
+#     hardcoded range (so a rotated/reconfigured segment is honoured).
+# Disjoint from every real provider/worker gateway_port by NODE_GATEWAY's own
+# contract, so this can never shadow a real machine (Definition 2).
+repair_port_p() {
+    [[ "$1" =~ ^[0-9]+$ ]] || return 1
+    [[ -n "${GW_REPAIR_LO:-}" && -n "${GW_REPAIR_HI:-}" ]] || return 1
+    [[ "$1" -ge "$GW_REPAIR_LO" && "$1" -le "$GW_REPAIR_HI" ]]
+}
+
 usage() {
     cat <<'EOF'
 usage: mlp [command]
@@ -138,8 +160,10 @@ usage: mlp [command]
                    that new machine, not here on the Mac.
    ssh-config       print an ssh_config for the pool (--write to install it)
    trust-gateway    re-accept the Gateway's host key after a rotate
-   fwd add <node> [entryip:]entryport[:targethost:targetport]
-                    forward a local port to a node (or through it to a third host)
+   fwd add <node|port> [entryip:]entryport[:targethost:targetport]
+                    forward a local port to a node, worker or repair host (or
+                    through it to a third host); <port> = a worker port, or a
+                    repair host's port inside the repair segment
    fwd ls           list local forwards with live state
    fwd rm [entryport|bind:entryport]  remove a forward (fzf pick when omitted)
    verify-capabilities [<node>|--all]
@@ -1060,11 +1084,9 @@ do_connect() {
         # Bare in-range port (item 4): goes straight there, BEFORE even
         # target_resolve's pool-resolve/worker-ledger steps run — no
         # ControlMaster needed just to know a number sits inside the
-        # repair range we already have from resolve_gateway. Disjoint from
-        # every real provider/worker gateway_port by NODE_GATEWAY's own
-        # contract, so this can never shadow a real name (Definition 2).
-        if [[ "$1" =~ ^[0-9]+$ && -n "${GW_REPAIR_LO:-}" && -n "${GW_REPAIR_HI:-}" \
-              && "$1" -ge "$GW_REPAIR_LO" && "$1" -le "$GW_REPAIR_HI" ]]; then
+        # repair range we already have from resolve_gateway. The rule
+        # itself lives in repair_port_p, shared with fwd_add (D1).
+        if repair_port_p "$1"; then
             type="repair"
             port="$1"
             user="repair"
@@ -2486,9 +2508,20 @@ fwd_add() {
     thost="$FWD_SPEC_THOST"
     tport="$FWD_SPEC_TPORT"
     resolve_gateway nodie || { FWD_ERR="resolve"; return 3; }
-    target_resolve "$node" || { FWD_ERR="resolve"; return 3; }
-    tuser="$TARGET_USER"
-    tport_lb="$TARGET_PORT"
+    # A bare in-range port is a repair host's listener (D1, same rule
+    # do_connect uses). Without this, target_resolve's bare-number branch
+    # answers `worker` and the second hop becomes worker@127.0.0.1 — an
+    # account the repair VM does not have, so the forward would look up
+    # fine in `fwd ls` and never carry a packet. The name form still goes
+    # through target_resolve, which already knows repair names.
+    if repair_port_p "$node"; then
+        tuser="repair"
+        tport_lb="$node"
+    else
+        target_resolve "$node" || { FWD_ERR="resolve"; return 3; }
+        tuser="$TARGET_USER"
+        tport_lb="$TARGET_PORT"
+    fi
     if [[ ! -d "$FWD_DIR" ]]; then
         mkdir -p "$FWD_DIR" || { FWD_ERR="start"; return 5; }
     fi
@@ -2647,7 +2680,7 @@ fwd_status() {
 fwd_view_add() {
     local node="${1:-}" spec="${2:-}"
     if [[ -z "$node" || -z "$spec" ]]; then
-        echo "usage: mlp fwd add <node> [entryip:]entryport[:targethost:targetport]" >&2
+            echo "usage: mlp fwd add <node|port> [entryip:]entryport[:targethost:targetport]" >&2
         exit 2
     fi
     if fwd_add "$node" "$spec"; then
@@ -2667,6 +2700,17 @@ fwd_view_add() {
                 [[ -n "$TARGET_DETAIL" ]] && printf '%s\n' "$TARGET_DETAIL" >&2
                 die "Gateway unreachable (${GW_USER}@${GW_IP})"
             fi
+            # Same two grills do_connect already has (D3): a repair name
+            # that hits several hosts is NOT "no such node or worker" —
+            # it exists, twice, and the fix is a port. `no such node or
+            # worker` itself stays verbatim as the last line: it is what
+            # test-mlp-fwd.sh 7d pins, and it is still the honest summary
+            # for a name that is in no registry at all.
+            if [[ "$TARGET_ERR" == "repair-ambiguous" ]]; then
+                die "repair name '${node}' matches multiple hosts (ports: ${TARGET_CANDIDATES}) — use the port instead: 'mlp fwd add <port> ...'"
+            fi
+            [[ -n "$TARGET_DETAIL" ]] && printf '%s\n' "$TARGET_DETAIL" >&2
+            printf 'note: a repair host shows up only while we can see its listener on the Gateway, so one that is powered off or just closed looks the same as one that never existed — check the repair section of "mlp ls".\n' >&2
             die "no such node or worker: ${node}"
             ;;
         inuse)
@@ -2846,12 +2890,31 @@ fwd_menu_add() {
         {
             printf 'gateway\n'
             gather_targets | awk -F'\t' '{ print $1 }'
+            # Online repair hosts, one row each: NAME<TAB>PORT. Same
+            # candidate shape `mlp ssh`'s picker uses (mlp:1180-1186), and
+            # for the same reason: a repair name is whatever a family
+            # member typed into a Windows dialog, so it is NOT unique
+            # (two machines can both be `mom-pc`) and it can be unreadable
+            # entirely (the nameplate is a file on the Gateway — '?' when
+            # it can't be read). Picking by PORT sidesteps both; picking
+            # by name would be rejected as ambiguous right after. The
+            # chosen row is reduced to its port below (D2).
+            while IFS= read -r rr; do
+                [[ -n "$rr" && "$rr" != "!UNCONFIGURED" ]] || continue
+                fwd_split_row "$rr"
+                printf '%s\t%s\n' "$FWD_C1" "$FWD_C2"
+            done < <(gather_repair_targets)
         } | fzf --prompt='node> ' --height='~40%' \
-                --header='forward to which node?'
+                --header='forward to which node?  (repair rows: NAME then its port)'
     )"
     close_gateway_master
     [[ -n "$selected" ]] || { echo "aborted."; return 1; }
     name="$selected"
+    # A repair row is "NAME<TAB>PORT" and the value fwd_add needs is the
+    # PORT; gateway/worker rows are a bare name and pass through untouched.
+    if [[ "$name" == *$'\t'* ]]; then
+        name="${name##*$'\t'}"
+    fi
     printf 'spec ([entryip:]entryport[:targethost:targetport], e.g. 8080): '
     read -r spec
     [[ -n "$spec" ]] || { echo "aborted."; return 1; }
