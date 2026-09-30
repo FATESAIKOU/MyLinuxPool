@@ -77,3 +77,15 @@
 
 - [x] 9.1 known-limitations.md（2026-09-30）（至少：隧道金鑰未收窄、AI 可見、rotate 後重輸 IP、登入金鑰難撤）
 - [ ] 9.2 commit 本 change；**merge 等使用者在桌面點兩下驗完**；是否 archive 由使用者決定
+
+## 10. 改版：臨時跳板（2026-09-30，design D9–D14；第一版不 merge）
+
+- [x] 10.0 review：唯讀調查（`OUT-recon-ephemeral.md`）；PM 定案 D10／D11 的細節
+- [x] 10.1 （`4664e92`；review `OUT-review-ephemeral-mac.md` 無必修）共用金鑰進 Gateway：test（refresh／rotate 共用組裝函式收 `REPAIR_TUNNEL_PUBKEY`）→ impl → review
+- [x] 10.2 （`4664e92`；`--rotate` 先寫 var 成功才取代舊鑰）Mac 端：`setup-repair-key`（產生／更換共用金鑰、寫 var、refresh）取代 `register-repair-host`；`package-repair-host` 改成全家共用一份包；拆掉舊指令、舊測試與各清單裡的登記：test → impl → review
+- [x] 10.3 （`4664e92`；測試由 Claude 子代理寫——DeepSeek 三輪無產出；review `OUT-review-ephemeral-vm.md` 無必修）VM 端：從啟動器拿名字、設 hostname、在段內挑 port、在 Gateway 上寫／刪名牌；forward 失敗換 port、認證失敗不換的測試：test → impl → review
+- [x] 10.4 （`7274745`；review 無必修，桌面 GUI 待使用者）Windows 啟動器：名字跟 IP 一起問並記住、經 D2 傳給 VM、捷徑與 VM 名改成通用：impl → review（在 fh-l 用測試位置驗）
+- [x] 10.5 （`c6c94ef`；測試與實作皆 Claude 子代理；review 抓到名牌內容可決定 port → 改成 port 只取 listener、名牌整行合格式才算數，二次 review 無必修）`mlp`：掃描跳板、`ls` 分區、`ssh <名字>`／`ssh <port>`、同名拒絕：test → impl → review
+- [x] 10.6 文件（`NODE_GATEWAY.ports.repair` 的真值在 10.7 寫入）：ARCHITECTURE、LAYOUT、README、`docs/REPAIR-HOST.md`、known-limitations、proposal
+- [ ] 10.7 真機：設定共用金鑰、新包裝到 fh-l、`mlp ls` 看得到名字、佔住 2400 時改用 2401、關視窗後消失、手機看不到；通過後撤掉 `fam-test`
+- [ ] 10.8 使用者桌面驗收 → merge

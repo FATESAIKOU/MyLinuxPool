@@ -40,6 +40,7 @@
    │  │ PROVIDER 固定段       ┆ WORKER 動態段                │  │
    │  │ 2220–2299            ┆ 2300–2399                   │  │
    │  │  [:2222]   [:2226]   ┆  [:2301] [:2302] …          │  │
+   │  │ REPAIR 臨時段 2400–2499（現場挑空埠）              │  │
    │  └──────────────────────┴─────────────────────────────┘  │
    └──────▲──────────────▲──────────────────▲─────────────────┘
           │              │                  │
@@ -71,7 +72,7 @@
   "tunnel_user": "sshproxy",
   "key_secret": "SSH_KEY_ACTIONS",
   "linode_label": "fws",
-  "ports": { "provider": [2220, 2299], "worker": [2300, 2399] },
+  "ports": { "provider": [2220, 2299], "worker": [2300, 2399], "repair": [2400, 2499] },
   "generation": 7,
   "rotated_at": "2026-09-13T08:00:00Z"
 }
@@ -80,6 +81,11 @@
 > Gateway 有**兩個**使用者身分，不可混用：`user`（`fatesaikou`）供 Actions 做
 > 管理操作；`tunnel_user`（`sshproxy`）是專門終結反向隧道的受限帳號，
 > provider 與 worker 一律以它登入。
+>
+> 家人維修跳板**沒有** `NODE_*`：全家共用一把隧道金鑰，公鑰放在單獨的
+> `REPAIR_TUNNEL_PUBKEY` var（一行 OpenSSH 公鑰，不是 JSON）；
+> `mlp` 直接掃 Gateway 的 listener 找在線的跳板（待實作確認）。
+> 操作見 [`docs/REPAIR-HOST.md`](REPAIR-HOST.md)。
 
 ### NODE_FH_L（provider，含跳板鏈與電源控制）
 

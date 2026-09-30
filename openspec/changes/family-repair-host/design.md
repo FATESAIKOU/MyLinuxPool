@@ -75,6 +75,37 @@ VM 從這個服務取得 Gateway IP，並把隧道狀態回報給它（啟動器
 - [D6 可能擋掉現役的 provider] → 實作前先查三台現役 provider 的 capabilities
 - [多台家人電腦] → 一台一份開機資料（名稱、port、金鑰各自獨立）；port 仍然人工挑，但 D4 會擋掉衝突
 
+## 改版：臨時跳板（2026-09-30）
+
+使用者在第一版真機驗收後要求改成「臨時跳板」。D4（每台在 Mac 上登錄一個 `NODE_<NAME>`）、D8 的一部分、與「AI 看得到這台」一起作廢；其餘決定照舊。使用者的裁示：
+- `mlp` 自己掃出在線的跳板，不寫進 GitHub var
+- 跳板用自己的 port 段，約 100 個，跟 provider、worker 分開
+- 手機（MyAiEntry）完全不知道它們存在
+- GitHub var 只登錄**一把**公鑰，所有跳板共用；**不收窄**（跟其他隧道金鑰一樣）
+- 名字由家人在啟動器裡、跟 Gateway IP 一起輸入
+- 撤銷任何一位＝換掉共用金鑰、全家重裝（家人不多，可接受）
+- 在同一分支上改，第一版不 merge
+
+**D9. 一把共用的隧道金鑰。** 使用者在 Mac 上跑一次設定指令：產生金鑰對、把公鑰寫進 GitHub var `REPAIR_TUNNEL_PUBKEY`（單行公鑰，不是 JSON；名字刻意避開 `NODE_`／`CLIENT_` 前綴，前者會被當 JSON 檢查、後者會進登入清單）、觸發 refresh；私鑰留在 Mac 本機（不進 repo）。收錄寫在 refresh 與 rotate **共用**的組裝函式裡——只改 refresh workflow 的話，rotate 出來的新 Gateway 會漏掉它、全家失聯。變數不存在＝沒有跳板，照常；存在但不是合法公鑰＝大聲失敗。換金鑰＝重跑同一條指令，舊金鑰隨下一次 refresh 失效。
+
+**D10. 專用 port 段 2400–2499。** Gateway 端不用改設定（反向轉發只綁 loopback，沒有防火牆或 `PermitListen`）。VM 開機時從段首開始試，被佔用（`remote port forwarding failed`）就換下一個；整段都滿就從頭再繞，啟動器沿用「一直沒接上」的逾時訊息（不另加狀態；家庭規模遠低於 100）。forward 失敗發生在認證成功之後，現行分類已歸為不計入 fail2ban 的快退；換 port 只在這一類失敗發生，**認證失敗絕不換 port**，並補測試。
+
+**D11. `mlp` 掃描 Gateway 找出在線的跳板。** `mlp ls` 顯示它們（跟 provider、worker 分開一區），`mlp ssh <名字>` 與 `mlp ssh <port>` 能連上。取名（2026-09-30 定案，依 `OUT-recon-ephemeral.md` §3）：VM 在 port 接上後，經同一條隧道連線在 Gateway 上寫 `~sshproxy/repair/<port>`（內容是名字），正常關機時刪掉。`mlp` 在一次 Gateway 連線裡同時讀這個目錄與實際的 listener：**listener 是事實，檔案只是名牌**——有檔沒 listener 不顯示，有 listener 沒檔顯示為「無名」。同名時列出 port，`mlp ssh <名字>` 拒絕並要求改用 port。不做「登入 VM 讀 hostname 驗證」：冒名者一樣改得了 hostname，擋不住冒名。
+port 段的唯一來源是 `NODE_GATEWAY.ports.repair`（`[2400,2499]`）；`mlp` 讀它（讀不到就大聲拒絕，不寫死 fallback），VM 端的值在打包時從它抄進開機資料。`pool-status` 的「Gateway listener 2000–2999」摘要行會自然列出跳板的 port（只有數字、沒有名字），不改。
+
+**D12. 啟動器同時問名字與 IP，並記住兩者。** 名字的格式限制在啟動器與 VM 兩端都檢查（小寫英數與 `-`）。VM 用它當 hostname。
+
+**D13. 安裝包不含任何「每台不同」的東西。** 同一份包可以交給全家；內容：共用隧道私鑰、CLIENT_* 公鑰快照（照舊排除 CLIENT_ACTIONS）、Gateway 的 SSH port、映像的 SHA256。打包不碰 GitHub（除了讀 CLIENT_* 快照）。
+
+**D14. 手機看不到。** 不寫 `NODE_*`、不進 state 快取、不出現在 MyAiEntry 讀的任何資料裡。
+
+**第一版的處置：** `register-repair-host` 與它的測試、parity 守衛由新指令取代；D3（靜態模式 port）、D5（權杖守衛）、D6（create-worker 閘門）、D7（退避）、D1／D2（VM 與啟動器）保留。現役的 `fam-test`（`NODE_FAM_TEST`、2240）在新版真機驗收通過後撤掉。
+
+**改版帶來的新風險：**
+- 共用私鑰：任何一位家人的電腦外洩，對方拿到 Gateway 上 `sshproxy` 的 shell，也能冒充任何一位家人、佔住整段 port。使用者知情後決定不收窄
+- 名字是家人自己打的，沒有認證：任何拿到包的人都能自稱任何名字；`mlp ssh` 連上後仍要使用者的金鑰才能登入，但**使用者可能登入到冒名的機器**
+- 撤銷要全家重裝
+
 ## Migration Plan
 
 新功能，不影響既有節點。只有兩處會碰到既有行為：D3 在不給新變數時維持原狀；D6 會讓指名沒宣告 `worker-host` 的 provider 失敗。

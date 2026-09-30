@@ -204,7 +204,7 @@ provider 邊緣刻意不放解密金鑰；KEY-DESIGN §8 之後也不再有任�
 | `profiles/` | 角色宣告：`gateway/`、`provider/`、`worker/`（含 Dockerfile） |
 | `shared-configs/` | 可分發安裝單位，見 `docs/LAYOUT.md` |
 | `scripts/` | 業務邏輯，**不依賴 GitHub Actions**（沒有 `${{ }}`、`$GITHUB_OUTPUT`），含 `lib/{log,crypto,ssh,profile}.sh` |
-| `ops-scripts/` | 人手動跑的：`mlp`、`register-client`、`register-provider.sh`、`register-repair-host`（在 Mac 上登錄家人維修承載機）、`verify-profile`、`preflight`、`pool-residue.sh`（唯讀量測殘骸用） |
+| `ops-scripts/` | 人手動跑的：`mlp`、`register-client`、`register-provider.sh`、`setup-repair-key`（設全家共用的跳板金鑰）、`package-repair-host`（打全家共用的維修包）、`verify-profile`、`preflight`、`pool-residue.sh`（唯讀量測殘骸用） |
 | `.github/` | workflow 與 `pool-ssh` composite action。所有 GitHub 專屬的東西只出現在這裡 |
 | `docs/` | 見文件表 |
 
@@ -504,4 +504,4 @@ scp installer.sh host:/tmp/ && cat crypto_key | ssh host 'bash /tmp/installer.sh
 | [`docs/LAYOUT.md`](docs/LAYOUT.md) | 目錄結構契約、unit 與 profile 的格式 |
 | [`docs/REQ.md`](docs/REQ.md) | 原始需求 |
 | [`docs/AUDIT.md`](docs/AUDIT.md) | provider 宿主機稽核的覆蓋範圍與盲區 |
-| [`docs/REPAIR-HOST.md`](docs/REPAIR-HOST.md) | 家人維修承載機：登錄、打包、家人步驟、連入、rotate、撤銷 |
+| [`docs/REPAIR-HOST.md`](docs/REPAIR-HOST.md) | 家人維修跳板：設共用金鑰、打包、家人步驟、連入、rotate、換鑰、撤銷 |
