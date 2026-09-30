@@ -1,6 +1,6 @@
 @echo off
 rem Install.cmd -- double-click entry for the family repair-host bundle.
-rem (openspec/changes/family-repair-host tasks 8d.3)
+rem (openspec/changes/archive/2026-10-01-family-repair-host tasks 8d.3)
 rem
 rem Why this file exists: on a normal family Windows, double-clicking the
 rem .ps1 only opens an editor (store App file association) and the default

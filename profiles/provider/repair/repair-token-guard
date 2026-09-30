@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# repair-token-guard — VM side of design D5 (openspec/changes/family-repair-host):
+# repair-token-guard — VM side of design D5 (openspec/changes/archive/2026-10-01-family-repair-host):
 # a family repair host must never hold a GitHub token (spec "維修承載機不持有
 # GitHub 權杖"). repair-tunnel-launch runs this before it dials anything, and
 # a refusal means the tunnel does not start at all.

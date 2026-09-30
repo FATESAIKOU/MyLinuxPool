@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ops-scripts/package-repair-host — pack the ONE shared family repair host
-# bundle on the owner's Mac (issue #6; openspec/changes/family-repair-host
+# bundle on the owner's Mac (issue #6; openspec/changes/archive/2026-10-01-family-repair-host
 # tasks 6.1/D13, EPHEMERAL-INTERFACE.md §7).
 #
 #   package-repair-host --key-dir <dir> --out <dir> --image-sha256 <sha256>

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # repair-tunnel-launch — ExecStart of mlp-tunnel-repair.service on a family
-# repair host (openspec/changes/family-repair-host, design D5 second half,
+# repair host (openspec/changes/archive/2026-10-01-family-repair-host, design D5 second half,
 # D2, D7).
 #
 #   repair-tunnel-launch          (no arguments)
