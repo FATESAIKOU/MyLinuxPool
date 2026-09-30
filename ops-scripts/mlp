@@ -179,7 +179,7 @@ check_deps() {
 #   that must stay output-free and keep their own return codes. A bare call
 #   behaves exactly as before (same globals, same messages, dies).
 resolve_gateway() {
-    local json rc fatal=1
+    local json rc fatal=1 repair_lo repair_hi
     [[ "${1:-}" == "nodie" ]] && fatal=0
     RESOLVE_DETAIL=""
     # --refresh, not the 30s cache. Every command here means "through the
@@ -205,6 +205,20 @@ resolve_gateway() {
         RESOLVE_DETAIL="NODE_GATEWAY is missing ip/user"
         [[ $fatal -eq 1 ]] && die "$RESOLVE_DETAIL"
         return 1
+    fi
+
+    # Ephemeral family-repair-host port range (EPHEMERAL-INTERFACE.md item
+    # 2): read straight from the SAME NODE_GATEWAY JSON above, never a
+    # hardcoded fallback. Both empty unless .ports.repair is a clean
+    # [lo,hi] pair of non-negative integers with lo<=hi — a malformed or
+    # absent field must read as "unconfigured", never as a guess.
+    repair_lo="$(printf '%s' "$json" | jq -r '.ports.repair[0] // empty' 2>/dev/null)"
+    repair_hi="$(printf '%s' "$json" | jq -r '.ports.repair[1] // empty' 2>/dev/null)"
+    GW_REPAIR_LO=""
+    GW_REPAIR_HI=""
+    if [[ "$repair_lo" =~ ^[0-9]+$ && "$repair_hi" =~ ^[0-9]+$ ]] && [[ "$repair_lo" -le "$repair_hi" ]]; then
+        GW_REPAIR_LO="$repair_lo"
+        GW_REPAIR_HI="$repair_hi"
     fi
 
     # NODE_GATEWAY carries the Gateway's host key, written by the rotate
@@ -391,6 +405,174 @@ gw_probe_port() {
 gw_run() {
     # Runs one command on the Gateway over the shared ControlMaster.
     ssh -S "$CTL" -o ConnectTimeout=8 "${GW_USER}@${GW_IP}" "$1" < /dev/null 2>/dev/null
+}
+
+# gather_repair_targets — Model: no args, prints TSV "name<TAB>port<TAB>up"
+#   rows to stdout, one per family-repair jump host currently observed
+#   (EPHEMERAL-INTERFACE.md items 5/8, design.md D9-D14). Prints the single
+#   sentinel line "!UNCONFIGURED" instead when the port range hasn't been
+#   read (GW_REPAIR_LO/GW_REPAIR_HI empty) — never a hardcoded range.
+#   Assumes CTL is already an open Gateway ControlMaster (gw_run only,
+#   never opens its own master, never calls gh).
+#
+#   D5's rule is "the listener is the only fact, the nameplate file is
+#   only a label": a row exists iff a listener was observed in range, so
+#   there is no "down" repair state here (a real simplification vs the
+#   provider/worker table's banner-probed up/down — see
+#   OUT-test-ephemeral-mlp.md LIMITATIONS). A nameplate with no matching
+#   listener is a stale/crashed-VM leftover and must never be shown.
+#
+#   Listeners and nameplates are fetched in exactly ONE remote command (one
+#   gw_run call) — that round trip is the concrete meaning item 5 gives to
+#   "one remote command": `ss -tln` for the listeners, a directory scan of
+#   /home/sshproxy/repair/ (the Gateway-side nameplate location, item 5)
+#   for the names, both in the same ssh invocation, separated by markers.
+gather_repair_targets() {
+    local remote_cmd out line
+    local listen_block nameplate_block
+    local f1 f2 f3 local_field f5 lport pport praw p pi found
+    local cur_port="" cur_content="" have_cur=0 crstripped
+    local ports=() plate_ports=() plate_names=()
+
+    if [[ -z "${GW_REPAIR_LO:-}" || -z "${GW_REPAIR_HI:-}" ]]; then
+        printf '!UNCONFIGURED\n'
+        return 0
+    fi
+
+    remote_cmd='printf "REPAIR-SCAN-L\n"; ss -tln 2>/dev/null; printf "REPAIR-SCAN-N\n"; for f in /home/sshproxy/repair/*; do [ -f "$f" ] || continue; printf "%s %s\n" "$(basename "$f")" "$(cat "$f" 2>/dev/null)"; done; printf "REPAIR-SCAN-END\n"'
+    out="$(gw_run "$remote_cmd")"
+
+    # Nameplate content is HOSTILE input (anyone holding the shared tunnel
+    # key can write these files) — must-fix 1 (OUT-review-ephemeral-mlp.md
+    # §2): it must never be able to fabricate a listener, truncate another
+    # file's mapping, or relocate a TSV column. Section boundaries are
+    # found by ANCHORING on the marker that can only legitimately occur
+    # once each, in a fixed position, rather than by matching markers
+    # line-by-line as the stream is read — the latter lets an attacker's
+    # own nameplate content (which may contain embedded newlines) inject
+    # a LOOKALIKE marker line and desync the state machine (this is
+    # exactly how a hostile file could forge a phantom listener or
+    # truncate the file listed after it). "REPAIR-SCAN-L" is always the
+    # very first line this function's own remote command prints, before
+    # anything attacker-controlled — so its FIRST occurrence anchors the
+    # listener block. "REPAIR-SCAN-N" then only legitimately occurs once
+    # before any attacker content exists yet, so its FIRST occurrence
+    # anchors the start of the nameplate block. "REPAIR-SCAN-END" is
+    # always this function's own LAST line printed — no attacker content
+    # is emitted after it — so its LAST occurrence (not first: a hostile
+    # nameplate can forge an earlier-looking one, see the 2512/2513 test
+    # fixture) anchors the true end of the nameplate block.
+    listen_block="${out#*REPAIR-SCAN-L$'\n'}"
+    listen_block="${listen_block%%REPAIR-SCAN-N*}"
+    nameplate_block="${out#*REPAIR-SCAN-N$'\n'}"
+    nameplate_block="${nameplate_block%$'\n'REPAIR-SCAN-END*}"
+
+    while IFS= read -r line; do
+        case "$line" in
+            LISTEN*) : ;;
+            *) continue ;;
+        esac
+        # Field-based, never `${line##*:}` on the whole line: an
+        # `ss -tln` row has TWO addr:port fields (local, then peer —
+        # usually "0.0.0.0:*"), so a greedy suffix match on the whole
+        # line grabs the PEER field's trailing "*" instead of the local
+        # port (a real bug hit writing the test for this scan; see
+        # OUT-test-ephemeral-mlp.md). Field 4 is the local address:port.
+        read -r f1 f2 f3 local_field f5 <<< "$line"
+        # Suggestion 2 (review §3): only a listener actually bound to
+        # 127.0.0.1 is a repair jump point — the reverse tunnel always
+        # binds loopback-only. `[::1]`, a wildcard `0.0.0.0`/`[::]` bind,
+        # or any LAN-reachable address in the same numeric range is a
+        # DIFFERENT service that happens to share a port number, not a
+        # jump host, and must never be listed as one.
+        case "$local_field" in
+            127.0.0.1:*) : ;;
+            *) continue ;;
+        esac
+        lport="${local_field##*:}"
+        [[ "$lport" =~ ^[0-9]+$ ]] || continue
+        [[ "$lport" -ge "$GW_REPAIR_LO" && "$lport" -le "$GW_REPAIR_HI" ]] || continue
+        ports+=("$lport")
+    done <<< "$listen_block"
+
+    # PM ruling (EPHEMERAL-INTERFACE item 3/5): a nameplate is valid only
+    # if its WHOLE content — not merely a valid-looking leading prefix —
+    # matches the name format, after stripping at most one trailing CR (a
+    # plain trailing newline never survives this far: the remote side's
+    # own `$(cat "$f")` already strips it before this function ever sees
+    # the byte stream; only a lone CR from a CRLF-authored file can still
+    # be sitting at the end). Anything else — "dad-pc<TAB>2504", a
+    # multi-line blob that starts with a clean-looking word, an ANSI
+    # escape, wrong case, oversized, empty — becomes "?" and is not a
+    # resolvable name; the discarded/rejected content is NEVER used for
+    # anything, in particular never as a port (must-fix 1).
+    #
+    # A nameplate's OWN raw content can itself contain embedded newlines
+    # (an attacker's file, `cat`'d verbatim) — those physical lines must
+    # still be treated as part of THIS ONE entry's whole content for
+    # validation, not silently dropped (dropping everything after the
+    # first line is exactly the "trust a prefix" mistake this ruling
+    # corrects: a multi-line hostile blob's first line can itself look
+    # like a clean name — see the test fixture's port 2508). A physical
+    # line starts a NEW entry when it matches the wire format's own
+    # "<digits> <rest>" record shape — this is the same, and only,
+    # boundary signal the remote command's own `printf "%s %s\n"
+    # "$(basename "$f")" ...` produces for a legitimate record, so a
+    # non-record line (anything not starting "<digits> ") is unambiguously
+    # more of the entry already being accumulated, never a new one. A
+    # nameplate whose file has NO active listener (e.g. 2560/mom-laptop
+    # in the non-hostile fixture — a stale-but-legitimate label, D5) still
+    # gets its own correctly-bounded entry this way, even though it will
+    # never be looked up below (only real listener ports are). LIMITATION
+    # (recorded, not exploited by any fixture in this test): this trusts
+    # the "<digits> " shape itself, not a port independently proven to
+    # have a listener — a hostile file could in principle self-terminate
+    # early by embedding an extra "<digits> " line of its own choosing
+    # (any digits, not necessarily a real port) partway through, walling
+    # off everything before it into what looks like a clean, separately-
+    # validated entry. Closing that fully needs the remote side to frame
+    # each record unambiguously (e.g. base64 per file) so content can
+    # never contain the delimiter at all — out of scope here since this
+    # function's test harness replays a fixed, already-`cat`'d byte
+    # stream regardless of what the remote command's text says.
+    while IFS= read -r line; do
+        pport="${line%% *}"
+        praw="${line#* }"
+        if [[ -n "$pport" && "$pport" != "$line" && "$pport" =~ ^[0-9]+$ ]]; then
+            if [[ "$have_cur" -eq 1 ]]; then
+                crstripped="${cur_content%$'\r'}"
+                if [[ "$crstripped" =~ ^[a-z]([a-z0-9-]{0,30}[a-z0-9])?$ ]]; then
+                    plate_ports+=("$cur_port")
+                    plate_names+=("$crstripped")
+                fi
+            fi
+            cur_port="$pport"
+            cur_content="$praw"
+            have_cur=1
+        elif [[ "$have_cur" -eq 1 ]]; then
+            cur_content="${cur_content}"$'\n'"${line}"
+        fi
+    done <<< "$nameplate_block"
+    if [[ "$have_cur" -eq 1 ]]; then
+        crstripped="${cur_content%$'\r'}"
+        if [[ "$crstripped" =~ ^[a-z]([a-z0-9-]{0,30}[a-z0-9])?$ ]]; then
+            plate_ports+=("$cur_port")
+            plate_names+=("$crstripped")
+        fi
+    fi
+
+    for p in ${ports[@]+"${ports[@]}"}; do
+        found="?"
+        pi=0
+        while [[ "$pi" -lt "${#plate_ports[@]}" ]]; do
+            if [[ "${plate_ports[$pi]}" == "$p" ]]; then
+                found="${plate_names[$pi]}"
+                break
+            fi
+            pi=$((pi + 1))
+        done
+        printf '%s\t%s\tup\n' "$found" "$p"
+    done
 }
 
 # ---- generic "run a command on any registered node" ----------------------
@@ -628,6 +810,19 @@ cmd_ls() {
         rows+=("$(printf '%s\t%s\t%s\t%s\t%s' "$name" "$type" "$provider" "$port" "$state")")
     done < <(gather_targets)
 
+    # Repair section (EPHEMERAL-INTERFACE.md item 8): rides this SAME
+    # already-open Gateway ControlMaster — gather_repair_targets never
+    # opens its own — so this adds no extra ssh session to `ls`.
+    local repair_rows=() rrow repair_unconfigured=0
+    while IFS= read -r rrow; do
+        [[ -n "$rrow" ]] || continue
+        if [[ "$rrow" == "!UNCONFIGURED" ]]; then
+            repair_unconfigured=1
+            continue
+        fi
+        repair_rows+=("$rrow")
+    done < <(gather_repair_targets)
+
     close_gateway_master
 
     # LAN-liveness follow-up (the 2026-09-25 incident): a node whose port we
@@ -683,6 +878,22 @@ cmd_ls() {
         printf "$fmt" "$name" "$type" "$provider" "$port"
         print_state "$state" "$statewidth"
     done
+
+    # Repair section (item 1's "loud refusal, `ls` still succeeds"): when
+    # the range can't be read, warn once on stderr and print nothing else
+    # here — the table above already succeeded and stands as-is. When it
+    # CAN be read, always show the section header, even with zero repair
+    # hosts observed right now (an empty section is still informative:
+    # "the range is configured and nothing is up", not silence).
+    if [[ "$repair_unconfigured" -eq 1 ]]; then
+        echo "mlp: NODE_GATEWAY.ports.repair not configured — skipping repair section" >&2
+    else
+        echo "repair:"
+        for rrow in ${repair_rows[@]+"${repair_rows[@]}"}; do
+            fwd_split_row "$rrow"
+            printf '  %-10s %-6s %s\n' "$FWD_C1" "$FWD_C2" "$FWD_C3"
+        done
+    fi
 }
 
 # ---- ssh ------------------------------------------------------------------
@@ -696,11 +907,14 @@ cmd_ls() {
 #   is opened silent so a dead Gateway stays a return code, not output.
 target_resolve() {
     local name="$1" json rc role port user workers_json match_port master_err
+    local repair_scan_out rline c
+    local candidates=()
     TARGET_TYPE=""
     TARGET_USER=""
     TARGET_PORT=""
     TARGET_ERR=""
     TARGET_DETAIL=""
+    TARGET_CANDIDATES=""
 
     json="$("$POOL_RESOLVE" "$name" 2>/dev/null)"
     rc=$?
@@ -741,7 +955,6 @@ target_resolve() {
     fi
     if [[ $rc -eq 0 ]]; then
         workers_json="$(gw_run '~/.mylinuxpool/bin/pool-port-alloc --list')"
-        close_gateway_master
     else
         TARGET_ERR="unreachable"
         return 1
@@ -758,33 +971,105 @@ target_resolve() {
     fi
 
     if [[ -n "$match_port" && "$match_port" != "null" ]]; then
+        close_gateway_master
         TARGET_TYPE="worker"
         TARGET_USER="worker"
         TARGET_PORT="$match_port"
         return 0
     fi
 
-    TARGET_ERR="notfound"
-    return 1
+    # Worker-ledger match failed too. Try the family-repair nameplate scan
+    # next — LAST in the fallthrough chain, on purpose (Definition 2,
+    # test-mlp-repair.sh header): provider/worker names are this pool's
+    # durable, deliberately-chosen registry and always win a collision; a
+    # repair name is whatever a family member typed into a Windows dialog
+    # once, so it is only ever consulted once both of those have already
+    # failed to match. Still rides the SAME open ControlMaster as the
+    # worker-ledger fetch just above (item 5) — close it only once, here.
+    if [[ -n "${GW_REPAIR_LO:-}" && -n "${GW_REPAIR_HI:-}" ]]; then
+        repair_scan_out="$(gather_repair_targets)"
+    fi
+    close_gateway_master
+
+    if [[ -z "${GW_REPAIR_LO:-}" || -z "${GW_REPAIR_HI:-}" ]]; then
+        # Definition 1 (item 1): loud — an extra detail line naming the
+        # missing config — but NOT reclassified. TARGET_ERR stays the
+        # plain "notfound" so an unrelated caller depending on the
+        # existing generic message (test-mlp-fwd.sh's regression case for
+        # an unknown name) never regresses.
+        TARGET_ERR="notfound"
+        TARGET_DETAIL="mlp: NODE_GATEWAY.ports.repair not configured — cannot rule out '${name}' being a repair host"
+        return 1
+    fi
+
+    while IFS= read -r rline; do
+        [[ -n "$rline" && "$rline" != "!UNCONFIGURED" ]] || continue
+        fwd_split_row "$rline"
+        [[ "$FWD_C1" == "$name" ]] && candidates+=("$FWD_C2")
+    done <<< "${repair_scan_out:-}"
+
+    case "${#candidates[@]}" in
+        0)
+            TARGET_ERR="notfound"
+            return 1
+            ;;
+        1)
+            TARGET_TYPE="repair"
+            TARGET_USER="repair"
+            TARGET_PORT="${candidates[0]}"
+            return 0
+            ;;
+        *)
+            TARGET_ERR="repair-ambiguous"
+            for c in "${candidates[@]}"; do
+                if [[ -z "$TARGET_CANDIDATES" ]]; then
+                    TARGET_CANDIDATES="$c"
+                else
+                    TARGET_CANDIDATES="${TARGET_CANDIDATES},${c}"
+                fi
+            done
+            return 1
+            ;;
+    esac
 }
 
 do_connect() {
     local type port user
     if [[ $# -eq 1 ]]; then
-        # Name form: resolve through the shared Model, then fall through to
-        # the same login below. This is what connect_by_name used to inline.
-        target_resolve "$1" || {
-            case "$TARGET_ERR" in
-                unreachable)
-                    [[ -n "$TARGET_DETAIL" ]] && printf '%s\n' "$TARGET_DETAIL" >&2
-                    die "Gateway unreachable (${GW_USER}@${GW_IP})"
-                    ;;
-                *) die "no such node or worker: $1" ;;
-            esac
-        }
-        type="$TARGET_TYPE"
-        port="$TARGET_PORT"
-        user="$TARGET_USER"
+        # Bare in-range port (item 4): goes straight there, BEFORE even
+        # target_resolve's pool-resolve/worker-ledger steps run — no
+        # ControlMaster needed just to know a number sits inside the
+        # repair range we already have from resolve_gateway. Disjoint from
+        # every real provider/worker gateway_port by NODE_GATEWAY's own
+        # contract, so this can never shadow a real name (Definition 2).
+        if [[ "$1" =~ ^[0-9]+$ && -n "${GW_REPAIR_LO:-}" && -n "${GW_REPAIR_HI:-}" \
+              && "$1" -ge "$GW_REPAIR_LO" && "$1" -le "$GW_REPAIR_HI" ]]; then
+            type="repair"
+            port="$1"
+            user="repair"
+        else
+            # Name form: resolve through the shared Model, then fall
+            # through to the same login below. This is what
+            # connect_by_name used to inline.
+            target_resolve "$1" || {
+                case "$TARGET_ERR" in
+                    unreachable)
+                        [[ -n "$TARGET_DETAIL" ]] && printf '%s\n' "$TARGET_DETAIL" >&2
+                        die "Gateway unreachable (${GW_USER}@${GW_IP})"
+                        ;;
+                    repair-ambiguous)
+                        die "repair name '$1' matches multiple hosts (ports: ${TARGET_CANDIDATES})"
+                        ;;
+                    *)
+                        [[ -n "$TARGET_DETAIL" ]] && printf '%s\n' "$TARGET_DETAIL" >&2
+                        die "no such node or worker: $1"
+                        ;;
+                esac
+            }
+            type="$TARGET_TYPE"
+            port="$TARGET_PORT"
+            user="$TARGET_USER"
+        fi
     else
         type="$1"
         port="$2"
@@ -799,7 +1084,7 @@ do_connect() {
         gateway)
             ssh_gateway_only "$GW_KNOWN_HOSTS" "$GW_USER" "$GW_IP" "$GW_PORT"
             ;;
-        provider|worker)
+        provider|worker|repair)
             # See scripts/lib/ssh.sh's trust-model note: the Gateway leg
             # is verified (dedicated known_hosts, via ProxyCommand); the
             # 127.0.0.1:<port> leg is not checked at all, on purpose.
