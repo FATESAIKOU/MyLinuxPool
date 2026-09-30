@@ -33,6 +33,12 @@
 # 7 rendered YAML valid + array shape, 8 idempotence. Injections:
 # empty-result guard removed -> 5 red; multi-key squeezed into ONE string ->
 # 7 red.
+# 9. REPAIR_TUNNEL_PUBKEY（design D9）在 rotate 路：collect→assemble→渲染
+#    的 cloud-config 的 sshproxy 清單含它；不存在 → 照常；值不合法 →
+#    大聲失敗；換新值 → 舊的不在。對現碼紅（collector 不認識它）。
+# 10. rotate_compute_new_gateway_json 保留 ports.repair（D10 的查證條；
+#     現碼的 `$existing * {...}` 已保留 → **這條對現碼是綠的**，是回歸
+#     保護，不是紅燈）。
 #
 # bash 3.2 compatible on purpose (macOS ships 3.2).
 # Run: scripts/tests/test-rotate-authkeys.sh
@@ -80,6 +86,12 @@ VARS_JSON="$(jq -n --arg v1 "$NODE_FH_L_VAL" --arg v2 "$NODE_FH_PXY_VAL" --arg v
     ]}')"
 WORKERS_JSON="$(jq -c -n --arg w "$WORKER_KEY" \
     '[{port:2300, tunnel_public_key:$w}]')"
+
+# REPAIR_TUNNEL_PUBKEY（design D9）：單行公鑰、不是 JSON。兩個值用來驗
+# 換鑰（舊的不在）。NOT_A_KEY 是合法 JSON 物件——最貼近現實的壞法。
+REPAIR_KEY="ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFIXTUREREPAIRSHARED repair-shared"
+REPAIR_KEY_OLD="ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFIXTUREREPAIRPREV repair-shared-prev"
+REPAIR_KEY_NOT_A_KEY='{"name":"not-a-key"}'
 
 CLIENTS_JSON="$(jq -c -n --arg a "$CLIENT_A" --arg ac "$CLIENT_ACTIONS" \
     '[{name:"fatesaikou-mac", public_key:$a, added_at:"2026-09-16T12:00:00Z"},
@@ -263,6 +275,110 @@ else
         bad "8. 兩次渲染不同（$C1 vs ${C2}）"
     fi
 fi
+
+# ---------------------------------------------------------------------------
+# 9. REPAIR_TUNNEL_PUBKEY（共用跳板公鑰，design D9）——rotate 這條路
+#
+# rotate 用同一組函式建新 Gateway（ONE assembly path）：collect →
+# rotate_assemble_sshproxy_keys → rotate_render_cloud_config。只改 refresh
+# workflow 而漏掉共用函式，rotate 出來的新機就會漏掉共用鑰 → 全家失聯
+# （recon §2.2 的最大陷阱）。這節在**鏈級**驗 rotate 的渲染結果。
+# ---------------------------------------------------------------------------
+echo "── 9. REPAIR_TUNNEL_PUBKEY：rotate 側的共用跳板公鑰 ──"
+if ! declare -F refresh_collect_tunnel_keys >/dev/null 2>&1 \
+   || ! declare -F rotate_assemble_sshproxy_keys >/dev/null 2>&1 \
+   || ! declare -F rotate_render_cloud_config >/dev/null 2>&1; then
+    bad "9. 缺 rotate 鏈函式，無法驗證"
+else
+    # rotate 鏈：vars+workers → collect → assemble → 渲染的 sshproxy 清單。
+    rotate_chain_list() {   # <vars-json>
+        local vars="$1" t
+        t="$(refresh_collect_tunnel_keys "$vars" "$WORKERS_JSON" </dev/null 2>/dev/null)" || return $?
+        rotate_assemble_sshproxy_keys "$t" </dev/null 2>/dev/null
+    }
+    rotate_rendered_lists() {   # <vars-json> → 兩份渲染後的清單到 $RL_LOGIN/$RL_SSH
+        local vars="$1" t rendered
+        t="$(refresh_collect_tunnel_keys "$vars" "$WORKERS_JSON" </dev/null 2>/dev/null)" || return $?
+        RL_SSH="$(rotate_assemble_sshproxy_keys "$t" </dev/null 2>/dev/null)" || return $?
+        RL_LOGIN="$(rotate_assemble_login_keys "$CLIENTS_JSON" "$CLIENT_ACTIONS" </dev/null 2>/dev/null)" || return $?
+        return 0
+    }
+    VARS_WITH_REPAIR="$(printf '%s' "$VARS_JSON" | jq -c --arg rk "$REPAIR_KEY" \
+        '.total_count = 4 | .variables += [{name:"REPAIR_TUNNEL_PUBKEY", value:$rk}]')"
+    VARS_BAD_REPAIR="$(printf '%s' "$VARS_JSON" | jq -c --arg rk "$REPAIR_KEY_NOT_A_KEY" \
+        '.total_count = 4 | .variables += [{name:"REPAIR_TUNNEL_PUBKEY", value:$rk}]')"
+    VARS_PREV_REPAIR="$(printf '%s' "$VARS_JSON" | jq -c --arg rk "$REPAIR_KEY_OLD" \
+        '.total_count = 4 | .variables += [{name:"REPAIR_TUNNEL_PUBKEY", value:$rk}]')"
+
+    # 9a：正對照——含修復公鑰的 vars 下，rotate 鏈本身組得出來（provider／
+    #     worker 鑰在）。這在現碼與實作後都該綠；它保證 9b 的「缺修復公鑰」
+    #     紅是缺那一把，不是整條鏈壞掉。
+    OUT="$(rotate_chain_list "$VARS_WITH_REPAIR")"; RC=$?
+    if [[ $RC -eq 0 ]] \
+       && printf '%s\n' "$OUT" | grep -qF "$PROV1_KEY" \
+       && printf '%s\n' "$OUT" | grep -qF "$WORKER_KEY"; then
+        ok "9a. 正對照：含修復公鑰的 vars 下 rotate 鏈照常（provider／worker 鑰在）"
+    else
+        bad "9a. 正對照失敗：rotate 鏈組不出來（rc=${RC}, out=[${OUT:0:200}]）——9b/9d 不可信"
+    fi
+
+    # 9b：有合法值 → 渲染出的 sshproxy 清單含它（provider 鑰也在）。
+    if rotate_rendered_lists "$VARS_WITH_REPAIR"; then
+        if printf '%s\n' "$RL_SSH" | grep -qF "$REPAIR_KEY"; then
+            ok "9b. rotate 渲染的 sshproxy 清單含共用跳板公鑰"
+        else
+            bad "9b. rotate 渲染缺共用跳板公鑰（sshproxy=[${RL_SSH:0:200}]）——rotate 出來的新 Gateway 全家撥不進"
+        fi
+    else
+        bad "9b. rotate 渲染鏈失敗，無法驗證"
+    fi
+
+    # 9c：值不合法 → 大聲失敗、無輸出。
+    OUT="$(rotate_chain_list "$VARS_BAD_REPAIR" 2>"$SANDBOX/rotate-repair.err")"; RC=$?
+    if [[ $RC -ne 0 && -z "$OUT" ]]; then
+        ok "9c. 值不是合法公鑰 → rotate 鏈中止、非 0、無輸出"
+    else
+        bad "9c. 壞值被接受（rc=$RC, out=[${OUT:0:200}]）——新 Gateway 會少一把鑰而看起來成功"
+    fi
+
+    # 9d：換新值 → 舊的不在（由 9a 把關：現碼根本沒收，所以先用
+    #      舊值單獨驗證「若收了會長什麼樣」不成立——這條的正對照是 9b
+    #      本身（收錄存在）；換值行為只在收錄落地後可驗，現碼下兩個都紅。
+    OUT_OLD="$(rotate_chain_list "$VARS_PREV_REPAIR")"
+    if printf '%s\n' "$OUT_OLD" | grep -qF "$REPAIR_KEY_OLD" \
+       && ! printf '%s\n' "$OUT" | grep -qF "$REPAIR_KEY_OLD"; then
+        ok "9d. 換新值後 rotate 清單不含舊值"
+    else
+        bad "9d. 換值行為不對（舊值存在於舊 var？[$(printf '%s\n' "$OUT_OLD" | grep -cF "$REPAIR_KEY_OLD")]，新結果含舊？[$(printf '%s\n' "$OUT" | grep -cF "$REPAIR_KEY_OLD")]）"
+    fi
+fi
+
+# ---------------------------------------------------------------------------
+# 10. rotate 改寫 NODE_GATEWAY 時保留 ports.repair（design D10 的查證條）
+#
+# 2026-09-30 查證：現碼 `$existing * {...}`（jq 的物件乘＝右邊覆蓋左邊、
+# 未提到的欄位保留）本來就會保留 ports.repair——**這條對現碼是綠的**，
+# 是回歸保護（下一次有人把 compute 改成「挑欄位重建」時會紅）。
+# ---------------------------------------------------------------------------
+echo "── 10. rotate_compute_new_gateway_json 保留 ports.repair ──"
+if ! declare -F rotate_compute_new_gateway_json >/dev/null 2>&1; then
+    bad "10. rotate_compute_new_gateway_json 未定義"
+else
+    OLD_GW='{"ip":"192.0.2.1","port":2100,"tunnel_user":"sshproxy","generation":41,"ports":{"provider":[2220,2299],"worker":[2300,2399],"repair":[2400,2499]}}'
+    NEW_GW="$(rotate_compute_new_gateway_json "$OLD_GW" "192.0.2.9" 42 "2026-09-30T00:00:00Z" "" </dev/null 2>/dev/null)"; RC=$?
+    if [[ $RC -eq 0 ]] && printf '%s' "$NEW_GW" | jq -e '.ports.repair == [2400,2499]' >/dev/null 2>&1; then
+        ok "10. 改寫後 ports.repair 原樣保留（$NEW_GW 的 .ports.repair）"
+    else
+        bad "10. ports.repair 掉了或改寫失敗（rc=$RC, new=[${NEW_GW:0:200}]）——mlp 將讀不到跳板段"
+    fi
+    # 附帶：其他未被提到的欄位也保留（同一條規則的旁證）。
+    if printf '%s' "$NEW_GW" | jq -e '.tunnel_user == "sshproxy" and .port == 2100' >/dev/null 2>&1; then
+        ok "10b. 未被提到的欄位（tunnel_user／port）也保留"
+    else
+        bad "10b. 未提到的欄位掉了（new=[${NEW_GW:0:200}]）"
+    fi
+fi
+
 
 # ---------------------------------------------------------------------------
 # 注入 1：拿掉空清單防線 → 第 5 條必須紅

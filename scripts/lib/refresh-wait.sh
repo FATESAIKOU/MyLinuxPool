@@ -17,7 +17,7 @@
 #     create_worker_build_run_cmd's caller)
 #   - ops-scripts/register-client (mlp register client)
 #   - ops-scripts/register-provider.sh (mlp register provider)
-#   - ops-scripts/register-repair-host (registers a family repair host)
+#   - ops-scripts/setup-repair-key (sets the shared repair tunnel key)
 # A grep for the function DEFINITION across the repo should find exactly
 # one place: here.
 

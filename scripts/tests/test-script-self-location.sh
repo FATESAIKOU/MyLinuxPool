@@ -136,6 +136,7 @@ probe_args() {
         mlp)             printf '%s' "__no_such_cmd__" ;;
         register-client) printf '%s' "--help" ;;
         pool-residue.sh) printf '%s' "--help" ;;
+        setup-repair-key) printf '%s' "--help" ;;
         *)               printf '%s' "" ;;
     esac
 }
@@ -144,7 +145,7 @@ probe_want() {
         mlp)             printf '%s' "unknown command" ;;
         register-client) printf '%s' "usage: register-client" ;;
         pool-residue.sh) printf '%s' "usage: pool-residue" ;;
-        register-repair-host) printf '%s' "usage: register-repair-host" ;;
+        setup-repair-key) printf '%s' "usage: setup-repair-key" ;;
         package-repair-host) printf '%s' "usage: package-repair-host" ;;
         verify-profile)  printf '%s' "usage: verify-profile" ;;
         preflight)       printf '%s' "preflight:" ;;

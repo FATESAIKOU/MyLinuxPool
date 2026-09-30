@@ -2,7 +2,7 @@
 # profiles/provider/repair/user-data.tmpl — cloud-init NoCloud user-data for a
 # family repair host (openspec/changes/family-repair-host, design D1/D4/D8).
 #
-# Rendered on the owner's Mac by ops-scripts/register-repair-host; every
+# Rendered on the owner's Mac by ops-scripts/package-repair-host; every
 # placeholder token (upper-case name between double at-signs) is replaced
 # there, and the renderer refuses to write a file that still contains one. Values are single-line by construction (names,
 # ports, one public-key line, base64), so no token can inject YAML.
@@ -48,7 +48,7 @@ package_upgrade: false
 # (2026-09-29 decision, tasks 8b.1 — so the owner's other machines and the AI
 # entry can all log in). This is a SNAPSHOT: the seed is static, nothing
 # fetches new keys at boot, so adding or rotating a client means building a
-# new seed (re-run register-repair-host) and rebooting the VM on it.
+# new bundle (re-run package-repair-host) and rebooting the VM on it.
 # Revoking one key means editing authorized_keys after logging in, or the
 # same rebuild. No password exists, so password login cannot be turned on by
 # accident later.
@@ -106,8 +106,8 @@ write_files:
     owner: root:root
     permissions: '0644'
     content: |
-      POOL_NODE_NAME=@@NODE_NAME@@
-      POOL_GATEWAY_PORT=@@PROVIDER_PORT@@
+      POOL_NODE_NAME=repair-host
+      POOL_GATEWAY_PORT_RANGE=@@PROVIDER_PORT_RANGE@@
       POOL_GATEWAY_USER=@@GATEWAY_TUNNEL_USER@@
       POOL_GATEWAY_SSH_PORT=@@GATEWAY_SSH_PORT@@
       POOL_GATEWAY_HOST=@@GATEWAY_HOST@@
@@ -127,7 +127,7 @@ write_files:
     content: @@TUNNEL_PRIVATE_KEY_B64@@
 
   # ---- the tunnel: tools (staged, see the header) ---------------------------
-  # Embedded by register-repair-host from the checkout it runs in, base64 so
+  # Embedded by package-repair-host from the checkout it runs in, base64 so
   # no file content can break the YAML. pool-tunnel and tunnel-identity.sh
   # are the unmodified shared-configs copies (static mode, D3 port);
   # everything repair-specific is in the four repair-* scripts next to this

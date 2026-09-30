@@ -121,6 +121,97 @@
 #        * 失敗，且輸出不像是被拒（例如網路不通）→ 不在本測試範圍（design 沒
 #          有要求非認證失敗也要放慢，那樣反而拖慢真正的網路恢復）
 #
+# ---- 本輪新增（工單 test-ephemeral-vm；PM 定案，EPHEMERAL-INTERFACE.md #3/#4/
+#      #6 為準；review 擔任 test 角色）--------------------------------------
+#
+# 這輪把「臨時跳板」的三件事接進 VM 端：D2 通道多帶一個名字（介面 #4）、
+# port 改成一個段而不是單一值（介面 #2/#6）、Gateway 上的名牌（介面 #5）。
+# 下面每一條都是**這支測試定義的新介面**，現碼幾乎全部還沒有——這是預期的紅。
+#
+# ---- repair-gateway-fetch：兩行 /gw（介面 #4，取代舊的「只有一行 IP」）-----
+#   body 改成兩行：第一行 IPv4，第二行 `name=<名字>`（名字格式跟啟動器同一份
+#   pattern，介面 #3：`^[a-z]([a-z0-9-]{0,30}[a-z0-9])?$`）。
+#   兩行都合法、沒有多餘的第三行 → 原子寫入 MLP_GATEWAY_ENV_FILE **兩行**：
+#     POOL_GATEWAY_HOST=<ip>
+#     REPAIR_NAME=<name>
+#   任一不合法（IP 格式錯、第二行不是 `name=`、名字格式錯、缺第二行、多一行
+#   垃圾）→ **完全不寫**（既有檔案內容原封不動，跟現在「空回應不寫」的規則
+#   是同一種 fail-closed），stderr 說明原因，exit 1。
+#
+# ---- 名字唯一來源：gateway.env 的 REPAIR_NAME（PM 裁定，no env 後門）------
+#   repair-tunnel-launch 要幫 VM 設 hostname 時，**只**能從
+#   ${MLP_GATEWAY_ENV_FILE} 的 REPAIR_NAME 讀名字。POOL_NODE_NAME（tunnel.env
+#   既有變數，pool-tunnel 自己拿去當它内部的 NAME/記錄用）**不是**名字的來源
+#   ——即使它被設成一個合法名字，也絕不能被拿去設 hostname。這是一個先前
+#   worker 卡住的爭點，PM 已裁定：唯一可信來源是 D2 → repair-gateway-fetch →
+#   gateway.env 這條路徑，其餘一律不採信。
+#
+#   設 hostname 的動作：`${MLP_REPAIR_HOSTNAME_BIN:-hostnamectl} set-hostname
+#   <name>`（測試覆寫用 MLP_REPAIR_HOSTNAME_BIN，同 MLP_REPAIR_POOL_TUNNEL_BIN
+#   的慣例）。同一個名字不必重複呼叫（用一個記憶中的「上次設過的名字」擋，不
+#   落地成檔案——重開機/重啟服務會重設一次，冪等，無害）。名字格式再驗一次
+#   （防禦性；正常情況下 fetch 已經驗過）。
+#
+# ---- 沒有合法答案 → 不撥號（PM 裁定，取代舊的「§3c2：沒答案就撥打
+#      placeholder」）------------------------------------------------------
+#   舊斷言：D2 沒有答案時，repair-tunnel-launch 讓 pool-tunnel 撥打開機資料裡
+#   的 .invalid placeholder，靠 DNS 在撥號當下失敗，屬於「明確失敗」。
+#   **這條被取代**：現在的規則是——每一輪，refresh_gateway_host 之後，
+#   gateway.env 裡若**沒有同時**拿到合法的 POOL_GATEWAY_HOST（IPv4）與合法的
+#   REPAIR_NAME，這一輪**完全不呼叫 pool-tunnel**（一次 ssh 撥號都不打），呼叫
+#   repair-gateway-report down，然後用 D7 的「快退」節奏（10/20/40/60…，
+#   NOT_COUNTED 那條，因為根本沒碰到 sshd）重試。
+#   為什麼換：(a) 撥 placeholder 靠的是 ssh 對 DNS 失敗訊息剛好落在
+#   NOT_COUNTED_RE 裡，是巧合式的耦合，不是設計；(b) 已知會失敗還是要真的
+#   起一個 ssh 子行程，白花一次系統呼叫；(c) 兩種「down」的理由（根本沒有
+#   Gateway 資訊 vs 真的網路失敗）現在混成同一句話，家人看不出差別。改成
+#   「不知道就不撥」讓這個狀態顯式化，也不再依賴 ssh 的錯誤字面。
+#   placeholder 字串可以留在模板/tunnel.env 裡（給沒有這層邏輯的舊版看），但
+#   repair-tunnel-launch **絕不能**把它交給 pool-tunnel/ssh。
+#
+# ---- Port 段（介面 #2/#6）--------------------------------------------------
+#   開機資料帶一個段（新 placeholder `@@PROVIDER_PORT_RANGE@@`，渲染成
+#   `POOL_GATEWAY_PORT_RANGE=<min>,<max>`，取代舊的單一值
+#   `@@PROVIDER_PORT@@`/`POOL_GATEWAY_PORT=`）。repair-tunnel-launch：
+#     * 開機讀不到這個段（不存在、格式不對、min>=max）→ 大聲拒絕（同
+#       repair-token-guard 的 fail-closed 慣例），不寫死 fallback，report down，
+#       exit 非 0。
+#     * 每次「重新開始找 Gateway」（也就是這一輪拿到合法的 host+name 之後開始
+#       撥號）都從段首（min）開始試。
+#     * 失敗分類擴成三種（見下）：`remote port forwarding failed`
+#       （NOT_COUNTED 的一種）→ 換下一個 port（到段尾繞回段首），快退；
+#       `Permission denied` 等（COUNTED）→ **絕不換 port**，照舊 310 秒／
+#       10 分鐘 <5 次的節奏（D7，不能退化）；其他 NOT_COUNTED（DNS、
+#       connection refused 等）→ 不算次數也**不換 port**（網路不通不代表這個
+#       port 被佔），原 port 快退重試。
+#     * 挑 port 的狀態是執行期的區域變數，不寫回任何檔案（OUT-recon-ephemeral
+#       §4.2 第 4 點）。
+#
+# ---- Gateway 上的名牌（介面 #5）--------------------------------------------
+#   接上（撥號成功）之後，用同一條 ControlMaster（`ssh -S "$CTL" ...`，跟
+#   pool-tunnel 自己的 health_check 同一種呼叫方式，不建新連線）在 Gateway 上
+#   把 `/home/sshproxy/repair/<實際連上的 port>` 覆寫成只有名字一行。
+#   重新接上（不管是不是換了 port）：先刪舊 port 的名牌，新連上後才寫新的。
+#   正常停止（收到 SIGTERM/INT，on_stop 路徑）：刪掉目前這個 port 的名牌，
+#   再收隧道。
+#
+# ---- 可測試性慣例（本測試對 repair-tunnel-launch 提出的要求，不是
+#      EPHEMERAL-INTERFACE.md 的一部分，是這支測試能不 hang 地驗證內部函式
+#      所需要的最小結構；impl 可以不同意，但要在報告裡講）-------------------
+#   repair-tunnel-launch 把主迴圈包進一個「只有直接執行時才跑」的守衛，跟
+#   pool-tunnel 自己 `main "$@"` 前面的 BASH_SOURCE 守衛同一種寫法。這樣測試
+#   可以 `source` 這支腳本去單獨呼叫下面幾個函式，不會被無窮迴圈卡住：
+#     * classify_dial_failure <ssh-stderr-text>   → 印 counted／forward／other
+#     * next_port <cur> <min> <max>               → 印下一個 port（到 max 繞回 min）
+#     * has_valid_gateway                          → 讀 $GATEWAY_ENV_FILE，兩個值都
+#                                                     合法才 return 0
+#     * apply_repair_name <name>                   → 呼叫 hostnamectl（見上）
+#     * nametag_write <port> <name>                → 見上
+#     * nametag_remove <port>                      → 見上
+#   這些函式名字是本測試的建議介面，不是鐵律；impl 若用別的名字，只要功能
+#   對得上、且腳本本身仍然「被 source 不會跑主迴圈」，測試改函式名即可
+#   （介面在檔頭寫清楚，改動要同步改本檔——TEAM-RULES 的慣例）。
+#
 # ---- 可測試性覆寫（只給這支測試用，不是給正式部署用）----------------------
 #   MLP_REPAIR_VM_DIR — 覆寫上面四支新腳本所在的目錄（預設
 #   profiles/provider/repair）。impl 開發中想先在別的地方驗證這支測試會不會
@@ -128,7 +219,7 @@
 #     MLP_REPAIR_VM_DIR=/path/to/wip bash scripts/tests/test-repair-host-vm.sh
 #
 # ==============================================================================
-# 要驗的（對應工單 1-5）
+# 要驗的（1-5 對應 task 5 舊工單；6-9 對應本輪 test-ephemeral-vm 工單 1-5）
 # ==============================================================================
 #   1. user-data 的性質：沒有 packages:；sshd 只聽 loopback、
 #      PasswordAuthentication no；runcmd 重啟 ssh.socket；屬於新使用者的檔案
@@ -148,6 +239,18 @@
 #      自己的退避數列（2,4,8,16,30,30,...）完全不變（對現碼綠——這是既有
 #      pool-tunnel 的行為，task 5 不該去動它，D7 只加在維修模式專用的
 #      repair-tunnel-launch 裡）
+#   6. /gw 兩行解析＋「沒有合法答案就不撥號」：兩行都合法 → 寫兩個值；任一
+#      不合法（含只有 IP 沒有名字、名字格式錯、IP 格式錯、多一行垃圾）→
+#      gateway.env 不變；repair-tunnel-launch 這一輪完全不呼叫 ssh、report
+#      down、走快退（取代舊 §3c2；對現碼紅：fetch 還是單行解析，launch 沒有
+#      這層守門）
+#   7. hostname：名字只能來自 gateway.env 的 REPAIR_NAME；只有 POOL_NODE_NAME
+#      （沒有 REPAIR_NAME）**不能**觸發設 hostname（對現碼紅：整個機制不存在）
+#   8. Port 段：讀不到段就拒絕啟動；從段首開始；`remote port forwarding
+#      failed` 換下一個 port（繞回段首）；`Permission denied` 絕不換 port、
+#      D7 節奏不變（對現碼紅：機制不存在）
+#   9. Gateway 名牌：接上寫、換 port 先刪舊再寫新、正常停止刪除（對現碼紅：
+#      機制不存在）
 #
 # ---- 正對照（量到 0 不算證據）-----------------------------------------------
 #   * §3/§4/§5：假 ssh／假 curl 真的被呼叫過（log 非空）才信後面的斷言
@@ -157,6 +260,10 @@
 #   * §4c：視窗計數器（count_max_window）先拿一組已知會違規的序列（pool-tunnel
 #     自己原生的快速退避數列，套進同一個計數器）自我驗證，確認它真的抓得到
 #     違規，不是一個永遠回答「沒問題」的空殼
+#   * §6：先確認 curl／ssh 假指令真的被呼叫過（沿用既有 log），再看 ssh 的
+#     撥號行（-M -S）次數是 0
+#   * §7/§8/§9：source 之後先用 `declare -F` 確認函式真的存在（不是測到一個
+#     從未定義、永遠不執行的名字），再呼叫並看假 hostnamectl／假 ssh 的 log
 #
 # ---- 注入（有真的原始碼可以動刀的地方才做；沒有的地方用 inj_skip 說明）----
 #   * §1：對 user-data.tmpl 的複本動刀（拿掉 defer: true、把 ListenAddress
@@ -166,6 +273,9 @@
 #   * §1e/1g、§2-4：subject 還不存在，沒有原始碼可以動刀——現碼本身的紅就是
 #     這些檢查「有在量」的證據，注入欄位記 inj_skip 並說明理由（跟
 #     test-register-repair-host.sh 對 §7 的處理方式一致）
+#   * §6-9：subject（新行為）現碼不存在，同上以 inj_skip 記；丟棄式綠版
+#     （scratchpad 複本）另外做注入，記在 OUT-test-ephemeral-vm.md 而不是本檔
+#     （本檔跑的是對現碼的紅／未來對落地版本的綠，不夾帶丟棄式實作）
 #
 # ==============================================================================
 # 這支測試看不到什麼（誠實記在這裡）
@@ -200,6 +310,33 @@
 #     cloud-init／sudo 自己的事）、不驗檔案的權限位（0440 等）與 owner、
 #     也不驗規則的指令範圍（ALL=(ALL) vs 收窄的 Cmnd 清單）——使用者的
 #     決定原文是「給免密碼 sudo」，範圍留給 impl。
+#   * §6：只驗「沒有合法答案的那一輪不撥號」，不驗「拿到合法答案之後馬上
+#     開始撥號的延遲」（也就是不驗這個轉換發生得多快）。
+#   * §7 的 hostname：只驗「呼叫了 hostnamectl 這個外部指令且參數對」，不驗
+#     真正的 Linux hostname 有沒有被改（那要真機或至少真的
+#     hostnamectl／systemd-hostnamed，不在這支離線測試範圍——跟 spike／真機
+#     驗收的既有分工一致）。也不驗「開機時就已經有名字」與「開機後才拿到
+#     名字」兩種時序哪個先——interface 沒有要求開機當下就要有 hostname。
+#   * §8 的 port 段：只驗「換 port」與「不換 port」兩種分類的邏輯本身
+#     （classify_dial_failure／next_port 這兩個純函式），**不**用真的多輪
+#     ssh 撥號迴圈去驗「主迴圈真的把這兩個函式接起來用」——那需要一個會
+#     依序回傳不同失敗訊息、成功後還能維持 ControlMaster 存活的假 ssh，
+#     這支測試沒有做（見下方「本測試看不到」的第一條）。impl 落地後，若
+#     只是把這兩個函式定義好卻沒有在主迴圈實際呼叫，本測試量不到。
+#   * §9 的名牌：只驗 nametag_write／nametag_remove 這兩個函式被單獨呼叫時
+#     組出的 ssh 遠端指令對不對（路徑、內容、用同一個 -S 控制端），**不**驗
+#     主迴圈在「接上」「換 port 重接」「收到 SIGTERM」這三個時間點真的有呼叫
+#     它們——同一個原因（沒有可以模擬「連上又斷開」的假 ssh 全流程）。
+#   * repair-gateway-fetch 兩行解析：只驗「名字格式」與「兩行都要有」，不驗
+#     name 大小寫以外的邊界（例如恰好 32 字元、恰好 1 字元）——那組邊界已經
+#     在 OUT-review-ephemeral-launcher.md §1.1 對啟動器那一端測過 17/17，這裡
+#     假設 VM 端用同一個 pattern 字面，不重複整組邊界，只驗「壞了會不會被
+#     擋」的代表案例。
+#   * 新增的 6-9 節全部是**單元測試層級**（source 之後呼叫個別函式，或跑一輪
+#     不含成功連線的主迴圈），沒有一個是「真的起一個會成功、又斷線、又用不同
+#     port 重連」的端到端模擬——這需要一個遠比現有 fake ssh 複雜的狀態機
+#     （維持 ControlMaster 存活、回應 -O check、依序執行遠端指令），這支測試
+#     沒有做，留給真機驗收（tasks 8）或後續加強。
 #
 # 全離線：ssh/curl/sleep 走 PATH shim；不連網、不開 VM；bash 3.2 相容。
 # Run: scripts/tests/test-repair-host-vm.sh
@@ -282,27 +419,54 @@ exit 0
 FAKE
 
 # ---- 假 curl：記 argv；依 URL 是 /gw 還是 /state 分流，依 FAKE_D2_MODE 決定
-# /gw 的行為（ip=回一個 IP；down=模擬服務不在，exit 7）。/state 一律 exit 0
-# （report 是盡力而為）。
+# /gw 的行為：
+#   ip       — 兩行 body（介面 #4）：第一行 FAKE_D2_IP，第二行
+#              name=FAKE_D2_NAME；FAKE_D2_EXTRA_LINE 非空時再加第三行垃圾
+#              （§6 的「多一行」案例）。
+#   ip_only  — 只回第一行（舊協定的形狀；§6 的「缺第二行」案例）。
+#   raw      — 原封不動印 FAKE_D2_RAW_BODY（給任意畸形內容用）。
+#   down（或其他）— 模擬服務不在，exit 7。
+# /state 一律 exit 0（report 是盡力而為）。
 cat > "$SHIMS/curl" <<'FAKE'
 #!/usr/bin/env bash
 printf '%s\n' "$*" >> "${CURL_LOG:-/dev/null}"
 if [[ ! -t 0 ]]; then cat > "${CURL_STDIN:-/dev/null}" 2>/dev/null; fi
 case "$*" in
     *"/gw"*)
-        if [[ "${FAKE_D2_MODE:-ip}" == "ip" ]]; then
-            printf '%s' "${FAKE_D2_IP:-198.51.100.7}"
-            exit 0
-        else
-            echo "curl: (7) Failed to connect to ${MLP_D2_HOST:-10.0.2.2} port ${MLP_D2_PORT:-18080}" >&2
-            exit 7
-        fi
+        case "${FAKE_D2_MODE:-ip}" in
+            ip)
+                body="${FAKE_D2_IP:-198.51.100.7}"$'\r\n'"name=${FAKE_D2_NAME:-mom-pc}"
+                [[ -n "${FAKE_D2_EXTRA_LINE:-}" ]] && body="${body}"$'\r\n'"${FAKE_D2_EXTRA_LINE}"
+                printf '%s' "$body"
+                exit 0
+                ;;
+            ip_only)
+                printf '%s' "${FAKE_D2_IP:-198.51.100.7}"
+                exit 0
+                ;;
+            raw)
+                printf '%s' "${FAKE_D2_RAW_BODY:-}"
+                exit 0
+                ;;
+            *)
+                echo "curl: (7) Failed to connect to ${MLP_D2_HOST:-10.0.2.2} port ${MLP_D2_PORT:-18080}" >&2
+                exit 7
+                ;;
+        esac
         ;;
     *"/state"*) exit 0 ;;
     *) exit 22 ;;
 esac
 FAKE
 chmod +x "$SHIMS/ssh" "$SHIMS/sleep" "$SHIMS/curl"
+
+# ---- 假 hostnamectl：記 argv（§7 用；不是真的改本機 hostname）------------
+cat > "$SHIMS/hostnamectl" <<'FAKE'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "${HOSTNAMECTL_LOG:-/dev/null}"
+exit 0
+FAKE
+chmod +x "$SHIMS/hostnamectl"
 
 # count_max_window <timestamps-file> <window-seconds>
 #   印出「任何一個長度 window-seconds 的視窗內，最多落了幾個時間戳」。
@@ -409,6 +573,20 @@ prop_sudoers_login_user_only() {
     ' "$1" 2>/dev/null
 }
 
+# ---- 本輪新增：模板不再帶每台不同的名字／單一 port（工單第 6 點） ----------
+# 名字現在完全來自 D2（見檔頭），模板不該再有 @@NODE_NAME@@ 這個逐台渲染的
+# token（POOL_NODE_NAME 這個變數名字可以留著給 pool-tunnel 自己的 NAME/記錄
+# 用，但它的值不能再是每台不同、由 register/package 決定的東西——這裡只驗
+# token 沒了，不驗 tunnel.env 還留不留 POOL_NODE_NAME 這一行本身）。
+prop_no_packaged_name()   { ! grep -q '@@NODE_NAME@@' "$1" 2>/dev/null; }
+# 單一 port 的 @@PROVIDER_PORT@@ 換成段的 @@PROVIDER_PORT_RANGE@@（介面
+# #2/#6）。用「精確吃掉右邊的 @@」的寫法，讓 @@PROVIDER_PORT_RANGE@@ 不會
+# 誤判成含有 @@PROVIDER_PORT@@（後者要求 PORT 後面立刻是 @@，前者是
+# _RANGE@@，兩者不會互相誤判）。
+prop_no_single_port()     { ! grep -q '@@PROVIDER_PORT@@' "$1" 2>/dev/null; }
+prop_has_port_range()     { grep -q '@@PROVIDER_PORT_RANGE@@' "$1" 2>/dev/null \
+                             && grep -q 'POOL_GATEWAY_PORT_RANGE=' "$1" 2>/dev/null; }
+
 echo "=== 0. 先決條件 ==="
 if [[ -f "$REPO_ROOT/$PTUNNEL" ]]; then
     ok "0a. ${PTUNNEL} 存在（§5 回歸的對象）"
@@ -444,8 +622,15 @@ if [[ -f "$TMPL_PATH" ]]; then
         || bad "1h. 模板沒有任何 /etc/sudoers.d/ 的 NOPASSWD 規則——repair 帳號在 VM 上沒有 root（8b.4，預期紅）"
     prop_sudoers_login_user_only "$TMPL_PATH" && ok "1h2. sudo 規則的 principal 只給登入使用者，不是 ALL" \
         || bad "1h2. sudo 規則的 principal 不是只有 @@LOGIN_USER@@（出現裸 ALL？）——blast radius 要對齐一個帳號（預期紅）"
+    prop_no_packaged_name "$TMPL_PATH" && ok "1i. 模板沒有 @@NODE_NAME@@（名字不再逐台包進開機資料，本輪工單第 6 點）" \
+        || bad "1i. 模板還有 @@NODE_NAME@@——名字應該完全來自 D2，不該再逐台渲染（預期紅）"
+    if prop_no_single_port "$TMPL_PATH" && prop_has_port_range "$TMPL_PATH"; then
+        ok "1j. 模板用 port 段（@@PROVIDER_PORT_RANGE@@／POOL_GATEWAY_PORT_RANGE=）取代單一 @@PROVIDER_PORT@@"
+    else
+        bad "1j. 模板還是單一 @@PROVIDER_PORT@@，或沒有段的 placeholder——port 應該是段，不寫死一個值（預期紅）"
+    fi
 else
-    for id in 1a 1b 1c 1d 1e 1f 1g 1g0 1h 1h2; do bad "${id}. ${TEMPLATE} 不存在——無法驗證"; done
+    for id in 1a 1b 1c 1d 1e 1f 1g 1g0 1h 1h2 1i 1j; do bad "${id}. ${TEMPLATE} 不存在——無法驗證"; done
 fi
 
 echo "--- 1x. 注入：對模板複本動刀，證明上面的比對真的在看內容 ---"
@@ -544,6 +729,7 @@ else
     inj_skip "1x. 模板不存在，無法動刀"
 fi
 inj_skip "1e/1g. 兩項在 task 5 落地後已綠（見上）；注入 1x 的三個模板突變各自對應 1d/1b/1f。1h/1h2 的注入（sudo-all）在模板出現 NOPASSWD 規則後才會執行，理由見該處。"
+inj_skip "1i/1j. 現碼本身就是紅（模板還沒換掉 @@NODE_NAME@@／@@PROVIDER_PORT@@）；本輪沒有對這兩項做正向注入——落地後只是『拿掉 port 段字串』這種平凡的字串比對，跟 1e/1g 同一類，價值有限"
 
 echo
 echo "=== 2. 權杖守衛（D5 後半） ==="
@@ -597,31 +783,32 @@ inj_skip "2. repair-token-guard 現碼不存在，沒有原始碼可以動刀—
 echo
 echo "=== 3. D2 取值／回報 ==="
 if [[ ! -x "$REPO_ROOT/$FETCH" && ! -x "$FETCH" ]]; then
-    for id in 3a 3b 3c 3d; do bad "${id}. ${FETCH}／${REPORT} 不存在——本測試定義它的行為（預期紅）"; done
+    for id in 3a 3b 3c 3d 3e 3f 3g 3h; do bad "${id}. ${FETCH}／${REPORT} 不存在——本測試定義它的行為（預期紅）"; done
 else
     FETCH_BIN="$REPO_ROOT/$FETCH"; [[ -x "$FETCH_BIN" ]] || FETCH_BIN="$FETCH"
     REPORT_BIN="$REPO_ROOT/$REPORT"; [[ -x "$REPORT_BIN" ]] || REPORT_BIN="$REPORT"
 
-    # 3a: 服務回 IP → 寫入 gateway.env
+    # 3a: 服務回兩行（IP + name，介面 #4）→ 兩個值都寫入 gateway.env
     GWENV="$SANDBOX/gateway.env"
     : > "$SANDBOX/curl.log"
     rm -f "$GWENV"
     out="$(env -i PATH="$SHIMS:/usr/bin:/bin" HOME="$HOME_DIR" \
-        CURL_LOG="$SANDBOX/curl.log" FAKE_D2_MODE=ip FAKE_D2_IP=198.51.100.7 \
+        CURL_LOG="$SANDBOX/curl.log" FAKE_D2_MODE=ip FAKE_D2_IP=198.51.100.7 FAKE_D2_NAME=mom-pc \
         MLP_GATEWAY_ENV_FILE="$GWENV" MLP_D2_HOST=10.0.2.2 MLP_D2_PORT=18080 \
         "$FETCH_BIN" 2>&1)"; rc=$?
     if [[ -s "$SANDBOX/curl.log" ]]; then
         ok "3a0. 正對照：假 curl 真的被呼叫（log 非空）"
-        if [[ $rc -eq 0 ]] && grep -q 'POOL_GATEWAY_HOST=198.51.100.7' "$GWENV" 2>/dev/null; then
-            ok "3a. 服務回 IP → ${GWENV} 含 POOL_GATEWAY_HOST=198.51.100.7（rc ${rc}）"
+        if [[ $rc -eq 0 ]] && grep -q 'POOL_GATEWAY_HOST=198.51.100.7' "$GWENV" 2>/dev/null \
+            && grep -q 'REPAIR_NAME=mom-pc' "$GWENV" 2>/dev/null; then
+            ok "3a. 兩行都合法 → ${GWENV} 同時有 POOL_GATEWAY_HOST=198.51.100.7 與 REPAIR_NAME=mom-pc（rc ${rc}）"
         else
-            bad "3a. 服務回 IP 但 ${GWENV} 沒有對的值（rc ${rc}, content [$(cat "$GWENV" 2>/dev/null)]）"
+            bad "3a. body 是兩行合法值，但 ${GWENV} 沒有兩個對的值（rc ${rc}, content [$(cat "$GWENV" 2>/dev/null)], out [${out}]）——現碼很可能還是單行解析（預期紅，見報告：tr -d '[:space:]' 連 CRLF 一起吃掉，兩行會被黏成一行再驗 IPv4，必定驗不過）"
         fi
     else
         bad "3a0（正對照失敗）：假 curl 沒被呼叫——3a 不可信（out [${out}]）"
     fi
 
-    # 3b: 把 fetch 出來的值疊到 pool-tunnel 的撥號上（模擬 EnvironmentFile 疊加）
+    # 3e-3h: /gw 兩行解析的反例——任一不合法都必須「完全不寫」，本輪工單第 1 點
     BASE_ENV="$SANDBOX/tunnel.env"
     cat > "$BASE_ENV" <<ENVEOF
 POOL_NODE_NAME=repair-test
@@ -630,12 +817,38 @@ POOL_GATEWAY_USER=sshproxy
 POOL_GATEWAY_SSH_PORT=2100
 POOL_GATEWAY_HOST=gateway-ip-set-at-launch.invalid
 ENVEOF
+    run_fetch_bad() {
+        # run_fetch_bad <id> <描述> <FAKE_D2_MODE 相關 env...>——先在 GWENV3
+        # 塞一個「識別得出來的舊值」，跑 fetch，斷言舊值原封不動、exit 非 0。
+        local id="$1" desc="$2"; shift 2
+        local gwenv="$SANDBOX/gateway-${id}.env"
+        printf 'POOL_GATEWAY_HOST=stale-%s.invalid\nREPAIR_NAME=stale-%s\n' "$id" "$id" > "$gwenv"
+        local out rc
+        out="$(env -i PATH="$SHIMS:/usr/bin:/bin" HOME="$HOME_DIR" "$@" \
+            MLP_GATEWAY_ENV_FILE="$gwenv" MLP_D2_HOST=10.0.2.2 MLP_D2_PORT=18080 \
+            "$FETCH_BIN" 2>&1)"; rc=$?
+        if [[ $rc -ne 0 ]] && grep -q "stale-${id}" "$gwenv" 2>/dev/null; then
+            ok "${id}. ${desc} → exit 非 0（${rc}）且 gateway.env 原封不動"
+        else
+            bad "${id}. ${desc} → 沒有 fail closed（rc ${rc}, content [$(cat "$gwenv" 2>/dev/null)], out [${out}]）"
+        fi
+    }
+    run_fetch_bad 3e "第二行缺失（body 只有 IP，舊協定的形狀）" FAKE_D2_MODE=ip_only FAKE_D2_IP=198.51.100.7
+    run_fetch_bad 3f "第二行名字格式不合法（大寫）" FAKE_D2_MODE=ip FAKE_D2_IP=198.51.100.7 FAKE_D2_NAME=Mom-Pc
+    run_fetch_bad 3g "第一行 IP 格式不合法" FAKE_D2_MODE=raw FAKE_D2_RAW_BODY=$'999.1.1.1\r\nname=mom-pc'
+    run_fetch_bad 3h "多一行垃圾" FAKE_D2_MODE=ip FAKE_D2_IP=198.51.100.7 FAKE_D2_NAME=mom-pc FAKE_D2_EXTRA_LINE=extra-garbage-line
+
+    # 3b: gateway.env 有值時，pool-tunnel 的撥號 argv 真的用得到它（直接構造
+    # gateway.env，跟 3a 的 fetch 解析結果脫鉤——3b 驗的是「EnvironmentFile
+    # 疊加 → 撥號」這條線路本身，不重複驗 fetch 怎麼解析）
+    GWENV_PLUMB="$SANDBOX/gateway-plumb.env"
+    printf 'POOL_GATEWAY_HOST=198.51.100.7\nREPAIR_NAME=mom-pc\n' > "$GWENV_PLUMB"
     : > "$SANDBOX/ssh.log"
     (
         set -a
         # shellcheck disable=SC1090
         . "$BASE_ENV"
-        [[ -f "$GWENV" ]] && . "$GWENV"
+        . "$GWENV_PLUMB"
         set +a
         env -i PATH="$SHIMS:/usr/bin:/bin" HOME="$HOME_DIR" SSH_LOG="$SANDBOX/ssh.log" \
             POOL_NODE_NAME="$POOL_NODE_NAME" POOL_GATEWAY_PORT="$POOL_GATEWAY_PORT" \
@@ -647,7 +860,7 @@ ENVEOF
     if [[ -n "$dial" ]]; then
         ok "3b0. 正對照：假 ssh 收到撥號呼叫"
         if printf '%s' "$dial" | grep -q '198.51.100.7'; then
-            ok "3b. D2 取到的 IP 真的傳到 pool-tunnel 的撥號 argv（不是取而不用）"
+            ok "3b. gateway.env 的 IP 真的傳到 pool-tunnel 的撥號 argv（不是取而不用）"
         else
             bad "3b. gateway.env 有值，但撥號 argv 沒用到它（argv [${dial}]）"
         fi
@@ -655,7 +868,8 @@ ENVEOF
         bad "3b0（正對照失敗）：假 ssh 沒被呼叫——3b 不可信"
     fi
 
-    # 3c: 服務不在 → 不覆寫；之後撥號用 placeholder（明確失敗）
+    # 3c: 服務不在 → repair-gateway-fetch 不覆寫既有 gateway.env（獨立於「要不
+    # 要撥號」——撥不撥號的新規則在 §6，這裡只驗 fetch 這一層本身的 fail-closed）
     GWENV2="$SANDBOX/gateway2.env"
     printf 'POOL_GATEWAY_HOST=stale-should-not-be-touched.invalid\n' > "$GWENV2"
     : > "$SANDBOX/curl.log"
@@ -668,24 +882,11 @@ ENVEOF
     else
         bad "3c. 服務不在時 gateway.env 被動過（content [$(cat "$GWENV2" 2>/dev/null)]）——family VM 可能連去猜出來的位址"
     fi
-    : > "$SANDBOX/ssh.log"
-    (
-        set -a
-        # shellcheck disable=SC1090
-        . "$BASE_ENV"
-        set +a
-        env -i PATH="$SHIMS:/usr/bin:/bin" HOME="$HOME_DIR" SSH_LOG="$SANDBOX/ssh.log" \
-            POOL_NODE_NAME="$POOL_NODE_NAME" POOL_GATEWAY_PORT="$POOL_GATEWAY_PORT" \
-            POOL_GATEWAY_USER="$POOL_GATEWAY_USER" POOL_GATEWAY_SSH_PORT="$POOL_GATEWAY_SSH_PORT" \
-            POOL_GATEWAY_HOST="$POOL_GATEWAY_HOST" \
-            bash "$REPO_ROOT/$PTUNNEL" --once >/dev/null 2>&1
-    )
-    dial2="$(grep -e '-M -S' "$SANDBOX/ssh.log" 2>/dev/null | tail -n 1)"
-    if printf '%s' "$dial2" | grep -q 'gateway-ip-set-at-launch.invalid'; then
-        ok "3c2. 沒有 D2 值時，撥號用開機資料裡的 placeholder（明確失敗，不是亂猜一個能連的位址）"
-    else
-        bad "3c2. 沒有 D2 值時撥號沒有用 placeholder（argv [${dial2}]）"
-    fi
+    # 舊 §3c2（「沒有 D2 值時，撥號用 placeholder」）已被 PM 取代——見檔頭與
+    # 下面的 §6：新規則是「沒有合法答案就不撥號」，不是「撥打一個保證失敗的
+    # 位址」。舊斷言本身其實仍然成立（pool-tunnel 拿到 placeholder 還是會去
+    # 撥），但它已經不是規格要的行為，繼續留著會誤導——故整段移除，改在 §6
+    # 驗新規則。
 
     # 3d: report
     : > "$SANDBOX/curl.log"
@@ -725,6 +926,13 @@ else
         POOL_NODE_NAME=repair-test POOL_GATEWAY_PORT=2255
         POOL_GATEWAY_USER=sshproxy POOL_GATEWAY_SSH_PORT=2100
         POOL_GATEWAY_HOST=203.0.113.9
+        # 本輪新增的兩個變數：現碼（沒有 §6/§8 的新邏輯）完全不讀它們，純粹
+        # 多餘、無害；未來落地版本需要它們才會撥號（gateway.env 要能被
+        # fetch 寫到有效值，MLP_D2_* 沒設就是預設的 10.0.2.2:18080，假 curl
+        # 預設 FAKE_D2_MODE=ip 會成功；段給 2400,2499）——這樣 D7 這個既有
+        # 斷言在新舊兩種實作下都能維持綠色，不用因為介面換了就報一次假紅。
+        MLP_GATEWAY_ENV_FILE="$SANDBOX/gateway-4.env"
+        POOL_GATEWAY_PORT_RANGE=2400,2499
     )
     if command -v timeout >/dev/null 2>&1; then
         # belt and suspenders：虛擬時鐘的 TERM 才是真正的終止機制（見假
@@ -845,6 +1053,272 @@ if [[ $? -eq 0 ]] && bash -n "$inj_lib/pool-tunnel" 2>/dev/null; then
 else
     inj_bad "5x. 注入腳本失敗（needle 落空或語法錯）——harness 問題"
 fi
+
+echo
+echo "=== 6. 沒有合法答案就不撥號（取代舊 §3c2；工單第 1/4 點；PM 裁定） ==="
+LAUNCH_BIN="$REPO_ROOT/$LAUNCH"; [[ -x "$LAUNCH_BIN" ]] || LAUNCH_BIN="$LAUNCH"
+if [[ ! -x "$LAUNCH_BIN" ]]; then
+    for id in 6a 6b 6c; do bad "${id}. ${LAUNCH} 不存在——本測試定義它的行為（預期紅）"; done
+else
+    run_launch_loop() {
+        # run_launch_loop <label> <gwenv-content-or-empty> [port-range|NONE]
+        #   跑一小段模擬時間（用假時鐘，絕不真的 sleep），把 gateway.env 先塞
+        #   成 <gwenv-content>（空字串＝完全沒有這個檔），FAKE_D2_MODE=down
+        #   讓即時的 fetch 一律失敗、不會覆寫我塞的內容。第三個參數是
+        #   POOL_GATEWAY_PORT_RANGE 的值，預設 2400,2499；傳字面 NONE 表示
+        #   完全不設這個環境變數（§8i 用來驗證「讀不到段就拒絕」）。結果記到
+        #   RL_DIALS／RL_FIRST_SLEEP／RL_DOWN／RL_HOSTCALL 四個全域變數。
+        local label="$1" content="$2" prange="${3:-2400,2499}"
+        local gwenv="$SANDBOX/gwenv-${label}.env"
+        local sshlog="$SANDBOX/ssh-${label}.log" sleeplog="$SANDBOX/sleep-${label}.log"
+        local curllog="$SANDBOX/curl-${label}.log" hostlog="$SANDBOX/hostnamectl-${label}.log"
+        local clock="$SANDBOX/clock-${label}"
+        if [[ -n "$content" ]]; then printf '%s\n' "$content" > "$gwenv"; else rm -f "$gwenv"; fi
+        : > "$sshlog"; : > "$sleeplog"; : > "$curllog"; : > "$hostlog"; printf '0\n' > "$clock"
+        local runenv=(
+            PATH="$SHIMS:/usr/bin:/bin" HOME="$HOME_DIR"
+            SSH_LOG="$sshlog" MLP_TEST_SLEEP_LOG="$sleeplog"
+            MLP_TEST_CLOCK="$clock" MLP_TEST_CLOCK_CAP=100
+            MLP_TEST_SSH_STDERR="Could not resolve hostname gateway-ip-set-at-launch.invalid: Name or service not known"
+            CURL_LOG="$curllog" FAKE_D2_MODE=down HOSTNAMECTL_LOG="$hostlog"
+            MLP_GATEWAY_ENV_FILE="$gwenv"
+            MLP_REPAIR_POOL_TUNNEL_BIN="$REPO_ROOT/$PTUNNEL"
+            POOL_NODE_NAME=repair-test POOL_GATEWAY_PORT=2255
+            POOL_GATEWAY_USER=sshproxy POOL_GATEWAY_SSH_PORT=2100
+            POOL_GATEWAY_HOST=gateway-ip-set-at-launch.invalid
+        )
+        [[ "$prange" != "NONE" ]] && runenv+=( POOL_GATEWAY_PORT_RANGE="$prange" )
+        if command -v timeout >/dev/null 2>&1; then
+            timeout -k 5 20 env -i "${runenv[@]}" "$LAUNCH_BIN" >/dev/null 2>&1
+        else
+            env -i "${runenv[@]}" "$LAUNCH_BIN" >/dev/null 2>&1 &
+            wait $! 2>/dev/null
+        fi
+        RL_DIALS="$(grep -c -e '-M -S' "$sshlog" 2>/dev/null | tr -d '[:space:]')"; [[ -z "$RL_DIALS" ]] && RL_DIALS=0
+        RL_FIRST_SLEEP="$(grep -v '^1$' "$sleeplog" 2>/dev/null | head -n 1)"; [[ -z "$RL_FIRST_SLEEP" ]] && RL_FIRST_SLEEP=-1
+        RL_DOWN="$(grep -c 'tunnel=down' "$curllog" 2>/dev/null | tr -d '[:space:]')"; [[ -z "$RL_DOWN" ]] && RL_DOWN=0
+        RL_HOSTCALL="$(wc -l < "$hostlog" 2>/dev/null | tr -d '[:space:]')"; [[ -z "$RL_HOSTCALL" ]] && RL_HOSTCALL=0
+    }
+
+    # 6a：從來沒有 gateway.env（模擬 D2 從沒回過答案）
+    run_launch_loop "6a" ""
+    if [[ "$RL_DIALS" -eq 0 ]]; then
+        ok "6a. 從沒拿到 D2 答案 → 一次 ssh 撥號都沒有（量到 ${RL_DIALS} 次）"
+    else
+        bad "6a. 從沒拿到 D2 答案，但還是撥了 ${RL_DIALS} 次號——現碼仍然撥打開機資料的 placeholder（舊 §3c2 的行為，已被取代，預期紅）"
+    fi
+    [[ "$RL_DOWN" -ge 1 ]] && ok "6a1. 有呼叫 report down（量到 ${RL_DOWN} 次）" \
+        || bad "6a1. 沒有呼叫 report down"
+    if [[ "$RL_FIRST_SLEEP" -ge 0 && "$RL_FIRST_SLEEP" -lt 300 ]]; then
+        ok "6a2. 重試節奏是快退（首次 sleep ${RL_FIRST_SLEEP}s < 300s），不是 D7 的 310 秒"
+    else
+        bad "6a2. 首次 sleep 是 ${RL_FIRST_SLEEP}s——不是預期的快退（可能整個沒有 sleep，或落到 310 秒的 counted 節奏）"
+    fi
+    [[ "$RL_HOSTCALL" -eq 0 ]] && ok "6a3. 沒有 gateway.env 時沒有呼叫 hostnamectl" \
+        || bad "6a3. 沒有 gateway.env 時卻呼叫了 hostnamectl（${RL_HOSTCALL} 次）"
+
+    # 6b：gateway.env 有合法 IP，但名字格式不合法（大寫）——繞過 fetch 直接塞
+    # 這個內容，測的是 repair-tunnel-launch 自己有沒有再驗一次名字格式
+    run_launch_loop "6b" $'POOL_GATEWAY_HOST=198.51.100.7\nREPAIR_NAME=Mom-Pc'
+    if [[ "$RL_DIALS" -eq 0 ]]; then
+        ok "6b. gateway.env 的名字格式不合法（Mom-Pc）→ 一次撥號都沒有"
+    else
+        bad "6b. 名字格式不合法（Mom-Pc）但還是撥了 ${RL_DIALS} 次號——launch 目前完全不驗 REPAIR_NAME（預期紅：這個概念還不存在）"
+    fi
+    [[ "$RL_HOSTCALL" -eq 0 ]] && ok "6b1. 名字不合法時沒有呼叫 hostnamectl" \
+        || bad "6b1. 名字不合法時卻呼叫了 hostnamectl（${RL_HOSTCALL} 次，argv 內容：$(cat "$SANDBOX/hostnamectl-6b.log" 2>/dev/null)）"
+
+    # 6c（正對照 / 回歸）：兩個值都合法 → 應該照樣撥號（不能矯枉過正變成完全不撥）
+    run_launch_loop "6c" $'POOL_GATEWAY_HOST=198.51.100.7\nREPAIR_NAME=mom-pc'
+    if [[ "$RL_DIALS" -ge 1 ]]; then
+        ok "6c. 正對照：兩個值都合法時，撥號照常發生（量到 ${RL_DIALS} 次）——不是這個 harness 本身沒在動"
+    else
+        bad "6c（正對照失敗）：兩個值都合法卻一次都沒撥號——上面 6a/6b 的『沒撥號』量不到意義，因為 harness 本身可能有問題"
+    fi
+fi
+inj_skip "6. 現碼的『撥不撥號』邏輯還沒有這一層守門，沒有原始碼可以動刀；6a/6b 對現碼的紅本身就是量測結果"
+
+echo
+echo "=== 7. 名字：hostname 動作與唯一來源（工單第 2 點） ==="
+run_src() {
+    # run_src <body-file> <extra env assignments...>
+    #   在乾淨環境＋假時鐘裡 source ${LAUNCH_BIN}，成功的話再 source
+    #   <body-file>。假時鐘的 TERM 自毀機制保底：現碼若沒有「被 source 不跑
+    #   主迴圈」的守衛，主迴圈會被假時鐘在 5 秒模擬時間內喊停，SRC_OUT 就會
+    #   缺少 body 腳本原本要印的標記——那本身就是「沒有守衛」的紅燈證據。
+    local bodyfile="$1"; shift
+    local clock="$SANDBOX/clock-src"
+    : > "$SANDBOX/ssh-src.log"; : > "$SANDBOX/sleep-src.log"; : > "$SANDBOX/hostnamectl-src.log"
+    printf '0\n' > "$clock"
+    local runenv=(
+        PATH="$SHIMS:/usr/bin:/bin" HOME="$HOME_DIR"
+        SSH_LOG="$SANDBOX/ssh-src.log" MLP_TEST_SLEEP_LOG="$SANDBOX/sleep-src.log"
+        MLP_TEST_CLOCK="$clock" MLP_TEST_CLOCK_CAP=5
+        FAKE_D2_MODE=down HOSTNAMECTL_LOG="$SANDBOX/hostnamectl-src.log"
+        MLP_REPAIR_POOL_TUNNEL_BIN="$REPO_ROOT/$PTUNNEL"
+        "$@"
+    )
+    if command -v timeout >/dev/null 2>&1; then
+        SRC_OUT="$(timeout -k 2 8 env -i "${runenv[@]}" bash -c \
+            'source "$1" 2>/dev/null || { echo SOURCE_FAILED; exit 0; }; source "$2"' \
+            _ "$LAUNCH_BIN" "$bodyfile" 2>&1)"
+    else
+        env -i "${runenv[@]}" bash -c \
+            'source "$1" 2>/dev/null || { echo SOURCE_FAILED; exit 0; }; source "$2"' \
+            _ "$LAUNCH_BIN" "$bodyfile" > "$SANDBOX/src-out.tmp" 2>&1 &
+        wait $! 2>/dev/null
+        SRC_OUT="$(cat "$SANDBOX/src-out.tmp" 2>/dev/null)"
+    fi
+}
+
+BODY_HOSTNAME="$SANDBOX/body-hostname.sh"
+cat > "$BODY_HOSTNAME" <<'BODY'
+if ! declare -F apply_repair_name >/dev/null 2>&1; then
+    echo "MISSING:apply_repair_name"
+    exit 0
+fi
+echo "GUARD_OK"
+printf 'POOL_GATEWAY_HOST=198.51.100.7\nREPAIR_NAME=mom-pc\n' > "$MLP_GATEWAY_ENV_FILE"
+apply_repair_name "mom-pc" 2>/dev/null
+if grep -q 'set-hostname mom-pc' "$HOSTNAMECTL_LOG" 2>/dev/null; then echo "OK:7a"; else echo "FAIL:7a"; fi
+: > "$HOSTNAMECTL_LOG"
+apply_repair_name "Bad_Name" 2>/dev/null
+if [[ -s "$HOSTNAMECTL_LOG" ]]; then echo "FAIL:7c"; else echo "OK:7c"; fi
+BODY
+
+GWENV_SRC="$SANDBOX/gwenv-src.env"
+run_src "$BODY_HOSTNAME" MLP_GATEWAY_ENV_FILE="$GWENV_SRC" \
+    POOL_NODE_NAME=repair-test POOL_GATEWAY_PORT=2255 POOL_GATEWAY_USER=sshproxy \
+    POOL_GATEWAY_SSH_PORT=2100 POOL_GATEWAY_HOST=gateway-ip-set-at-launch.invalid
+
+if printf '%s' "$SRC_OUT" | grep -q '^MISSING:'; then
+    for id in 7.0 7a 7c; do bad "${id}. $(printf '%s' "$SRC_OUT" | grep '^MISSING:')——apply_repair_name 這個函式（或同等機制）還不存在（預期紅）"; done
+elif ! printf '%s' "$SRC_OUT" | grep -q '^GUARD_OK$'; then
+    for id in 7.0 7a 7c; do bad "${id}. source ${LAUNCH} 沒有在合理時間內把控制權還給呼叫端（沒有守衛，或主迴圈把假時鐘也吃掉了）——SRC_OUT=[${SRC_OUT}]"; done
+else
+    ok "7.0. source ${LAUNCH} 安全返回（有守衛），可以單獨呼叫內部函式"
+    printf '%s' "$SRC_OUT" | grep -q '^OK:7a$' && ok "7a. gateway.env 有合法 REPAIR_NAME → 呼叫 hostnamectl set-hostname <name>" \
+        || bad "7a. 沒有呼叫對的 hostnamectl set-hostname（SRC_OUT=[${SRC_OUT}]）"
+    printf '%s' "$SRC_OUT" | grep -q '^OK:7c$' && ok "7c. 名字格式不合法（Bad_Name）時，不盲目把它交給 hostnamectl（防禦性再驗一次格式）" \
+        || bad "7c. 格式不合法的名字被直接交給 hostnamectl（SRC_OUT=[${SRC_OUT}]）"
+fi
+inj_skip "7. apply_repair_name 現碼不存在，沒有原始碼可以動刀；7b（唯一來源、無 POOL_NODE_NAME 後門）在 §6a3/6b1 用全流程驗過——只要 gateway.env 沒有合法 REPAIR_NAME，不管 POOL_NODE_NAME 是什麼，hostnamectl 都不該被呼叫"
+
+echo
+echo "=== 8. Port 段：起始、換 port、Permission denied 絕不換 port（工單第 3/4 點） ==="
+BODY_PORT="$SANDBOX/body-port.sh"
+cat > "$BODY_PORT" <<'BODY'
+missing=""
+declare -F next_port >/dev/null 2>&1 || missing="${missing} next_port"
+declare -F classify_dial_failure >/dev/null 2>&1 || missing="${missing} classify_dial_failure"
+declare -F has_valid_gateway >/dev/null 2>&1 || missing="${missing} has_valid_gateway"
+if [[ -n "$missing" ]]; then
+    echo "MISSING:${missing}"
+    exit 0
+fi
+echo "GUARD_OK"
+echo "NP1:$(next_port 2400 2400 2499)"
+echo "NP2:$(next_port 2499 2400 2499)"
+echo "NP3:$(next_port 2450 2400 2499)"
+echo "CF1:$(classify_dial_failure 'Permission denied (publickey).')"
+echo "CF2:$(classify_dial_failure 'remote port forwarding failed')"
+echo "CF3:$(classify_dial_failure 'Connection refused')"
+printf 'POOL_GATEWAY_HOST=198.51.100.7\nREPAIR_NAME=mom-pc\n' > "$MLP_GATEWAY_ENV_FILE"
+if has_valid_gateway; then echo "HVG1:yes"; else echo "HVG1:no"; fi
+printf 'POOL_GATEWAY_HOST=198.51.100.7\nREPAIR_NAME=Bad_Name\n' > "$MLP_GATEWAY_ENV_FILE"
+if has_valid_gateway; then echo "HVG2:yes"; else echo "HVG2:no"; fi
+: > "$MLP_GATEWAY_ENV_FILE"
+if has_valid_gateway; then echo "HVG3:yes"; else echo "HVG3:no"; fi
+BODY
+
+run_src "$BODY_PORT" MLP_GATEWAY_ENV_FILE="$SANDBOX/gwenv-src2.env" \
+    POOL_NODE_NAME=repair-test POOL_GATEWAY_PORT=2255 POOL_GATEWAY_USER=sshproxy \
+    POOL_GATEWAY_SSH_PORT=2100 POOL_GATEWAY_HOST=gateway-ip-set-at-launch.invalid
+
+if printf '%s' "$SRC_OUT" | grep -q '^MISSING:'; then
+    for id in 8a 8b 8c 8d 8e; do bad "${id}. $(printf '%s' "$SRC_OUT" | grep '^MISSING:')——port 段／分類函式還不存在（預期紅）"; done
+elif ! printf '%s' "$SRC_OUT" | grep -q '^GUARD_OK$'; then
+    for id in 8a 8b 8c 8d 8e; do bad "${id}. source ${LAUNCH} 沒能安全返回——SRC_OUT=[${SRC_OUT}]"; done
+else
+    np1="$(printf '%s' "$SRC_OUT" | grep '^NP1:' | cut -d: -f2)"
+    np2="$(printf '%s' "$SRC_OUT" | grep '^NP2:' | cut -d: -f2)"
+    np3="$(printf '%s' "$SRC_OUT" | grep '^NP3:' | cut -d: -f2)"
+    [[ "$np1" == "2401" ]] && ok "8a. next_port 段中間 +1（2400→${np1}）" || bad "8a. next_port(2400,2400,2499) got ${np1}，預期 2401"
+    [[ "$np2" == "2400" ]] && ok "8b. next_port 到段尾繞回段首（2499→${np2}）" || bad "8b. next_port(2499,2400,2499) got ${np2}，預期 2400（繞回段首）"
+    [[ "$np3" == "2451" ]] && ok "8b2. next_port 一般情形（2450→${np3}）" || bad "8b2. next_port(2450,2400,2499) got ${np3}，預期 2451"
+
+    cf1="$(printf '%s' "$SRC_OUT" | grep '^CF1:' | cut -d: -f2)"
+    cf2="$(printf '%s' "$SRC_OUT" | grep '^CF2:' | cut -d: -f2)"
+    cf3="$(printf '%s' "$SRC_OUT" | grep '^CF3:' | cut -d: -f2)"
+    [[ "$cf1" == "counted" ]] && ok "8c. Permission denied 分類為 counted（絕不換 port，D7 節奏）" || bad "8c. classify_dial_failure(Permission denied) got [${cf1}]，預期 counted"
+    [[ "$cf2" == "forward" ]] && ok "8d. remote port forwarding failed 分類為 forward（換下一個 port）" || bad "8d. classify_dial_failure(remote port forwarding failed) got [${cf2}]，預期 forward（獨立於 counted／其他 not-counted）"
+    [[ "$cf3" == "other" || "$cf3" == "not-counted" ]] && ok "8e. Connection refused 分類為其他 not-counted（不換 port，也不算次數）" || bad "8e. classify_dial_failure(Connection refused) got [${cf3}]，預期 other／not-counted 且不是 forward"
+
+    hvg1="$(printf '%s' "$SRC_OUT" | grep '^HVG1:' | cut -d: -f2)"
+    hvg2="$(printf '%s' "$SRC_OUT" | grep '^HVG2:' | cut -d: -f2)"
+    hvg3="$(printf '%s' "$SRC_OUT" | grep '^HVG3:' | cut -d: -f2)"
+    [[ "$hvg1" == "yes" ]] && ok "8f. has_valid_gateway：兩個值都合法 → true" || bad "8f. 兩個值都合法時 has_valid_gateway got [${hvg1}]"
+    [[ "$hvg2" == "no" ]] && ok "8g. has_valid_gateway：名字格式不合法 → false" || bad "8g. 名字不合法時 has_valid_gateway got [${hvg2}]"
+    [[ "$hvg3" == "no" ]] && ok "8h. has_valid_gateway：檔案是空的 → false" || bad "8h. 空檔時 has_valid_gateway got [${hvg3}]"
+fi
+
+# 8i：讀不到 port 段（環境裡沒有 POOL_GATEWAY_PORT_RANGE）→ 大聲拒絕、不撥號
+# ——用全流程跑（不是 source），因為這是「一開機就該拒絕」的行為，不是單一函式
+run_launch_loop "8i" $'POOL_GATEWAY_HOST=198.51.100.7\nREPAIR_NAME=mom-pc' NONE
+if [[ "$RL_DIALS" -eq 0 ]]; then
+    ok "8i. 沒有 POOL_GATEWAY_PORT_RANGE 時，即使 gateway.env 合法，也完全不撥號（大聲拒絕，fail-closed）"
+else
+    bad "8i. 沒有 POOL_GATEWAY_PORT_RANGE，但還是撥了 ${RL_DIALS} 次號——現碼還是單一 POOL_GATEWAY_PORT（環境裡的 2255），沒有段的概念、也沒有『讀不到就拒絕』這層（預期紅）"
+fi
+inj_skip "8. next_port／classify_dial_failure／has_valid_gateway／port 段拒絕 現碼都不存在，沒有原始碼可以動刀"
+
+echo
+echo "=== 9. Gateway 名牌（工單第 5 點） ==="
+BODY_NAMETAG="$SANDBOX/body-nametag.sh"
+cat > "$BODY_NAMETAG" <<'BODY'
+missing=""
+declare -F nametag_write >/dev/null 2>&1 || missing="${missing} nametag_write"
+declare -F nametag_remove >/dev/null 2>&1 || missing="${missing} nametag_remove"
+if [[ -n "$missing" ]]; then
+    echo "MISSING:${missing}"
+    exit 0
+fi
+echo "GUARD_OK"
+nametag_write 2455 mom-pc 2>/dev/null
+nametag_remove 2455 2>/dev/null
+echo "DONE"
+BODY
+
+run_src "$BODY_NAMETAG" MLP_GATEWAY_ENV_FILE="$SANDBOX/gwenv-src3.env" \
+    POOL_NODE_NAME=repair-test POOL_GATEWAY_PORT=2255 POOL_GATEWAY_USER=sshproxy \
+    POOL_GATEWAY_SSH_PORT=2100 POOL_GATEWAY_HOST=198.51.100.7
+
+if printf '%s' "$SRC_OUT" | grep -q '^MISSING:'; then
+    for id in 9a 9b; do bad "${id}. $(printf '%s' "$SRC_OUT" | grep '^MISSING:')——名牌函式還不存在（預期紅）"; done
+elif ! printf '%s' "$SRC_OUT" | grep -q '^GUARD_OK$'; then
+    for id in 9a 9b; do bad "${id}. source ${LAUNCH} 沒能安全返回——SRC_OUT=[${SRC_OUT}]"; done
+else
+    write_line="$(grep -e '-S' "$SANDBOX/ssh-src.log" 2>/dev/null | grep '2455' | grep -v 'rm ' | tail -n 1)"
+    remove_line="$(grep -e '-S' "$SANDBOX/ssh-src.log" 2>/dev/null | grep '2455' | grep 'rm ' | tail -n 1)"
+    if [[ -n "$write_line" ]]; then
+        ok "9a0. 正對照：假 ssh 收到針對 port 2455 的名牌寫入呼叫"
+        if printf '%s' "$write_line" | grep -q '/home/sshproxy/repair/2455' && printf '%s' "$write_line" | grep -q 'mom-pc'; then
+            ok "9a. 名牌寫入 /home/sshproxy/repair/2455，內容含名字 mom-pc，走同一條 ControlMaster（-S）"
+        else
+            bad "9a. 名牌寫入的路徑或內容不對（argv [${write_line}]）"
+        fi
+    else
+        bad "9a0（正對照失敗）：假 ssh 沒收到名牌寫入呼叫——9a 不可信（SSH_LOG=[$(cat "$SANDBOX/ssh-src.log" 2>/dev/null)]）"
+    fi
+    if [[ -n "$remove_line" ]]; then
+        ok "9b0. 正對照：假 ssh 收到針對 port 2455 的名牌刪除呼叫"
+        printf '%s' "$remove_line" | grep -q '/home/sshproxy/repair/2455' && ok "9b. 名牌刪除指到對的路徑" \
+            || bad "9b. 名牌刪除指令沒有指到 /home/sshproxy/repair/2455（argv [${remove_line}]）"
+    else
+        bad "9b0（正對照失敗）：假 ssh 沒收到名牌刪除呼叫——9b 不可信"
+    fi
+fi
+inj_skip "9. nametag_write／nametag_remove 現碼不存在，沒有原始碼可以動刀；本節只驗這兩個函式單獨呼叫時組出的 ssh 遠端指令，不驗主迴圈在『接上／換 port／SIGTERM』三個時間點真的有呼叫它們（見檔頭限制）"
 
 echo
 printf 'passed %d / failed %d / injection-pass %d / injection-fail %d\n' \

@@ -1,0 +1,204 @@
+#!/usr/bin/env bash
+# ops-scripts/setup-repair-key — EPHEMERAL-INTERFACE.md §7, design D9.
+#
+# Sets up the ONE shared tunnel key every family repair host dials with:
+# mints an ed25519 pair in a 700 directory, publishes the PUBLIC half to
+# the REPAIR_TUNNEL_PUBKEY repo variable (single line, not JSON), and
+# dispatches refresh-authorized-keys.yml and waits for it — so "done"
+# means the Gateway actually authorizes the key.
+#
+# The private key NEVER leaves the key dir: it travels to GitHub never,
+# to logs never, to argv never (the var write goes over stdin, the same
+# discipline as register-client).
+#
+# Refusal is the point, not an edge: re-running without --rotate must NOT
+# silently replace the key every issued bundle dials with (that would
+# brick all of them at once, with no message).
+
+set -euo pipefail
+
+# Resolve this script's REAL location, following symlinks, so it can be
+# linked into a directory on PATH (`ln -s .../ops-scripts/mlp <dir on PATH>`).
+# Both $0 and BASH_SOURCE name the LINK, not the target, so dirname on
+# either lands in the link's directory and every repo-relative path below
+# becomes wrong — the symptom is "scripts/lib/ssh.sh: No such file".
+# `readlink` without -f is used deliberately: -f is GNU-only.
+#
+# This block is duplicated in every ops-script because it has to run
+# BEFORE the script knows where the repo is — there is nothing to source
+# yet. test-script-self-location.sh asserts the copies stay identical.
+_mlp_self="${BASH_SOURCE[0]:-$0}"
+while [ -L "$_mlp_self" ]; do
+    _mlp_dir="$(cd -P "$(dirname "$_mlp_self")" && pwd)"
+    _mlp_self="$(readlink "$_mlp_self")"
+    case "$_mlp_self" in /*) ;; *) _mlp_self="${_mlp_dir}/${_mlp_self}" ;; esac
+done
+SCRIPT_DIR="$(cd -P "$(dirname "$_mlp_self")" && pwd)"
+unset _mlp_self _mlp_dir
+
+REPO="${POOL_REPO:-FATESAIKOU/MyLinuxPool}"
+DEFAULT_KEY_DIR="${HOME}/.config/mlp/repair-tunnel"
+VAR_NAME="REPAIR_TUNNEL_PUBKEY"
+REFRESH_WORKFLOW="refresh-authorized-keys.yml"
+
+# The refresh-wait logic is the SINGLE shared implementation in
+# scripts/lib/refresh-wait.sh (RUNBOOK §7.12, fourth incident — a second
+# copy of the wait loop here would risk the old `status != "queued"` bug
+# that reported "<unknown>" for a refresh that had actually succeeded).
+# shellcheck source=../scripts/lib/refresh-wait.sh
+source "${SCRIPT_DIR}/../scripts/lib/refresh-wait.sh"
+
+log() {
+    local level="$1"; shift
+    local ts=""
+    ts="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    if [[ "$level" == "INFO" ]]; then
+        printf '[%s] %s %s\n' "$ts" "$level" "$*"
+    else
+        printf '[%s] %s %s\n' "$ts" "$level" "$*" >&2
+    fi
+}
+
+usage() {
+    cat >&2 <<'EOF'
+usage: setup-repair-key [--key-dir DIR] [--rotate]
+  --key-dir DIR  key directory (default ~/.config/mlp/repair-tunnel, mode 700);
+                 holds id_tunnel (ed25519, mode 600) + id_tunnel.pub
+  --rotate       a key pair already exists: mint a fresh one instead of refusing
+EOF
+}
+
+# trigger_refresh — fire the authorized-keys refresh workflow and wait for
+# its outcome via the SINGLE shared implementation
+# dispatch_refresh_and_wait (scripts/lib/refresh-wait.sh — RUNBOOK §7.12).
+# Failure to trigger is a WARN, not fatal: the var is already written and
+# the next manual/periodic refresh would pick it up (same rationale as
+# register-client's trigger_refresh); the run's own outcome, when
+# reachable, is reported.
+trigger_refresh() {
+    log INFO "triggering ${REFRESH_WORKFLOW}"
+    # dispatch_refresh_and_wait reads GH_REPO from the environment; this
+    # script uses REPO — hand it over so the shared waiter targets the
+    # same repository.
+    GH_REPO="$REPO" dispatch_refresh_and_wait 300 || {
+        log WARN "refresh workflow did not complete successfully (see above) — check it manually from the Actions tab"
+        return 0
+    }
+    return 0
+}
+
+KEY_DIR=""
+ROTATE=0
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --key-dir) [[ $# -ge 2 ]] || { usage; exit 2; }; KEY_DIR="$2"; shift 2 ;;
+        --rotate) ROTATE=1; shift ;;
+        -h|--help) usage; exit 0 ;;
+        *) log ERROR "unknown argument: $1"; usage; exit 2 ;;
+    esac
+done
+
+for tool in gh ssh-keygen; do
+    command -v "$tool" >/dev/null 2>&1 || {
+        log ERROR "${tool} not found on PATH"
+        exit 1
+    }
+done
+
+if [[ -z "$KEY_DIR" ]]; then
+    KEY_DIR="$DEFAULT_KEY_DIR"
+fi
+PRIV_KEY="${KEY_DIR}/id_tunnel"
+PUB_KEY="${KEY_DIR}/id_tunnel.pub"
+
+# ---- key dir: create 700, never silently keep it looser --------------------
+if [[ ! -d "$KEY_DIR" ]]; then
+    mkdir -p "$KEY_DIR" || {
+        log ERROR "could not create key directory ${KEY_DIR}"
+        exit 1
+    }
+fi
+dir_mode=""
+if stat -c '%a' "$KEY_DIR" >/dev/null 2>&1; then
+    dir_mode="$(stat -c '%a' "$KEY_DIR")"
+else
+    dir_mode="$(stat -f '%Lp' "$KEY_DIR")"
+fi
+if [[ "$dir_mode" != "700" ]]; then
+    if chmod 700 "$KEY_DIR" 2>/dev/null; then
+        log INFO "tightened ${KEY_DIR} to mode 700 (was ${dir_mode})"
+    else
+        log ERROR "key directory ${KEY_DIR} has mode ${dir_mode} and it cannot be tightened — refusing to keep a private key readable by others"
+        exit 1
+    fi
+fi
+
+# ---- refuse to clobber a live key (unless --rotate) -------------------------
+# Either half present counts as present: replacing half a pair silently is
+# the same brick-every-bundle failure as replacing the whole pair. With
+# --rotate the old pair stays put until the new one is published (see the
+# atomic mint below) — it is never deleted first.
+if [[ -f "$PRIV_KEY" || -f "$PUB_KEY" ]]; then
+    if [[ "$ROTATE" -eq 0 ]]; then
+        log ERROR "a key pair already exists in ${KEY_DIR} — refusing to replace the key every issued bundle dials with (re-run with --rotate to mint a fresh one)"
+        exit 3
+    fi
+    log INFO "rotating: the old pair stays in place until the new one is published"
+fi
+
+# ---- mint ---------------------------------------------------------------------
+# Atomicity (a live key is the root of every issued bundle): the new pair is
+# minted to TEMPORARY names and only moved into place AFTER the var write
+# succeeds. A failed var write must leave the old pair byte-identical (or,
+# on first setup, leave nothing behind) — otherwise the local key and the
+# var disagree and every bundle built afterwards dials with a key the
+# Gateway never authorized.
+# -N "" is deliberate: this script runs non-interactively (tests, ssh), and
+# ssh-keygen without -N prompts. To use a passphrase-protected key, mint it
+# yourself; an existing pair is never touched here (see the refusal above).
+ROT_TMP=""
+ROT_TMP="$(mktemp "${KEY_DIR}/.id_tunnel.rotate.XXXXXX")" || {
+    log ERROR "could not create a temporary file in ${KEY_DIR} — nothing was changed"
+    exit 1
+}
+rm -f "$ROT_TMP"
+ROT_PRIV="$ROT_TMP"
+ROT_PUB="${ROT_TMP}.pub"
+cleanup_tmp() {
+    rm -f "$ROT_PRIV" "$ROT_PUB"
+}
+log INFO "generating an ed25519 pair WITHOUT a passphrase in ${KEY_DIR}"
+ssh-keygen -t ed25519 -N "" -C "repair-tunnel" -f "$ROT_PRIV" || {
+    log ERROR "ssh-keygen failed — nothing was changed"
+    cleanup_tmp
+    exit 1
+}
+chmod 600 "$ROT_PRIV"
+log INFO "generated a new pair (public half: ${ROT_PUB})"
+
+PUB=""
+PUB="$(tr -d '\r\n' < "$ROT_PUB")"
+if [[ -z "$PUB" ]]; then
+    log ERROR "newly generated ${ROT_PUB} is empty — refusing to publish nothing"
+    cleanup_tmp
+    exit 1
+fi
+
+# ---- publish the PUBLIC half --------------------------------------------------
+# The value goes to gh on stdin — never as --body on the command line.
+# What is published is one OpenSSH public key line, not JSON.
+if printf '%s' "$PUB" | gh variable set "$VAR_NAME" --repo "$REPO"; then
+    mv -f "$ROT_PRIV" "$PRIV_KEY"
+    mv -f "$ROT_PUB" "$PUB_KEY"
+    log INFO "wrote ${VAR_NAME} (public half of the shared repair tunnel key)"
+else
+    cleanup_tmp
+    log ERROR "could not write ${VAR_NAME} — nothing was changed (re-run once GitHub is reachable)"
+    exit 1
+fi
+
+# ---- refresh ------------------------------------------------------------------
+trigger_refresh
+
+log INFO "done: shared repair key set up. New bundles dial with it once refresh succeeds."

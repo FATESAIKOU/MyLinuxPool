@@ -10,8 +10,10 @@
 # 127.0.0.1, which VirtualBox NAT exposes to the VM as 10.0.2.2 (spike
 # OUT-spike-repair.md §3(c)).
 #
-# Protocol: GET http://${MLP_D2_HOST}:${MLP_D2_PORT}/gw, body = the IPv4
-# address as plain text (surrounding whitespace and CR/LF are ignored).
+# Protocol: GET http://${MLP_D2_HOST}:${MLP_D2_PORT}/gw, body = TWO lines
+# (EPHEMERAL-INTERFACE.md item 4): the IPv4, then `name=<repair name>`.
+# The name follows the same rule as the launcher side (interface item 3).
+# Both lines are validated; anything else fail-closes (see below).
 #
 # Environment:
 #   MLP_D2_HOST           default 10.0.2.2 (the NAT host address)
@@ -22,14 +24,16 @@
 #                         /etc/mlp/tunnel.env (EnvironmentFile=-, later
 #                         file wins) and repair-tunnel-launch re-reads
 #
-# Exit 0: got a valid IPv4, wrote one line `POOL_GATEWAY_HOST=<ip>`
-#   atomically (temp file in the same directory + mv, like pool-tunnel's
-#   publish_gateway), so nobody ever reads half a file.
+# Exit 0: got two valid lines, wrote them atomically (temp file in the
+# same directory + mv, like pool-tunnel's publish_gateway), so nobody
+# ever reads half a file:
+#   POOL_GATEWAY_HOST=<ip>
+#   REPAIR_NAME=<name>
 # Exit 1: no answer, timeout, empty or malformed answer, or the file could
-#   not be written. The existing file is left exactly as it was — not
-#   written, not emptied. That is deliberate: with nothing new, the tunnel
-#   dials whatever it had (the last good value, or the seed's .invalid
-#   placeholder, which fails at DNS). It never guesses an address.
+# not be written. The existing file is left exactly as it was — not
+# written, not emptied. That is deliberate: repair-tunnel-launch refuses
+# to dial without a valid answer (PM ruling), so a stale file can never
+# be mistaken for a fresh one. It never guesses an address.
 #   mlp-d2-fetch.service is ordered Before= the tunnel unit but not
 #   Required= by it, so a failure here never blocks the tunnel unit.
 #
@@ -60,6 +64,10 @@ OUT_FILE="${MLP_GATEWAY_ENV_FILE:-/run/mlp/gateway.env}"
 
 OCTET='(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])'
 IPV4_RE="^${OCTET}\\.${OCTET}\\.${OCTET}\\.${OCTET}\$"
+# Same hostname-label rule as the launcher side (interface item 3). Kept as
+# a literal here (not sourced from anywhere): this file must stand alone on
+# the VM, and the launcher enforces the identical text on its end.
+NAME_RE='^[a-z]([a-z0-9-]{0,30}[a-z0-9])?$'
 
 say() { printf 'repair-gateway-fetch: %s\n' "$*" >&2; }
 
@@ -82,21 +90,43 @@ URL="http://${D2_HOST}:${D2_PORT}/gw"
 
 # --noproxy '*': an http_proxy in the environment must never route the
 # request for 10.0.2.2 somewhere else. -f: an HTTP error status is a failure,
-# not a body. --max-filesize: an address is 15 bytes; refuse a huge answer.
+# not a body. --max-filesize: an answer is two short lines; refuse a huge one.
 body="$(curl -fsS --noproxy '*' --max-time "$D2_TIMEOUT" --max-filesize 256 "$URL" </dev/null 2>/dev/null)"
 rc=$?
 if [[ $rc -ne 0 ]]; then
     say "no answer from the launcher at ${URL} (curl exit ${rc}) — leaving ${OUT_FILE} as it is"
     exit 1
 fi
-ip="$(printf '%s' "$body" | tr -d '[:space:]')"
-if [[ -z "$ip" ]]; then
+if [[ -z "$body" ]]; then
     say "the launcher at ${URL} answered with nothing — leaving ${OUT_FILE} as it is"
     exit 1
 fi
+
+# Two-line body, nothing else. CRs are transport; one trailing LF is
+# tolerated. Anything else — a single-line legacy answer, a bad IP, a
+# second line that is not `name=`, a bad name, a third junk line — leaves
+# the file exactly as it was (the old single-line code accepted a bare IP;
+# that shape now fails closed on purpose).
+norm="$(printf '%s' "$body" | tr -d '\r')"
+norm="${norm%$'\n'}"
+if [[ "$norm" != *$'\n'* || "$norm" == *$'\n'*$'\n'* ]]; then
+    say "the launcher at ${URL} did not answer exactly 2 lines (IP + name=) — leaving ${OUT_FILE} as it is"
+    exit 1
+fi
+ip="${norm%%$'\n'*}"
+name_line="${norm#*$'\n'}"
 if ! [[ "$ip" =~ $IPV4_RE ]]; then
     # Never echo the answer in full: it is untrusted input going to a log.
-    say "the launcher at ${URL} answered something that is not an IPv4 address (${#ip} bytes) — leaving ${OUT_FILE} as it is"
+    say "the launcher at ${URL} answered something that is not an IPv4 address — leaving ${OUT_FILE} as it is"
+    exit 1
+fi
+if [[ "$name_line" != name=* ]]; then
+    say "the launcher at ${URL} answered a second line that is not name=<name> — leaving ${OUT_FILE} as it is"
+    exit 1
+fi
+name="${name_line#name=}"
+if [[ -z "$name" ]] || ! [[ "$name" =~ $NAME_RE ]]; then
+    say "the launcher at ${URL} answered a name that fails the format — leaving ${OUT_FILE} as it is"
     exit 1
 fi
 
@@ -108,9 +138,9 @@ if ! tmp="$(mktemp "${out_dir}/.gateway.env.XXXXXX" 2>/dev/null)"; then
     say "cannot create a temp file in ${out_dir} — got ${ip} but could not record it"
     exit 1
 fi
-if ! printf 'POOL_GATEWAY_HOST=%s\n' "$ip" > "$tmp" 2>/dev/null; then
+if ! printf 'POOL_GATEWAY_HOST=%s\nREPAIR_NAME=%s\n' "$ip" "$name" > "$tmp" 2>/dev/null; then
     rm -f "$tmp"
-    say "writing ${tmp} failed — got ${ip} but could not record it"
+    say "writing ${tmp} failed — got an answer but could not record it"
     exit 1
 fi
 chmod 644 "$tmp" 2>/dev/null || true
@@ -119,5 +149,5 @@ if ! mv -f "$tmp" "$OUT_FILE" 2>/dev/null; then
     say "could not move the new value into ${OUT_FILE}"
     exit 1
 fi
-printf 'repair-gateway-fetch: Gateway IP %s from %s -> %s\n' "$ip" "$URL" "$OUT_FILE"
+printf 'repair-gateway-fetch: Gateway %s name %s from %s -> %s\n' "$ip" "$name" "$URL" "$OUT_FILE"
 exit 0

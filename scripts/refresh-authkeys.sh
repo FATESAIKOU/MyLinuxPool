@@ -75,6 +75,9 @@ refresh_collect_clients() {
 #   authorized_keys is assembled from:
 #     - every NODE_* whose .role == "provider", field .tunnel_public_key
 #     - every POOL_WORKERS[] entry's .tunnel_public_key
+#     - REPAIR_TUNNEL_PUBKEY when present (the whole family's shared
+#       repair key, design D9 — a SINGLE OpenSSH public key line, NOT a
+#       JSON object, so it never goes through the NODE_* fromjson path)
 #   Output: one key line per stdout line, de-duplicated (sorted -u).
 #   Both sides absent -> prints nothing and exits 0 — an empty tunnel
 #   list is a legal state (KEY-DESIGN items 5/6 have not landed yet), and
@@ -83,9 +86,13 @@ refresh_collect_clients() {
 #   Wrong input shape or an unparseable NODE_* value -> non-zero, no
 #   output (a provider whose var cannot be read must not silently lose
 #   its tunnel key).
+#   REPAIR_TUNNEL_PUBKEY present but not a valid public key line ->
+#   non-zero, no output (same level as the CLIENT_ACTIONS self-lockout
+#   guard: this key is the whole family's only door; silently dropping
+#   it, or assembling without it while looking successful, is a lockout).
 refresh_collect_tunnel_keys() {
     local vars_json="${1:-}" workers_json="${2:-}"
-    local list bad node_keys worker_keys
+    local list bad node_keys worker_keys repair_keys
 
     list="$(printf '%s' "$vars_json" | jq -c '
         if type == "object" and (.variables | type) == "array" then .variables
@@ -118,7 +125,39 @@ refresh_collect_tunnel_keys() {
          | if type == "array" then .[] else empty end
          | .tunnel_public_key // empty] | .[]' 2>/dev/null)"
 
-    printf '%s\n%s\n' "$node_keys" "$worker_keys" \
+    # REPAIR_TUNNEL_PUBKEY (design D9): the value IS one public key line,
+    # not a JSON object — extract it raw, never fromjson it. Its name must
+    # never gain a NODE_ prefix, which would route it into the object check
+    # above and fail the whole batch (recon §2.2 naming constraint).
+    repair_keys="$(printf '%s' "$list" | jq -r '
+        [.[] | select(.name == "REPAIR_TUNNEL_PUBKEY") | .value // empty]
+        | .[]' 2>/dev/null)"
+    if [[ -n "$repair_keys" ]]; then
+        # The validator must work wherever this collector runs. The refresh
+        # workflow sources lib/authkeys.sh alongside this file, but the
+        # rotate workflow only sources rotate-gateway.sh + this file (the
+        # lazy source inside rotate_assemble_login_keys runs in a subshell
+        # and is invisible here) — so ensure it is loaded, resolved from
+        # THIS file's location rather than $PWD or SCRIPT_DIR.
+        if ! declare -F authkeys_valid_pubkey >/dev/null 2>&1; then
+            local _authkeys_lib
+            _authkeys_lib="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd)/lib/authkeys.sh"
+            if [[ -f "$_authkeys_lib" ]]; then
+                # shellcheck source=lib/authkeys.sh
+                source "$_authkeys_lib"
+            fi
+        fi
+        local _rk
+        while IFS= read -r _rk; do
+            [[ -n "$_rk" ]] || continue
+            if ! authkeys_valid_pubkey "$_rk" 2>/dev/null; then
+                printf 'refresh-authkeys: REPAIR_TUNNEL_PUBKEY is not a valid public key line — refusing (no output)\n' >&2
+                return 1
+            fi
+        done <<< "$repair_keys"
+    fi
+
+    printf '%s\n%s\n%s\n' "$node_keys" "$worker_keys" "$repair_keys" \
         | sed '/^[[:space:]]*$/d' | sort -u
     return 0
 }
