@@ -30,15 +30,65 @@
 # "down" repair state (see LIMITATIONS below, this is a real simplification
 # vs the provider/worker table's banner-based up/down).
 #
+# ---- User UI change (post-acceptance ticket, supersedes the original ---
+# ---- "repair:" section design below) -----------------------------------
+# A real user, after desktop acceptance, found the original design's
+# `repair:` sub-section (its own little 3-column `  NAME  PORT  STATE`
+# block under the main table) visually broken: its columns never lined up
+# with the main table's NAME/TYPE/PROVIDER/PORT/STATE columns above it.
+# New contract (this supersedes every "repair:" header/sub-block
+# assumption anywhere below or in earlier sections of this file — where
+# those conflict with this note, THIS note wins):
+#
+#   cmd_ls: NO separate section, no "repair:" line, ever. Each repair host
+#   gathered by gather_repair_targets becomes ONE MORE ROW in the exact
+#   same `rows` array/table gateway/provider/worker rows already go
+#   through — same header ("NAME TYPE PROVIDER PORT STATE"), same
+#   namewidth/provwidth/statewidth computation (so a long repair name
+#   widens every column, same as a long provider/container name already
+#   does), same `fmt`/print_state rendering. Column values:
+#     NAME = the nameplate name, or "?" — exactly gather_repair_targets's
+#            own field 1, untouched.
+#     TYPE = the literal string "repair".
+#     PROVIDER = "-" (repair hosts have no provider; same convention the
+#            gateway row already uses for the same reason).
+#     PORT = gather_repair_targets's field 2 (the listener's real port).
+#     STATE = "up" (gather_repair_targets's field 3 — there is no other
+#            value today, see the no-"down"-state note above).
+#   Two repair hosts sharing a name are simply two rows with the same
+#   NAME and different PORT — nothing new needed for that, it falls out
+#   of "each gathered row becomes one table row".
+#   When ports.repair is unconfigured: zero rows have TYPE=repair (same
+#   as before — gather_repair_targets contributes nothing), the existing
+#   stderr warning is unchanged, and the gateway/provider/worker rows are
+#   completely unaffected — this was already true structurally (repair
+#   rows were always additive), the user ticket doesn't change it, and
+#   §1c re-confirms it explicitly under the new format.
+#
+#   cmd_ssh with no argument (the fzf picker): its candidate list, today
+#   built purely from gather_targets, must ALSO include one line per
+#   gather_repair_targets row — type "repair", provider "-", user
+#   "repair", state from field 3, in the SAME 6-field
+#   name/type/provider/port/user/state shape every other candidate
+#   already uses (so `--with-nth=1,2,3,4,6` keeps showing the right
+#   columns without a picker-specific carve-out). Selecting a repair line
+#   dials it by PORT via the existing `do_connect "$type" "$port" "$user"`
+#   call every other picker selection already makes — never a second,
+#   name-based resolve (which would be exactly the ambiguity/"?"-is-not-
+#   a-real-name problem the picker is supposed to sidestep by letting the
+#   human pick a specific row/port instead of typing a name).
+#
 # ---- Definition 1 (ticket item 1): missing port range -----------------
 # "Loud refusal for repair-specific operations, but `mlp ls` still shows
 # providers/workers" is defined as:
 #   * `mlp ls`: prints the existing gateway/provider/worker table exactly
 #     as before (unaffected), prints ONE line to STDERR
 #     ("mlp: NODE_GATEWAY.ports.repair not configured — skipping repair
-#     section"), omits the "repair:" block from stdout entirely (not even
-#     an empty one), and EXITS 0 — the parts of `ls` that could succeed,
-#     did.
+#     section"), and EXITS 0 — the parts of `ls` that could succeed, did.
+#     Under the merged-table format below (user UI change), "no repair
+#     section" means "zero rows with TYPE=repair", not a separate block —
+#     there was never a distinct block to omit in the first place once
+#     repair rows are just rows in the one table.
 #   * `mlp ssh <name>` (name, not a bare port): if provider/worker
 #     resolution already failed, AND the range is unconfigured, this is
 #     LOUD (an extra stderr line naming NODE_GATEWAY.ports.repair as the
@@ -199,6 +249,83 @@ ok()  { pass=$((pass+1)); printf '  ok    %s\n' "$1"; }
 bad() { fail=$((fail+1)); printf '  FAIL  %s\n' "$1"; }
 inj_ok()  { injpass=$((injpass+1)); printf '  ok    (注入) %s\n' "$1"; }
 inj_bad() { injfail=$((injfail+1)); printf '  FAIL  (注入) %s\n' "$1"; }
+
+# ---- merged-table geometry helpers (user UI change) ------------------------
+# `mlp ls` no longer has a separate "repair:" section (see header note
+# below) — a repair host is just another row in the SAME table, under the
+# SAME "NAME TYPE PROVIDER PORT STATE" header, using whatever column
+# widths that run's own header line ended up with (repair names can be
+# longer than any provider/worker name seen, growing every column — never
+# hardcode a width). "checking each field starts at the header's column
+# offset" (the ticket's own suggested technique): find where each label
+# starts in the header line ACTUALLY PRINTED for this run, then check a
+# row's own field value sits at that exact byte offset.
+#
+# col_of <line> <needle> — byte offset of the first (only expected)
+# occurrence of $needle in $line, or -1 if absent.
+col_of() {
+    local hay="$1" needle="$2" prefix
+    prefix="${hay%%$needle*}"
+    [[ "$prefix" == "$hay" ]] && { printf -- '-1'; return; }
+    printf '%s' "${#prefix}"
+}
+
+# repair_row_present <ls_out_file> <name> <port> [state=up] — true iff some
+# row has exactly $name starting at column 0 (immediately followed by
+# whitespace or end of line, so "twin" never matches a hypothetical
+# "twinX"), "repair" at the header's TYPE offset, "-" at PROVIDER, $port at
+# PORT and $state at STATE — all at THIS run's own measured offsets.
+repair_row_present() {
+    local outfile="$1" name="$2" port="$3" state="${4:-up}"
+    local hdr type_col prov_col port_col state_col row after
+    hdr="$(grep -m1 '^NAME' "$outfile" 2>/dev/null)" || return 1
+    [[ -n "$hdr" ]] || return 1
+    type_col="$(col_of "$hdr" "TYPE")"; prov_col="$(col_of "$hdr" "PROVIDER")"
+    port_col="$(col_of "$hdr" "PORT")"; state_col="$(col_of "$hdr" "STATE")"
+    [[ "$type_col" -ge 0 && "$prov_col" -ge 0 && "$port_col" -ge 0 && "$state_col" -ge 0 ]] || return 1
+    while IFS= read -r row; do
+        [[ "${row:0:${#name}}" == "$name" ]] || continue
+        after="${row:${#name}:1}"
+        [[ -z "$after" || "$after" == " " ]] || continue
+        [[ "${row:$type_col:6}" == "repair" ]] || continue
+        [[ "${row:$prov_col:1}" == "-" ]] || continue
+        [[ "${row:$port_col:${#port}}" == "$port" ]] || continue
+        [[ "${row:$state_col:${#state}}" == "$state" ]] || continue
+        return 0
+    done < "$outfile"
+    return 1
+}
+
+# repair_row_absent_port <ls_out_file> <port> — true iff NO row has type
+# "repair" at that offset AND this exact port at the PORT offset (i.e. a
+# nameplate-only or out-of-range port never became a row at all).
+repair_row_absent_port() {
+    local outfile="$1" port="$2"
+    local hdr type_col port_col row
+    hdr="$(grep -m1 '^NAME' "$outfile" 2>/dev/null)" || return 0
+    [[ -n "$hdr" ]] || return 0
+    type_col="$(col_of "$hdr" "TYPE")"; port_col="$(col_of "$hdr" "PORT")"
+    [[ "$type_col" -ge 0 && "$port_col" -ge 0 ]] || return 0
+    while IFS= read -r row; do
+        [[ "${row:$type_col:6}" == "repair" ]] || continue
+        [[ "${row:$port_col:${#port}}" == "$port" ]] || continue
+        return 1
+    done < "$outfile"
+    return 0
+}
+
+# repair_row_count <ls_out_file> — number of rows whose TYPE column reads
+# "repair" (whatever their NAME — "?" included).
+repair_row_count() {
+    local outfile="$1" hdr type_col row n=0
+    hdr="$(grep -m1 '^NAME' "$outfile" 2>/dev/null)" || { printf '0'; return; }
+    type_col="$(col_of "$hdr" "TYPE")"
+    [[ "$type_col" -ge 0 ]] || { printf '0'; return; }
+    while IFS= read -r row; do
+        [[ "${row:$type_col:6}" == "repair" ]] && n=$((n + 1))
+    done < "$outfile"
+    printf '%s' "$n"
+}
 
 # ---- shims ----------------------------------------------------------------
 # ssh: argv one token per line into ARGV_LOG, CALL-EOL between calls (same
@@ -398,11 +525,13 @@ elif ! grep -qE '^gateway[[:space:]]+gateway' "$SANDBOX/ls1c.out"; then
 elif ! grep -qE '^provider1[[:space:]]+provider' "$SANDBOX/ls1c.out"; then
     bad "1c. provider1 row missing from ls output — regression"
 elif grep -qxF 'repair:' "$SANDBOX/ls1c.out"; then
-    bad "1c. repair section printed even though ports.repair is unconfigured"
+    bad "1c. a 'repair:' section header line is printed — the merged-table format (user UI change) must never print one, configured or not"
+elif [[ "$(repair_row_count "$SANDBOX/ls1c.out")" != "0" ]]; then
+    bad "1c. some row has TYPE=repair even though ports.repair is unconfigured (count: $(repair_row_count "$SANDBOX/ls1c.out"))"
 elif ! grep -qF 'ports.repair' "$SANDBOX/ls1c.err"; then
     bad "1c. no loud stderr warning naming ports.repair (err=[$(cat "$SANDBOX/ls1c.err")])"
 else
-    ok "1c. ls: provider/worker table intact, repair section absent, one loud stderr line, exit 0"
+    ok "1c. ls: provider/worker table intact, zero repair rows, one loud stderr line, exit 0"
 fi
 
 # 1d: `mlp ssh <name>` with the range unconfigured and no other match —
@@ -452,37 +581,67 @@ else
 fi
 
 # ==========================================================================
-echo "=== 2. mlp ls repair section (cases a-e in one fixture) ==="
+# §2 rewritten for the user UI change (see header note): repair hosts are
+# rows in the MAIN table now, not a separate "repair:" block — see
+# repair_row_present/repair_row_absent_port/col_of above.
+echo "=== 2. mlp ls: repair hosts are rows in the main table (cases a-e) ==="
 run_ls "$GW_JSON_OK" "$SANDBOX/repair-scan-main.txt" "$SANDBOX/ls2.out" "$SANDBOX/ls2.err"
 rc=$?
-check_row() {
-    local pat="$1" label="$2"
-    if grep -qE "$pat" "$SANDBOX/ls2.out"; then
-        ok "$label"
-    else
-        bad "$label (not found in ls output)"
-    fi
-}
-check_missing_row() {
-    local pat="$1" label="$2"
-    if grep -qE "$pat" "$SANDBOX/ls2.out"; then
-        bad "$label (found, should be ABSENT)"
-    else
-        ok "$label"
-    fi
-}
 if [[ $rc -ne 0 ]]; then
     bad "2. mlp ls exit=$rc (want 0)"
 else
     ok "2-header. mlp ls exit 0"
 fi
-check_row '^repair:$' "2-section. repair: header present"
-check_row '^ +dad-pc +2503 +up$' "2a. listener+nameplate -> shown with its name (dad-pc/2503)"
-check_row '^ +\? +2550 +up$' "2b. listener without nameplate -> shown as ?/2550"
-check_missing_row '2560' "2c. nameplate without listener (2560/mom-laptop) -> NOT shown"
-check_missing_row '2404' "2d. listener outside [2500,2599] (2404) -> NOT shown"
-check_row '^ +twin +2510 +up$' "2e-1. duplicate-name host #1 (twin/2510) shown"
-check_row '^ +twin +2520 +up$' "2e-2. duplicate-name host #2 (twin/2520) shown"
+if grep -qxF 'repair:' "$SANDBOX/ls2.out"; then
+    bad "2-no-section. a 'repair:' section header line is printed (user UI change: there must be no separate section at all)"
+else
+    ok "2-no-section. no 'repair:' section header line — repair hosts are plain rows"
+fi
+if repair_row_present "$SANDBOX/ls2.out" "dad-pc" "2503"; then
+    ok "2a. listener+nameplate -> a row with NAME=dad-pc TYPE=repair PROVIDER=- PORT=2503 STATE=up, columns at the table's own offsets"
+else
+    bad "2a. no correctly-shaped dad-pc/2503 row (row: $(grep '2503' "$SANDBOX/ls2.out" || echo '<absent>'))"
+fi
+if repair_row_present "$SANDBOX/ls2.out" "?" "2550"; then
+    ok "2b. listener without nameplate -> a row with NAME=?, same column shape as any other row"
+else
+    bad "2b. no correctly-shaped ?/2550 row (row: $(grep '2550' "$SANDBOX/ls2.out" || echo '<absent>'))"
+fi
+if repair_row_absent_port "$SANDBOX/ls2.out" "2560"; then
+    ok "2c. nameplate without listener (2560/mom-laptop) -> no repair row at all"
+else
+    bad "2c. a repair row exists for port 2560, which has a nameplate but no listener"
+fi
+if repair_row_absent_port "$SANDBOX/ls2.out" "2404"; then
+    ok "2d. listener outside [2500,2599] (2404) -> no repair row at all"
+else
+    bad "2d. a repair row exists for port 2404, which is outside the configured range"
+fi
+if repair_row_present "$SANDBOX/ls2.out" "twin" "2510"; then
+    ok "2e-1. duplicate-name host #1 (twin/2510) is its own correctly-shaped row"
+else
+    bad "2e-1. no correctly-shaped twin/2510 row (row: $(grep '2510' "$SANDBOX/ls2.out" || echo '<absent>'))"
+fi
+if repair_row_present "$SANDBOX/ls2.out" "twin" "2520"; then
+    ok "2e-2. duplicate-name host #2 (twin/2520) is its own correctly-shaped row"
+else
+    bad "2e-2. no correctly-shaped twin/2520 row (row: $(grep '2520' "$SANDBOX/ls2.out" || echo '<absent>'))"
+fi
+
+# 2f. Explicit alignment cross-check (ticket's own "or by checking each
+# field starts at the header's column offset" — repair_row_present already
+# does this per-row; this additionally proves a repair row's STATE offset
+# is the exact SAME offset the GATEWAY row's own "up" sits at, i.e. one
+# shared geometry, not a repair-row-specific one that happens to overlap).
+hdr2="$(grep -m1 '^NAME' "$SANDBOX/ls2.out" 2>/dev/null || true)"
+gw_row2="$(grep -E '^gateway ' "$SANDBOX/ls2.out" 2>/dev/null || true)"
+state_col2="$(col_of "$hdr2" "STATE")"
+if [[ -n "$hdr2" && -n "$gw_row2" && "$state_col2" -ge 0 \
+      && "${gw_row2:$state_col2:2}" == "up" ]]; then
+    ok "2f. the gateway row's STATE column sits at the same measured offset repair_row_present checks for repair rows — one shared table geometry"
+else
+    bad "2f. could not confirm shared geometry (hdr=[$hdr2] gw_row=[$gw_row2] state_col=$state_col2)"
+fi
 
 # INJECTION for §2: a mutant gather_repair_targets that emits nameplate-only
 # rows too (ignores D5's "listener is the only fact"), proving 2c is a real
@@ -839,10 +998,10 @@ fi
 # assertion assumed "dad-pc" was a legitimate resolvable prefix; that was
 # itself a instance of the same bug category the ticket is about (trust
 # something less than the whole nameplate) and has been corrected.
-if grep -qE '^ +\? +2503 +up$' "$SANDBOX/ls7.out"; then
+if repair_row_present "$SANDBOX/ls7.out" "?" "2503"; then
     ok "7a. TAB-in-nameplate: shown as ? (whole content is invalid), on its REAL listener port 2503 — never a name derived from a prefix of the content"
 else
-    bad "7a. TAB-in-nameplate: want '? 2503 up', got (row: $(grep '2503' "$SANDBOX/ls7.out" || echo '<absent>')) — either a prefix-derived name leaked through, or the real port did not"
+    bad "7a. TAB-in-nameplate: want a correctly-shaped ?/2503 row, got (row: $(grep '2503' "$SANDBOX/ls7.out" || echo '<absent>')) — either a prefix-derived name leaked through, or the real port did not, or the column shape is off"
 fi
 
 # 7b. newline+forged row: must not fabricate a listener that was never in
@@ -860,17 +1019,17 @@ fi
 # a clean-looking "evil" for it (this file's original, now-corrected
 # assumption) would itself be trusting a "valid-looking prefix" of a
 # hostile blob.
-if grep -qE '^ +\? +2508 +up$' "$SANDBOX/ls7.out"; then
+if repair_row_present "$SANDBOX/ls7.out" "?" "2508"; then
     ok "7b-2. the newline-forging file's OWN listener (2508) shows ?, not the leading-word 'evil' it starts with"
 else
-    bad "7b-2. port 2508 does not show ? (row: $(grep '2508' "$SANDBOX/ls7.out" || echo '<absent>')) — a multi-line hostile blob's leading word is being accepted as a name"
+    bad "7b-2. port 2508 does not show a correctly-shaped ? row (row: $(grep '2508' "$SANDBOX/ls7.out" || echo '<absent>')) — a multi-line hostile blob's leading word is being accepted as a name"
 fi
 
 # 7c. section-marker truncation: 2512's own nameplate begins with a
 # newline, landing a bare "REPAIR-SCAN-END" on its own line — this must
 # not silently discard the NEXT (uninvolved) file's real mapping.
-if grep -qE '^ +victim-name +2513 +up$' "$SANDBOX/ls7.out"; then
-    ok "7c. section-marker truncation: the uninvolved next file (2513/victim-name) keeps its real name"
+if repair_row_present "$SANDBOX/ls7.out" "victim-name" "2513"; then
+    ok "7c. section-marker truncation: the uninvolved next file (2513/victim-name) keeps its real name, correctly shaped"
 else
     bad "7c. section-marker truncation: 2513 lost its real name 'victim-name' (row: $(grep '2513' "$SANDBOX/ls7.out" || echo '<absent>')) — one file's forged marker silently dropped another file's mapping"
 fi
@@ -884,22 +1043,24 @@ fi
 
 # 7e. 5000-char nameplate: too long to be a valid name (item 3's format
 # caps at 32 chars total) -> must display as "?", not the raw 5000 bytes.
-if grep -qE '^ +\? +2506 +up$' "$SANDBOX/ls7.out"; then
+if repair_row_present "$SANDBOX/ls7.out" "?" "2506"; then
     ok "7e. 5000-char nameplate: shown as ? (invalid format), not the raw content"
 else
-    bad "7e. 5000-char nameplate: NOT shown as ? — invalid/oversized nameplate content is displayed raw (output grew by ~5000 bytes: $(wc -c < "$SANDBOX/ls7.out" | tr -d ' ') total)"
+    bad "7e. 5000-char nameplate: NOT shown as a correctly-shaped ? row — invalid/oversized nameplate content is displayed raw (output grew by ~5000 bytes: $(wc -c < "$SANDBOX/ls7.out" | tr -d ' ') total)"
 fi
 
 # 7f. Invalid name format (uppercase + underscore, "Dad_PC") -> "?".
-if grep -qE '^ +\? +2507 +up$' "$SANDBOX/ls7.out"; then
+if repair_row_present "$SANDBOX/ls7.out" "?" "2507"; then
     ok "7f. invalid-format nameplate 'Dad_PC' (uppercase/underscore) shown as ?, not raw"
 else
-    bad "7f. invalid-format nameplate 'Dad_PC' NOT shown as ? (row: $(grep '2507' "$SANDBOX/ls7.out" || echo '<absent>')) — name-format validation (item 3) is not applied to nameplate content"
+    bad "7f. invalid-format nameplate 'Dad_PC' NOT shown as a correctly-shaped ? row (row: $(grep '2507' "$SANDBOX/ls7.out" || echo '<absent>')) — name-format validation (item 3) is not applied to nameplate content"
 fi
 
 # 7g. Row count: exactly one row per REAL 127.0.0.1 listener, no more, no
 # fewer (catches 7b's phantom AND any other file's silent count drift).
-gotcount="$(grep -c '^  ' "$SANDBOX/ls7.out" 2>/dev/null || echo 0)"
+# Counted by TYPE=repair now (merged table — user UI change), not by a
+# section's own leading-whitespace convention (there is no section).
+gotcount="$(repair_row_count "$SANDBOX/ls7.out")"
 if [[ "$gotcount" == "$REAL_LISTENER_COUNT" ]]; then
     ok "7g. ls repair row count ($gotcount) == real listener count ($REAL_LISTENER_COUNT)"
 else
@@ -980,7 +1141,7 @@ elif grep -qxF 'repair@127.0.0.1' "$SANDBOX/argv7i.log"; then
     bad "7i-port. the LOGIN ssh leg was invoked for 'safe-name' despite it not resolving"
 elif ! grep -qF 'no such node or worker: safe-name' "$SANDBOX/dc7i.err"; then
     bad "7i-port. missing the existing generic notfound message (err=[$(cat "$SANDBOX/dc7i.err")])"
-elif ! grep -qE '^ +\? +2509 +up$' "$SANDBOX/ls7.out"; then
+elif ! repair_row_present "$SANDBOX/ls7.out" "?" "2509"; then
     bad "7i-port. ls does not show listener 2509 as ? (row: $(grep '2509' "$SANDBOX/ls7.out" || echo '<absent>'))"
 else
     ok "7i-port. mlp ssh safe-name refuses (plain notfound, no login leg) AND ls shows its listener 2509 as ?"
@@ -1032,7 +1193,7 @@ printf 'REPAIR-SCAN-L\nLISTEN 0 128 127.0.0.1:2546 0.0.0.0:*\nREPAIR-SCAN-N\n254
 pos_control() {
     local label="$1" fixture="$2" port="$3"
     run_ls "$GW_JSON_OK" "$fixture" "$SANDBOX/ls-$label.out" "$SANDBOX/ls-$label.err"
-    if ! grep -qE "^ +mom-laptop +${port} +up\$" "$SANDBOX/ls-$label.out"; then
+    if ! repair_row_present "$SANDBOX/ls-$label.out" "mom-laptop" "$port"; then
         bad "$label-ls. ls does not show 'mom-laptop' cleanly on port $port (row: $(grep "$port" "$SANDBOX/ls-$label.out" || echo '<absent>')) — a VALID nameplate must resolve, not just an invalid one show ?"
         return
     fi
@@ -1093,10 +1254,10 @@ echo "=== 8. ss address family: only 127.0.0.1:<port> counts (suggestion 2) ==="
 } > "$SANDBOX/addrfam-ls.txt"
 
 run_ls "$GW_JSON_OK" "$SANDBOX/addrfam-ls.txt" "$SANDBOX/ls8.out" "$SANDBOX/ls8.err"
-if grep -qE '^ +real-one +2521 +up$' "$SANDBOX/ls8.out"; then
-    ok "8a. a genuine 127.0.0.1 listener in range is still shown"
+if repair_row_present "$SANDBOX/ls8.out" "real-one" "2521"; then
+    ok "8a. a genuine 127.0.0.1 listener in range is still shown, correctly shaped"
 else
-    bad "8a. real-one/2521 (127.0.0.1) missing from ls output — regression"
+    bad "8a. real-one/2521 (127.0.0.1) missing/malformed in ls output — regression"
 fi
 if grep -q 'six-one\|2522' "$SANDBOX/ls8.out"; then
     bad "8b. an [::1] (IPv6 loopback) listener is shown as a repair row — only 127.0.0.1:<port> should count"
@@ -1113,7 +1274,7 @@ if grep -q 'lan-five\|2524' "$SANDBOX/ls8.out"; then
 else
     ok "8d. a non-loopback LAN-reachable listener in range is NOT shown"
 fi
-gotcount8="$(grep -c '^  ' "$SANDBOX/ls8.out" 2>/dev/null || echo 0)"
+gotcount8="$(repair_row_count "$SANDBOX/ls8.out")"
 if [[ "$gotcount8" == "1" ]]; then
     ok "8e. total repair row count is 1 (only the real 127.0.0.1 listener), address-family noise excluded"
 else
@@ -1166,10 +1327,10 @@ if [[ "$scancount9a" == "1" ]]; then
 else
     bad "9a-onecall. scan ran $scancount9a remote commands (want 1) — sudo was added as a SEPARATE round trip instead of inside the existing one"
 fi
-if grep -qE '^ +clean-host +2560 +up$' "$SANDBOX/ls9a.out"; then
+if repair_row_present "$SANDBOX/ls9a.out" "clean-host" "2560"; then
     ok "9a-sanity. a normal clean nameplate still resolves through whatever sudo wrapping now exists"
 else
-    bad "9a-sanity. clean-host/2560 missing from ls output (got: $(grep '2560' "$SANDBOX/ls9a.out" || echo '<absent>')) — sudo wrapping broke the ordinary case"
+    bad "9a-sanity. clean-host/2560 missing/malformed in ls output (got: $(grep '2560' "$SANDBOX/ls9a.out" || echo '<absent>')) — sudo wrapping broke the ordinary case"
 fi
 
 # 9b. sudo -n failure: the WIRE MARKER (header) is "REPAIR-SCAN-SUDO-FAIL"
@@ -1183,10 +1344,10 @@ if [[ $rc -ne 0 ]]; then
 else
     ok "9b-rc. mlp ls exits 0 even when sudo -n failed"
 fi
-if grep -qE '^ +\? +2561 +up$' "$SANDBOX/ls9b.out"; then
+if repair_row_present "$SANDBOX/ls9b.out" "?" "2561"; then
     ok "9b-listed. the real listener (2561) is still shown, as ? (not silently dropped, not left showing a stale/wrong name)"
 else
-    bad "9b-listed. listener 2561 is not shown as ? (row: $(grep '2561' "$SANDBOX/ls9b.out" || echo '<absent>')) — a sudo failure must not remove a real listener from the list"
+    bad "9b-listed. listener 2561 is not shown as a correctly-shaped ? row (row: $(grep '2561' "$SANDBOX/ls9b.out" || echo '<absent>')) — a sudo failure must not remove a real listener from the list"
 fi
 if grep -qi 'sudo' "$SANDBOX/ls9b.err" && grep -qi 'nameplate' "$SANDBOX/ls9b.err"; then
     ok "9b-warn. a loud stderr line mentions both sudo and nameplates"
@@ -1207,6 +1368,131 @@ if grep -qi 'sudo' "$SANDBOX/inj9.err" && grep -qi 'nameplate' "$SANDBOX/inj9.er
     inj_ok "9b-inj. a mutant that DOES warn+list-as-? produces exactly what 9b wants — proves 9b isn't satisfied by mere chance"
 else
     inj_bad "9b-inj. mutant produced unexpected stderr=[$(cat "$SANDBOX/inj9.err")] stdout=[$got]"
+fi
+
+# ==========================================================================
+# §10: user UI change — the fzf picker behind `mlp ssh` (no argument) must
+# include repair hosts, and selecting one must dial it by PORT (never by
+# re-resolving its NAME, which is exactly how duplicates/"?" stay
+# selectable and unambiguous — see header note). Reuses the fzf-shim
+# technique test-tab-field-collapse.sh established: a fake fzf that reads
+# all of stdin, then picks (and echoes back, like real fzf would) the one
+# line matching what this test case asked for; cmd_ssh is called
+# DIRECTLY (same as that file's own comment explains: main's
+# interactive_only guard is one frame up and out of scope for a function
+# call, not cmd_ssh's problem to re-check).
+echo "=== 10. mlp ssh (no argument, fzf picker) includes repair hosts ==="
+
+# Picking fzf: consumes ALL of stdin into FZF_STDIN_LOG first (so it can
+# be inspected afterward regardless of whether a match was found), then
+# picks the tab-delimited line whose field 1 (name) == FZF_PICK_NAME and
+# field 4 (port) == FZF_PICK_PORT — exactly the shape cmd_ssh's existing
+# candidate stream already uses for gateway/provider/worker
+# (name/type/provider/port/user/state); real fzf exits 1 with no output
+# when nothing matches the query, which this mirrors when the wanted
+# fields are never found at all.
+cat > "$SANDBOX/shims/fzf" <<'FAKE'
+#!/usr/bin/env bash
+cat > "${FZF_STDIN_LOG:-/dev/null}"
+awk -F'\t' -v n="${FZF_PICK_NAME:-}" -v p="${FZF_PICK_PORT:-}" \
+    '$1 == n && $4 == p { print; found=1; exit } END { exit(found ? 0 : 1) }' \
+    "${FZF_STDIN_LOG:-/dev/null}"
+FAKE
+chmod +x "$SANDBOX/shims/fzf"
+
+# 10a. Unique repair candidate ("dad-pc", the repair-scan-main.txt
+# fixture's unique host at port 2503) reaches the picker's stdin at all,
+# and selecting it dials port 2503 as user "repair" — same do_connect
+# call path every other picker selection already goes through.
+: > "$SANDBOX/argv10a.log"
+got_rc=0
+MLP_FILE="$MLP_FILE" FAKE_GW_JSON="$GW_JSON_OK" FAKE_GH_VARS_FILE="$SANDBOX/gh-vars.txt" \
+FAKE_NODES_JSON="$SANDBOX/nodes.json" FAKE_WORKERS_FILE="$SANDBOX/workers.json" \
+FAKE_REPAIR_SCAN_FILE="$SANDBOX/repair-scan-main.txt" FAKE_UP_PORTS="2323" \
+ARGV_LOG="$SANDBOX/argv10a.log" FZF_STDIN_LOG="$SANDBOX/fzf10a.stdin" \
+FZF_PICK_NAME="dad-pc" FZF_PICK_PORT="2503" \
+HOME="$SANDBOX/home" PATH="$SANDBOX/shims:$PATH" \
+    bash -c '
+        source "$MLP_FILE" >/dev/null 2>&1
+        POOL_RESOLVE="'"$SANDBOX"'/shims/pool-resolve"
+        cmd_ssh
+    ' >/dev/null 2>"$SANDBOX/dc10a.err" || got_rc=$?
+if ! grep -qE $'^dad-pc\trepair\t-\t2503\t' "$SANDBOX/fzf10a.stdin" 2>/dev/null; then
+    bad "10a-candidate. the picker's own stdin never contained a dad-pc/repair/-/2503 candidate line (stdin: $(tr '\n' '|' < "$SANDBOX/fzf10a.stdin" 2>/dev/null || echo '<missing>')) — repair hosts are not in the picker's list yet"
+else
+    ok "10a-candidate. the repair host 'dad-pc' (port 2503) reaches the fzf picker's candidate list, correctly shaped"
+fi
+if [[ $got_rc -ne 0 ]]; then
+    bad "10a-connect. cmd_ssh (picker) exited $got_rc unexpectedly (want 0) after picking dad-pc (err: $(cat "$SANDBOX/dc10a.err"))"
+elif ! grep -qxF '2503' "$SANDBOX/argv10a.log"; then
+    bad "10a-connect. ssh argv missing -p 2503 after picking dad-pc (log: $(tr '\n' '|' < "$SANDBOX/argv10a.log"))"
+elif ! grep -qxF 'repair@127.0.0.1' "$SANDBOX/argv10a.log"; then
+    bad "10a-connect. ssh argv missing repair@127.0.0.1 after picking dad-pc"
+else
+    ok "10a-connect. picking the repair candidate dials -p 2503 repair@127.0.0.1, same do_connect path as any other picker selection"
+fi
+
+# 10b. Duplicate-name candidates ("twin" at BOTH 2510 and 2520) must
+# appear as two SEPARATE, individually-selectable lines — picking the
+# SECOND one specifically (port 2520) must dial 2520, never 2510, and
+# must never go through a name-based (ambiguous) resolve at all: the
+# picker sidesteps §3b's "same name refuses" refusal entirely, by
+# letting the human pick a row/port instead of typing a name.
+: > "$SANDBOX/argv10b.log"
+got_rc=0
+MLP_FILE="$MLP_FILE" FAKE_GW_JSON="$GW_JSON_OK" FAKE_GH_VARS_FILE="$SANDBOX/gh-vars.txt" \
+FAKE_NODES_JSON="$SANDBOX/nodes.json" FAKE_WORKERS_FILE="$SANDBOX/workers.json" \
+FAKE_REPAIR_SCAN_FILE="$SANDBOX/repair-scan-main.txt" FAKE_UP_PORTS="2323" \
+ARGV_LOG="$SANDBOX/argv10b.log" FZF_STDIN_LOG="$SANDBOX/fzf10b.stdin" \
+FZF_PICK_NAME="twin" FZF_PICK_PORT="2520" \
+HOME="$SANDBOX/home" PATH="$SANDBOX/shims:$PATH" \
+    bash -c '
+        source "$MLP_FILE" >/dev/null 2>&1
+        POOL_RESOLVE="'"$SANDBOX"'/shims/pool-resolve"
+        cmd_ssh
+    ' >/dev/null 2>"$SANDBOX/dc10b.err" || got_rc=$?
+twin_candidates="$(grep -cE $'^twin\trepair\t-\t' "$SANDBOX/fzf10b.stdin" 2>/dev/null)"
+[[ -n "$twin_candidates" ]] || twin_candidates=0
+if [[ "$twin_candidates" != "2" ]]; then
+    bad "10b-candidates. expected 2 separate 'twin' repair candidates (2510 and 2520) in the picker's stdin, got $twin_candidates (stdin: $(tr '\n' '|' < "$SANDBOX/fzf10b.stdin" 2>/dev/null || echo '<missing>'))"
+else
+    ok "10b-candidates. both same-named repair hosts (twin/2510, twin/2520) are separate, individually-selectable candidate lines"
+fi
+if [[ $got_rc -ne 0 ]]; then
+    bad "10b-connect. cmd_ssh (picker) exited $got_rc unexpectedly after picking twin/2520 (err: $(cat "$SANDBOX/dc10b.err"))"
+elif grep -qxF '2510' "$SANDBOX/argv10b.log"; then
+    bad "10b-connect. picking twin/2520 dialed 2510 instead — the picker's port-based selection is being second-guessed by a name-based (ambiguous) resolve"
+elif ! grep -qxF '2520' "$SANDBOX/argv10b.log"; then
+    bad "10b-connect. ssh argv missing -p 2520 after picking twin/2520 (log: $(tr '\n' '|' < "$SANDBOX/argv10b.log"))"
+else
+    ok "10b-connect. picking the SECOND same-named candidate (twin/2520) dials exactly 2520, never 2510 and never an ambiguity refusal — the picker's own port selection is authoritative"
+fi
+
+# 10c. Regression: the picker's existing provider/worker/gateway
+# candidates and their own selection-to-dial path are unaffected by
+# adding repair candidates (same fixture already has provider1/w1).
+if grep -qE $'^provider1\tprovider\t-\t2323\t' "$SANDBOX/fzf10a.stdin" 2>/dev/null; then
+    ok "10c. the existing provider candidate (provider1) is still present in the picker's stdin, unaffected by adding repair candidates"
+else
+    bad "10c. provider1 is missing from the picker's stdin (stdin: $(tr '\n' '|' < "$SANDBOX/fzf10a.stdin" 2>/dev/null || echo '<missing>')) — regression"
+fi
+
+# INJECTION for §10: a mutant cmd_ssh whose candidate-building loop skips
+# repair entirely (today's actual shape) — proves 10a-candidate is
+# load-bearing by showing the CURRENT gap fails it on purpose here too,
+# and a real fix (which adds the loop) would flip it.
+got="$(MLP_FILE="$MLP_FILE" HOME="$SANDBOX/home" PATH="$SANDBOX/shims:$PATH" \
+    bash -c '
+        source "$MLP_FILE" >/dev/null 2>&1
+        {
+            printf "gateway\tgateway\t-\t22\tgw\tup\n"
+            printf "provider1\tprovider\t-\t2323\tpu\tup\n"
+        }
+    ' 2>&1)"
+if ! printf '%s' "$got" | grep -qF 'repair'; then
+    inj_ok "10a-inj. a mutant candidate stream with no repair line at all (today's actual shape) is visibly missing one — 10a-candidate (which wants one) would catch this"
+else
+    inj_bad "10a-inj. mutant unexpectedly contains 'repair' — injection itself is broken"
 fi
 
 echo

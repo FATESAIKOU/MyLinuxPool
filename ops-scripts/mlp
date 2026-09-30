@@ -827,17 +827,27 @@ cmd_ls() {
         rows+=("$(printf '%s\t%s\t%s\t%s\t%s' "$name" "$type" "$provider" "$port" "$state")")
     done < <(gather_targets)
 
-    # Repair section (EPHEMERAL-INTERFACE.md item 8): rides this SAME
-    # already-open Gateway ControlMaster — gather_repair_targets never
-    # opens its own — so this adds no extra ssh session to `ls`.
-    local repair_rows=() rrow repair_unconfigured=0
+    # Repair hosts (EPHEMERAL-INTERFACE.md item 8) are just MORE ROWS in
+    # this SAME table — user UI change (post-acceptance ticket): the
+    # original design's separate "repair:" sub-block never lined up with
+    # the main table's columns, so a repair host is now exactly one more
+    # entry in `rows`, sharing the same NAME/TYPE/PROVIDER/PORT/STATE
+    # shape (TYPE="repair", PROVIDER="-", matching the gateway row's own
+    # "-" convention for "no provider"). This rides the SAME already-open
+    # Gateway ControlMaster — gather_repair_targets never opens its own —
+    # so this adds no extra ssh session to `ls`. STATE is NEVER re-probed
+    # via gw_probe_port here: gather_repair_targets's own field 3 ("up")
+    # IS the state — D5 makes the listener the only fact, so a row only
+    # exists when one was already observed; there is no separate probe.
+    local repair_unconfigured=0 rrow
     while IFS= read -r rrow; do
         [[ -n "$rrow" ]] || continue
         if [[ "$rrow" == "!UNCONFIGURED" ]]; then
             repair_unconfigured=1
             continue
         fi
-        repair_rows+=("$rrow")
+        fwd_split_row "$rrow"
+        rows+=("$(printf '%s\trepair\t-\t%s\t%s' "$FWD_C1" "$FWD_C2" "$FWD_C3")")
     done < <(gather_repair_targets)
 
     close_gateway_master
@@ -896,20 +906,14 @@ cmd_ls() {
         print_state "$state" "$statewidth"
     done
 
-    # Repair section (item 1's "loud refusal, `ls` still succeeds"): when
-    # the range can't be read, warn once on stderr and print nothing else
-    # here — the table above already succeeded and stands as-is. When it
-    # CAN be read, always show the section header, even with zero repair
-    # hosts observed right now (an empty section is still informative:
-    # "the range is configured and nothing is up", not silence).
+    # Definition 1's "loud refusal, `ls` still succeeds": when the range
+    # can't be read, warn once on stderr — the table above (zero TYPE=repair
+    # rows, since gather_repair_targets contributed nothing but the
+    # sentinel) already succeeded and stands as-is. Under the merged-table
+    # format there is no separate section left to omit; this is now the
+    # ENTIRE repair-specific behavior for the unconfigured case.
     if [[ "$repair_unconfigured" -eq 1 ]]; then
         echo "mlp: NODE_GATEWAY.ports.repair not configured — skipping repair section" >&2
-    else
-        echo "repair:"
-        for rrow in ${repair_rows[@]+"${repair_rows[@]}"}; do
-            fwd_split_row "$rrow"
-            printf '  %-10s %-6s %s\n' "$FWD_C1" "$FWD_C2" "$FWD_C3"
-        done
     fi
 }
 
@@ -1141,7 +1145,7 @@ cmd_ssh() {
         die "Gateway unreachable (${GW_USER}@${GW_IP})"
     fi
 
-    local name type provider port user state selected r
+    local name type provider port user state selected r rr
     selected="$(
         {
             printf 'gateway\tgateway\t-\t%s\t%s\tup\n' "$GW_PORT" "$GW_USER"
@@ -1153,6 +1157,20 @@ cmd_ssh() {
                 state="$(gw_probe_port "$port")"
                 printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$name" "$type" "$provider" "$port" "$user" "$state"
             done < <(gather_targets)
+            # Repair hosts (user UI change): same candidate shape as every
+            # other row (name/type/provider/port/user/state), so
+            # --with-nth=1,2,3,4,6 shows them with no picker-specific
+            # carve-out. Selecting one dials it by PORT via the exact same
+            # do_connect call below every other selection already goes
+            # through — never a second, name-based resolve (that would
+            # reopen the same ambiguity/"?" problem the picker exists to
+            # sidestep by letting the human pick a specific port instead
+            # of typing a name). Still the SAME open ControlMaster.
+            while IFS= read -r rr; do
+                [[ -n "$rr" && "$rr" != "!UNCONFIGURED" ]] || continue
+                fwd_split_row "$rr"
+                printf '%s\trepair\t-\t%s\trepair\t%s\n' "$FWD_C1" "$FWD_C2" "$FWD_C3"
+            done < <(gather_repair_targets)
         } | fzf --delimiter=$'\t' --with-nth=1,2,3,4,6 \
                 --header='NAME  TYPE  PROVIDER  PORT  STATE' \
                 --prompt='ssh> ' --height='~60%'
