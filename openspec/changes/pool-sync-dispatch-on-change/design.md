@@ -17,7 +17,7 @@
 **Non-Goals（使用者決定或刻意不做）：**
 - 失敗重試標記（`refresh-pending`）：不做，pool-sync 維持不保存狀態，dispatch 失敗交給每日排程
 - `concurrency` group：不加
-- 改 `register-provider.sh` 的 dispatch：不動，它的等待是 step 9 驗證的前提
+- 改 `register-provider.sh` 的 dispatch：不動。重複註冊時，Gateway 上可能根本還沒有那把金鑰（例如先前的 refresh 失敗過）；如果跳過 dispatch，step 9 的驗證就永遠過不了。它的等待正是 step 9 的前提
 
 ## Decisions
 
@@ -37,7 +37,7 @@ dispatch 失敗時記警告並註明「會由每日排程收斂」，tick 本身
 
 - [D2 條件寫錯，會讓「金鑰第一次產生」時不 dispatch] → 測試要覆蓋「剛寫入就恰好一次」，並附注入
 - [dispatch 失敗後最壞 24 小時才收斂] → 使用者接受；會產生新金鑰的只有首次 sync 或金鑰重建，而 register-provider 自己會 dispatch 並等待
-- [GitHub 的排程會延遲，額度用盡時還會被自動停用] → 已知限制；repo 目前是 public
+- [GitHub 的排程會延遲，Actions 被停用時排程完全不跑，而且排程只在預設分支上存在，所以「最多 24 小時」從 merge 之後起算、也不是嚴格上界] → 已知限制；repo 目前是 public
 - [排程 run 的空 nonce] → D3 要有測試或靜態檢查
 
 ## Migration Plan

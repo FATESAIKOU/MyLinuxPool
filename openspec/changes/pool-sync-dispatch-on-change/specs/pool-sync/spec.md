@@ -24,13 +24,13 @@
 
 #### Scenario: 重複註冊 provider
 - **WHEN** `register-provider.sh` 在金鑰已經發布的機器上再跑一次
-- **THEN** 它跟現在一樣成功，不因「沒有寫入」而失敗
+- **THEN** 它跟現在一樣成功，不因「沒有寫入」而失敗，而且仍然 dispatch refresh 並等待它完成（Gateway 上可能還沒有這把金鑰，例如先前的 refresh 失敗過）
 
 ### Requirement: 每日排程刷新
 `refresh-authorized-keys.yml` MUST 每天自動執行一次（UTC 20:00），把 Gateway 的 authorized_keys 收斂到 GitHub 上的宣告。手動 dispatch 與等待 refresh 結果的既有呼叫端 MUST 不受排程影響。
 
 #### Scenario: 一次 dispatch 失敗後
-- **WHEN** 某台 provider 的新金鑰寫入了，但 dispatch 失敗
+- **WHEN** 這個變更 merge 進預設分支之後（GitHub 只執行預設分支上的排程），某台 provider 的新金鑰寫入了，但 dispatch 失敗
 - **THEN** 最晚在下一次每日排程之後，Gateway 就會接受這把金鑰
 
 #### Scenario: 等待 refresh 的呼叫端
