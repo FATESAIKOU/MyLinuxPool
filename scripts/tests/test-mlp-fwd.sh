@@ -119,10 +119,10 @@ SANDBOX="$(mktemp -d "${TMPDIR:-/tmp}/test-mlp-fwd.XXXXXX")"
 trap 'rm -rf "$SANDBOX"' EXIT INT TERM
 mkdir -p "$SANDBOX/shims" "$SANDBOX/home" "$SANDBOX/fwdstate"
 
-pass=0; fail=0; injfail=0
+pass=0; fail=0; injfail=0; injpass=0
 ok()  { pass=$((pass+1)); printf '  ok    %s\n' "$1"; }
 bad() { fail=$((fail+1)); printf '  FAIL  %s\n' "$1"; }
-inj_ok()  { printf '  ok    (注入) %s\n' "$1"; }
+inj_ok()  { injpass=$((injpass+1)); printf '  ok    (注入) %s\n' "$1"; }
 inj_bad() { injfail=$((injfail+1)); printf '  FAIL  (注入) %s\n' "$1"; }
 
 # ---- stubs：全部離線，只記 argv 與回放罐頭答案 ---------------------------
@@ -139,6 +139,12 @@ inj_bad() { injfail=$((injfail+1)); printf '  FAIL  (注入) %s\n' "$1"; }
 #   RC=1＋其他字 → unreachable。
 #   -O exit：永遠回 0。
 #   啟動標記：以 FAKE_START_RC 離開。
+#   REPAIR-SCAN-L 在 argv 裡：repair 掃描那一條遠端命令，回放
+#     FAKE_REPAIR_SCAN_FILE，並在 SCAN_LOG 記一筆。
+#     位置有講究：這條 pattern 與其他都不重疋，但**不能**插到啟動標記或
+#     -M 那條之前——第一版探針就是把 -M 提到啟動標記前面，結果搶走
+#     fwd_add 的啟動呼叫（OUT-recon-fwd.md §5 的坑）。放在 pool-port-alloc
+#     之後、啟動標記之前，兩邊都不動。
 #   -M 獨立出現：open_gateway_master 的建連，回 0（由 FAKE_MASTER_RC 控制）。
 #   placeholder 加 true：隧道探測，以 FAKE_TUNNEL_RC 離開。
 cat > "$SANDBOX/shims/ssh" <<'FAKE'
@@ -151,6 +157,13 @@ case "$joined" in
 esac
 case "$joined" in
   *"pool-port-alloc"*) cat "${FAKE_WORKERS_FILE:-/dev/null}" 2>/dev/null; exit 0 ;;
+esac
+case "$joined" in
+  *"REPAIR-SCAN-L"*)
+    printf 'SCAN\n' >> "${SCAN_LOG:-/dev/null}"
+    cat "${FAKE_REPAIR_SCAN_FILE:-/dev/null}" 2>/dev/null
+    exit 0
+    ;;
 esac
 case "$joined" in
   *"timeout 3 bash"*) printf '%s' "${FAKE_TARGET_ERR:-}" >&2; exit "${FAKE_TARGET_RC:-0}" ;;
@@ -176,8 +189,11 @@ cat "${FAKE_PS_FILE:-/dev/null}" 2>/dev/null
 exit 0
 FAKE
 # 解析 stub：gateway 回固定答案；其餘名字查 FAKE_NODES_JSON，查無即 exit 1。
+# 每次呼叫（含 gateway）都寫一行到 PR_LOG。「fwd ls 不重新解析」那格要
+# 數的就是這本帳——沒有它，「0 次」量不出來是不是因為根本沒在數。
 cat > "$SANDBOX/shims/pool-resolve" <<'FAKE'
 #!/usr/bin/env bash
+printf 'PR %s\n' "$*" >> "${PR_LOG:-/dev/null}"
 if [[ "${1:-}" == "gateway" ]]; then
   if [[ -n "${FAKE_GW_JSON:-}" ]]; then printf '%s\n' "$FAKE_GW_JSON"; else printf '{"ip":"9.9.9.9","user":"gw","port":22}\n'; fi
   exit "${FAKE_GW_RC:-0}"
@@ -965,6 +981,604 @@ else
     bad "21c. fwd_menu_add 接線不對"
 fi
 
+# ==========================================================================
+# 22. repair 機器：mlp fwd 的名字／port／選單／訊息／ls 不重解析
+#     （openspec/changes/archive/2026-10-01-repair-fwd，tasks 1.1）
+#
+# ---- 介面（以 openspec/changes/archive/2026-10-01-repair-fwd/ 為準） ------------------------
+#   D1 段內的裸數字 port ＝ repair。do_connect 與 fwd_add 各呼叫同一個判斷；
+#      段沒設定時裸數字維持舊行為（worker）。**所以 R2 只量 fwd_add 的結果
+#      （argv），不去斷言 target_resolve 的內部分支**——共用判斷住在哪一層
+#      是實作選擇，argv 才是這裡的契約。寫成「target_resolve 2503 必須回
+#      repair」會把 D1 允許的兩種做法（fwd_add 自己短路／改 target_resolve）
+#      擋掉一種，是過度約束。
+#   D2 fwd 選單每台在線的 repair 一列（名字或 ? ＋ port），**選到的值是
+#      port**，靠 D1 解析；段沒設定時不列 repair，選單也不壞掉。
+#   D3 fwd_view_add 的訊息比照 do_connect：repair-ambiguous 列出候選 port；
+#      notfound 前印 TARGET_DETAIL（未設定段的警告）並多一行說明「repair
+#      只在線上時才找得到」。'no such node or worker' 這句維持原樣（7d 釘著）。
+#   D4 不跟隨、不重試：fwd ls 不重新解析 node 名字（0 次 pool-resolve、
+#      0 次 repair 掃描），舊轉發不會接到之後拿到同 port 的別台機器。
+#
+# ---- 這節刻意沒釘的東西（別當成已測到） ---------------------------------
+#   * R4 只釘「列出兩個候選 port」與「不再誤報 no such node or worker」。
+#     D3 還要求「提示改用 port」——那句**措辭**沒釘死：自己生一句措辭再拿
+#     自己寫的斷言去量它是自證，不是證據。
+#   * R6 用 `interactive_only() { return 0; }` 放行 TTY 閘（非互動行程進不了
+#     fwd_menu_add），量的是候選流與「選到就以 port 解析」；閘本身不在本節
+#     （21c 靜態釘接線）。
+#   * 真 fzf 互動、真機上 down／換 port 的自然斷（D4）都不在這裡，全是 stub。
+#   * R7 的「0 次」不是憑空：R1b 用同一套帳在 add 路徑量到掃描 1 次、
+#     pool-resolve ≥1 次；R1c 量到成功時 stderr 0 行。零是量出來的，不是漏的。
+#
+# ---- 紅燈是本節的預期 ---------------------------------------------------
+#   impl 之前：R2/R4/R5/R6 紅，R1/R3/R7 綠。檔尾有分節失敗數，可以一眼分辨
+#   「本節預期紅」與「0-21 節回歸」。
+echo "=== 22. repair 機器：fwd 的名字／port／選單／訊息／ls 不重解析 ==="
+
+# ---- 22.1 夾具 ------------------------------------------------------------
+# 段用**非預設**的 [2500,2599]（文件寫的預設是 [2400,2499]）：2503 落在
+# 預設段外，所以一紅就分得出「讀了設定」與「讀死常數」。
+RP_GW_JSON='{"ip":"9.9.9.9","user":"gw","port":22,"ports":{"repair":[2500,2599]}}'
+RP_GW_JSON_NOPORTS='{"ip":"9.9.9.9","user":"gw","port":22}'
+printf '%s\n' '[{"container":"w1","port":2401,"provider":"pn"}]' > "$SANDBOX/rp-workers.json"
+# 掃描回放（形狀照 test-mlp-repair.sh 的 repair-scan-main.txt）：
+#   2503 dad-pc   唯一名 → 名字形式
+#   2510/2520 twin 同名兩台 → 同名拒絕（R4）與選單逐台可選（R6）
+#   2550 沒名牌    → ? ＋ port（D5：listener 是唯一事實）
+#   2404 段外      → 不該出現在任何 repair 列（段沒讀錯的另一個證據）
+cat > "$SANDBOX/rp-scan.txt" <<'SCAN'
+REPAIR-SCAN-L
+LISTEN 0 128 127.0.0.1:2404 0.0.0.0:*
+LISTEN 0 128 127.0.0.1:2503 0.0.0.0:*
+LISTEN 0 128 127.0.0.1:2510 0.0.0.0:*
+LISTEN 0 128 127.0.0.1:2520 0.0.0.0:*
+LISTEN 0 128 127.0.0.1:2550 0.0.0.0:*
+REPAIR-SCAN-N
+2503 dad-pc
+2510 twin
+2520 twin
+REPAIR-SCAN-END
+SCAN
+
+# ---- 22.2 跑法與量法 ------------------------------------------------------
+RP_COMMON=(
+  "POOL_OVERRIDE=$SANDBOX/shims/pool-resolve"
+  "FAKE_GW_RC=0" "FAKE_MASTER_RC=0"
+  "FAKE_PS_FILE=$SANDBOX/ps-none.txt" "FAKE_NODES_JSON=$SANDBOX/nodes.json"
+  "FAKE_WORKERS_FILE=$SANDBOX/rp-workers.json"
+  "FAKE_REPAIR_SCAN_FILE=$SANDBOX/rp-scan.txt"
+  "FAKE_START_RC=0" "FAKE_TUNNEL_RC=0" "FAKE_TARGET_RC=1"
+  "FAKE_TARGET_ERR=bash: connect: Connection refused"
+  "SSH_REAL=$SSH_FILE" "HOME=$SANDBOX/home" "PATH=$SANDBOX/shims:$PATH"
+)
+# 三本帳：argv／pool-resolve／repair 掃描。清帳 + 開新的 FWD 目錄。
+rp_reset() {
+    rm -rf "$SANDBOX/rp-$1"
+    mkdir -p "$SANDBOX/rp-$1"
+    : > "$SANDBOX/$1-argv.log"
+    : > "$SANDBOX/$1-pr.log"
+    : > "$SANDBOX/$1-scan.log"
+    : > "$SANDBOX/$1-out"
+    : > "$SANDBOX/$1-err"
+}
+# rp_case <前綴> <mlp檔> <gwjson> <node> <spec> [VAR=VAL ...]
+#   跑 fwd_add（ViewModel），印 RC/ERR/NODE/OUT位元組/ERR位元組。
+#   沙箱突變檔的 SCRIPT_DIR 會指進沙箱、source 不到真的 ssh.sh，走
+#   ssh_via_gateway 就 command not found——三個跑法都在 source 之後補 source
+#   真的那份（與注入 24 同一個坑）。
+rp_case() {
+    local pfx="$1" mf="$2" gwjson="$3" node="$4" spec="$5"; shift 5
+    local d="$SANDBOX/rp-$pfx"
+    rp_reset "$pfx"
+    env "${RP_COMMON[@]}" "MLP_FILE=$mf" "FWD_OVERRIDE=$d" "FAKE_GW_JSON=$gwjson" \
+        "ARGV_LOG=$SANDBOX/$pfx-argv.log" "PR_LOG=$SANDBOX/$pfx-pr.log" \
+        "SCAN_LOG=$SANDBOX/$pfx-scan.log" "ADD_OUT=$SANDBOX/$pfx-out" \
+        "ADD_ERR=$SANDBOX/$pfx-err" "RP_NODE=$node" "RP_SPEC=$spec" \
+        "$@" \
+        bash -c 'source "$MLP_FILE" >/dev/null 2>&1
+                 source "$SSH_REAL" >/dev/null 2>&1
+                 FWD_DIR="$FWD_OVERRIDE"; POOL_RESOLVE="$POOL_OVERRIDE"
+                 : > "$ADD_OUT"; : > "$ADD_ERR"
+                 if fwd_add "$RP_NODE" "$RP_SPEC" >"$ADD_OUT" 2>"$ADD_ERR"; then rc=0; else rc=$?; fi
+                 printf "RC=%s ERR=%s NODE=%s OUT=%s ERRB=%s" "$rc" "$FWD_ERR" "$FWD_ADD_NODE" \
+                   "$(wc -c < "$ADD_OUT" | tr -d " ")" "$(wc -c < "$ADD_ERR" | tr -d " ")"' 2>&1
+}
+# rp_view <前綴> <mlp檔> <gwjson> <node> <spec> [VAR=VAL ...]
+#   跑 fwd_view_add（View，R4/R5 量的是人真的看到的那段）。die 會 exit，
+#   所以放在子殼層裡跑，rc 才量得到。
+rp_view() {
+    local pfx="$1" mf="$2" gwjson="$3" node="$4" spec="$5"; shift 5
+    local d="$SANDBOX/rp-$pfx"
+    rp_reset "$pfx"
+    env "${RP_COMMON[@]}" "MLP_FILE=$mf" "FWD_OVERRIDE=$d" "FAKE_GW_JSON=$gwjson" \
+        "ARGV_LOG=$SANDBOX/$pfx-argv.log" "PR_LOG=$SANDBOX/$pfx-pr.log" \
+        "SCAN_LOG=$SANDBOX/$pfx-scan.log" "ADD_OUT=$SANDBOX/$pfx-out" \
+        "ADD_ERR=$SANDBOX/$pfx-err" "RP_NODE=$node" "RP_SPEC=$spec" \
+        "$@" \
+        bash -c 'source "$MLP_FILE" >/dev/null 2>&1
+                 source "$SSH_REAL" >/dev/null 2>&1
+                 FWD_DIR="$FWD_OVERRIDE"; POOL_RESOLVE="$POOL_OVERRIDE"
+                 : > "$ADD_OUT"; : > "$ADD_ERR"
+                 ( fwd_view_add "$RP_NODE" "$RP_SPEC" >"$ADD_OUT" 2>"$ADD_ERR" )
+                 rc=$?
+                 printf "RC=%s" "$rc"' 2>&1
+}
+# rp_menu <前綴> <mlp檔> <gwjson> <spec> [VAR=VAL ...]
+#   跑 fwd_menu_add（不帶參數的選單）。spec 用 here-string 餵 stdin；TTY 閘
+#   用 interactive_only 放行（見節首）。候選流由 fzf stub 落盤。
+rp_menu() {
+    local pfx="$1" mf="$2" gwjson="$3" spec="$4"; shift 4
+    local d="$SANDBOX/rp-$pfx"
+    rp_reset "$pfx"
+    : > "$SANDBOX/$pfx-menu-out"
+    : > "$SANDBOX/$pfx-menu-err"
+    : > "$SANDBOX/$pfx-menu-res"
+    ( env "${RP_COMMON[@]}" "MLP_FILE=$mf" "FWD_OVERRIDE=$d" "FAKE_GW_JSON=$gwjson" \
+        "ARGV_LOG=$SANDBOX/$pfx-argv.log" "PR_LOG=$SANDBOX/$pfx-pr.log" \
+        "SCAN_LOG=$SANDBOX/$pfx-scan.log" "FZF_STDIN_LOG=$SANDBOX/$pfx-fzf.stdin" \
+        "RP_SPEC=$spec" "MENU_RES=$SANDBOX/$pfx-menu-res" "$@" \
+        bash -c 'source "$MLP_FILE" >/dev/null 2>&1
+                 source "$SSH_REAL" >/dev/null 2>&1
+                 FWD_DIR="$FWD_OVERRIDE"; POOL_RESOLVE="$POOL_OVERRIDE"
+                 interactive_only() { return 0; }
+                 fwd_menu_add
+                 printf "RC=%s" "$?" > "$MENU_RES"' <<< "$spec" \
+        > "$SANDBOX/$pfx-menu-out" 2> "$SANDBOX/$pfx-menu-err" ) || true
+    printf '%s' "$(cat "$SANDBOX/$pfx-menu-res" 2>/dev/null || true)"
+}
+# rp_ls <前綴> <mlp檔> <gwjson>：fwd ls 一筆 repair 轉發，回 RC/PR次數/SCAN次數。
+#   ps 回放那一筆的 node 名是 dad-pc，但這條路**不該**去解析它。
+rp_ls() {
+    local pfx="$1" mf="$2" gwjson="$3"
+    local d="$SANDBOX/rp-$pfx"
+    rp_reset "$pfx"
+    touch "$d/fwd-127.0.0.1-8080"
+    printf ' 4444 ssh -S %s -N -f -L 127.0.0.1:8080:192.168.0.50:80 repair@127.0.0.1 mlp-fwd-node=dad-pc\n' \
+        "$d/fwd-127.0.0.1-8080" > "$SANDBOX/rp-ls-ps.txt"
+    env "${RP_COMMON[@]}" "MLP_FILE=$mf" "FWD_OVERRIDE=$d" "FAKE_GW_JSON=$gwjson" \
+        "FAKE_PS_FILE=$SANDBOX/rp-ls-ps.txt" \
+        "ARGV_LOG=$SANDBOX/$pfx-argv.log" "PR_LOG=$SANDBOX/$pfx-pr.log" \
+        "SCAN_LOG=$SANDBOX/$pfx-scan.log" "LS_OUT=$SANDBOX/$pfx-out" \
+        "LS_ERR=$SANDBOX/$pfx-err" \
+        bash -c 'source "$MLP_FILE" >/dev/null 2>&1
+                 source "$SSH_REAL" >/dev/null 2>&1
+                 FWD_DIR="$FWD_OVERRIDE"; POOL_RESOLVE="$POOL_OVERRIDE"
+                 fwd_view_ls >"$LS_OUT" 2>"$LS_ERR"
+                 printf "RC=%s PR=%s SCAN=%s" "$?" \
+                   "$(grep -c "^PR " "$PR_LOG" 2>/dev/null || true)" \
+                   "$(grep -c "^SCAN$" "$SCAN_LOG" 2>/dev/null || true)"' 2>&1
+}
+# 量法小幫手。
+rp_has()   { grep -qxF -- "$2" "$1" 2>/dev/null; }
+rp_lack()  { ! grep -qxF -- "$2" "$1" 2>/dev/null; }
+# rp_opt <argv檔> <選項> <值>：<選項> 的**下一個** argv 就是 <值>
+#   （不只抓「整份裡某處有這個值」——那會被別處的同值假綠）。
+rp_opt()   { awk -v o="$2" -v v="$3" 'p == o && $0 == v { found = 1; exit } { p = $0 } END { exit (found ? 0 : 1) }' "$1" 2>/dev/null; }
+rp_count() { grep -c "$2" "$1" 2>/dev/null || true; }
+# rp_lines <檔>：非空白行數（die 訊息與說明行的計數基準）。
+rp_lines() { grep -c '[^[:space:]]' "$1" 2>/dev/null || true; }
+# rp_row <候選流檔> <token> <token>：有一列同時含這兩個 token（不綁死欄位形狀）。
+rp_row()   { grep -F -- "$2" "$1" 2>/dev/null | grep -qF -- "$3"; }
+# rp_tail <檔>：最後一個非空白行。
+rp_tail()  { grep '[^[:space:]]' "$1" 2>/dev/null | tail -1; }
+
+pre22_pass="$pass"; pre22_fail="$fail"
+
+# ---- R1. 名字形式：現碼就該能用（recon §1 量過） -------------------------
+got="$(rp_case r1 "$MLP_FILE" "$RP_GW_JSON" dad-pc "8080:192.168.0.50:80")"
+if [[ "$got" == "RC=0 ERR= NODE=dad-pc OUT=0 ERRB=0" ]] \
+   && rp_opt "$SANDBOX/r1-argv.log" -p 2503 \
+   && rp_has "$SANDBOX/r1-argv.log" 'repair@127.0.0.1' \
+   && rp_has "$SANDBOX/r1-argv.log" '-L' \
+   && rp_has "$SANDBOX/r1-argv.log" '127.0.0.1:8080:192.168.0.50:80' \
+   && rp_has "$SANDBOX/r1-argv.log" 'mlp-fwd-node=dad-pc' \
+   && rp_lack "$SANDBOX/r1-argv.log" 'worker@127.0.0.1'; then
+    ok "R1a. 名字形式：-p 2503 + repair@127.0.0.1 + -L 完整 + mlp-fwd-node=dad-pc"
+else
+    bad "R1a. 名字形式不對（got [$got] argv=[$(tr '\n' '|' < "$SANDBOX/r1-argv.log")]）"
+fi
+r1_scan="$(rp_count "$SANDBOX/r1-scan.log" '^SCAN$')"
+r1_pr="$(rp_count "$SANDBOX/r1-pr.log" '^PR ')"
+if [[ "$r1_scan" == "1" && "$r1_pr" -ge 1 ]]; then
+    ok "R1b. 計數器對照：同一套帳在 add 路徑量得到（掃描 ${r1_scan} 次、pool-resolve ${r1_pr} 次）"
+else
+    bad "R1b. 計數器在 add 路徑就量不到（scan=${r1_scan} pr=${r1_pr}）——R7 的 0 次會是假零"
+fi
+r1_errlines="$(rp_lines "$SANDBOX/r1-err")"
+if [[ "$r1_errlines" == "0" ]]; then
+    ok "R1c. 計數器對照：同樣的行數量法在成功時量到 stderr ${r1_errlines} 行——R5 要求的「多一行」有基準"
+else
+    bad "R1c. 成功路徑的 stderr 不該有內容，量到 ${r1_errlines} 行"
+fi
+
+# ---- R2. 段內 port 形式：現碼紅（第二跳會是 worker@127.0.0.1） -----------
+got="$(rp_case r2 "$MLP_FILE" "$RP_GW_JSON" 2503 "8080")"
+if [[ "$got" == "RC=0 ERR= NODE=2503 OUT=0 ERRB=0" ]] \
+   && rp_opt "$SANDBOX/r2-argv.log" -p 2503 \
+   && rp_has "$SANDBOX/r2-argv.log" 'repair@127.0.0.1' \
+   && rp_lack "$SANDBOX/r2-argv.log" 'worker@127.0.0.1' \
+   && rp_has "$SANDBOX/r2-argv.log" '127.0.0.1:8080:127.0.0.1:8080'; then
+    ok "R2. 段內裸數字 port → 第二跳用 repair@127.0.0.1"
+else
+    bad "R2. 段內 port 沒被當 repair（got [$got] argv=[$(tr '\n' '|' < "$SANDBOX/r2-argv.log")]）"
+fi
+
+# ---- R3. 段外／未設定段：裸數字維持 worker（D1 的語意邊界，回歸保護） -----
+#   2401 落在**文件預設段** [2400,2499] 裡但不在設定的 [2500,2599] 裡：
+#   讀死常數的實作會在這裡現形。2503 ＋ 未設定段是 Definition 1。
+got3a="$(rp_case r3a "$MLP_FILE" "$RP_GW_JSON" 2401 "8080")"
+if [[ "$got3a" == "RC=0 ERR= NODE=2401 OUT=0 ERRB=0" ]] \
+   && rp_opt "$SANDBOX/r3a-argv.log" -p 2401 \
+   && rp_has "$SANDBOX/r3a-argv.log" 'worker@127.0.0.1' \
+   && rp_lack "$SANDBOX/r3a-argv.log" 'repair@127.0.0.1'; then
+    ok "R3a. 段外裸數字（2401，卻在預設段內）維持 worker——段是讀設定的"
+else
+    bad "R3a. 段外 port 被誤認成 repair（got [$got3a] argv=[$(tr '\n' '|' < "$SANDBOX/r3a-argv.log")]）"
+fi
+got3b="$(rp_case r3b "$MLP_FILE" "$RP_GW_JSON_NOPORTS" 2503 "8080")"
+if [[ "$got3b" == "RC=0 ERR= NODE=2503 OUT=0 ERRB=0" ]] \
+   && rp_opt "$SANDBOX/r3b-argv.log" -p 2503 \
+   && rp_has "$SANDBOX/r3b-argv.log" 'worker@127.0.0.1' \
+   && rp_lack "$SANDBOX/r3b-argv.log" 'repair@127.0.0.1'; then
+    ok "R3b. ports.repair 未設定時裸數字維持 worker（Def1，不猜段）"
+else
+    bad "R3b. 未設定段卻把裸數字當 repair（got [$got3b] argv=[$(tr '\n' '|' < "$SANDBOX/r3b-argv.log")]）"
+fi
+
+# ---- R4. 同名 repair：拒絕並列 port（現碼紅：說成 no such node or worker）-
+got="$(rp_view r4 "$MLP_FILE" "$RP_GW_JSON" twin 8080)"
+if [[ "$got" != "RC=0" ]] \
+   && grep -q '2510' "$SANDBOX/r4-err" \
+   && grep -q '2520' "$SANDBOX/r4-err" \
+   && ! grep -q 'no such node or worker' "$SANDBOX/r4-err"; then
+    ok "R4. 同名 repair → 非零、列出兩個候選 port、不再誤報 no such node or worker"
+else
+    bad "R4. 同名 repair 的處理不對（got [$got] err=[$(tr '\n' '|' < "$SANDBOX/r4-err")]）"
+fi
+
+# ---- R5. 找不到／未設定段：多一行說明，generic 字串留著（現碼紅） ---------
+#   7d 回歸釘的 'no such node or worker' 這裡一起量：它必須是**最後一行**，
+#   前面那行才是新增的說明。「多一行」與「generic 沒被改寫」同時成立。
+got="$(rp_view r5a "$MLP_FILE" "$RP_GW_JSON" ghost-pc 8080)"
+r5a_lines="$(rp_lines "$SANDBOX/r5a-err")"
+r5a_last="$(rp_tail "$SANDBOX/r5a-err")"
+if [[ "$got" != "RC=0" && "$r5a_lines" -ge 2 \
+   && "$r5a_last" == *"no such node or worker: ghost-pc"* ]]; then
+    ok "R5a. repair 名字查無 → 多一行說明（在線才找得到），generic 那句留著當最後一行"
+else
+    bad "R5a. 查無時沒有說明行（got [$got] 行數 [${r5a_lines}] want ≥2 末行 [${r5a_last}]）"
+fi
+got="$(rp_view r5b "$MLP_FILE" "$RP_GW_JSON_NOPORTS" ghost-pc 8080)"
+r5b_lines="$(rp_lines "$SANDBOX/r5b-err")"
+r5b_last="$(rp_tail "$SANDBOX/r5b-err")"
+if [[ "$got" != "RC=0" && "$r5b_lines" -ge 2 \
+   && "$r5b_last" == *"no such node or worker: ghost-pc"* ]] \
+   && grep -q 'ports.repair' "$SANDBOX/r5b-err"; then
+    ok "R5b. ports.repair 未設定 → 印出警告行（TARGET_DETAIL），generic 那句留著"
+else
+    bad "R5b. 未設定段沒有警告行（got [$got] 行數 [${r5b_lines}] 末行 [${r5b_last}] err=[$(tr '\n' '|' < "$SANDBOX/r5b-err")]）"
+fi
+
+# ---- R6. 不帶參數的選單：候選含在線 repair，選到就以 port 解析（現碼紅） ---
+# fzf stub（test-mlp-repair.sh §10 同一手法）：先把整份候選流落盤，再挑出同時
+# 含 FZF_PICK_NAME 與 FZF_PICK_PORT 的那一列回傳（真 fzf 挑不到就是 exit 1
+# 且無輸出）。**刻意不綁欄位位置**：D2 只說「顯示名字（或 ?）與 port、選到的
+# 值是 port」，欄位形狀是實作選擇；要量的是「那一列最後被當成 port 解析」。
+# 兩個 FZF_PICK_* 都沒給時維持原本的大聲拒絕（不該有靜默 fzf）。
+cat > "$SANDBOX/shims/fzf" <<'FAKE'
+#!/usr/bin/env bash
+if [[ -z "${FZF_PICK_NAME:-}" && -z "${FZF_PICK_PORT:-}" ]]; then
+    echo "test stub: refusing fzf (no FZF_PICK_* set)" >&2
+    exit 255
+fi
+cat > "${FZF_STDIN_LOG:-/dev/null}"
+n="${FZF_PICK_NAME:-}"
+p="${FZF_PICK_PORT:-}"
+while IFS= read -r line; do
+    if [[ "$line" == *"$n"* && "$line" == *"$p"* ]]; then
+        printf '%s\n' "$line"
+        exit 0
+    fi
+done < "${FZF_STDIN_LOG:-/dev/null}"
+exit 1
+FAKE
+chmod +x "$SANDBOX/shims/fzf"
+
+got="$(rp_menu r6a "$MLP_FILE" "$RP_GW_JSON" 8080 FZF_PICK_NAME=dad-pc FZF_PICK_PORT=2503)"
+if rp_row "$SANDBOX/r6a-fzf.stdin" 'dad-pc' '2503' \
+   && rp_row "$SANDBOX/r6a-fzf.stdin" 'gateway' 'gateway' \
+   && rp_row "$SANDBOX/r6a-fzf.stdin" 'w1' 'w1'; then
+    ok "R6a. 選單候選含在線 repair（dad-pc ＋ 2503），gateway 與 worker 沒被擠掉"
+else
+    bad "R6a. 選單裡沒有 repair 候選（候選流=[$(tr '\n' '|' < "$SANDBOX/r6a-fzf.stdin" 2>/dev/null)]）"
+fi
+if [[ "$got" == "RC=0" ]] && rp_opt "$SANDBOX/r6a-argv.log" -p 2503 \
+   && rp_has "$SANDBOX/r6a-argv.log" 'repair@127.0.0.1' \
+   && rp_lack "$SANDBOX/r6a-argv.log" 'worker@127.0.0.1'; then
+    ok "R6b. 選到 dad-pc 那列 → 以 port 2503 起 repair 轉發"
+else
+    bad "R6b. 選到 repair 那列沒以 port 解析（got [$got] argv=[$(tr '\n' '|' < "$SANDBOX/r6a-argv.log" 2>/dev/null)]）"
+fi
+# R6c 是「以 port 解析」唯一有辨識力的那格：twin 同名兩台，選名字必定
+# ambiguity 拒絕，選 port 2510 會直達 2510。dad-pc 那格分辨不出這件事。
+got="$(rp_menu r6c "$MLP_FILE" "$RP_GW_JSON" 8080 FZF_PICK_NAME=twin FZF_PICK_PORT=2510)"
+if [[ "$got" == "RC=0" ]] && rp_opt "$SANDBOX/r6c-argv.log" -p 2510 \
+   && rp_has "$SANDBOX/r6c-argv.log" 'repair@127.0.0.1' \
+   && ! grep -q 'matches multiple' "$SANDBOX/r6c-menu-err"; then
+    ok "R6c. 同名的 twin 選 2510 那台就直達 2510——不是走名字（那會被拒）"
+else
+    bad "R6c. 同名列沒以 port 解析（got [$got] argv=[$(tr '\n' '|' < "$SANDBOX/r6c-argv.log" 2>/dev/null)] err=[$(tr '\n' '|' < "$SANDBOX/r6c-menu-err" 2>/dev/null)]）"
+fi
+# R6d：沒有名牌的 listener 也要能選（D5 形狀：顯示 ? ＋ port）。
+got="$(rp_menu r6d "$MLP_FILE" "$RP_GW_JSON" 8080 FZF_PICK_NAME='?' FZF_PICK_PORT=2550)"
+if [[ "$got" == "RC=0" ]] && rp_opt "$SANDBOX/r6d-argv.log" -p 2550 \
+   && rp_has "$SANDBOX/r6d-argv.log" 'repair@127.0.0.1'; then
+    ok "R6d. 沒有名牌的那台（? ＋ 2550）也在候選裡，選到就以 2550 起"
+else
+    bad "R6d. 沒有名牌的 repair 選不到（got [$got] argv=[$(tr '\n' '|' < "$SANDBOX/r6d-argv.log" 2>/dev/null)]）"
+fi
+# R6e：段沒設定 → 不列 repair，且選單要正常收掉（不能壞掉、不能誤列）。
+got="$(rp_menu r6e "$MLP_FILE" "$RP_GW_JSON_NOPORTS" 8080 FZF_PICK_NAME=dad-pc FZF_PICK_PORT=2503)"
+if rp_row "$SANDBOX/r6e-fzf.stdin" 'gateway' 'gateway' \
+   && ! grep -q '2503' "$SANDBOX/r6e-fzf.stdin" \
+   && grep -q 'aborted' "$SANDBOX/r6e-menu-out"; then
+    ok "R6e. 段沒設定時不列 repair，選單仍正常收掉（aborted，不是崩）"
+else
+    bad "R6e. 未設定段的選單形狀不對（got [$got] 候選流=[$(tr '\n' '|' < "$SANDBOX/r6e-fzf.stdin" 2>/dev/null)] out=[$(tr '\n' '|' < "$SANDBOX/r6e-menu-out" 2>/dev/null)]）"
+fi
+
+# ---- R7. fwd ls 不重新解析 node 名字（D4 的機制） -------------------------
+got="$(rp_ls r7 "$MLP_FILE" "$RP_GW_JSON")"
+if [[ "$got" == "RC=0 PR=0 SCAN=0" ]] && grep -q 'dad-pc' "$SANDBOX/r7-out"; then
+    ok "R7. fwd ls 不重新解析：0 次 pool-resolve、0 次 repair 掃描，名字仍從 ps 顯示"
+else
+    bad "R7. fwd ls 有重新解析（got [$got] 輸出=[$(tr '\n' '|' < "$SANDBOX/r7-out")]）"
+fi
+
+# ---- 22-inj. 對照：把目標行為**做壞**，斷言必須轉紅 ------------------------
+# 紅燈那幾格光看「現在是紅的」不足以證明斷言在量東西——也可能是 harness 壞掉。
+# 所以每一格都配一次對照突變。實作落地（openspec D1–D4）之後角色反轉了：
+# **目標行為現在就是產品碼本身**，紅燈格已轉綠，所以還留著的對照全部改成
+# 「做壞它，斷言必須轉紅」——這才是現在唯一還有牙的形狀。
+# 轉不到就是 harness 問題（inj_bad），不是被測物的問題。
+# 注意突變檔都寫在沙箱裡，SCRIPT_DIR 會指錯，所以三個跑法都補 source 真的 ssh.sh。
+#
+# 錨點一律用「行比對 + 形狀 assert」，不用整段字串比對：措辭改了不該讓護欄報假警，
+# 但**形狀**變了（分支不見、換成別的形狀、函式被改寫）必須大聲壞掉——寧可
+# inj_bad 說「形狀變了」，也不要靜靜留一條量不到東西的注入。
+
+# 22-inj1：**已移除（PM 裁定 2026-10-01，工單 test-repair-fwd-injections）**。
+#   它是「把目標行為做出來」的突變（把段內裸數字的短路塞回 fwd_add），只套得在
+#   還沒有 D1 的產品碼上：真實實作把那三行放進 `else`、縮排變 8 空白，字串針就
+#   落空了（OUT-impl-repair-fwd.md §5.2）。它的意圖現在由 **R2 本身**接手——
+#   R2 斷言的正是「段內 port 的第二跳是 repair@127.0.0.1」，而真的程式碼就是
+#   那個目標行為，所以 R2 綠就是這個意圖被滿足的證據。再留一條會把同一件事
+#   用假造的程式碼再證一次。
+#
+# 22-inj2（D1 的壞形狀：共用判斷 repair_port_p 對**任何**裸數字都回真）。
+#   R3a（段外的 2401）／R3b（段未設定的 2503）必須轉紅。
+#   這條從「改 fwd_add 的解析」改成「改 D1 那個共用判斷本身」——形狀隨實作變了，
+#   意圖沒變，而且這是唯一一條能守住「段界沒被拿掉」的護欄。
+#   三個條件一起拿掉（兩個界非空、-ge/-le）是刻意的：只拿掉 -ge/-le 時，
+#   `GW_REPAIR_LO=""` 會讓 `[[ 2503 -ge "" ]]` 自己回 false，R3b 變不出差異
+#   （OUT-impl-repair-fwd.md §5.4 第 3 點量過）。全數字那個條件留著。
+INJ_R2="$SANDBOX/rp-mut-norange.sh"
+python3 - "$MLP" "$INJ_R2" <<'PY'
+import sys
+src = open(sys.argv[1], encoding="utf-8").read()
+old = ('repair_port_p() {\n'
+       '    [[ "$1" =~ ^[0-9]+$ ]] || return 1\n'
+       '    [[ -n "${GW_REPAIR_LO:-}" && -n "${GW_REPAIR_HI:-}" ]] || return 1\n'
+       '    [[ "$1" -ge "$GW_REPAIR_LO" && "$1" -le "$GW_REPAIR_HI" ]]\n'
+       '}\n')
+new = ('repair_port_p() {\n'
+       '    [[ "$1" =~ ^[0-9]+$ ]] || return 1\n'
+       '    # INJECTED: 段界被拿掉——任何裸數字都當 repair\n'
+       '    return 0\n'
+       '}\n')
+assert src.count(old) == 1, "repair_port_p needle count=%d" % src.count(old)
+open(sys.argv[2], "w", encoding="utf-8").write(src.replace(old, new, 1))
+PY
+if [[ $? -ne 0 ]]; then
+    inj_bad "22-inj2. 突變腳本失敗（D1 的共用判斷形狀變了）——harness 問題"
+elif ! bash -n "$INJ_R2" 2>/dev/null; then
+    inj_bad "22-inj2. 突變版語法錯誤——harness 問題"
+else
+    got3a="$(rp_case rinj2a "$INJ_R2" "$RP_GW_JSON" 2401 "8080")"
+    got3b="$(rp_case rinj2b "$INJ_R2" "$RP_GW_JSON_NOPORTS" 2503 "8080")"
+    if rp_has "$SANDBOX/rinj2a-argv.log" 'repair@127.0.0.1' \
+       && rp_lack "$SANDBOX/rinj2a-argv.log" 'worker@127.0.0.1' \
+       && rp_has "$SANDBOX/rinj2b-argv.log" 'repair@127.0.0.1' \
+       && rp_lack "$SANDBOX/rinj2b-argv.log" 'worker@127.0.0.1'; then
+        inj_ok "22-inj2. 段界拿掉後段外與未設定段都被認成 repair（${got3a}/${got3b}）——R3a/R3b 會紅"
+    else
+        inj_bad "22-inj2. 段界拿掉後 R3a/R3b 仍綠（${got3a}/${got3b}）——R3 是空的"
+    fi
+fi
+
+# 22-inj3（D3 的 repair-ambiguous 那一格被**拿掉**）。R4 必須轉紅。
+#   方向在 2026-10-01 翻過來（工單 test-repair-fwd-injections-2）：實作落地後
+#   「把目標行為做出來」已無意義——真實程式碼就是那個目標行為，突變插進去的那份
+#   是死碼，R4 靠真實程式碼本來就會綠。當時量到的證據：突變的訊息一次都沒被印
+#   出來（OUT-test-repair-fwd-injections.md §4）。所以改成反向：**拿掉那一格**，
+#   同名 repair 必須又變回 no such node or worker、兩個候選 port 一個都不列，
+#   R4 才會紅。這條從「必定通過」變成有牙。
+#   錨點用行比對而不是整段字串比對：措辭改了不該讓這條報假警，但**形狀**變了
+#   （分支不見、或換成別的形狀）必須大聲壞掉，而不是靜靜變成惰性注入。
+INJ_R3="$SANDBOX/rp-mut-ambiguous.sh"
+python3 - "$MLP" "$INJ_R3" <<'PY'
+import sys
+lines = open(sys.argv[1], encoding="utf-8").read().split("\n")
+anchor = '            if [[ "$TARGET_ERR" == "repair-ambiguous" ]]; then'
+hits = [k for k, l in enumerate(lines) if l == anchor]
+assert len(hits) == 1, "ambiguous-branch anchor count=%d" % len(hits)
+i = hits[0]
+assert lines[i + 1].lstrip().startswith('die "repair name '), "expected a die line right after, got %r" % lines[i + 1]
+assert lines[i + 2] == "            fi", "expected the branch to close there, got %r" % lines[i + 2]
+del lines[i:i + 3]
+open(sys.argv[2], "w", encoding="utf-8").write("\n".join(lines))
+PY
+if [[ $? -ne 0 ]]; then
+    inj_bad "22-inj3. 突變腳本失敗（D3 的分支形狀變了）——harness 問題"
+elif ! bash -n "$INJ_R3" 2>/dev/null; then
+    inj_bad "22-inj3. 突變版語法錯誤——harness 問題"
+else
+    got="$(rp_view rinj3 "$INJ_R3" "$RP_GW_JSON" twin 8080)"
+    # R4 的判準要整個翻面：非零仍成立，但兩個候選 port 都不列、generic 那句回來。
+    if [[ "$got" != "RC=0" ]] && grep -q 'no such node or worker: twin' "$SANDBOX/rinj3-err" \
+       && ! grep -q '2510' "$SANDBOX/rinj3-err" && ! grep -q '2520' "$SANDBOX/rinj3-err"; then
+        inj_ok "22-inj3. 拿掉 repair-ambiguous 分支後同名又變回 no such node or worker、兩個 port 一個都沒列（got [$got]）——R4 會紅"
+    else
+        inj_bad "22-inj3. 拿掉那一格後 R4 仍綠（got [$got] err=[$(tr '\n' '|' < "$SANDBOX/rinj3-err")]）——R4 的訊息護欄是空的"
+    fi
+fi
+
+# 22-inj4（D3 的 notfound 說明行 ＋ TARGET_DETAIL 印出被**拿掉**）。R5a/R5b 必須轉紅。
+#   方向同 22-inj3（工單 test-repair-fwd-injections-2）：改成做壞它。理由與量到的
+#   死碼證據見 OUT-test-repair-fwd-injections.md §4（那時這條報的行數從實作前的
+#   2/3 變成 3/5——多的那行就是突變重複印的，滿足判準的仍是真實程式碼）。
+#   **兩行一起拿掉**：只拿掉離線說明那一行，R5b 還剩 TARGET_DETAIL 的警告行撐著
+#   （2 行）不會紅；兩行都拿掉，兩格一起掉回 1 行（只剩 generic 那句），R5b 的
+#   ports.repair 警告也一起消失——R5a／R5b 同時翻紅。
+INJ_R4="$SANDBOX/rp-mut-offline.sh"
+python3 - "$MLP" "$INJ_R4" <<'PY'
+import sys
+lines = open(sys.argv[1], encoding="utf-8").read().split("\n")
+hits = [k for k, l in enumerate(lines) if l.startswith("            printf 'note: a repair host shows up only")]
+assert len(hits) == 1, "offline-note anchor count=%d" % len(hits)
+j = hits[0]
+prev = lines[j - 1]
+assert "TARGET_DETAIL" in prev and ">&2" in prev, "expected the TARGET_DETAIL print right before the note, got %r" % prev
+del lines[j - 1:j + 1]
+open(sys.argv[2], "w", encoding="utf-8").write("\n".join(lines))
+PY
+if [[ $? -ne 0 ]]; then
+    inj_bad "22-inj4. 突變腳本失敗（D3 的說明行形狀變了）——harness 問題"
+elif ! bash -n "$INJ_R4" 2>/dev/null; then
+    inj_bad "22-inj4. 突變版語法錯誤——harness 問題"
+else
+    got="$(rp_view rinj4a "$INJ_R4" "$RP_GW_JSON" ghost-pc 8080)"
+    la="$(rp_lines "$SANDBOX/rinj4a-err")"
+    la_last="$(rp_tail "$SANDBOX/rinj4a-err")"
+    gotb="$(rp_view rinj4b "$INJ_R4" "$RP_GW_JSON_NOPORTS" ghost-pc 8080)"
+    lb="$(rp_lines "$SANDBOX/rinj4b-err")"
+    lb_last="$(rp_tail "$SANDBOX/rinj4b-err")"
+    # 兩格都該掉回「只剩 generic 那一句」：R5a 的 ≥2 行、R5b 的 ≥2 行＋ports.repair
+    # 警告同時失效。
+    if [[ "$la" == "1" && "$lb" == "1" \
+       && "$la_last" == *"no such node or worker: ghost-pc"* \
+       && "$lb_last" == *"no such node or worker: ghost-pc"* ]] \
+       && ! grep -q 'ports.repair' "$SANDBOX/rinj4b-err"; then
+        inj_ok "22-inj4. 拿掉說明行與 TARGET_DETAIL 後兩格都只剩 generic 那一句（行數 ${la}/${lb}）——R5a/R5b 會紅"
+    else
+        inj_bad "22-inj4. 拿掉那兩行後 R5 仍綠（行數 ${la}/${lb} 末行 [${la_last}]/[${lb_last}]）——護欄是空的"
+    fi
+fi
+
+# 22-inj5：**已移除（PM 裁定 2026-10-01，工單 test-repair-fwd-injections）**。
+#   它是「把 D2 的選單做出來」的突變（插 repair 迴圈 ＋ 收斂成 port），同樣只
+#   套得在還沒有 D2 的產品碼上：任何正確的 D2 實作都必須在 `gather_targets`
+#   與 `} | fzf` 之間插東西，插完那段原文就不存在了（OUT-impl-repair-fwd.md
+#   §5.3）。它的意圖由 **R6a–R6e 五格**接手：候選流（r6a 數得到 dad-pc ＋
+#   2503）、以 port 解析（r6c 選同名的 twin/2510 直達 2510，不是走名字）、段
+#   未設定時不列 repair 也不壞掉（r6e）——真的選單就是那個目標行為。
+#   （當初量到「D2 依賴 D1」的那個證據也一起沒了：那需要一個只有選單、沒有 D1
+#   的產品碼才量得到。**2026-10-01 由 22-inj7 接手**——見那條。）
+
+# 22-inj6（D4 的反面：ls 偏要重新解析）。R7 必須轉紅——證明「0 次」這個
+#   數字是量出來的，不是因為根本沒在數。
+INJ_R6="$SANDBOX/rp-mut-ls-reresolve.sh"
+python3 - "$MLP" "$INJ_R6" <<'PY'
+import sys
+src = open(sys.argv[1], encoding="utf-8").read()
+old = ('    FWD_STATUS_ROWS=()\n'
+       '    fwd_records\n')
+new = ('    FWD_STATUS_ROWS=()\n'
+       '    fwd_records\n'
+       '    # INJECTED: 每列偏要重新解析一次（D4 明說不做）\n'
+       '    local _rp_r\n'
+       '    resolve_gateway nodie || true\n'
+       '    for _rp_r in ${FWD_RECORDS[@]+"${FWD_RECORDS[@]}"}; do\n'
+       '        fwd_split_row "$_rp_r"\n'
+       '        target_resolve "$FWD_C3" || true\n'
+       '    done\n')
+assert src.count(old) == 1, "fwd_status needle count=%d" % src.count(old)
+open(sys.argv[2], "w", encoding="utf-8").write(src.replace(old, new, 1))
+PY
+if [[ $? -ne 0 ]]; then
+    inj_bad "22-inj6. 突變腳本失敗（被測物形狀變了）——harness 問題"
+elif ! bash -n "$INJ_R6" 2>/dev/null; then
+    inj_bad "22-inj6. 突變版語法錯誤——harness 問題"
+else
+    got="$(rp_ls rinj6 "$INJ_R6" "$RP_GW_JSON")"
+    if [[ "$got" == "RC=0 PR=0 SCAN=0" ]]; then
+        inj_bad "22-inj6. 塞了重新解析之後 R7 仍綠（got [$got]）——R7 的 0 次不是量出來的"
+    else
+        if [[ "$got" == "RC=0 PR="* && "$got" == *"SCAN=1" ]]; then
+            inj_ok "22-inj6. 塞了重新解析後 R7 的計數會動（got [$got]）——R7 的 0 次是量出來的"
+        else
+            inj_bad "22-inj6. 行為變了但不是預期的重新解析（got [$got]）——harness 問題"
+        fi
+    fi
+fi
+
+# 22-inj7（「D2 依賴 D1」那條護欄，工單 test-repair-fwd-injections-2 新增）。
+#   把 D1 的共用判斷 `repair_port_p` 改成**對所有 port 都回假**（＝ D1 整個失效），
+#   於是 fwd_add 對數字走回 target_resolve 的裸數字分支 → 第二跳變成
+#   worker@127.0.0.1。**R6b／R6c／R6d 必須轉紅，而 R6a（候選列表）仍然綠。**
+#   這個對比就是這條存在的理由：列表長得完全正確、互動也沒壞，撥出去卻是錯的
+#   帳號——repair VM 上沒有 worker 這個人，轉發會在 `fwd ls` 裡看起來健康、
+#   卻一個封包都帶不過去。D2 與 D1 必須同一批上，這是當初 inj5 量到的結論
+#   （OUT-test-repair-fwd.md §5 第 5 點），inj5 移除後由這條接手。
+#   錨點同樣是行比對：repair_port_p 的內文改寫（合併條件、改 case）時這條會
+#   大聲報「形狀變了」，不會靜靜變惰性注入。
+INJ_R7="$SANDBOX/rp-mut-noport.sh"
+python3 - "$MLP" "$INJ_R7" <<'PY'
+import sys
+lines = open(sys.argv[1], encoding="utf-8").read().split("\n")
+hits = [k for k, l in enumerate(lines) if l == "repair_port_p() {"]
+assert len(hits) == 1, "repair_port_p anchor count=%d" % len(hits)
+i = hits[0]
+assert lines[i + 4] == "}", "expected a 5-line function, got %r" % lines[i + 4]
+assert "=~ ^[0-9]+$" in lines[i + 1], "unexpected first condition %r" % lines[i + 1]
+assert "GW_REPAIR_LO" in lines[i + 2] and "GW_REPAIR_HI" in lines[i + 2], "unexpected bounds check %r" % lines[i + 2]
+assert "-ge" in lines[i + 3] and "-le" in lines[i + 3], "unexpected range check %r" % lines[i + 3]
+lines[i:i + 5] = [
+    "repair_port_p() {",
+    "    # INJECTED: 段內判斷對所有 port 都回假——D1 整個失效",
+    "    return 1",
+    "}",
+]
+open(sys.argv[2], "w", encoding="utf-8").write("\n".join(lines))
+PY
+if [[ $? -ne 0 ]]; then
+    inj_bad "22-inj7. 突變腳本失敗（D1 的共用判斷形狀變了）——harness 問題"
+elif ! bash -n "$INJ_R7" 2>/dev/null; then
+    inj_bad "22-inj7. 突變版語法錯誤——harness 問題"
+else
+    ga="$(rp_menu rinj7a "$INJ_R7" "$RP_GW_JSON" 8080 FZF_PICK_NAME=dad-pc FZF_PICK_PORT=2503)"
+    gc="$(rp_menu rinj7c "$INJ_R7" "$RP_GW_JSON" 8080 FZF_PICK_NAME=twin FZF_PICK_PORT=2510)"
+    gd="$(rp_menu rinj7d "$INJ_R7" "$RP_GW_JSON" 8080 FZF_PICK_NAME='?' FZF_PICK_PORT=2550)"
+    # 判準：候選列表**照舊**含 repair（所以 R6a 仍綠），但三格的第二跳都變成
+    # worker@127.0.0.1（所以 R6b/R6c/R6d 會紅）。兩個都要量，只量一半會漏掉
+    # 「列表也壞了」那種退化。
+    if rp_row "$SANDBOX/rinj7a-fzf.stdin" 'dad-pc' '2503' \
+       && rp_has "$SANDBOX/rinj7a-argv.log" 'worker@127.0.0.1' \
+       && rp_lack "$SANDBOX/rinj7a-argv.log" 'repair@127.0.0.1' \
+       && rp_opt "$SANDBOX/rinj7a-argv.log" -p 2503 \
+       && rp_has "$SANDBOX/rinj7c-argv.log" 'worker@127.0.0.1' \
+       && rp_lack "$SANDBOX/rinj7c-argv.log" 'repair@127.0.0.1' \
+       && rp_opt "$SANDBOX/rinj7c-argv.log" -p 2510 \
+       && rp_has "$SANDBOX/rinj7d-argv.log" 'worker@127.0.0.1' \
+       && rp_lack "$SANDBOX/rinj7d-argv.log" 'repair@127.0.0.1' \
+       && rp_opt "$SANDBOX/rinj7d-argv.log" -p 2550; then
+        inj_ok "22-inj7. D1 失效時列表照舊（R6a 仍綠）但三格全撥成 worker@127.0.0.1（${ga}/${gc}/${gd}）——R6b/R6c/R6d 會紅"
+    else
+        inj_bad "22-inj7. D1 拿掉後 R6b/R6c/R6d 仍綠（${ga}/${gc}/${gd} argv=[$(tr '\n' '|' < "$SANDBOX/rinj7c-argv.log" 2>/dev/null)]）——列表與身分綁在一起那道護欄是空的"
+    fi
+fi
+
 echo "=== 10-16、22-26. 注入：拿掉修正，斷言必須轉紅 ==="
 # 10. 健康檢測換成只問本機 → 隧道已死仍回報 up，2d 必須紅。
 INJ1="$SANDBOX/mutant-probe-check.sh"
@@ -1343,7 +1957,13 @@ else
 fi
 
 echo
-printf 'passed %d / failed %d / injection-fail %d\n' "$pass" "$fail" "$injfail"
+# 分節失敗數：22 節（repair）是紅燈批次的預期紅，0-21 節必須維持全綠。
+# 只印總數會讓「預期紅」與「回歸」混在一起看不出來。
+rp22_fail=$((fail - pre22_fail))
+rp22_pass=$((pass - pre22_pass))
+printf 'passed %d / failed %d / injection-pass %d / injection-fail %d\n' "$pass" "$fail" "$injpass" "$injfail"
+printf '  其中 0-21 節：passed %d / failed %d（回歸守門，必須全綠）\n' "$pre22_pass" "$pre22_fail"
+printf '       22 節 repair：passed %d / failed %d（紅燈批次的預期紅；impl 落地後 failed 應為 0）\n' "$rp22_pass" "$rp22_fail"
 if [[ "$fail" -ne 0 ]]; then exit "$fail"; fi
 if [[ "$injfail" -ne 0 ]]; then exit 2; fi
 exit 0
