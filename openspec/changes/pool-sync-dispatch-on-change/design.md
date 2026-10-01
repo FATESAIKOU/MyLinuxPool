@@ -25,7 +25,7 @@
 `tunnel_key_publish` 進門把 `TUNNEL_KEY_CHANGED` 設為 0，真的寫入成功後才設為 1；`tunnel_key_ensure_published` 透傳。回傳碼照舊。如果改成用回傳碼區分，`register-provider.sh:670` 碰到「已一致」會 `exit 1`，pool-sync 每個 tick 也會印一條假的 `tunnel key convergence failed`。`tunnel_key_mint` 同時補上顯式的 `return 0`。
 
 **D2. pool-sync 只在 `TUNNEL_KEY_CHANGED=1` 時 dispatch。**
-dispatch 失敗時記警告並註明「會由每日排程收斂」，tick 本身不失敗，也不寫任何檔案。
+dispatch 失敗時記警告並註明「會由每日排程收斂」，tick 本身不失敗，也不寫任何檔案。實作的條件是 `!= "1"` 就不 dispatch，而不是 `== "0"` 才不 dispatch：lib 只會設 0 或 1，遇到任何意外值都往不 dispatch 那邊偏，比較保守。變數根本不存在時（舊版 lib），fail-open 照舊 dispatch。警告字串寫死了 `20:00 UTC`，這是刻意接受的耦合：改 cron 時要一起改 pool-sync 和 RUNBOOK 的引用。
 
 **D3. 每日排程 `cron: "0 20 * * *"`（UTC），加在 `workflow_dispatch` 旁邊。**
 排程 run 沒有 dispatch input，`inputs.nonce` 求值為空字串。`refresh-wait.sh` 只認 16 位十六進位的 nonce，所以排程 run 不會被誤認（`team/OUT-review-issue7-schedule-title.md`：用 `refresh-wait.sh:127` 原樣的比對邏輯，跑 10 個合成視窗驗過）。這個檔案裡沒有任何 step 讀 `inputs.*`。
@@ -39,8 +39,8 @@ dispatch 失敗時記警告並註明「會由每日排程收斂」，tick 本身
 ## Risks / Trade-offs
 
 - [D2 條件寫錯，會讓「金鑰第一次產生」時不 dispatch] → 測試要覆蓋「剛寫入就恰好一次」，並附注入
-- [dispatch 失敗後最壞 24 小時才收斂] → 使用者接受；會產生新金鑰的只有首次 sync 或金鑰重建，而 register-provider 自己會 dispatch 並等待
-- [GitHub 的排程會延遲，Actions 被停用時排程完全不跑，而且排程只在預設分支上存在，所以「最多 24 小時」從 merge 之後起算、也不是嚴格上界] → 已知限制；repo 目前是 public
+- [dispatch 失敗後要等到下一次每日排程才收斂] → 使用者接受；會產生新金鑰的只有首次 sync 或金鑰重建，而 register-provider 自己會 dispatch 並等待
+- [GitHub 的排程會延遲，Actions 被停用時排程完全不跑，而且排程只在預設分支上存在，所以「下一次每日排程」從 merge 之後才開始算，也不是嚴格的時間上界] → 已知限制；repo 目前是 public
 - [排程 run 的空 nonce] → 已查證安全；`test-refresh-attribution.sh` 加行為情境釘住（tasks 1.3）
 
 ## Migration Plan

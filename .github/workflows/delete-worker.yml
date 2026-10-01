@@ -232,8 +232,11 @@ jobs:
       #     OUT-qa-c3 §1's blanket "rerun heals D2–D5", which holds only for
       #     D2.) Manual path: ledger_remove + `gh variable set POOL_WORKERS`,
       #     dispatch refresh-authorized-keys.yml for the key, and let the next
-      #     create/delete/rotate push converge the cache (no schedule trigger
-      #     exists in this repo).
+      #     create/delete/rotate push converge the cache.
+      #     Separately: that same refresh workflow also runs on its own daily
+      #     schedule (UTC 20:00), so a dispatch you skip still converges the
+      #     Gateway's authorized_keys — but it does not touch the state cache,
+      #     and not before the next one.
       #
       # This step only prints (log + $GITHUB_STEP_SUMMARY). It runs no ssh,
       # no gh, and cannot fail the run further — a failing failure-handler
@@ -297,9 +300,15 @@ jobs:
               echo "   pure function, no network)"
               echo "3. printf '%s' \"\$new\" | gh variable set POOL_WORKERS"
               echo "4. gh workflow run refresh-authorized-keys.yml --repo \${GH_REPO}"
-              echo "   (re-authorizes the Gateway without the dead key; the state"
-              echo "   cache converges on the next create/delete/rotate push — no"
-              echo "   schedule trigger exists in this repo, nothing to run by hand)"
+              echo "   (re-authorizes the Gateway without the dead key. Run this step"
+              echo "   now — a leftover authorized key is a security issue, not something"
+              echo "   to swallow, for the same reason step Refresh above fails the run."
+              echo "   Providers only dispatch this when they really wrote a new tunnel"
+              echo "   key, so don't count on them picking it up. If you skip this step,"
+              echo "   the workflow's own daily schedule (UTC 20:00) does pull the dead"
+              echo "   key off eventually — but that can take up to a day. The Gateway's"
+              echo "   state cache is separate: only the next create/delete/rotate push"
+              echo "   converges it, so 'mlp ls' can still list this worker until then.)"
             else
               echo "The run failed outside the traced steps (cancelled, or a step"
               echo "was skipped before Release ran). Check the log for the first"

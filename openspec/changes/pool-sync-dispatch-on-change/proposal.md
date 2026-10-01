@@ -6,7 +6,7 @@ issue #7：每台 provider 的 `pool-sync.timer` 每 30 分鐘 tick 一次，每
 
 - `tunnel_key_publish`／`tunnel_key_ensure_published` 回報**這一次有沒有真的寫入**（輸出變數，回傳碼維持原樣：成功＝0、失敗＝非 0），讓呼叫端分得出「沒變動」與「剛寫入」。`tunnel_key_mint` 補上顯式的成功回傳。
 - `pool-sync` **只在真的寫入了新的隧道金鑰時**才 dispatch refresh。dispatch 失敗只記警告，不留任何標記檔；pool-sync「`~/.mylinuxpool` 底下不保存狀態」的原則維持不變（使用者決定）。
-- `refresh-authorized-keys.yml` 加一個**每日排程**（UTC 20:00，台灣時間 04:00），當作保險：dispatch 失敗、有人直接在 GitHub UI 改 `CLIENT_*`／`NODE_*`、Gateway 上被手動加了金鑰，這些情況過去靠 pool-sync 那個 bug 順手收斂，修好之後改由排程收斂（最多 24 小時）。
+- `refresh-authorized-keys.yml` 加一個**每日排程**（UTC 20:00，台灣時間 04:00），當作保險：dispatch 失敗、有人直接在 GitHub UI 改 `CLIENT_*`／`NODE_*`、Gateway 上被手動加了金鑰，這些情況過去靠 pool-sync 那個 bug 順手收斂，修好之後改由排程收斂（最晚在下一次每日排程之後）。
 - **不加** `concurrency` group。加了之後排隊中的 refresh 會被取消，結論變成 `cancelled`，會誤傷等待 refresh 結果的硬失敗呼叫端（register-provider、create-worker、delete-worker）。
 
 ## Capabilities
