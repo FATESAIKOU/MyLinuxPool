@@ -40,7 +40,7 @@
 | Gateway | Linode `fws` | 唯一有公開 IP 的機器。它自己不跑運算，只當跳板與反向隧道的落點。可整台丟棄重建 |
 | Provider | `fh-l`（裸機，平常關機）<br>`fh-proxy`（WSL2，常駐） | 真正跑東西的機器。在 NAT 後面，由自己撥出反向隧道到 Gateway |
 | Worker | Docker 容器 | 跑在某個 provider 上的拋棄式環境，一樣有自己的 Gateway 埠 |
-| Repair 跳板 | 家人電腦上的 VirtualBox NAT VM | 臨時的，登入的是 `repair`（免密碼 sudo）。**不寫任何 `NODE_*`**——`mlp` 是掃 Gateway 的 listener 與名牌發現它的，所以手機看不到它。全家共用一把隧道金鑰與一份安裝包，見 `docs/REPAIR-HOST.md` |
+| Repair 跳板 | 家人電腦上的 VirtualBox NAT VM | 臨時的，登入的是 `repair`（免密碼 sudo）。**不寫任何 `NODE_*`、不進 state 快取**，所以手機讀的資料裡沒有它；`mlp` 是掃 Gateway 的 listener 與名牌發現它的。全家共用一把隧道金鑰與一份安裝包，見 `docs/REPAIR-HOST.md` |
 
 **進入任何節點的唯一路徑**：`ssh -J <gateway> -p <port> <user>@127.0.0.1`
 
@@ -293,10 +293,10 @@ step 逐一串流回終端機**。分界線是：需要憑證或需要編排的�
 
 ```bash
 ops-scripts/mlp fwd add 2301 8080                   # 本機 8080 → port 2301 那個 worker 的 8080
-ops-scripts/mlp fwd add fh-proxy 9000:9000         # 本機 9000 → fh-proxy 的 9000
+ops-scripts/mlp fwd add fh-proxy 9000:9000          # 本機 9000 → fh-proxy 的 9000
 ops-scripts/mlp fwd add mom-pc 18088:192.168.0.1:80
-                                                  # 經家人的跳板，看家人那邊的路由器管理頁
-ops-scripts/mlp fwd ls                             # 有哪些、還通不通、對端什麼狀態
+                                                    # 經家人的跳板，看家人那邊的路由器管理頁
+ops-scripts/mlp fwd ls                              # 有哪些、還通不通、對端什麼狀態
 ops-scripts/mlp fwd rm 18088
 ```
 
@@ -307,7 +307,7 @@ ops-scripts/mlp fwd rm 18088
 閘道，不是你家這邊。repair 可以用名字，也可以用它在 repair 段裡的 port。
 
 轉發**只存在於你的 Mac**：池裡零狀態，Gateway 不知道，別人連不到；重開機後
-不記得（刻意不做的）。repair 跳板離線時那條轉發就**自然斷掉**、不會自動改接到
+不記得（刻意不做的），`fwd ls` 會留下幾列 `down` 的殘留，`fwd rm` 清掉即可。repair 跳板離線時那條轉發就**自然斷掉**、不會自動改接到
 別台機器，要再轉就自己重下一次。設計與取捨見 `docs/FWD-DESIGN.md`。
 
 ### 家人維修跳板
