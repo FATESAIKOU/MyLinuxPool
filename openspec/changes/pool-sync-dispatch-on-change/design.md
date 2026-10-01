@@ -27,8 +27,11 @@
 **D2. pool-sync 只在 `TUNNEL_KEY_CHANGED=1` 時 dispatch。**
 dispatch 失敗時記警告並註明「會由每日排程收斂」，tick 本身不失敗，也不寫任何檔案。
 
-**D3. 每日排程 `cron: "0 20 * * *"`（UTC）。**
-排程觸發的 run 沒有 dispatch input，`run-name` 裡的 nonce 會是空的。要確認兩件事：排程的 displayTitle 不會被 `refresh-wait.sh` 誤認成某次手動 dispatch，而且 workflow 裡任何讀 `inputs.*` 的步驟在空值下都不會失敗。
+**D3. 每日排程 `cron: "0 20 * * *"`（UTC），加在 `workflow_dispatch` 旁邊。**
+排程 run 沒有 dispatch input，`inputs.nonce` 求值為空字串。`refresh-wait.sh` 只認 16 位十六進位的 nonce，所以排程 run 不會被誤認（`team/OUT-review-issue7-schedule-title.md`：用 `refresh-wait.sh:127` 原樣的比對邏輯，跑 10 個合成視窗驗過）。這個檔案裡沒有任何 step 讀 `inputs.*`。
+另外做兩項強化：
+- `run-name` 改成 `refresh-authorized-keys ${{ github.event_name }} ${{ inputs.nonce }}`，排程 run 在標題上就看得出來（驗收 3.3 用得到）
+- 在 `run-name` 旁加註解：它是 `refresh-wait.sh` 認 run 的依據，不能刪，也不能只剩空白（只剩空白時 GitHub 會改用事件資訊當標題）；`on:` 底下必須保留 `workflow_dispatch`，因為 `inputs` 依賴它
 
 **D4. 一次上線，不拆兩個 PR。**
 同一個 tick 裡，provider 從同一份 clone 拿到新的 lib，並收斂 pool-runtime，但這個 tick 執行的仍是舊版 pool-sync：舊版不讀 `TUNNEL_KEY_CHANGED`，照舊 dispatch，行為跟現在一樣。下一個 tick 才執行新邏輯。中間的混合狀態最多多派一次 refresh，所以不需要拆成兩個 PR。
@@ -38,7 +41,7 @@ dispatch 失敗時記警告並註明「會由每日排程收斂」，tick 本身
 - [D2 條件寫錯，會讓「金鑰第一次產生」時不 dispatch] → 測試要覆蓋「剛寫入就恰好一次」，並附注入
 - [dispatch 失敗後最壞 24 小時才收斂] → 使用者接受；會產生新金鑰的只有首次 sync 或金鑰重建，而 register-provider 自己會 dispatch 並等待
 - [GitHub 的排程會延遲，Actions 被停用時排程完全不跑，而且排程只在預設分支上存在，所以「最多 24 小時」從 merge 之後起算、也不是嚴格上界] → 已知限制；repo 目前是 public
-- [排程 run 的空 nonce] → D3 要有測試或靜態檢查
+- [排程 run 的空 nonce] → 已查證安全；`test-refresh-attribution.sh` 加行為情境釘住（tasks 1.3）
 
 ## Migration Plan
 
