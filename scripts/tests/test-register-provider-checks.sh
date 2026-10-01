@@ -667,6 +667,160 @@ else
     fi
 fi
 
+
+echo "=== 7. 金鑰已發布時重跑註冊：仍然成功、仍然派 refresh（issue #7 tasks 1.4）==="
+# 為什麼要有這格：openspec D1 決定用**輸出變數**（TUNNEL_KEY_CHANGED）回報
+# 「有沒有寫入」，**回傳碼照舊**。若改成用回傳碼區分，
+# `tunnel_key_ensure_published ... || exit 1` 就會在「已經發布過」的機器上把整個
+# 註冊打斷：一台已經有可用隧道身分的 provider，再註冊一次卻失敗。
+# 而 register-provider 這條路**必須**無條件 dispatch：它是「剛建立」這條路上
+# 唯一保證 Gateway 會授權新鑰的地方（pool-sync 只在有寫入時派，而這裡沒有寫入）。
+# 所以這格把兩個後果一起釘住：exit 0、以及 dispatch 確實有發生。
+#
+# 手法：直接打 step6_5_tunnel_identity（它用 exit 結束，跑在子殼層）。
+#
+# **兩個必須避開的地雷（第一版都踩到了）**：
+#   1. register-provider.sh:9 自己有 `STATE_DIR="${HOME}/.mylinuxpool"`。我的假 gh
+#      一開始也用 STATE_DIR 當它的記帳目錄 → 被頂層初始化蓋掉，nonce 與 run 列表
+#      寫到別處（或寫不進去），於是等待端永遠認不出自己那次，一路輪詢到
+#      `dispatch_refresh_and_wait 300` 的 300 秒 deadline。**症狀是整支測試卡住，
+#      不是紅燈**——那種失敗形狀最難查，所以這裡用自己的變數名 RP14_STATE。
+#   2. register-provider.sh:22 有 `trap 'rm -rf "$REPO_DIR"' EXIT INT TERM`。
+#      被測物結束時會**把我放進去的那份 lib 刪掉**，所以每次呼叫都要現做一份。
+RP14_LIB_SRC="$SANDBOX/rp14-lib"
+mkdir -p "$RP14_LIB_SRC/scripts/lib" "$SANDBOX/home14/.ssh"
+cp -p "$REPO_ROOT/scripts/lib/tunnel-key.sh" "$RP14_LIB_SRC/scripts/lib/tunnel-key.sh"
+cp -p "$REPO_ROOT/scripts/lib/refresh-wait.sh" "$RP14_LIB_SRC/scripts/lib/refresh-wait.sh"
+# 本機的隧道金鑰（已存在 → 不會重產）
+ssh-keygen -t ed25519 -N "" -C "mlp-tunnel-t" -f "$SANDBOX/home14/.ssh/id_tunnel" >/dev/null 2>&1
+RP14_PUB="$(tr -d '\r\n' < "$SANDBOX/home14/.ssh/id_tunnel.pub" 2>/dev/null)"
+
+RP14_STUB="$SANDBOX/rp14-stub"
+mkdir -p "$RP14_STUB"
+# **必須真的套用 --jq / --json**（照 test-refresh-attribution.sh 的形狀）：等待端把
+# 「哪一筆是我們的」整個交給 gh 的 --jq。第一版直接 cat 原始 JSON，row 變成整份
+# 陣列字串，同樣一路輪詢到 300 秒。
+cat > "$RP14_STUB/gh" <<'FAKE_GH14'
+#!/usr/bin/env bash
+printf 'args=%s\n' "$*" >> "${RP14_LOG:-/dev/null}"
+_fields=""; _filter=""; _prev=""
+for a in "$@"; do
+    [[ "$_prev" == "--json" ]] && _fields="$a"
+    [[ "$_prev" == "--jq" ]] && _filter="$a"
+    _prev="$a"
+done
+case "${1:-} ${2:-}" in
+    "workflow run")
+        for a in "$@"; do
+            case "$a" in nonce=*) printf '%s' "${a#nonce=}" > "${RP14_STATE}/nonce" ;; esac
+        done
+        # 立刻放一筆「我們的 run」進列表：標題含本次 nonce（run-name 內插的形狀）、
+        # completed/success —— 等待端因此第一次查詢就收工，不會碰到 300 秒 deadline。
+        n="$(cat "${RP14_STATE}/nonce" 2>/dev/null)"
+        printf '[{"databaseId":321,"status":"completed","conclusion":"success","displayTitle":"refresh-authorized-keys workflow_dispatch %s"}]' "$n" \
+            > "${RP14_STATE}/runs.json"
+        exit 0 ;;
+    "run list")
+        json="$(cat "${RP14_STATE}/runs.json" 2>/dev/null)"
+        [[ -n "$_fields" && "$json" == \[* ]] && json="$(printf '%s' "$json" | jq -c "[.[] | {${_fields}}]")"
+        if [[ -n "$_filter" ]]; then printf '%s' "$json" | jq -r "$_filter"
+        else printf '%s\n' "$json"; fi
+        exit 0 ;;
+    "api repos/"*)
+        # var 已經含 tunnel_public_key（＝「已經發布過」）
+        printf '%s\n' "$RP14_VAR_JSON"; exit 0 ;;
+esac
+exit 0
+FAKE_GH14
+printf '#!/usr/bin/env bash\nexit 0\n' > "$RP14_STUB/sleep"
+chmod +x "$RP14_STUB/gh" "$RP14_STUB/sleep"
+
+# rp14_run <前綴> <var json> [被測的 register-provider 副本]
+#   每號一次現做一份 REPO_DIR（陷阱會刪掉它），回 0 就代表沒踩到 300 秒 deadline。
+rp14_run() {
+    local pfx="$1" varjson="$2" src="${3:-$RP_STRIP}"
+    local rd="$SANDBOX/$pfx-rd" st="$SANDBOX/$pfx-state"
+    rm -rf "$rd" "$st"
+    mkdir -p "$rd/scripts/lib" "$rd/stub" "$st" "$SANDBOX/home14"
+    cp -p "$RP14_LIB_SRC/scripts/lib/tunnel-key.sh" "$rd/scripts/lib/tunnel-key.sh"
+    cp -p "$RP14_LIB_SRC/scripts/lib/refresh-wait.sh" "$rd/scripts/lib/refresh-wait.sh"
+    cp -p "$RP14_STUB/gh" "$RP14_STUB/sleep" "$rd/stub/"
+    : > "$SANDBOX/$pfx-gh.log"
+    # 有 timeout 保險：萬一又是 300 秒輪詢，這裡會得到 124 而不是讓整支測試卡住。
+    timeout -k 5 60 env RP14_LOG="$SANDBOX/$pfx-gh.log" RP14_STATE="$st" \
+        RP14_VAR_JSON="$varjson" RPSRC="$src" TESTHOME="$SANDBOX/home14" \
+        HOME="$SANDBOX/home14" PATH="/usr/bin:/bin" \
+      bash -c '
+        set -- --name t --gateway-port 1
+        GH_POOL_TOKEN=dummy HOME="$HOME" PATH="$PATH" source "$RPSRC" >/dev/null 2>&1
+        NAME="t"; VAR_NAME="NODE_T"; REPO="testowner/testrepo"
+        REPO_DIR="'"$rd"'"          # 必須在 source 之後設：頂層初始化會蓋掉環境變數
+        PATH="'"$rd"'/stub:/usr/bin:/bin"
+        rc=0; ( step6_5_tunnel_identity >"$TESTHOME/out" 2>"$TESTHOME/err" ) || rc=$?
+        printf "RC=%s" "$rc"' 2>&1
+}
+rp14_dispatch() { grep -c 'workflow run' "$SANDBOX/$1-gh.log" 2>/dev/null || true; }
+
+RP14_SAME="$(jq -c -n --arg pk "$RP14_PUB" '{name:"t",role:"provider",tunnel_public_key:$pk}')"
+RP14_EMPTY="$(jq -c -n '{name:"t",role:"provider"}')"
+
+if [[ -z "$RP14_PUB" ]]; then
+    bad "7a. 金鑰已發布時重跑仍成功（前提不成立：產不出本機公鑰，ssh-keygen 不可用？）"
+    bad "7b. 金鑰已發布時仍派 dispatch（前提不成立）"
+    bad "7c. 對照組：var 沒有這把鑰（前提不成立）"
+else
+    got="$(rp14_run rp14same "$RP14_SAME")"
+    if [[ "$got" == "RC=0" ]]; then
+        ok "7a. 金鑰已經發布過時重跑註冊仍然成功（D1 的回傳碼語意沒變）"
+    else
+        bad "7a. 金鑰已發布就失敗（got [$got]）——回傳碼若被拿來表達「沒寫入」，這台機器永遠註冊不了第二次"
+    fi
+    if [[ "$(rp14_dispatch rp14same)" == "1" ]]; then
+        ok "7b. 而且**仍然**派了一次 refresh（register-provider 不因「沒寫入」而跳過 dispatch）"
+    else
+        bad "7b. 金鑰已發布就沒有 dispatch（$(rp14_dispatch rp14same) 次）——新鑰不會被 Gateway 授權"
+    fi
+    # 7c. 對照組：var 裡沒有這把鑰（真的會寫入）時也要成功、也要 dispatch。
+    #     它同時是 7b 的正對照——證明「派了 1 次」是量出來的，不是假 gh 沒接上。
+    got="$(rp14_run rp14new "$RP14_EMPTY")"
+    if [[ "$got" == "RC=0" ]] && [[ "$(rp14_dispatch rp14new)" == "1" ]] \
+       && grep -q 'variable set' "$SANDBOX/rp14new-gh.log" 2>/dev/null; then
+        ok "7c. 對照組：var 沒有這把鑰 → 有寫入、也派 1 次、rc 0（證明 7b 的計數會動）"
+    else
+        bad "7c. 對照組不對（got [$got]；dispatch $(rp14_dispatch rp14new) 次；gh.log [$(tr '\n' '|' < "$SANDBOX/rp14new-gh.log" 2>/dev/null)]）"
+    fi
+fi
+
+# 7-inj. 把「無條件 dispatch」改成「只在 TUNNEL_KEY_CHANGED=1 時 dispatch」
+#       ——那正是 issue #7 修 pool-sync 時很可能順手套到 register-provider 的改法。
+#       7b 必須轉紅：證明 7b 量的真的是「有沒有派」這件事。
+RP14_SRC2="$SANDBOX/rp14-src-changed.sh"
+python3 - "$REPO_ROOT/$RP" "$RP14_SRC2" <<'PYI14'
+import sys
+src = open(sys.argv[1], encoding="utf-8").read()
+old = '    GH_REPO="$REPO" dispatch_refresh_and_wait 300 || {'
+new = ('    if [[ "${TUNNEL_KEY_CHANGED:-0}" != "1" ]]; then\n'
+       '        return 0\n'
+       '    fi\n'
+       '    GH_REPO="$REPO" dispatch_refresh_and_wait 300 || {')
+assert src.count(old) == 1, "dispatch needle count=%d" % src.count(old)
+open(sys.argv[2], "w", encoding="utf-8").write(src.replace(old, new, 1))
+PYI14
+if [[ $? -ne 0 ]]; then
+    inj_bad "7-inj. 突變腳本失敗（register-provider 的 dispatch 呼叫點形狀變了）——harness 問題"
+elif ! bash -n "$RP14_SRC2" 2>/dev/null; then
+    inj_bad "7-inj. 突變版語法錯誤——harness 問題"
+else
+    sed -e '$d' "$RP14_SRC2" > "$SANDBOX/rp14-strip.sh"
+    got="$(rp14_run rp14i "$RP14_SAME" "$SANDBOX/rp14-strip.sh")"
+    n_disp="$(rp14_dispatch rp14i)"
+    if [[ "$got" == "RC=0" && "$n_disp" == "0" ]]; then
+        inj_ok "7-inj. 改成「只在有寫入時 dispatch」之後：rc 0 但 dispatch ${n_disp} 次——7b 會紅"
+    else
+        inj_bad "7-inj. 突變沒產生預期的形狀（rc [$got]、dispatch ${n_disp} 次）——harness 問題"
+    fi
+fi
+
 echo
 printf 'passed %d / failed %d / injection-fail %d\n' "$pass" "$fail" "$injfail"
 if [[ "$fail" -ne 0 ]]; then exit "$fail"; fi
