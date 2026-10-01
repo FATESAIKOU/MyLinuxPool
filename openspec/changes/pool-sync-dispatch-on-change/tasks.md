@@ -17,5 +17,5 @@
 ## 3. 驗收
 
 - [x] 3.1 （`team/OUT-review-issue7-impl.md`、`-tests.md`：必修 0）review：獨立驗收（呼叫端相容、條件邊界、排程與 refresh-wait 的互動、文件）
-- [ ] 3.2 PM 閘門（preflight、全套 `</dev/null`、CI），開 PR
+- [x] 3.2 PM 閘門（preflight、全套 53 支 `</dev/null`、CI 36899848670 綠），PR #11
 - [ ] 3.3 merge 後（使用者 merge）：量 refresh 的 run 紀錄——`workflow_dispatch` 從每 30 分鐘兩次降到 0；隔天確認有一筆 `schedule` 的 run。spec「一次 dispatch 失敗後」屬人工驗收：要量的話，在 Gateway 上對照「var 有、authorized_keys 沒有」的狀態經過一次排程後是否收斂
