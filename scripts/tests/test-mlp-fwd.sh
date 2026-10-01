@@ -983,9 +983,9 @@ fi
 
 # ==========================================================================
 # 22. repair 機器：mlp fwd 的名字／port／選單／訊息／ls 不重解析
-#     （openspec/changes/repair-fwd，tasks 1.1）
+#     （openspec/changes/archive/2026-10-01-repair-fwd，tasks 1.1）
 #
-# ---- 介面（以 openspec/changes/repair-fwd/ 為準） ------------------------
+# ---- 介面（以 openspec/changes/archive/2026-10-01-repair-fwd/ 為準） ------------------------
 #   D1 段內的裸數字 port ＝ repair。do_connect 與 fwd_add 各呼叫同一個判斷；
 #      段沒設定時裸數字維持舊行為（worker）。**所以 R2 只量 fwd_add 的結果
 #      （argv），不去斷言 target_resolve 的內部分支**——共用判斷住在哪一層

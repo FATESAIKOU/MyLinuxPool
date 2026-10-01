@@ -31,12 +31,12 @@
 `repair-ambiguous` 列出候選 port，並提示改用 port；notfound 前印 `TARGET_DETAIL`（未設定段的警告）。另外加一行說明：repair 機器只在線上時才找得到，因為 listener 是唯一事實，分不出「從來沒有」和「現在不在線」。「no such node or worker」這個字串維持原樣，因為 `test-mlp-fwd.sh` 7d 有回歸測試釘著。
 
 **D4. 不加任何跟隨或重試機制。**
-fwd 的 master 是端到端到 VM 的 ssh 連線，經 Gateway 上的反向轉發。家人的 VM 一斷，Gateway 就收掉那條反向轉發，master 的連線也就跟著斷。所以舊的 fwd 不可能改接到之後拿到同一個 port 的另一台機器。這條是推論，要在真機驗收時量到。
+fwd 的 master 是端到端到 VM 的 ssh 連線，經 Gateway 上的反向轉發。家人的 VM 一斷，Gateway 就收掉那條反向轉發，master 的連線也就跟著斷。所以舊的 fwd 不可能改接到之後拿到同一個 port 的另一台機器。使用者 2026-10-01 在 mom-pc 上關掉啟動器親自驗過。
 
 ## Risks / Trade-offs
 
 - [D1 改變 `target_resolve <段內 port>` 的語意] → 只在段已設定且 port 落在段內時才改；測試同時釘住「未設定段時仍是 worker」
-- [master 的生命週期是推論（D4）] → 真機驗收實際關掉 mom-pc 的啟動器，量 `fwd ls` 與本機 port 的變化
+- [master 的生命週期（D4）] → 使用者 2026-10-01 在 mom-pc 上關掉啟動器驗過
 - [名字沒有認證] → fwd 沿用 listener 事實，沒有新增冒名風險；已記在 repair-host 的已知限制
 
 ## Migration Plan

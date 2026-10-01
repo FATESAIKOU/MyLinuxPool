@@ -33,8 +33,8 @@ gateway port，或是落在跳板段內的 repair port（見下面「目標也�
 
 ### 目標也可以是 repair（維修跳板）
 
-> 這一節描述的是已實作的行為（`openspec/changes/repair-fwd/`；真機驗收見
-> `OUT-impl-repair-fwd-live.md`）。段內 port 的判定住在 `repair_port_p`，
+> 這一節描述的是已實作的行為（`openspec/changes/archive/2026-10-01-repair-fwd/`；真機驗收記在
+> 該目錄的 `tasks.md` 3.2）。段內 port 的判定住在 `repair_port_p`，
 > `do_connect` 與 `fwd_add` 各呼叫一次。
 
 跳板段（`ports.repair`）裡的 repair 機器也可以是轉發的目標，三種指定方式：

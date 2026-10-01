@@ -127,7 +127,7 @@ mlp fwd ls                                # 這條轉發的現況
 自己的 port（`mlp fwd add mom-pc 2222`），或用跳板段內的 port 指定那台機器
 （`mlp fwd add 2401 …`）；參數表見 `FWD-DESIGN.md` §1。
 （實作已落地：`mlp fwd` 對 repair 的名字、port、選單都可用；真機量過
-`mom-pc` 轉家人路由器，見 `OUT-impl-repair-fwd-live.md`。）
+`mom-pc` 轉家人路由器，見 `openspec/changes/archive/2026-10-01-repair-fwd/tasks.md` 3.2。）
 
 **家人關掉視窗，這條轉發就斷。** 轉發的 master 是一條通到 VM 的 ssh 連線；家人
 一關視窗，VM 關機、Gateway 收掉那條反向轉發，master 就跟著斷，`mlp fwd ls` 會
@@ -167,7 +167,7 @@ bash ops-scripts/setup-repair-key --key-dir ~/.config/mlp/repair-tunnel --rotate
 然後把新包交給**每一位**家人，叫他：**關掉「維修連線」的視窗，再點一次新包的
 `Install.cmd`**。重裝就是換新（PM 裁示：VM 沒有要保留的狀態），安裝器會自己
 把舊的那台關機、移除、然後照原流程裝新的——家人不用手動跑任何
-`VBoxManage` 指令（實測見 `OUT-impl-installer-reinstall.md`）。
+`VBoxManage` 指令（2026-09-30 在 Windows 11 上連續安裝六次驗過）。
 
 兩個必須先講清楚的行為：若「維修連線」視窗還開著（18080 埠被佔），安裝器會
 **用中文請他先關掉**、最多等 60 秒，**不會**直接關掉他的程式；等不到就整個
