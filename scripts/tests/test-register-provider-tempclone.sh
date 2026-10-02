@@ -253,21 +253,53 @@ log_stub ssh 'echo "SSH-2.0-OpenSSH_9.6 testbanner"
 exit 0'
 
 # ---- fake repo tree the fake git materialises at the clone destination --
-cat > "$SANDBOX/template/profiles/provider/no-sudo/profile.json" <<'EOF'
-{"shared_config":["pool-runtime"],"sudoers_rules":[],"systemd_user_services":[],"linger":false}
-EOF
+#
+# 2026-10-02（D8 之後）：profile 直接用 **repo 裡那一份** profiles/provider/no-sudo/profile.json，
+#   而不是手寫一份。register-provider 的能力步驟是照 clone 裡的 profile 宣告的
+#   能力去驗（step7_5_capabilities），手寫的 profile 沒有 capabilities 欄位時，
+#   那一段會「沒有東西可驗」而看起來像通過——註冊在 7.5 就 exit 1 的時候，這裡
+#   看到的症狀是 authorized_keys 沒寫，離真正的原因很遠。
+#   shared_config 裡的 pool-runtime 仍然是本檔自己的假 install.sh（見下），
+#   gh／wol 用的是真的——gh 只需要 --check（不進 shared_config 的話就不會被安裝），
+#   wol 需要真的被安裝一次，因為 pool-wol 的判準是「已安裝的那一份與單位的
+#   files/pool-wol 逐位元組相同」，而假 clone 不會真的跑收斂迴圈。
+cp profiles/provider/no-sudo/profile.json "$SANDBOX/template/profiles/provider/no-sudo/profile.json"
 
+# 這個假單位要放什麼，profile 宣告了什麼就放什麼：pool-resolve（step 9 要呼叫）、
+# pool-tunnel.service / pool-tunnel.timer（step 7 要複製到 ~/.config/systemd/user）。
+# 用真的 profile.json 之後，systemd_user_services 也一起進來了——不放的話 step 7
+# 會擋下來（那是有用的攔截：它正是當年「宣告了但沒人裝」的那個形狀）。
 cat > "$SANDBOX/template/shared-configs/pool-runtime/install.sh" <<'EOF'
 #!/usr/bin/env bash
-mkdir -p "$HOME/.mylinuxpool/bin"
+mkdir -p "$HOME/.mylinuxpool/bin" "$HOME/.config/systemd/user"
 cat > "$HOME/.mylinuxpool/bin/pool-resolve" <<'INNER'
 #!/usr/bin/env bash
 echo '{"ip":"127.0.0.1","tunnel_user":"tester"}'
 INNER
 chmod +x "$HOME/.mylinuxpool/bin/pool-resolve"
+# pool-sync.timer 是 step 9.5 明確去找的那一個（少了它 step 9.5 會擋下來）。
+for u in pool-tunnel.service pool-tunnel.timer pool-sync.timer; do
+    printf '[Unit]\nDescription=fixture %s\n' "$u" > "$HOME/.config/systemd/user/$u"
+done
 exit 0
 EOF
 chmod +x "$SANDBOX/template/shared-configs/pool-runtime/install.sh"
+
+# 三個真單位（PR-A 已驗過）。能力步驟是從 clone 裡現場查 unit.json 再跑該單位
+# 的 --check 的，沒有這三個目錄，capability_plan 會把每一個鍵都算成「沒有單位
+# 實作」→ rc=2 → 註冊失敗，而症狀又是「7.5 死掉」。
+for u in worker-host gh wol; do
+    mkdir -p "$SANDBOX/template/shared-configs/$u/files"
+    cp "shared-configs/$u/unit.json"  "$SANDBOX/template/shared-configs/$u/unit.json"
+    cp "shared-configs/$u/install.sh" "$SANDBOX/template/shared-configs/$u/install.sh"
+    chmod +x "$SANDBOX/template/shared-configs/$u/install.sh"
+    [[ -f "shared-configs/$u/files/pool-wol" ]] \
+        && cp "shared-configs/$u/files/pool-wol" "$SANDBOX/template/shared-configs/$u/files/pool-wol"
+done
+# PR-B 的共用 runner：step7_5_capabilities 從 clone 讀它，缺檔時該步驟直接
+# return 1（訊息寫得很清楚，但註冊一樣死在那裡）。
+mkdir -p "$SANDBOX/template/scripts/lib"
+cp scripts/lib/capability.sh "$SANDBOX/template/scripts/lib/capability.sh"
 
 # The registration-time authorization step assembles authorized_keys from
 # CLIENT_* using the SHARED functions. The clone template must therefore
@@ -515,7 +547,13 @@ D_HOME="$SANDBOX/d"; mkdir -p "$D_HOME"
 run_register "$D_HOME" "$SANDBOX/run-d.log" "" "$CLIENT_VARS_EMPTY"
 rc=$?
 cat "$ARGV_LOG" >> "$ALL_ARGV"
-if [[ $rc -ne 0 ]]; then
+# 前提：這一輪**真的走到** step 8（authorized_keys）。D8 之後註冊會先跑能力步驟，
+#   而 register-provider 的 EXIT trap 會把 set -e 的中止轉成 exit 0——於是能力步驟
+#   先死掉的話，9a/10a 會看到「rc=0」並報成「有 CLIENT_* 的擋防失效」，
+#   而那時候根本還沒走到那一段。少了這個前提，這兩條在別處壞掉時是**假綠**。
+if ! grep -q 'step 8/9' "$SANDBOX/run-d.log" 2>/dev/null; then
+    bad "9a. 前提不成立：這一輪沒走到 step 8（能力步驟先擋下來了），abort 的來源分不出來——harness 或產品問題"
+elif [[ $rc -ne 0 ]]; then
     ok "9a. registration aborts when no CLIENT_* public keys can be assembled (exit $rc)"
 else
     bad "9a. registration returned 0 with no CLIENT_* keys — it would have written a list nobody can use"
@@ -532,7 +570,9 @@ E_HOME="$SANDBOX/e"; mkdir -p "$E_HOME"
 run_register "$E_HOME" "$SANDBOX/run-e.log" "" "$CLIENT_VARS_NO_ACTIONS"
 rc=$?
 cat "$ARGV_LOG" >> "$ALL_ARGV"
-if [[ $rc -ne 0 ]]; then
+if ! grep -q 'step 8/9' "$SANDBOX/run-e.log" 2>/dev/null; then
+    bad "10a. 前提不成立：這一輪沒走到 step 8（能力步驟先擋下來了），abort 的來源分不出來——harness 或產品問題"
+elif [[ $rc -ne 0 ]]; then
     ok "10a. registration aborts when CLIENT_ACTIONS is absent (exit $rc)"
 else
     bad "10a. registration returned 0 without CLIENT_ACTIONS — Actions would be locked out of the new provider"

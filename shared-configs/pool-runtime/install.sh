@@ -85,6 +85,20 @@ file_matches() {
     cmp -s "$installed" "$source"
 }
 
+# install_file <source> <target> <mode>
+#   換檔取代原地覆寫：bash 邊執行邊讀腳本，cp -f 會改寫正在執行的那個 inode（D10）。
+#   同目錄暫存 → chmod → mv -f（同檔案系統的 rename 是原子的）；失敗不留暫存檔。
+install_file() {
+    local src="$1" dst="$2" mode="$3" dir tmp
+    dir="${dst%/*}"
+    tmp="$(mktemp "${dir}/.${dst##*/}.XXXXXX")" || return 1
+    if ! cp "$src" "$tmp" || ! chmod "$mode" "$tmp"; then
+        rm -f "$tmp"
+        return 1
+    fi
+    mv -f "$tmp" "$dst" || { rm -f "$tmp"; return 1; }
+}
+
 check_installed() {
     local f
     for f in $BINARIES; do
@@ -111,17 +125,19 @@ if [[ "$CHECK_ONLY" -eq 1 ]]; then
 fi
 
 mkdir -p "$BIN_DIR"
-cp -f "${FILES_DIR}"/pool-resolve "${FILES_DIR}"/pool-tunnel \
-      "${FILES_DIR}"/pool-status "${FILES_DIR}"/pool-port-alloc "${FILES_DIR}"/pool-sync \
-      "${FILES_DIR}"/tunnel-identity.sh \
-      "${BIN_DIR}/"
-chmod +x "${BIN_DIR}"/pool-resolve "${BIN_DIR}"/pool-tunnel \
-         "${BIN_DIR}"/pool-status "${BIN_DIR}"/pool-port-alloc "${BIN_DIR}"/pool-sync
+for f in $BINARIES; do
+    install_file "${FILES_DIR}/${f}" "${BIN_DIR}/${f}" 755 || {
+        log ERROR "could not install ${f}"; exit 1; }
+done
+# tunnel-identity.sh ships WITHOUT the executable bit (see $LIBS above).
+install_file "${FILES_DIR}/tunnel-identity.sh" "${BIN_DIR}/tunnel-identity.sh" 644 || {
+    log ERROR "could not install tunnel-identity.sh"; exit 1; }
 
 mkdir -p "$UNIT_DIR"
-cp -f "${FILES_DIR}/pool-tunnel.service" "${UNIT_DIR}/pool-tunnel.service"
-cp -f "${FILES_DIR}/pool-sync.service" "${UNIT_DIR}/pool-sync.service"
-cp -f "${FILES_DIR}/pool-sync.timer" "${UNIT_DIR}/pool-sync.timer"
+for f in $UNITS; do
+    install_file "${FILES_DIR}/${f}" "${UNIT_DIR}/${f}" 644 || {
+        log ERROR "could not install ${f}"; exit 1; }
+done
 
 chown -R "${TARGET_USER}:${TARGET_USER}" "${HOME_DIR}/.mylinuxpool" 2>/dev/null || true
 chown -R "${TARGET_USER}:${TARGET_USER}" "$UNIT_DIR" 2>/dev/null || true

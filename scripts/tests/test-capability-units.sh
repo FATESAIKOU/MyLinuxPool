@@ -126,6 +126,41 @@ for u in worker-host gh wol; do
     ok "1.1b. shared-configs/${u} 有 install.sh 與 --check，且讀 MLP_CAPABILITY_PARAMS"
 done
 
+# 1.1x：**每個 install.sh 都必須可執行**（2026-10-02，PM 加的）。
+#   為什麼是一條斷言而不是文件裡一句話：pool-sync 的收斂迴圈是
+#   `if [[ ! -x "$install" ]] → log WARN → continue`，register-provider 的 step 3
+#   是 `[[ ! -x ]] → exit 1`。一個 644 的 install.sh 在**測試裡**完全正常
+#   （`bash install.sh` 一樣跑得動，PR-A 的每一條判準都照樣量得到），線上卻是
+#   「wol 永遠不被安裝 → 宣告裡的 wol 永遠不成立」。那正是 PR-A 上線時發生過的事。
+#   兩個來源都要看：
+#     磁碟上的 -x（工作樹現況，開發中與未 commit 的檔也在內）
+#     git index 的 mode（100755）——那是別人 clone 到的樣子。
+#   讀 index 用 `git ls-files -s`（唯讀；不動 index）。
+not_exec=""
+not_tracked=""
+for inst in "$REPO_ROOT"/shared-configs/*/install.sh; do
+    [[ -f "$inst" ]] || continue
+    u_rel="${inst#"$REPO_ROOT"/}"
+    [[ -x "$inst" ]] || not_exec="${not_exec} ${u_rel}(磁碟)"
+    # `-c safe.directory=*`：容器／CI 上 repo 由別的使用者持有時，git 會整個拒絕
+    # （dubious ownership），那時每一個檔都會看起來「不在 index 裡」——一個假的
+    # 全軍覆沒，比沒有這條斷言更壞。
+    mode="$(git -c safe.directory='*' -C "$REPO_ROOT" ls-files -s -- "$u_rel" 2>/dev/null | awk '{print $1}' | head -1)"
+    if [[ -z "$mode" ]]; then
+        not_tracked="${not_tracked} ${u_rel}"
+    elif [[ "$mode" != "100755" ]]; then
+        not_exec="${not_exec} ${u_rel}(index=${mode})"
+    fi
+done
+if [[ -n "$not_exec" ]]; then
+    bad "1.1x. 這些 install.sh 不可執行：${not_exec} —— pool-sync 會整個跳過該單位（線上症狀：宣告永遠不成立，測試裡看不出來）"
+else
+    ok "1.1x. 每個 shared-configs/*/install.sh 都可執行（磁碟 -x 與 git index 的 100755 都對）"
+fi
+if [[ -n "$not_tracked" ]]; then
+    bad "1.1y. 這些 install.sh 不在 git index 裡（clone 不會帶過去）：${not_tracked}"
+fi
+
 # 1.1c：兩個單位實作同一個鍵 → preflight 必須擋。
 #   副本注入 ＋ 未注入的同一份副本當對照，兩者輸出相減才不會把 preflight 的
 #   其他雜訊當成證據。
@@ -240,6 +275,27 @@ fakeroot_call() {  # fakeroot_call <bash程式碼片段>
          bash -c "source scripts/lib/capability.sh >/dev/null 2>&1; $1" 2>&1 </dev/null )
 }
 
+# **capability_declaration 的契約：stdout 是值，stderr 是日誌**（每個鍵一行
+# `capability <key>: rc=<n>`，呼叫端靠它分 WARN(1)／INFO(2)，D3／D4）。
+# 所以讀它的值**只能**取 stdout：
+#   fakeroot_out <片段>  → 只 stdout（丟掉 stderr）
+#   fakeroot_err <片段>  → 只 stderr（丟掉 stdout）
+# 為什麼要拆開：日誌行裡就有鍵名（`capability alpha: rc=1`），兩者合併時
+# 「1 → 不納入 alpha」會因為日誌裡出現 alpha 而**假綠**。這不是本條的問題，
+# 是契約改變之後測試端要跟著改的那一半。
+fakeroot_out() {  # fakeroot_out <bash程式碼片段>
+    ( cd "$FAKEROOT" \
+      && MLP_REPO_ROOT="$FAKEROOT" REPO_ROOT="$FAKEROOT" HOME="$SANDBOX/home" PATH="$SHIMS:$PATH" \
+         CAP_LOG="$SANDBOX/fakecap.log" \
+         bash -c "source scripts/lib/capability.sh >/dev/null 2>&1; $1" 2>/dev/null </dev/null )
+}
+fakeroot_err() {  # fakeroot_err <bash程式碼片段>
+    ( cd "$FAKEROOT" \
+      && MLP_REPO_ROOT="$FAKEROOT" REPO_ROOT="$FAKEROOT" HOME="$SANDBOX/home" PATH="$SHIMS:$PATH" \
+         CAP_LOG="$SANDBOX/fakecap.log" \
+         bash -c "source scripts/lib/capability.sh >/dev/null 2>&1; $1" 2>&1 >/dev/null </dev/null )
+}
+
 if [[ "$RUNNER_OK" -eq 0 ]]; then
     :  # 1.2c–1.2e 已在上面各報一次，這裡不重複
 elif [[ ! -r "$FAKEROOT/scripts/lib/capability.sh" ]]; then
@@ -326,18 +382,49 @@ else
     fi
 
     # 1.2e：0 納入、1 不納入、2 保留現有值。
+    #   捕獲**只取 stdout**（見 fakeroot_out 的說明）：stderr 是日誌，而日誌行裡
+    #   就有鍵名，合併的話「1 → 不納入 alpha」會因為 `capability alpha: rc=1`
+    #   而假綠。順帶多加一個要求：stdout 必須是**可解析的 JSON object**——
+    #   只有在日誌被隔離之後，這個要求才有意義（混入日誌就 parse 不了）。
     : > "$SANDBOX/fakecap.log"
-    decl0="$(FAKE_CAP_RC=0 fakeroot_call 'capability_declaration profile.json "{}"')"
-    decl1="$(FAKE_CAP_RC=1 fakeroot_call 'capability_declaration profile.json "{}"')"
-    decl2="$(FAKE_CAP_RC=2 fakeroot_call 'capability_declaration profile.json "{\"beta\":{\"old\":true}}"')"
+    decl0="$(FAKE_CAP_RC=0 fakeroot_out 'capability_declaration profile.json "{}"')"
+    decl1="$(FAKE_CAP_RC=1 fakeroot_out 'capability_declaration profile.json "{}"')"
+    decl2="$(FAKE_CAP_RC=2 fakeroot_out 'capability_declaration profile.json "{\"beta\":{\"old\":true}}"')"
     e=""
-    printf '%s' "$decl0" | grep -q 'alpha' || e="${e} 0 時沒有納入 alpha"
-    printf '%s' "$decl1" | grep -q 'alpha' && e="${e} 1 時仍然納入 alpha"
-    printf '%s' "$decl2" | grep -q 'old' || e="${e} 2 時沒有保留現有值"
+    printf '%s' "$decl0" | jq -e 'type == "object"' >/dev/null 2>&1 || e="${e} rc=0 的 stdout 不是 JSON object"
+    printf '%s' "$decl1" | jq -e 'type == "object"' >/dev/null 2>&1 || e="${e} rc=1 的 stdout 不是 JSON object"
+    printf '%s' "$decl2" | jq -e 'type == "object"' >/dev/null 2>&1 || e="${e} rc=2 的 stdout 不是 JSON object"
+    printf '%s' "$decl0" | jq -e '.alpha == {"k":1}' >/dev/null 2>&1 || e="${e} 0 時沒有納入 alpha 的參數"
+    printf '%s' "$decl1" | jq -e 'has("alpha") | not' >/dev/null 2>&1 || e="${e} 1 時仍然納入 alpha"
+    printf '%s' "$decl2" | jq -e '.beta == {"old":true}' >/dev/null 2>&1 || e="${e} 2 時沒有保留現有值"
+    printf '%s' "$decl2" | jq -e 'has("alpha") | not' >/dev/null 2>&1 || e="${e} 2 時把沒有現有值的 alpha 也放進去了"
     if [[ -z "$e" ]]; then
-        ok "1.2e. capability_declaration：0 納入、1 不納入、2 保留現有值"
+        ok "1.2e. capability_declaration：0 納入、1 不納入、2 保留現有值（stdout 只有值）"
     else
         bad "1.2e. capability_declaration 三態錯誤：${e}"
+    fi
+
+    # 1.2f2：**stderr 每個鍵一行 rc**（這是契約的另一半，呼叫端靠它分
+    #   WARN(1)／INFO(2)，pool-sync 與 register-provider 都不會為了拿狀態
+    #   再呼叫一次 capability_plan——那會把每個單位的 --check 跑兩遍）。
+    #   兩件事都要量得到：每個鍵**恰好一行**、rc 的值是該鍵自己的回傳碼。
+    #   profile.json 宣告 alpha、beta；FAKE_CAP_RC 是所有假單位共用的開關。
+    rcerr0="$(FAKE_CAP_RC=0 fakeroot_err 'capability_declaration profile.json "{}"')"
+    rcerr2="$(FAKE_CAP_RC=2 fakeroot_err 'capability_declaration profile.json "{\"beta\":{\"old\":true}}"')"
+    se=""
+    for k in alpha beta; do
+        [[ "$(printf '%s\n' "$rcerr0" | grep -c "^capability ${k}: rc=0$")" == "1" ]] \
+            || se="${se} rc=0 時 ${k} 的日誌行不是恰好一行"
+        [[ "$(printf '%s\n' "$rcerr2" | grep -c "^capability ${k}: rc=2$")" == "1" ]] \
+            || se="${se} rc=2 時 ${k} 的日誌行不是恰好一行"
+    done
+    # 行的總數也要等於鍵數：多一行（例如把整份宣告也寫進 stderr）就是錯的。
+    [[ "$(printf '%s\n' "$rcerr0" | grep -c '^capability ')" == "2" ]] \
+        || se="${se} rc=0 的 stderr 有 $(printf '%s\n' "$rcerr0" | grep -c '^capability ') 行 capability（應該 2）"
+    if [[ -z "$se" ]]; then
+        ok "1.2f2. stderr：每個鍵恰好一行 capability <key>: rc=<n>（呼叫端靠它分 WARN／INFO）"
+    else
+        bad "1.2f2. stderr 的 rc 日誌不對：${se}"
     fi
 fi
 
@@ -478,6 +565,10 @@ case "$mode" in
     ratelimit) printf 'gh: HTTP 403: API rate limit exceeded\n' >&2; exit 1 ;;
     neterr)    printf 'error connecting to api.github.com\n' >&2; exit 1 ;;
     http5xx)   printf 'gh: HTTP 502\n' >&2; exit 1 ;;
+    # review §4.4：`gh api --include … --jq …` 在 **HTTP 200** 時也可能非 0 退出
+    # （--jq 的表達式取不到值、舊版 gh 拒絕 --include 卻仍印出標頭…）。
+    # 單位的 case 有 `2*) one=0` 那一格，於是 code=200 → 判成「成立」→ 假 pass。
+    ok200fail) printf 'HTTP/2.0 200\n'; printf '{"id":1,"name":"%s","full_name":"%s"}\n' "$repo" "$repo"; exit 1 ;;
     *)         printf '{"id":1,"name":"%s","full_name":"%s"}\n' "$repo" "$repo" ;;
 esac
 exit 0
@@ -507,6 +598,20 @@ if [[ "$UNIT_RC" -eq 1 ]]; then
     ok "1.3f. gh：拒絕存取 → 1"
 else
     bad "1.3f. gh：403 應回 1，卻回 ${UNIT_RC}（out=[${UNIT_OUT}]）——只看 \`command -v gh\` 就不會有 1"
+fi
+
+# 1.3g2：**gh 非 0 退出、但 HTTP 是 200 → 必須回 2**（review §4.4）
+#   走到單位的 `case` 就代表有東西不對勁（gh 回 0 上面就 continue 了），
+#   而「檢查沒有完成」與「檢查說不成立」是兩件事：後者回 1，前者只能回 2。
+#   回 0 會讓一個沒跑完的檢查變成 `pass`——正是 CAPABILITY-DESIGN.md §2
+#   說的「把『讀不懂』說成『沒有』」那類錯誤的反向版。
+run_unit_check "$REPO_ROOT" gh "$GH_PARAMS" FAKE_GH_MODE=ok200fail GH_LOG="$GH_LOG"
+if [[ "$UNIT_RC" -eq 2 ]]; then
+    ok "1.3g2. gh：HTTP 200 但 gh 非 0 退出 → 2（無法確認），不是 0（假 pass）也不是 1"
+elif [[ "$UNIT_RC" -eq 0 ]]; then
+    bad "1.3g2. gh 非 0 退出卻回 0 —— 檢查根本沒完成，這是**假 pass**（review §4.4）"
+else
+    bad "1.3g2. 預期 2，實際 ${UNIT_RC}（out=[${UNIT_OUT}]）"
 fi
 
 # 1.3g：網路錯誤或 5xx → 2
@@ -663,6 +768,35 @@ else
 fi
 
 echo "=== 注入 ==="
+
+# INJ-G2：把 gh 單位的 `2*)` 那一格改回 `one=0` → 1.3g2 必須轉紅。
+#   1.3g2 在產品碼修好之後是綠的；沒有這條注入就沒有辦法證明它是因為
+#   「`2*)` 那一格被改成 2」才綠的，而不是因為假 gh 壞掉所以單元根本沒跑到迴圈。
+# run_unit_check 走的是 <root>/shared-configs/<unit>/install.sh，所以突變檔要放
+# 在那個形狀裡（第一版直接放 <root>/install.sh → rc=127 → 注入看起來沒生效）。
+GH_MUT="$SANDBOX/gh-inj-root"
+mkdir -p "$GH_MUT/shared-configs/gh/files"
+cp "$REPO_ROOT/shared-configs/gh/install.sh" "$GH_MUT/shared-configs/gh/install.sh"
+python3 - "$REPO_ROOT/shared-configs/gh/install.sh" "$GH_MUT/shared-configs/gh/install.sh" <<'INJG2'
+import sys
+src = open(sys.argv[1], encoding="utf-8").read()
+old = "    2*)          one=2 ;;"
+assert src.count(old) == 1, "needle `2*) one=2` count=%d" % src.count(old)
+open(sys.argv[2], "w", encoding="utf-8").write(src.replace(old, "    2*)          one=0 ;;", 1))
+INJG2
+if [[ $? -ne 0 ]]; then
+    inj_bad "INJ-G2. 突變腳本失敗（gh 單位的 `2*)` 那一格形狀變了）——harness 問題"
+elif ! bash -n "$GH_MUT/shared-configs/gh/install.sh" 2>/dev/null; then
+    inj_bad "INJ-G2. 突變版語法錯誤——harness 問題"
+else
+    run_unit_check "$GH_MUT" gh "$GH_PARAMS" FAKE_GH_MODE=ok200fail GH_LOG="$GH_LOG"
+    if [[ "$UNIT_RC" -eq 0 ]]; then
+        inj_ok "INJ-G2. 把 `2*)` 改回 one=0 之後 HTTP 200＋gh 非 0 就變成 0 ——1.3g2 有牙"
+    else
+        inj_bad "INJ-G2. 改回 one=0 之後仍然回 ${UNIT_RC}——1.3g2 不是在看那一格（harness 或注入沒生效）"
+    fi
+fi
+
 
 # INJ-1：假 docker 改成成功 → 1.3c（應該是 1）必須轉紅。
 #   證明 1.3c 真的在看 docker 的結果，不是無論如何都回 1。

@@ -50,7 +50,7 @@
   - 1 的能力：不放。
   - 2 的能力：保留現有宣告裡的值；現有宣告裡沒有的話就不加。
 
-pool-sync、register-provider、`mlp verify-capabilities` 只呼叫這三個函式，create-worker 只用 `capability_plan`。`mlp` 是從使用者電腦對遠端機器驗證，所以要在那台機器上跑**同一份**單位的 `--check`。具體怎麼送過去由 impl 決定，只有一條要求：不能另外寫一份驗證邏輯。
+pool-sync、register-provider、`mlp verify-capabilities` 只呼叫這三個函式。create-worker 不碰 runner，因為 worker 的能力不驗證，跑 runner 就會執行 `--check`；它用 `profile_capabilities` 原樣讀 profile。目前 `capability_plan` 還沒有任何生產端在用，只有測試會呼叫它；留著是給之後要列出「鍵→單位→參數」的消費端用的。`mlp` 是從使用者電腦對遠端機器驗證，所以要在那台機器上跑**同一份**單位的 `--check`。具體怎麼送過去由 impl 決定，只有一條要求：不能另外寫一份驗證邏輯。
 
 **D4. pool-sync 的宣告是一條獨立的路徑，永遠不安裝。**
 收斂迴圈完全不動。收斂結束後另外跑一段：
@@ -88,6 +88,11 @@ provider 的 `default` 與 `no-sudo` 兩個 profile 都列這三個能力。Gate
 這樣 register-provider 和 pool-sync 寫的是同一個函式算出來的值，不會互相打架。
 
 register-provider 是先 `usermod -aG docker` 再驗證，而它當下這個 session 的群組還是舊的，所以 `capability_check` 要包在 `sudo -n -u <user>` 裡，在一個群組已經重新解析過的 process 裡跑，跟今天的 `docker info` 一樣（`register-provider.sh:774`）。不這樣做的話，`worker-host` 會回 2，每一台新註冊的機器都會失敗。
+
+**D10. 安裝時用換檔取代原地覆寫。**
+`pool-runtime` 和 `wol` 的 `install.sh` 改成：先複製到同一個目錄下的暫存檔，`chmod` 完再 `mv` 過去，不再用 `cp -f` 直接覆寫目標檔。
+
+原因：bash 是邊執行邊讀腳本的。pool-sync 收斂到新版時，`cp -f` 會改寫**正在執行**的那個檔案（同一個 inode），還在跑的舊版 process 就會讀到新內容，然後出錯（2026-10-02 fh-l 碰過：`line 410: syntax error`，那一輪失敗）。`mv` 換的是目錄項，舊版 process 手上的還是原來那個檔案，所以不受影響（使用者 2026-10-02 裁定併進 PR-B）。
 
 **D9. 程式註解要少。** 理由寫在這份文件和 commit 裡。
 

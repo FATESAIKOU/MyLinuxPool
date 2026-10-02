@@ -102,6 +102,10 @@ capability_declaration() {
         else
             rc=2
         fi
+        # 每個鍵一行到 stderr：呼叫端要靠它分 WARN(1)／INFO(2)，而 pool-sync
+        # 不該為了拿狀態再呼叫一次 capability_plan（那會把 --check 跑兩遍，
+        # 兩次結果可能不一樣，API 也多打一倍）。
+        printf 'capability %s: rc=%s\n' "$key" "$rc" >&2
         case "$rc" in
             0) acc="$(jq -c --arg k "$key" --argjson v "$params" '. + {($k): $v}' <<< "$acc")" ;;
             2) acc="$(jq -c --arg k "$key" --argjson e "$existing" \
@@ -111,3 +115,11 @@ capability_declaration() {
     done < <(jq -r '(.capabilities // {}) | keys_unsorted[]' "$profile" 2>/dev/null)
     printf '%s\n' "$acc"
 }
+
+# CLI：bash capability.sh --check <鍵>　（參數與 repo 根走環境變數）
+# 給需要換一個 process 來驗證的呼叫端用（register-provider 的 sudo -u）——
+# 那種情況沒辦法 source，source 會把對方的 shell 也換掉。
+if [[ "${1:-}" == "--check" && -n "${2:-}" ]]; then
+    capability_check "$2" "${MLP_CAPABILITY_PARAMS:-{\}}"
+    exit "$?"
+fi

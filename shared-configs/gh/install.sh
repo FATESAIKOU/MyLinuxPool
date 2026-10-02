@@ -1,21 +1,17 @@
 #!/usr/bin/env bash
 # shared-configs/gh/install.sh — docs/LAYOUT.md §1
 #
-# needs_key=false: this unit has no files/ at all, so --key is accepted
-# (interface parity) but unused. The token-file/credential-helper part of
-# this unit is instead driven by GH_POOL_TOKEN in the environment — that
-# is a DIFFERENT secret from --key's FILE_CRYPTO_KEY, and --key is
-# reserved for that one purpose across every unit, so it would be
-# misleading to overload it here. When GH_POOL_TOKEN isn't set (the
-# Gateway's own case — it deliberately holds no GitHub credential, spec
-# §10.2b), this unit just installs the `gh` binary and stops there.
+# needs_key=false: this unit has no files/, so --key is accepted (interface
+# parity) but unused — the token is driven by GH_POOL_TOKEN in the environment
+# instead (a different secret from --key's FILE_CRYPTO_KEY, which stays
+# reserved for that one purpose across every unit). Without GH_POOL_TOKEN this
+# unit just installs the `gh` binary (the Gateway's case: it deliberately
+# holds no GitHub credential, spec §10.2b).
 #
-# needs_root=true: apt-installing `gh` needs root, but ONLY when `gh` isn't
-# already on PATH — the root check is gated on that (see below), not
-# unconditional, so a caller that already has `gh` some other way (e.g.
-# ops-scripts/register-provider.sh's own --no-sudo tarball bootstrap, run before this
-# unit ever gets called) can still call this unit as a normal user to get
-# the token file + git credential helper set up.
+# needs_root=true: only for apt-installing `gh`, and only when `gh` isn't
+# already on PATH — so a caller that already has `gh` another way (e.g.
+# register-provider's --no-sudo tarball bootstrap) can still run this as a
+# normal user.
 
 set -uo pipefail
 
@@ -57,9 +53,30 @@ check_installed() {
 }
 
 # --- github 能力（D2／D5）-------------------------------------------------
-# --check 的回傳碼是「能力成立嗎」：0 成立、1 確定不成立、2 無法確認。token 走
-# pool-sync 的 ~/.mylinuxpool/gh_token 慣例——宣告要能驗證同一份憑證。
+# --check 的回傳碼是「能力成立嗎」：0 成立、1 確定不成立、2 無法確認。
+# 形狀與權限在這裡判斷（不在 mlp）：malformed 是宣告本身壞掉 → 1 且不打 API；
+# 非 read 的權限沒有定義好的驗證方式 → 2，不能報 pass 也不能報成確定不成立。
+# token 走 pool-sync 的 ~/.mylinuxpool/gh_token 慣例——宣告要能驗證同一份憑證。
 cap_check() {
+    local params="${MLP_CAPABILITY_PARAMS:-{\}}"
+    local schema_err
+    schema_err="$(jq -r '
+        if type != "object" then "capability value must be an object"
+        elif (has("repos") | not) then ""
+        elif (.repos | type) != "object" then ".repos must be an object"
+        elif [.repos[] | select(type != "array")] | length > 0 then "every .repos value must be an array"
+        elif [.repos[][] | select(. != "read" and . != "write" and . != "trigger-actions")] | length > 0
+          then "permission values must be read/write/trigger-actions"
+        else "" end' 2>/dev/null <<< "$params")"
+    if [[ -n "$schema_err" ]]; then
+        log ERROR "github: malformed declaration — ${schema_err}"
+        return 1
+    fi
+    if [[ "$(jq -r '[((.repos // {}) | .[])[] | select(. != "read")] | length' 2>/dev/null <<< "$params")" != "0" ]]; then
+        log INFO "github: write/trigger-actions have no defined verification"
+        return 2
+    fi
+
     local token
     token="$(cat "$TOKEN_FILE" 2>/dev/null)" || token=""
     [ -n "$token" ] || token="${GH_TOKEN:-${GITHUB_TOKEN:-}}"
@@ -82,21 +99,21 @@ cap_check() {
         one=2
         case "$code" in
             401|403|404) one=1 ;;
-            2*)          one=0 ;;
+            # 能走到這裡就代表 gh 非 0 退出，沒有理由判成成立。
+            2*)          one=2 ;;
         esac
         if [ -z "$code" ]; then
-            # 拿不到狀態碼（舊版 gh、或輸出被改寫）才比對文字。403 有兩種意思：
-            # 無權存取、以及被 rate limit——限流時回 1 會讓 github 從三台機器
-            # 的宣告裡同時消失，那正是三態要防的事。
+            # 拿不到狀態碼才比對文字。403 有兩種意思：無權存取、以及被 rate
+            # limit——限流時回 1 會讓 github 從三台機器的宣告裡同時消失。
             case "$out" in
                 *"rate limit"*|*"Rate limit"*|*"secondary rate"*) one=2 ;;
                 *403*|*"Resource not accessible"*|*"Not Found"*|*404*) one=1 ;;
             esac
         fi
-        # 1 一旦出現就不被 2 蓋掉：已經確定有一個庫讀不到，2 的「保留」不該救它。
+        # 1 一旦出現就不被 2 蓋掉。
         [ "$one" -eq 1 ] && rc=1 || { [ "$rc" -eq 0 ] && rc="$one"; }
         log INFO "github: ${repo} → ${one}（code=${code:-none} ${out}）"
-    done < <(jq -r '(.repos // {}) | keys_unsorted[]' <<< "${MLP_CAPABILITY_PARAMS:-{\}}" 2>/dev/null)
+    done < <(jq -r '(.repos // {}) | keys_unsorted[]' <<< "$params" 2>/dev/null)
     return "$rc"
 }
 
@@ -126,20 +143,16 @@ else
 fi
 
 # 生產觸發條件：Gateway 上 100% 走此路（provision-gateway 的 rotate/repair
-# 呼叫只帶 POOL_TRUSTED_IPS 與 GATEWAY_SSH_LISTEN_PORTS，不帶
-# GH_POOL_TOKEN——Gateway 依 spec §10.2b 刻意不持有 GitHub 憑證）；provider
-# 上不觸發（register-provider 執行時環境裡有 GH_POOL_TOKEN，會往下走寫
-# token 檔與 credential helper）。退場條件是 Gateway 政策改變、開始持有
-# GitHub 憑證——那與 §10.2b 直接衝突，不預期發生。
+# 呼叫不帶 GH_POOL_TOKEN，Gateway 依 spec §10.2b 刻意不持有 GitHub 憑證）；
+# provider 上不觸發。退場條件是 Gateway 政策改變、開始持有憑證。
 if [[ -z "${GH_POOL_TOKEN:-}" ]]; then
     log INFO "GH_POOL_TOKEN not set — installing the gh binary only (no token file/credential helper)"
     exit 0
 fi
 
 # `gh auth login --with-token` insists on a `read:org` scope our PAT
-# doesn't have and none of our operations need — gh honors a bare
-# GH_TOKEN env var (which pool-resolve loads from this file) with no
-# login step at all.
+# doesn't have and none of our operations need — gh honors a bare GH_TOKEN
+# env var (which pool-resolve loads from this file) with no login step.
 mkdir -p "$(dirname "$TOKEN_FILE")"
 need_write=1
 if [[ -f "$TOKEN_FILE" ]] && [[ "$(cat "$TOKEN_FILE")" == "$GH_POOL_TOKEN" ]]; then
@@ -157,8 +170,7 @@ chown "${TARGET_USER}:${TARGET_USER}" "$TOKEN_FILE" 2>/dev/null || true
 # Plain `git` (fetch/pull/clone) doesn't consult GH_TOKEN at all — it has
 # its own, separate credential story. A global credential helper that
 # reads the token FILE at invocation time (not a value baked into
-# .gitconfig) fixes that without depending on any `gh auth login` state,
-# and re-running this replaces whatever helper (or none) was there before.
+# .gitconfig) fixes that without depending on any `gh auth login` state.
 GITCONFIG="${HOME_DIR}/.gitconfig"
 cred_helper="!f() { echo username=x-access-token; echo \"password=\$(cat ${TOKEN_FILE} 2>/dev/null)\"; }; f"
 current_helper="$(git config --file "$GITCONFIG" --get credential.https://github.com.helper 2>/dev/null || true)"

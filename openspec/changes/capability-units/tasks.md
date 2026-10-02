@@ -24,24 +24,25 @@
 - [x] 1.2 紅燈：runner 的三態與參數傳遞（`MLP_CAPABILITY_PARAMS`）。`capability_declaration` 遇到 0、1、2 的組合要算對
 - [x] 1.3 紅燈：各單位的 `--check` 判準（D5），用假的 `docker`、`gh`、`id`、`getent`
 - [x] 1.4 實作 D1、D2、D3、D5、D7、preflight
-- [ ] 1.5 review、閘門、PR-A
+- [x] 1.5 review、閘門、PR-A
 
 ## 2. PR-B：自動宣告
 
-- [ ] 2.1 紅燈：pool-sync 的宣告路徑
+- [x] 2.1 紅燈：pool-sync 的宣告路徑
   - 已經一致時零寫入，要附正對照
   - 結果 1 就拿掉、2 就保留、恢復就加回
   - 只 merge `capabilities`
   - `needs_root` 的單位照樣驗證但不安裝
   - 宣告失敗不影響 tick
   - 寫入宣告不觸發任何 workflow（`gh workflow run` 零次）；只有隧道金鑰真的寫入時才 dispatch refresh，跟 #11 一樣
-- [ ] 2.2 紅燈：register-provider
+- [x] 2.2 紅燈：register-provider
   - 結果不是 0 就失敗，並且指名是哪個能力
   - 全部通過就寫入 runner 的宣告
   - 不再補 `worker-host` 預設
-- [ ] 2.3 紅燈：`mlp verify-capabilities` 改用 runner，現有的三態輸出與回傳碼不退化；新鍵不用改 mlp 就能報 pass
-- [ ] 2.4 紅燈：create-worker 照 profile 寫入，沒有就寫 `{}`
-- [ ] 2.5 實作 D4、D8，provider profile 加 `capabilities`
+- [x] 2.3 紅燈：`mlp verify-capabilities` 改用 runner，現有的三態輸出與回傳碼不退化；新鍵不用改 mlp 就能報 pass
+- [x] 2.4 紅燈：create-worker 照 profile 寫入，沒有就寫 `{}`
+- [x] 2.5 實作 D4、D8，provider profile 加 `capabilities`
+- [x] 2.5b D10：`pool-runtime`／`wol` 安裝改成換檔，不再原地覆寫（附測試：安裝後目標檔是新的 inode；正在執行的舊版不受影響）
 - [ ] 2.6 review、閘門、PR-B
 - [ ] 2.7 merge 後真機驗收：三台收斂成預期的宣告；停掉一台的 docker 再恢復，宣告會跟著消失、出現
 

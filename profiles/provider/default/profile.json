@@ -13,5 +13,22 @@
   "linger": true,
   "sudoers_rules": [
     "ALL=(root) NOPASSWD: /usr/bin/systemctl poweroff, /usr/sbin/ethtool"
-  ]
+  ],
+  "capabilities": {
+    "worker-host": {
+      "runtime": "docker"
+    },
+    "github": {
+      "repos": {
+        "FATESAIKOU/MyBrain": [
+          "read"
+        ]
+      }
+    },
+    "wol": {
+      "methods": [
+        "unicast"
+      ]
+    }
+  }
 }

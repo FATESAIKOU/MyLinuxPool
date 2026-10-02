@@ -168,6 +168,17 @@ if [[ "$unit" == "pool-runtime" ]]; then
     printf '#!/usr/bin/env bash\necho "{\\"ip\\":\\"127.0.0.1\\",\\"tunnel_user\\":\\"tester\\"}"\n' \
         > "${HOME}/.mylinuxpool/bin/pool-resolve"
     chmod +x "${HOME}/.mylinuxpool/bin/pool-resolve"
+    # PR-B（D8）：能力步驟會驗 wol，而 wol 的判準是「已安裝的那一份與單位的
+    # files/pool-wol **逐位元組相同**」。provider 的 profile 的 shared_config 裡
+    # 有 wol，所以真機上 pool-sync 的收斂迴圈會把它裝好；這個假 clone 不跑收斂
+    # 迴圈，所以由 pool-runtime 這個假單位代勞——**從同一個 clone 裡的** wol 單位
+    # 複製（$0 的兩層上層），不是造一個假檔案。少了這一步，註冊會死在能力步驟，
+    # 而這一節量的是 argv/stdin，症狀會離真正的原因很遠。
+    wsrc="$(cd "$(dirname "$0")/.." && pwd)/wol/files/pool-wol"
+    if [[ -f "$wsrc" ]]; then
+        cp "$wsrc" "${HOME}/.mylinuxpool/bin/pool-wol"
+        chmod +x "${HOME}/.mylinuxpool/bin/pool-wol"
+    fi
 fi
 exit 0
 FAKE_INSTALL
@@ -195,6 +206,11 @@ fi
 # loop this section measures. The keys are fake but well-formed, and this
 # suite is about argv/stdin transport, not key assembly.
 if [[ "${1:-}" == "api" ]]; then
+    # gh 能力（PR-B）：判準會對 profile 裡的每個 repo 打一次
+    # `gh api --include repos/<repo> --jq .full_name`，讀得到 = exit 0。
+    case "$*" in
+      repos/*) printf '%s\n' "${GH_REPO_FULL_NAME:-FATESAIKOU/MyBrain}"; exit 0 ;;
+    esac
     printf '%s\n' '{"total_count":2,"variables":[
       {"name":"CLIENT_FATESAIKOU_MAC","value":"{\"name\":\"fatesaikou-mac\",\"public_key\":\"ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIKTTRANSPORTMAC mac@test\",\"added_at\":\"2026-09-16T12:00:00Z\"}"},
       {"name":"CLIENT_ACTIONS","value":"{\"name\":\"actions\",\"public_key\":\"ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIKTTRANSPORTACT actions@test\",\"added_at\":\"2026-09-16T12:00:00Z\"}"}
@@ -504,8 +520,23 @@ emit "── 3) register-provider.sh unit install loop ──"
 REG_SRC="ops-scripts/register-provider.sh"
 TPL="$SANDBOX/register-template"
 mkdir -p "$TPL/profiles/provider/no-sudo" "$TPL/shared-configs" "$TPL/scripts/lib"
-printf '%s\n' '{"shared_config":["pool-runtime","unit-alpha","unit-beta"],"sudoers_rules":[],"systemd_user_services":[],"linger":false}' \
-    > "$TPL/profiles/provider/no-sudo/profile.json"
+# profile 的 capabilities 用 repo 裡那一份 provider profile 的（形狀不自己編）。
+# step7_5_capabilities 是照 clone 裡的 profile 逐鍵去問 runner 的；沒有
+# capabilities 時那一段沒有東西可驗，註冊會在 7.5 就 exit 1——而症狀是
+# 「register-provider 沒跑到最後」，離真正的原因很遠。
+jq -c '{shared_config:["pool-runtime","unit-alpha","unit-beta"],sudoers_rules:[],systemd_user_services:[],linger:false}
+       + {capabilities: (.capabilities // {})} ' \
+    < profiles/provider/no-sudo/profile.json > "$TPL/profiles/provider/no-sudo/profile.json"
+# 三個真單位（PR-A 的產物）。能力步驟現場查 unit.json 再跑該單位的 --check；
+# 沒有這三個目錄，每個鍵都會被算成「沒有單位實作」（rc=2）→ 註冊失敗。
+for u in worker-host gh wol; do
+    mkdir -p "$TPL/shared-configs/$u/files"
+    cp "shared-configs/$u/unit.json"  "$TPL/shared-configs/$u/unit.json"
+    cp "shared-configs/$u/install.sh" "$TPL/shared-configs/$u/install.sh"
+    chmod +x "$TPL/shared-configs/$u/install.sh"
+    [[ -f "shared-configs/$u/files/pool-wol" ]] \
+        && cp "shared-configs/$u/files/pool-wol" "$TPL/shared-configs/$u/files/pool-wol"
+done
 for u in pool-runtime unit-alpha unit-beta; do
     mkdir -p "$TPL/shared-configs/$u"
     cp "$SANDBOX/fake-install.sh" "$TPL/shared-configs/$u/install.sh"

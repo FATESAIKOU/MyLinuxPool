@@ -115,16 +115,18 @@ create_worker_missing_secrets() {
 # create_worker_ledger_add <workers_json> <port> <provider> <image>
 #     <container> <created_at> <tunnel_public_key> <profile_json>
 #   Prints the new POOL_WORKERS array: ledger_add, plus the image profile's
-#   capabilities copied into the entry (CAPABILITY-DESIGN.md §3 — a worker's
-#   capabilities come from its image, so consumers reading POOL_WORKERS do
-#   not have to read the profile; a profile without the field yields `{}`,
-#   the "declared no capabilities" object, never null).
-#   Reads the profile here, not in the workflow, so the copy is one shared
-#   implementation (LAYOUT §3: the workflow stays a thin caller).
+#   capabilities copied into the entry (CAPABILITY-DESIGN.md §3 — consumers
+#   reading POOL_WORKERS do not have to read the profile; a profile without
+#   the field yields `{}`, the "declared no capabilities" object, never
+#   null). A non-object capabilities is rejected rather than coerced.
+#   Worker capabilities are **not verified** here (spec.md:75) — this runs on
+#   an Actions runner, where a real check would call the GitHub API for a
+#   worker. So it copies the declaration and does not touch the runner.
 create_worker_ledger_add() {
     local workers_json="$1" port="$2" provider="$3" image="$4"
     local container="$5" created_at="$6" tunnel_public_key="$7" profile_json="$8"
     local caps
+    # profile_capabilities 做形狀檢查：非 object 就回 1 並印 'is not an object'。
     caps="$(profile_capabilities "$profile_json")" || return 1
     ledger_add "$workers_json" "$port" "$provider" "$image" "$container" \
         "$created_at" "$tunnel_public_key" "$caps"

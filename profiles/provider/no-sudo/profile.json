@@ -11,5 +11,22 @@
     "pool-sync.timer"
   ],
   "linger": true,
-  "sudoers_rules": []
+  "sudoers_rules": [],
+  "capabilities": {
+    "worker-host": {
+      "runtime": "docker"
+    },
+    "github": {
+      "repos": {
+        "FATESAIKOU/MyBrain": [
+          "read"
+        ]
+      }
+    },
+    "wol": {
+      "methods": [
+        "unicast"
+      ]
+    }
+  }
 }
