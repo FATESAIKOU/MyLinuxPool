@@ -101,14 +101,28 @@
     { "host": "127.0.0.1", "port": 2222,
       "user": "fatesaikou", "key_secret": "SSH_KEY_ACTIONS" }
   ],
-  "capabilities": ["docker", "worker-host"],
+  "capabilities": {
+    "worker-host": { "runtime": "docker" },
+    "github":      { "repos": { "FATESAIKOU/MyBrain": ["read"] } },
+    "wol":         { "methods": ["unicast"] }
+  },
   "power": {
-    "launch":   { "method": "wol-unicast", "via": "fh-proxy",
+    "launch":   { "method": "wol-unicast",
+                  "via": ["fh-proxy-asus", "fh-proxy"],
                   "mac": "B4:2E:99:FB:63:5E", "target_ip": "192.168.0.136" },
     "shutdown": { "method": "ssh", "command": "sudo systemctl poweroff" }
   }
 }
 ```
+
+> `capabilities` 的 value 永遠是 object（`{"鍵": 參數}`），不是標籤陣列。
+> 每個鍵對應一個單位（`shared-configs/<unit>/unit.json` 的 `capability` 欄位），
+> 它的 `install.sh --check` 是那個能力的唯一判準。契約見
+> [CAPABILITY-DESIGN.md](CAPABILITY-DESIGN.md)。
+>
+> `power.launch.via` 是**有順序**的發送者清單（`mlp wake` 依序嘗試，順序就是
+> 優先順序）；它是**被叫醒者**的鏈路事實。發送者自己有沒有資格發 magic packet，
+> 是另一件事，由該機器的 `wol` 能力判定——兩者不可互相取代。
 
 > **`key_secret` names an identity, not a destination** (2026-09-14
 > incident). It used to be per-machine — `SSH_KEY_GATEWAY`,
@@ -140,10 +154,13 @@
 
 ### NODE_FH_PROXY
 
-同上，差異：`gateway_port: 2226`，
-`capabilities: ["docker","worker-host","wol-sender","wsl2"]`，
-並帶 `wol_sender.shell` 指向
-`/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe`。
+同上，差異：`gateway_port: 2226`，`registered_with: "--no-sudo"`
+（→ 走 `profiles/provider/no-sudo/profile.json`）。
+
+> 舊版的 `capabilities: ["docker","worker-host","wol-sender","wsl2"]` 與
+> `wol_sender.shell` 都**已移除**。`wol_sender.shell` 在程式碼裡已無任何引用；
+> 取代它的是該機器的 `wol` 能力（`{"methods":["unicast"]}`），由 `wol` 單位
+> 自己的 `--check` 判定資格。
 
 > **`{"via":"gateway"}` 是這份 schema 的重點。**
 > 跳板鏈不重複寫 Gateway 的 IP，而是遞迴引用 `NODE_GATEWAY`。

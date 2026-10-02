@@ -100,6 +100,12 @@ cp -p "$REPO_ROOT/$TUNNEL_ID" "$REPO/$TUNNEL_ID"
 # --expand-hops 對任何節點都回兩跳鏈（run_on_node 用）。
 # 注意：gather_targets 只做大小寫轉換、不做底線轉連字號（與 power_targets
 # 不同），所以 NODE_FH_L 查的是 fh_l——兩個拼法都要認。
+#
+# fh-proxy-asus 是 fh-l 的**代送方**。D6 之後（PR-C）它還必須能被解析、而且
+# **宣告 `wol`**，否則 `mlp wake` 會把它略過（宣告讀不到 → 不當成有資格），
+# 一個封包都不送。少了它，注入 4（拿掉 wake 守衛 → 應該真的送出 WoL）會得到
+# `wol=0`，而紅的原因看起來像「守衛拿掉也沒用」——其實是「沒人合格」。
+# 這裡補的是**現實的形狀**，命題不變：守衛拿掉之後真的要送得出 WoL。
 cat > "$REPO/shared-configs/pool-runtime/files/pool-resolve" <<'FAKE'
 #!/usr/bin/env bash
 printf 'PR %s\n' "$*" >> "${PR_LOG:-/dev/null}"
@@ -109,6 +115,9 @@ if [[ "${2:-}" == "--expand-hops" ]]; then
 fi
 case "${1:-}" in
     gateway) printf '{"ip":"9.9.9.9","user":"gw","port":22}\n'; exit 0 ;;
+    fh-proxy-asus|fh_proxy_asus)
+        printf '%s\n' '{"name":"fh-proxy-asus","role":"provider","gateway_port":2300,"user":"worker","capabilities":{"worker-host":{"runtime":"docker"},"wol":{"methods":["unicast"]}}}'
+        exit 0 ;;
     fh-l|fh_l)
         printf '%s\n' '{"name":"fh-l","role":"provider","gateway_port":2323,"user":"worker","power":{"launch":{"method":"wol-unicast","via":"fh-proxy-asus","mac":"B4:2E:99:FB:63:5E","target_ip":"192.168.0.136"},"shutdown":{"method":"ssh","command":"sudo systemctl poweroff"}}}'
         exit 0 ;;

@@ -40,8 +40,24 @@
 #   同屬答案與現實脫鉤，前者正是 fwd 超時／不可達分家的同類教訓。
 #   unknown 照樣往下試；全 unknown 收場不可以說 could not wake（沒驗證過的結論）。
 #
+# §16-25（PR-C／D6）多一層契約：**wol 決定資格，via 只決定順序**。
+#   沒宣告 wol 的代送方一個封包都不送，被略過的那台照樣佔一個 (n/m) 序號；
+#   沒有人有資格要明確失敗；宣告讀不到 ≠ 有資格；verify-capabilities 要回報
+#   via 裡沒宣告 wol 的機器。細節在那一段自己的註解。
+#   斷言只釘行為（序號／訊息／封包數／回傳碼），不綁新的函式名——D6 沒規定
+#   Model／ViewModel 怎麼切，綁名稱等於替 impl 決定介面。
+#   事件檔多一種行：`WOL <節點>` 只記真正送出封包的那一次（見 wake_run 的 stub）。
+#   SEND 數「有沒有為了任何事由去碰這台機器」，WOL 數「送了幾個封包」——分開算，
+#   否則「為了讀宣告去查它」會被算成「送了封包」。
+#   代送方的宣告從哪裡讀是 impl 的自由，所以 pool-resolve 與 gh 兩個 stub 都從
+#   同一份 node-map.json 出答案。
+#   ⚠️ bash 3.2 的已知錯：**`$VAR` 後面緊接多位元組字元會被吃掉**（`"（$X）"` 會
+#   報 `X?: unbound variable`）。新的訊息裡變數一律用半形括號包。
+#
 # 相容：只用 bash 3.2 就有的語法（無 nameref、無大小寫轉換、無關聯陣列、
 #   空陣列在 set -u 下不直接展開；測試本體連索引陣列都不用，只用字串與檔案）。
+#   已在 macOS bash 3.2.57 與 ubuntu 24.04 / bash 5.2.21（--network none）兩邊
+#   各跑過一次，結果一致。
 #
 # Run: scripts/tests/test-wake-via.sh
 set -uo pipefail
@@ -103,8 +119,31 @@ fi
 exit 1
 FAKE
 # gh：具名喚醒走不到它，留空殼以免誤觸網路。
+#   §16 起多一項：代送方的宣告「從哪裡讀」是 impl 的自由（pool-resolve 是
+#   正式途徑，直接 gh api 也不是不可能）。兩個讀法都從同一份 NODE_MAP 出答案，
+#   斷言才量的是「有沒有篩選資格」，不是「走哪一個讀取器」。查不到的節點回 3，
+#   與 pool-resolve 對 404 的回碼一致——「讀不到」必須在兩條路上長得一樣，
+#   否則同一個缺陷只在一條路上被測到。
 cat > "$SANDBOX/shims/gh" <<'FAKE'
 #!/usr/bin/env bash
+printf 'CALL %s\n' "$*" >> "${GH_LOG:-/dev/null}"
+if [[ -n "${NODE_MAP:-}" && -f "$NODE_MAP" ]]; then
+  for a in "$@"; do
+    case "$a" in
+      repos/*/actions/variables\?*)
+        jq -r 'keys_unsorted[] | "NODE_" + (. | ascii_upcase | gsub("-"; "_"))' "$NODE_MAP" 2>/dev/null
+        exit 0
+        ;;
+      repos/*/actions/variables/NODE_*)
+        out="$(jq -r --arg v "${a##*/}" \
+          'to_entries[] | select("NODE_" + (.key | ascii_upcase | gsub("-"; "_")) == $v) | .value' \
+          "$NODE_MAP" 2>/dev/null)"
+        if [[ -n "$out" ]]; then printf '%s\n' "$out"; exit 0; fi
+        exit 3
+        ;;
+    esac
+  done
+fi
 exit 0
 FAKE
 # sleep：只把秒數記進事件檔，不真的等。等待預算全部用這裡的加總量。
@@ -246,6 +285,13 @@ wake_run() {
         POOL_RESOLVE="$POOL_OVERRIDE"
         run_on_node() {
             printf "SEND %s\n" "$1" >> "$EVENT_LOG"
+            # WOL <節點>：只記真正送出封包的那一次（命令裡有 pool-wol）。
+            # SEND 數的是「有沒有為了任何事由去碰這台機器」——§16 的資格篩選
+            # 會為了讀宣告去查節點，那不是封包。兩個計數分開，才不會把
+            # 「查過它」說成「送過它」，也不會把「送過它」藏在 SEND 裡面。
+            case "$2" in
+                *pool-wol*) printf "WOL %s\n" "$1" >> "$EVENT_LOG" ;;
+            esac
             rc=0
             while IFS=: read -r m r; do
                 if [[ "$m" == "$1" ]]; then rc="$r"; break; fi
@@ -263,8 +309,22 @@ wake_run() {
     printf 'RC=%s ' "$(cat "$SANDBOX/w-rc-done" 2>/dev/null | sed 's/^RC=//')"
     ev_split "$SANDBOX/ev.log"
 }
-NODE2='{"fh-l":{"name":"fh-l","role":"provider","gateway_port":2323,"user":"worker","power":{"launch":{"method":"wol-unicast","via":["s1","s2"],"mac":"B4:2E:99:FB:63:5E","target_ip":"192.168.0.136"}}}}'
-NODE1='{"fh-l":{"name":"fh-l","role":"provider","gateway_port":2323,"user":"worker","power":{"launch":{"method":"wol-unicast","via":["s1"],"mac":"B4:2E:99:FB:63:5E","target_ip":"192.168.0.136"}}}}'
+# D6 之後（PR-C），**真的代送方都會宣告 `wol`**：wake 只把宣告了 `wol` 的那台
+# 當成能用的代送方（design.md D6／spec.md「叫醒只交給有資格的代送方」）。
+# 這兩個 node 以前**只出現在 fh-l 的 via 清單裡**，`POOL_RESOLVE` 查不到它們，
+# 於是 `node_wol_state` 回 2（宣告讀不到）→ 兩台都被略過 → 3a-3d／12 全部
+# `SENDS=0`。
+#
+# 這不是夾具過時，是**夾具沒反映現實**：那個形狀在 PR-C 之後不存在了。
+# 而「宣告讀不到就當成有資格」正是 §16.4 的命題、注入 20 專門抓的錯誤方向，
+# 所以讓 3a-3d 綠的唯一辦法不是放寬 16.4，而是讓 s1/s2 真的查得到、而且真的
+# 宣告 `wol`。命題不變：3a-3d 量的一樣是換人、預算、不謊報。
+NODE_S1='{"name":"s1","role":"provider","user":"worker","capabilities":{"worker-host":{"runtime":"docker"},"wol":{"methods":["unicast"]}}}'
+NODE_S2='{"name":"s2","role":"provider","user":"worker","capabilities":{"worker-host":{"runtime":"docker"},"wol":{"methods":["unicast"]}}}'
+FH_L_VIA2='{"name":"fh-l","role":"provider","gateway_port":2323,"user":"worker","power":{"launch":{"method":"wol-unicast","via":["s1","s2"],"mac":"B4:2E:99:FB:63:5E","target_ip":"192.168.0.136"}}}'
+FH_L_VIA1='{"name":"fh-l","role":"provider","gateway_port":2323,"user":"worker","power":{"launch":{"method":"wol-unicast","via":["s1"],"mac":"B4:2E:99:FB:63:5E","target_ip":"192.168.0.136"}}}'
+NODE2="{\"fh-l\":${FH_L_VIA2},\"s1\":${NODE_S1},\"s2\":${NODE_S2}}"
+NODE1="{\"fh-l\":${FH_L_VIA1},\"s1\":${NODE_S1},\"s2\":${NODE_S2}}"
 # 3a：s1 送出 ok 但永不 up → 必須換人（兩次 SEND），最終失敗、絕不報 up。
 printf '%s\n' "$NODE2" > "$SANDBOX/node-map.json"
 printf 's1:0\ns2:0\n' > "$SANDBOX/send-map"
@@ -758,6 +818,587 @@ else
         else
             inj_bad "15. 行為變了但不是預期的截斷（got [$got]）——harness 問題"
         fi
+    fi
+fi
+
+# ==== 16-25. D6：wol 決定資格，via 只決定順序 ============================
+#
+# design.md D6／spec.md「叫醒只交給有資格的代送方」：via 的順序不變，但沒宣告
+# wol 的代送方一個封包都不送；被略過的那台照樣佔一個 (n/m) 序號（不佔的話，
+# 使用者會以為自己在用第一順位，其實第一順位被吃掉了，而且畫面上看不出來）；
+# 沒有人有資格要明確失敗，不能靜靜結束。
+#
+# 斷言全部釘 cmd_wake 的**行為**（序號、訊息、封包數、回傳碼），不釘任何新的
+# 函式名——D6 沒有規定 Model／ViewModel 怎麼切，釘名稱等於替 impl 決定介面，
+# 也會讓「實作只是換了個函式名」看起來像通過。
+#
+# 宣告從哪裡讀是 impl 的自由（pool-resolve 是正式途徑；直接 gh api 也存在過），
+# 所以 pool-resolve 與 gh 兩個 stub 都從同一份 node-map.json 出答案。
+#
+# 每個 case 都寫成 chk_16x <被測 mlp>：回 0 = 符合 D6，實測值放進 LAST_GOT。
+# 同一段斷言跑兩次——對產品碼（必須紅，紅的原因是「沒做篩選」而不是指令不存在）
+# 與對注入版（INJ-P／INJ-T 必須綠）。注入證明的是這份斷言本身有牙，不是另一份
+# 複寫的檢查順便有牙。
+
+D6_ALPHA_NOWOL='{"name":"alpha","role":"provider","user":"worker","capabilities":{"worker-host":{"runtime":"docker"}}}'
+D6_ALPHA_WOL='{"name":"alpha","role":"provider","user":"worker","capabilities":{"worker-host":{"runtime":"docker"},"wol":{"methods":["unicast"]}}}'
+D6_BRAVO_WOL='{"name":"bravo","role":"provider","user":"worker","capabilities":{"worker-host":{"runtime":"docker"},"wol":{"methods":["unicast"]}}}'
+D6_BRAVO_NOWOL='{"name":"bravo","role":"provider","user":"worker","capabilities":{"github":{"repos":{"FATESAIKOU/MyBrain":["read"]}}}}'
+D6_CHARLIE_NOWOL='{"name":"charlie","role":"provider","user":"worker","capabilities":{"worker-host":{"runtime":"docker"}}}'
+LAST_GOT=""
+
+# d6_fhl <via-json>：被叫醒的節點。它自己宣告 worker-host，讓 verify-capabilities
+# 走完整條路徑（沒有宣告時 cap_verify_one 會在列 rows 之前就 return）。
+d6_fhl() {
+    printf '{"name":"fh-l","role":"provider","gateway_port":2323,"user":"worker","capabilities":{"worker-host":{"runtime":"docker"}},"power":{"launch":{"method":"wol-unicast","via":%s,"mac":"B4:2E:99:FB:63:5E","target_ip":"192.168.0.136"}}}' "$1"
+}
+
+# d6_map <via-json> <alpha> <bravo> [charlie]：寫 node-map.json。沒給的節點
+# 就不在 map 裡，於是 pool-resolve 與 gh 兩個 stub 都回「查不到」。
+d6_map() {
+    {
+        printf '{"fh-l":%s,"alpha":%s,"bravo":%s' "$(d6_fhl "$1")" "$2" "$3"
+        [[ -n "${4:-}" ]] && printf ',"charlie":%s' "$4"
+        printf '}\n'
+    } > "$SANDBOX/node-map.json"
+}
+
+d6_wol()    { awk -v n="$1" '$1 == "WOL" && $2 == n {c++} END {printf "%d", c+0}' "$SANDBOX/ev.log"; }
+d6_send()   { awk -v n="$1" '$1 == "SEND" && $2 == n {c++} END {printf "%d", c+0}' "$SANDBOX/ev.log"; }
+d6_wol_n()  { awk '$1 == "WOL" {c++} END {printf "%d", c+0}' "$SANDBOX/ev.log"; }
+d6_send_n() { awk '$1 == "SEND" {c++} END {printf "%d", c+0}' "$SANDBOX/ev.log"; }
+d6_order()  { awk '$1 == "WOL" {printf "%s ", $2}' "$SANDBOX/ev.log"; }
+d6_both()   { cat "$SANDBOX/w-out" "$SANDBOX/w-err" > "$SANDBOX/w-both" 2>/dev/null; }
+
+# d6_line3 <檔> <a> <b> <c>：同一行同時含 a、b，且含 c（大小寫不拘）才回行號。
+#   「不是喚醒行」是刻意的：現有的 `waking <node> via <sender> (n/m): unicast
+#   WoL to ...` 本身就同時含節點名、序號與 "WoL"，把它算成略過行等於沒斷言。
+#   略過行必須是另一行——而且必須寫出原因，這是 D6 唯一要求的訊息內容。
+d6_line3() {
+    awk -v a="$2" -v b="$3" -v c="$4" 'index($0, a) && index($0, b) && index(tolower($0), c) && !index($0, "waking") {print NR; exit}' "$1"
+}
+d6_line2() {
+    awk -v a="$2" -v b="$3" 'index($0, a) && index($0, b) && !index($0, "waking") {print NR; exit}' "$1"
+}
+d6_at() { awk -v p="$2" 'index($0, p) {print NR; exit}' "$1"; }
+d6_num() { case "$1" in ""|*[!0-9]*) return 1 ;; esac; }
+
+# chk_16x 全部回 0 = 符合 D6。跑完把實測值寫進 LAST_GOT 給失敗訊息用。
+# 16.1：via=[alpha,bravo]，只有 bravo 宣告 wol。
+chk_161() {
+    local save="$MLP_FILE" rc=0 got skip try aw bw
+    MLP_FILE="$1"; LAST_GOT=""
+    d6_map '["alpha","bravo"]' "$D6_ALPHA_NOWOL" "$D6_BRAVO_WOL"
+    printf 'alpha:0\nbravo:0\n' > "$SANDBOX/send-map"
+    got="$(wake_run 0)"; d6_both
+    skip="$(d6_line3 "$SANDBOX/w-out" 'alpha' '(1/2)' 'wol')"
+    try="$(d6_at "$SANDBOX/w-out" 'waking fh-l via bravo (2/2)')"
+    aw="$(d6_wol alpha)"; bw="$(d6_wol bravo)"
+    LAST_GOT="$got a_wol=$aw b_wol=$bw skip_at=[$skip] try_at=[$try] out=[$(tr '\n' '|' < "$SANDBOX/w-out" | head -c 220)]"
+    d6_num "$skip" || rc=1                # 略過行帶序號 1/2 與原因（原因提到 wol）
+    d6_num "$try"  || rc=1                # 換到 bravo，序號仍是 2/2（沒有被壓縮成 1/1）
+    if d6_num "$skip" && d6_num "$try" && [[ "$skip" -ge "$try" ]]; then rc=1; fi
+    [[ "$aw" == "0" ]] || rc=1            # alpha 一個封包都不送
+    [[ "$(d6_send alpha)" == "0" ]] || rc=1
+    [[ "$bw" == "1" ]] || rc=1
+    [[ "$got" == "RC=0 SENDS=1"* ]] || rc=1
+    MLP_FILE="$save"; return "$rc"
+}
+
+# 16.2：via=[bravo,alpha]，兩台都宣告 wol → 照 via 的順序，先 bravo。
+#   這是 16.1 的對照組：如果「永遠跳過第一台」也能過 16.1，這一條會擋下來。
+chk_162() {
+    local save="$MLP_FILE" rc=0 got order b1 a2
+    MLP_FILE="$1"; LAST_GOT=""
+    d6_map '["bravo","alpha"]' "$D6_ALPHA_WOL" "$D6_BRAVO_WOL"
+    printf 'alpha:0\nbravo:0\n' > "$SANDBOX/send-map"
+    got="$(wake_run 999999)"
+    order="$(d6_order)"
+    b1="$(d6_at "$SANDBOX/w-out" 'waking fh-l via bravo (1/2)')"
+    a2="$(d6_at "$SANDBOX/w-out" 'waking fh-l via alpha (2/2)')"
+    LAST_GOT="$got order=[$order] bravo_at=[$b1] alpha_at=[$a2]"
+    [[ "$order" == "bravo alpha " ]] || rc=1
+    d6_num "$b1" || rc=1
+    d6_num "$a2" || rc=1
+    if d6_num "$b1" && d6_num "$a2" && [[ "$b1" -ge "$a2" ]]; then rc=1; fi
+    # 兩台都有資格時，時間預算與既有 §3c 完全相同（90 + 210 = 300）：
+    # 篩選不准順手改掉預算。
+    [[ "$got" == "RC=1 SENDS=2 TOT=300 W1=bravo:90 W2=alpha:210" ]] || rc=1
+    MLP_FILE="$save"; return "$rc"
+}
+
+# 16.3：via 裡沒有一台宣告 wol → 失敗、零封包、說明原因。
+#   「不得宣稱 every sender failed」是這條的牙：把兩台都 continue 掉、一個
+#   封包都不送，卻照舊印出「每一台都失敗」，是對沒有觀察過的事下結論——
+#   跟這個 repo 反覆在守的同一件事（§11、§10 的 unknown 不併回 3）。
+chk_163() {
+    local save="$MLP_FILE" rc=0 got wn sn
+    MLP_FILE="$1"; LAST_GOT=""
+    d6_map '["alpha","charlie"]' "$D6_ALPHA_NOWOL" "$D6_BRAVO_WOL" "$D6_CHARLIE_NOWOL"
+    printf 'alpha:0\ncharlie:0\n' > "$SANDBOX/send-map"
+    got="$(wake_run 0)"; d6_both
+    wn="$(d6_wol_n)"; sn="$(d6_send_n)"
+    LAST_GOT="$got wol=$wn send=$sn both=[$(tr '\n' '|' < "$SANDBOX/w-both" | head -c 240)]"
+    [[ "$got" == "RC=0"* ]] && rc=1        # 不能靜靜結束（回 0）
+    [[ "$wn" == "0" ]] || rc=1             # 零封包
+    [[ "$sn" == "0" ]] || rc=1             # 連 run_on_node 都沒碰過
+    grep -qi 'wol' "$SANDBOX/w-both" || rc=1        # 訊息說明原因
+    grep -q 'every sender failed' "$SANDBOX/w-both" && rc=1
+    grep -q 'did not come up' "$SANDBOX/w-both" && rc=1
+    grep -q 'is up' "$SANDBOX/w-both" && rc=1
+    MLP_FILE="$save"; return "$rc"
+}
+
+# 16.4：代送方的宣告讀不到（它的 NODE_* 不存在）→ 略過並說明，不能當成有資格。
+#   「讀不到」必須與「沒宣告 wol」分開：分開之後才不會出現兩種都算合格的情形。
+chk_164() {
+    local save="$MLP_FILE" rc=0 got skip try gw gw2 bw
+    MLP_FILE="$1"; LAST_GOT=""
+    d6_map '["ghost","bravo"]' "$D6_ALPHA_NOWOL" "$D6_BRAVO_WOL"   # ghost 不在 map 裡
+    printf 'ghost:0\nbravo:0\n' > "$SANDBOX/send-map"
+    got="$(wake_run 0)"; d6_both
+    skip="$(d6_line2 "$SANDBOX/w-out" 'ghost' '(1/2)')"
+    try="$(d6_at "$SANDBOX/w-out" 'waking fh-l via bravo (2/2)')"
+    gw="$(d6_wol ghost)"; gw2="$(d6_send ghost)"; bw="$(d6_wol bravo)"
+    LAST_GOT="$got ghost_wol=$gw ghost_send=$gw2 bravo_wol=$bw skip_at=[$skip] try_at=[$try] out=[$(tr '\n' '|' < "$SANDBOX/w-out" | head -c 220)]"
+    d6_num "$skip" || rc=1                # 略過行：指名它、帶序號、不是喚醒行
+    d6_num "$try"  || rc=1
+    if d6_num "$skip" && d6_num "$try" && [[ "$skip" -ge "$try" ]]; then rc=1; fi
+    [[ "$gw" == "0" ]] || rc=1            # 讀不到 ≠ 有資格：零封包
+    [[ "$gw2" == "0" ]] || rc=1
+    [[ "$bw" == "1" ]] || rc=1
+    [[ "$got" == "RC=0 SENDS=1"* ]] || rc=1
+    MLP_FILE="$save"; return "$rc"
+}
+
+# d6_verify <mlp> <node>：cmd_verify_capabilities 跑一節點，出 stdout+stderr 併檔。
+d6_verify() {
+    MLP_FILE="$1" POOL_OVERRIDE="$SANDBOX/shims/pool-resolve" NODE_MAP="$SANDBOX/node-map.json" \
+    MLP_REPO_ROOT="$REPO_ROOT" GH_LOG="$SANDBOX/gh.log" ARGV_LOG="$SANDBOX/argv.log" \
+    OUTF="$SANDBOX/v-out" ERRF="$SANDBOX/v-err" RESDONE="$SANDBOX/v-rc" \
+    HOME="$SANDBOX/home" PATH="$SANDBOX/shims:$PATH" \
+    bash -c '
+        source "$MLP_FILE" >/dev/null 2>&1
+        POOL_RESOLVE="$POOL_OVERRIDE"
+        : > "$OUTF"; : > "$ERRF"; rm -f "$RESDONE"
+        ( cmd_verify_capabilities "$1" >"$OUTF" 2>"$ERRF" )
+        printf "RC=%s" "$?" > "$RESDONE"' _ "$2" 2>/dev/null
+    D6_VRC="$(sed 's/^RC=//' "$SANDBOX/v-rc" 2>/dev/null)"
+    cat "$SANDBOX/v-out" "$SANDBOX/v-err" > "$SANDBOX/v-both" 2>/dev/null
+}
+
+# 16.5a：verify-capabilities 要回報 via 裡沒宣告 wol 的機器（這裡是 alpha）。
+chk_165a() {
+    local rc=0 hit
+    LAST_GOT=""
+    d6_map '["alpha","bravo"]' "$D6_ALPHA_NOWOL" "$D6_BRAVO_WOL"
+    d6_verify "$1" fh-l
+    hit="$(awk 'index($0, "alpha") && index(tolower($0), "wol") {print NR; exit}' "$SANDBOX/v-both")"
+    LAST_GOT="rc=$D6_VRC hit_at=[$hit] out=[$(tr '\n' '|' < "$SANDBOX/v-both" | head -c 220)]"
+    d6_num "$hit" || rc=1
+    case "$D6_VRC" in 0|1|3) ;; *) rc=1 ;; esac   # 不得是 usage／崩潰的回碼
+    return "$rc"
+}
+
+# 16.5b：同一個 via，只是不合格的那台換成 bravo → 報的也必須換成 bravo。
+#   這是「照宣告回報」而不是「照位置／照名稱回報」的證據。
+chk_165b() {
+    local rc=0 hit
+    LAST_GOT=""
+    d6_map '["alpha","bravo"]' "$D6_ALPHA_WOL" "$D6_BRAVO_NOWOL"
+    d6_verify "$1" fh-l
+    hit="$(awk 'index($0, "bravo") && index(tolower($0), "wol") {print NR; exit}' "$SANDBOX/v-both")"
+    LAST_GOT="rc=$D6_VRC hit_at=[$hit] out=[$(tr '\n' '|' < "$SANDBOX/v-both" | head -c 220)]"
+    d6_num "$hit" || rc=1
+    case "$D6_VRC" in 0|1|3) ;; *) rc=1 ;; esac
+    return "$rc"
+}
+
+# 16.6a：略過一台之後時間預算不變。序號仍然照 via 走（被略過的照樣佔號），
+#   所以唯一被嘗試的那台是末台，吃剩餘，總計仍是 300，被略過的那台零等待。
+chk_166a() {
+    local save="$MLP_FILE" rc=0 got
+    MLP_FILE="$1"; LAST_GOT=""
+    d6_map '["alpha","bravo"]' "$D6_ALPHA_NOWOL" "$D6_BRAVO_WOL"
+    printf 'alpha:0\nbravo:0\n' > "$SANDBOX/send-map"
+    got="$(wake_run 999999)"
+    LAST_GOT="$got"
+    [[ "$got" == "RC=1 SENDS=1 TOT=300 W1=bravo:300" ]] || rc=1
+    MLP_FILE="$save"; return "$rc"
+}
+
+# 16.6b：被略過的那台存在時，第四態仍然是第四態（不能因為少試一台就降級成
+#   「沒醒」，也不能變成 could not wake）。這是 D6「四態與時間預算都不動」。
+chk_166b() {
+    local save="$MLP_FILE" rc=0 got
+    MLP_FILE="$1"; LAST_GOT=""
+    d6_map '["alpha","bravo"]' "$D6_ALPHA_NOWOL" "$D6_BRAVO_WOL"
+    printf 'alpha:0\nbravo:0\n' > "$SANDBOX/send-map"
+    got="$(wake_run 999999 1)"; d6_both
+    LAST_GOT="$got both=[$(tr '\n' '|' < "$SANDBOX/w-both" | head -c 220)]"
+    [[ "$got" == "RC=1 SENDS=1"* ]] || rc=1
+    grep -q 'could not wake' "$SANDBOX/w-out" && rc=1
+    grep -q 'could not verify whether fh-l woke' "$SANDBOX/w-out" || rc=1
+    MLP_FILE="$save"; return "$rc"
+}
+
+# 16.7 混合情境：`via=[alpha(沒宣告 wol), bravo(有)]`，bravo 送出之後**證實沒醒**
+#   （rc=3）。這是 16.6a 的同一個情境多問一句：16.6a 只量計數器
+#   （`SENDS=1 TOT=300 W1=bravo:300`），量不到那句結語。
+#
+#   命題：最終結語**不得**出現 `every sender failed:`。alpha 從未被試過——
+#   說它「失敗」是對沒有觀察過的事情下結論（WAKE-VIA-DESIGN.md §6 花 27 行在
+#   避的那件事，跟 §10／§11 的 unknown 不併回 3、跟 §16.3 的
+#   「不得宣稱 every sender failed」是同一條原則）。§16.3 那條牙只蓋「全部被略過」，
+#   這條蓋「有人被略過、有人真的失敗了」——那才是混合情境，也是最容易漏掉的那個。
+#
+#   同時釘住幾件事，避免用錯的方式變綠：
+#     * 仍然要說「沒醒」（不能改成什麼都不說）；
+#     * 仍然要說是 bravo 沒醒、且原因是沒在預算內起來（逐台原因不能被拿掉）；
+#     * **不准**改成 unknown 那一族——這裡 n_unknown=0，宣稱「無法確認」是另一個
+#       方向的假話；
+#     * **stderr 的 die 訊息不得寫成「all 2 wake sender(s) failed」**——同樣是
+#       over-claim 的另一半：那一行用 `total`（via 的台數），而實際只試了 1 台。
+#       stdout 的標題說「could not wake」是對的，stderr 補一句「all 2 failed」把它
+#       抵消掉，使用者看到的還是同一個錯誤結論。
+#
+# 失敗時把「哪一條子句紅了」放進 LAST_WHY。注入 25／26 各只壞一件事，於是它們能
+# 證明自己的那條子句真的被量到——如果只看「16.7 紅了」，兩個注入會互相顶包。
+chk_167() {
+    local save="$MLP_FILE" rc=0 got aw bw overclaim die_all die_n die_line why=""
+    MLP_FILE="$1"; LAST_GOT=""; LAST_WHY=""
+    d6_map '["alpha","bravo"]' "$D6_ALPHA_NOWOL" "$D6_BRAVO_WOL"
+    printf 'alpha:0\nbravo:0\n' > "$SANDBOX/send-map"
+    got="$(wake_run 999999)"; d6_both
+    aw="$(d6_wol alpha)"; bw="$(d6_wol bravo)"
+    overclaim="$(grep -c 'every sender failed' "$SANDBOX/w-out" 2>/dev/null || true)"
+    # 「all 2 wake sender…」這個過度宣稱的字面，出現幾次。容忍中間的字
+    # （`all 2 tried wake sender…` 也是同一個缺陷的變體）。
+    die_all="$(grep -cE 'all 2 .*wake sender' "$SANDBOX/w-err" 2>/dev/null || true)"
+    # 那一行 die（若有）報的台數。只認 `all N … wake sender(s) failed` 這個形狀，
+    # 中間可以夾任何字（impl 寫成 `all 1 tried …` 也讀得出來）。換成別的措辭時
+    # 下面兩個判斷自動不成立——**不報台數的訊息不會 over-claim**。
+    die_line="$(grep -m1 'sender(s) failed' "$SANDBOX/w-err" 2>/dev/null || true)"
+    die_n="$(printf '%s' "$die_line" | sed -n 's/^mlp: all \([0-9][0-9]*\) .*wake sender(s) failed.*/\1/p')"
+    LAST_GOT="$got alpha_wol=$aw bravo_wol=$bw overclaim_lines=$overclaim die_all2=$die_all die_n=[${die_n:-none}] err=[$(tr '\n' '|' < "$SANDBOX/w-err" 2>/dev/null | head -c 120)] out=[$(tr '\n' '|' < "$SANDBOX/w-out" | head -c 240)]"
+    [[ "$got" == "RC=1 SENDS=1"* ]] || { rc=1; why="${why} setup"; }
+    [[ "$aw" == "0" ]] || { rc=1; why="${why} setup"; }   # 混合情境的前提：alpha 零封包
+    [[ "$bw" == "1" ]] || { rc=1; why="${why} setup"; }   # bravo 送出了
+    # ← 命題（stdout）：結語不得說「每一台都失敗」
+    [[ "$overclaim" == "0" ]] || { rc=1; why="${why} heading"; }
+    grep -q 'could not wake' "$SANDBOX/w-out" || { rc=1; why="${why} lost-wording"; }
+    grep -q 'could not verify whether fh-l woke' "$SANDBOX/w-out" && { rc=1; why="${why} wrong-unknown"; }
+    grep -qF 'bravo: sent, but fh-l did not come up' "$SANDBOX/w-out" || { rc=1; why="${why} lost-reason"; }
+    # ← 命題（stderr）：die 訊息不得說「all 2 … failed」，也不得報 2 這個台數
+    [[ "$die_all" == "0" ]] || { rc=1; why="${why} die-all2"; }
+    [[ "$die_n" == "1" || -z "$die_n" ]] || { rc=1; why="${why} die-count"; }
+    LAST_WHY="$why"
+    MLP_FILE="$save"; return "$rc"
+}
+
+# 產品碼上的實測：每一條都必須紅，而且紅的原因是「沒做資格篩選」。
+D6_CASES="161 162 163 164 165a 165b 166a 166b 167"
+D6_WAKE_CASES="161 162 163 164 166a 166b"
+D6_VERIFY_CASES="165a 165b"
+d6_report() {   # d6_report <mlp>：跑全部 case，逐條 ok/bad
+    local c fn label rc_any=0
+    for c in $D6_CASES; do
+        fn="chk_${c}"
+        case "$c" in
+            161) label="16.1 via=[A,B] 只有 B 宣告 wol：A 帶序號 1/2 被略過且零封包，改用 B (2/2)" ;;
+            162) label="16.2 兩台都有資格時照 via 順序（先 B），預算仍是 90＋210" ;;
+            163) label="16.3 沒有人宣告 wol：非 0、零封包、說明原因，且不宣稱「每一台都失敗」" ;;
+            164) label="16.4 代送方宣告讀不到：略過並帶序號，不能當成有資格" ;;
+            165a) label="16.5a verify-capabilities 回報 via 裡沒宣告 wol 的機器（alpha）" ;;
+            165b) label="16.5b 同一個 via 換一台不合格（bravo）→ 回報也換成 bravo" ;;
+            166a) label="16.6a 略過一台後時間預算不變：末台吃剩餘，總計 300，略過者零等待" ;;
+            166b) label="16.6b 略過一台後第四態仍是第四態（unknown，不降級成 could not wake）" ;;
+            167) label="16.7 混合情境（alpha 被略過、bravo 送出但沒醒）：結語不得說 every sender failed" ;;
+        esac
+        if "$fn" "$1"; then ok "$label"; else bad "$label (got [$LAST_GOT])"; rc_any=1; fi
+    done
+    return "$rc_any"
+}
+
+echo "=== 16-25. D6：wol 決定資格，via 只決定順序 ==="
+d6_report "$MLP_FILE"
+
+# d6_inject <突變檔> <case 清單>：同一組斷言在突變版上必須全綠。全綠回 0。
+d6_inject() {
+    local c fn red=""
+    for c in $2; do
+        fn="chk_${c}"
+        "$fn" "$1" || red="${red} ${c}"
+    done
+    LAST_GOT="紅的 case:${red:-<無>}"
+    [[ -z "$red" ]]
+}
+
+# inj_gate <編號> <突變檔>：突變檔沒產生或語法錯就是 harness 問題，不是斷言的問題。
+inj_gate() {
+    if [[ ! -f "$2" ]]; then
+        inj_bad "${1}. 突變腳本失敗（被測物形狀變了）——harness 問題"
+        return 1
+    fi
+    if ! bash -n "$2" 2>/dev/null; then
+        inj_bad "${1}. 突變版語法錯誤——harness 問題"
+        return 1
+    fi
+    return 0
+}
+
+# 18-21、23、24. 注入：拿掉 D6 的修正，斷言必須轉紅。
+#
+#   D6 落地之後，這幾條的性質變了：紅燈階段它們是**正向對照**（把 D6 注進沒有篩選
+#   的產品碼，斷言必須轉綠，用來排除「斷言寫錯」）；現在產品碼自己就是那份正確版本，
+#   正向對照變成**拿掉修正**（OUT-test-capability-prc-red.md §4 限制 2 指定的改法）。
+#   **命題不變**：每一條仍然是同一個命題的有牙證明，18／23 從「注進去會綠」翻成
+#   「拿掉會紅」是同一件事的兩面——證明斷言量到的就是 D6，不是別的。
+#
+#   錨點全部重新對到 impl 實際的形狀（`node_wol_state`、wake 迴圈裡的篩選、
+#   `cap_verify_one` 裡的 via 回報），每一個都用 python `assert count == 1` 守著，
+#   突變版都過 `bash -n`。錨點是程式碼行，不是註解。
+
+# 18. 拿掉 wake 迴圈裡的整段篩選（node_wol_state 的判斷＋略過行＋continue）
+#     → 16.1／16.3／16.4／16.6a／16.6b 必須紅，16.2 必須**仍綠**。
+#     16.2 仍綠是這條的另一半：它證明「兩台都有資格」時本來就與篩選無關，
+#     所以它綠不是因為篩選不存在。
+INJP="$SANDBOX/mutant-no-wol-gate.sh"
+python3 - "$MLP" "$INJP" <<'PY'
+import sys
+src = open(sys.argv[1], encoding="utf-8").read()
+old = ('        node_wol_state "$sender"; wst=$?\n'
+       '        if [[ "$wst" -ne 0 ]]; then\n'
+       '            if [[ "$wst" -eq 2 ]]; then\n'
+       '                skip_reasons+=("cannot read its declaration \u2014 not usable as a wol sender")\n'
+       '            else\n'
+       '                skip_reasons+=("does not declare the wol capability")\n'
+       '            fi\n'
+       '            skip_names+=("$sender")\n'
+       '            printf \'  %s (%d/%d): skipped \u2014 %s\\n\' "$sender" "$i" "$total" "${skip_reasons[${#skip_reasons[@]}-1]}"\n'
+       '            continue\n'
+       '        fi\n')
+assert src.count(old) == 1, "wol-gate needle count != 1"
+open(sys.argv[2], "w", encoding="utf-8").write(src.replace(old, '', 1))
+PY
+if inj_gate 18 "$INJP"; then
+    red=""
+    for c in $D6_WAKE_CASES; do
+        fn="chk_${c}"
+        "$fn" "$INJP" || red="${red} ${c}"
+    done
+    LAST_GOT="紅的 case:${red:-<無>}"
+    if [[ "$red" == " 161 163 164 166a 166b" ]]; then
+        inj_ok "18. 拿掉 wake 的篩選 → 16.1/16.3/16.4/16.6a/16.6b 紅、16.2 仍綠——篩選是這些斷言的唯一支點"
+    else
+        inj_bad "18. 拿掉篩選後紅的不是那五條 ($LAST_GOT)——harness 問題"
+    fi
+fi
+
+# 19. 略過行不帶序號 → 16.1／16.4 紅（被略過的照樣佔一個 (n/m) 的序號），其餘仍綠。
+INJQ="$SANDBOX/mutant-wol-noordinal.sh"
+python3 - "$MLP" "$INJQ" <<'PY'
+import sys
+src = open(sys.argv[1], encoding="utf-8").read()
+old = '            printf \'  %s (%d/%d): skipped \u2014 %s\\n\' "$sender" "$i" "$total" "${skip_reasons[${#skip_reasons[@]}-1]}"\n'
+new = '            printf \'  %s: skipped \u2014 %s\\n\' "$sender" "${skip_reasons[${#skip_reasons[@]}-1]}"\n'
+assert src.count(old) == 1, "ordinal needle count != 1"
+open(sys.argv[2], "w", encoding="utf-8").write(src.replace(old, new, 1))
+PY
+if inj_gate 19 "$INJQ"; then
+    red=""
+    chk_161 "$INJQ" || red="${red} 161"
+    chk_164 "$INJQ" || red="${red} 164"
+    others=1
+    chk_162 "$INJQ" || others=0
+    chk_163 "$INJQ" || others=0
+    chk_166a "$INJQ" || others=0
+    LAST_GOT="紅的 case:${red:-<無>}；其餘綠=$others"
+    if [[ "$red" == " 161 164" ]] && [[ "$others" -eq 1 ]]; then
+        inj_ok "19. 拿掉序號後 16.1／16.4 紅 ($LAST_GOT)——序號斷言有牙"
+    else
+        inj_bad "19. 拿掉序號後紅的不是 161+164 ($LAST_GOT)——harness 問題"
+    fi
+fi
+
+# 20. 「宣告讀不到」也當成有資格（wst 2 不再被篩掉）→ 16.4 紅，16.1／16.3 仍綠。
+#     這是這個 repo 反覆在守的方向錯誤：把「不知道」當成「可以」。
+INJR="$SANDBOX/mutant-wol-readok.sh"
+python3 - "$MLP" "$INJR" <<'PY'
+import sys
+src = open(sys.argv[1], encoding="utf-8").read()
+old = '        if [[ "$wst" -ne 0 ]]; then\n'
+new = '        if [[ "$wst" -eq 1 ]]; then\n'
+assert src.count(old) == 1, "readok needle count != 1"
+open(sys.argv[2], "w", encoding="utf-8").write(src.replace(old, new, 1))
+PY
+if inj_gate 20 "$INJR"; then
+    if chk_164 "$INJR"; then
+        inj_bad "20. 讀不到當成有資格後 16.4 仍綠——『讀不到 ≠ 有資格』沒被量到"
+    else
+        if chk_161 "$INJR" && chk_163 "$INJR"; then
+            inj_ok "20. 讀不到當成有資格後 16.4 紅（ghost 收到封包）、16.1／16.3 仍綠——16.4 有牙"
+        else
+            inj_bad "20. 紅的不只 16.4——harness 問題"
+        fi
+    fi
+fi
+
+# 21. via 順序被弄反 → 16.2 紅，而且實測送出順序真的反過來。
+INJS="$SANDBOX/mutant-wol-reversed.sh"
+python3 - "$MLP" "$INJS" <<'PY'
+import sys
+src = open(sys.argv[1], encoding="utf-8").read()
+old = ('    for sender in "${WAKE_SENDERS[@]}"; do\n'
+       '        i=$((i + 1))\n')
+new = ('    local ri\n'
+       '    for (( ri=${#WAKE_SENDERS[@]}-1; ri>=0; ri-- )); do\n'
+       '        sender="${WAKE_SENDERS[$ri]}"\n'
+       '        i=$((i + 1))\n')
+assert src.count(old) == 1, "reversed needle count != 1"
+open(sys.argv[2], "w", encoding="utf-8").write(src.replace(old, new, 1))
+PY
+if inj_gate 21 "$INJS"; then
+    red=""
+    chk_162 "$INJS" || red="${red} 162"
+    order_seen="$(d6_order)"
+    LAST_GOT="紅的 case:${red:-<無>}；實際送出順序=[$order_seen]"
+    if [[ "$red" == " 162" ]] && [[ "$order_seen" == "alpha bravo " ]]; then
+        inj_ok "21. 順序弄反後 16.2 紅且實際先送 alpha ($LAST_GOT)——via 順序有牙"
+    else
+        inj_bad "21. 順序弄反後 16.2 沒紅或順序沒反 ($LAST_GOT)——harness 問題"
+    fi
+fi
+
+# 23. 拿掉 cap_verify_one 裡的 via 回報 → 16.5a／16.5b 紅。
+INJT="$SANDBOX/mutant-no-via-wol-report.sh"
+python3 - "$MLP" "$INJT" <<'PY'
+import sys
+src = open(sys.argv[1], encoding="utf-8").read()
+old = ('    # D6: which of this node\'s via senders cannot be used \u2014 same declaration\n'
+       '    # check wake uses, so the two can\'t disagree.\n'
+       '    local s wst\n'
+       '    while IFS= read -r s; do\n'
+       '        [[ -n "$s" ]] || continue\n'
+       '        node_wol_state "$s"; wst=$?\n'
+       '        [[ "$wst" -eq 0 ]] && continue\n'
+       '        if [[ "$wst" -eq 2 ]]; then\n'
+       '            printf \'  %-14s %-14s %s\\n\' "via:$s" "${C_YELLOW}unverifiable${C_RESET}" \\\n'
+       '                "cannot read its declaration \u2014 not usable as a wol sender"\n'
+       '        else\n'
+       '            printf \'  %-14s %-14s %s\\n\' "via:$s" "${C_YELLOW}unverifiable${C_RESET}" \\\n'
+       '                "does not declare wol \u2014 mlp wake will skip it"\n'
+       '        fi\n'
+       '    done < <(wake_sender_names "$json")\n')
+assert src.count(old) == 1, "via-report needle count != 1"
+open(sys.argv[2], "w", encoding="utf-8").write(src.replace(old, '', 1))
+PY
+if inj_gate 23 "$INJT"; then
+    # chk_* 回 0 = 斷言成立（綠）。拿掉回報之後它們必須變成紅（回非 0）。
+    if ! chk_165a "$INJT" && ! chk_165b "$INJT"; then
+        inj_ok "23. 拿掉 verify 的 via 回報 → 16.5a/16.5b 紅——回報這兩條斷言的唯一支點就是它"
+    else
+        inj_bad "23. 拿掉 via 回報後斷言仍綠 ($LAST_GOT)——harness 問題"
+    fi
+fi
+
+# 24. via 回報固定只看第一台 → 16.5b 紅、16.5a 仍綠（回報確實照宣告，不是照位置）。
+INJU="$SANDBOX/mutant-via-firstonly.sh"
+python3 - "$MLP" "$INJU" <<'PY'
+import sys
+src = open(sys.argv[1], encoding="utf-8").read()
+old = '    done < <(wake_sender_names "$json")\n'
+new = '    done < <(wake_sender_names "$json" | head -1)\n'
+assert src.count(old) == 1, "firstonly needle count != 1"
+open(sys.argv[2], "w", encoding="utf-8").write(src.replace(old, new, 1))
+PY
+if inj_gate 24 "$INJU"; then
+    if chk_165b "$INJU"; then
+        inj_bad "24. 固定回報第一台後 16.5b 仍綠——照宣告回報沒被量到"
+    else
+        if chk_165a "$INJU"; then
+            inj_ok "24. 固定回報第一台後 16.5b 紅、16.5a 仍綠——回報確實照宣告"
+        else
+            inj_bad "24. 紅的不只 16.5b——harness 問題"
+        fi
+    fi
+fi
+
+# 25. 混合情境的結語被寫回 over-claim 版 → 16.7 紅，其餘仍綠。
+#     錨點用 regex 而不是字串：只要那句標題還是
+#     `echo "could not wake ${node}…"` 這個形狀（impl 怎麼加限定詞都還在），
+#     就整句換成沒有限定詞的版本。這樣 impl 把結語改成什麼措辭都不必重錨。
+#     若他改成一句不以 `could not wake` 開頭的話，這條注入會如實報 harness 問題，
+#     那時要重錨——**不會**默默通過。
+INJV="$SANDBOX/mutant-overclaim-heading.sh"
+python3 - "$MLP" "$INJV" <<'PY'
+import re
+import sys
+src = open(sys.argv[1], encoding="utf-8").read()
+pat = re.compile(r'^[ \t]*echo "could not wake \$\{node\}[^"]*"$', re.M)
+new, n = pat.subn('        echo "could not wake ${node} \u2014 every sender failed:"', src)
+assert n >= 1, "overclaim-heading regex matched 0 times (shape changed?)"
+open(sys.argv[2], "w", encoding="utf-8").write(new)
+PY
+if inj_gate 25 "$INJV"; then
+    if chk_167 "$INJV"; then
+        inj_bad "25. 把結語寫回 over-claim 版後 16.7 仍綠——『不得宣稱沒試過的代送方失敗』沒被量到"
+    else
+        got167="$LAST_GOT"          # 先留份證據：下面的迴圈會覆寫 LAST_GOT
+        why167="$LAST_WHY"
+        others=1
+        for c in 161 163 164 166a 166b; do
+            fn="chk_${c}"
+            "$fn" "$INJV" || others=0
+        done
+        LAST_GOT="${got167}｜紅的子句=[${why167}]｜其餘仍綠=$others"
+        # 紅的子句必須是 heading：這個突變只動 stdout 的標題，die 那行沒碰。
+        if [[ "$others" -eq 1 && "$why167" == " heading" ]]; then
+            inj_ok "25. 結語寫回 over-claim 版後 16.7 紅在 heading 子句、其餘仍綠 ($LAST_GOT)"
+        else
+            inj_bad "25. 紅的子句不是 heading（或連帶壞到別條）($LAST_GOT)——harness 問題"
+        fi
+    fi
+fi
+
+# 26. die 訊息改回用 `total`（`all 2 wake sender(s) failed`，實際只試了 1 台）
+#     → 16.7 紅在 die 子句，heading 子句必須仍是綠的。
+#     這一條專抓 stdout 對、stderr 把它抵消掉的情況：兩邊都「看起來有寫」，
+#     使用者讀到的結論卻是錯的。錨點是程式碼行，不是註解。
+#     錨在**變數**（`${attempted}` → `${total}`）而不是整行文字：混合情境走的是
+#     哪一個 die 分支會隨 impl 的寫法變動，錨變數就不受影響。
+INJW="$SANDBOX/mutant-die-total.sh"
+python3 - "$MLP" "$INJW" <<'PY'
+import re
+import sys
+src = open(sys.argv[1], encoding="utf-8").read()
+pat = re.compile(r'^([ \t]*die "all )\$\{attempted\}', re.M)
+new, n = pat.subn(r'\1${total}', src)
+assert n >= 1, "die-total regex matched 0 times (shape changed?)"
+open(sys.argv[2], "w", encoding="utf-8").write(new)
+PY
+if inj_gate 26 "$INJW"; then
+    if chk_167 "$INJW"; then
+        inj_bad "26. die 訊息寫回 all 2 … failed 後 16.7 仍綠——stderr 的 over-claim 沒被量到"
+    else
+        got167="$LAST_GOT"
+        why167="$LAST_WHY"
+        others=1
+        for c in 161 163 164 166a 166b; do
+            fn="chk_${c}"
+            "$fn" "$INJW" || others=0
+        done
+        LAST_GOT="${got167}｜紅的子句=[${why167}]｜其餘仍綠=$others"
+        # 紅的子句必須只有 die 那兩個：stdout 標題這個突變沒碰，必須仍然綠。
+        case "$why167" in
+            " die-all2"|" die-count"|" die-all2 die-count"|" die-count die-all2")
+                if [[ "$others" -eq 1 ]]; then
+                    inj_ok "26. die 訊息寫回 all 2 … failed 後 16.7 紅在 die 子句、heading 仍綠 ($LAST_GOT)"
+                else
+                    inj_bad "26. 紅的子句是對的但連帶壞到別條 ($LAST_GOT)——harness 問題"
+                fi ;;
+            *) inj_bad "26. 紅的子句不是 die 那兩個 (got [$why167])——harness 問題" ;;
+        esac
     fi
 fi
 

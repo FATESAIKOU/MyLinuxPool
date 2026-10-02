@@ -1393,8 +1393,25 @@ cmd_wake() {
     waited_total=0
     n_unknown=0
     i=0
+    attempted=0
+    skip_names=()
+    skip_reasons=()
     for sender in "${WAKE_SENDERS[@]}"; do
         i=$((i + 1))
+        # D6: via is the order; a sender must also declare wol. A skipped
+        # sender keeps its (n/m) index and costs no time — the budget belongs
+        # to senders that can actually be used.
+        node_wol_state "$sender"; wst=$?
+        if [[ "$wst" -ne 0 ]]; then
+            if [[ "$wst" -eq 2 ]]; then
+                skip_reasons+=("cannot read its declaration — not usable as a wol sender")
+            else
+                skip_reasons+=("does not declare the wol capability")
+            fi
+            skip_names+=("$sender")
+            printf '  %s (%d/%d): skipped — %s\n' "$sender" "$i" "$total" "${skip_reasons[${#skip_reasons[@]}-1]}"
+            continue
+        fi
         if [[ "$i" -lt "$total" ]]; then
             budget=90
         else
@@ -1404,6 +1421,7 @@ cmd_wake() {
             budget=$((300 - waited_total))
         fi
         echo "waking ${node} via ${sender} (${i}/${total}): unicast WoL to ${mac} @ ${target_ip} ..."
+        attempted=$((attempted + 1))
         wake_try_sender "$sender" "$mac" "$target_ip" "$port" "$budget"
         trc=$?
         if [[ "$trc" -eq 0 ]]; then
@@ -1434,15 +1452,32 @@ cmd_wake() {
         waited_total=$((waited_total + budget))
     done
 
+    # Nothing usable in the list: say so without pretending any send failed —
+    # no packet was ever sent, so "every sender failed" would be a claim about
+    # something never observed.
+    if [[ "$attempted" -eq 0 ]]; then
+        echo "no sender on ${node}'s via list declares wol — nothing was sent:"
+        k=0
+        while [[ "$k" -lt "${#skip_names[@]}" ]]; do
+            printf '  %s: %s\n' "${skip_names[$k]}" "${skip_reasons[$k]}"
+            k=$((k + 1))
+        done
+        die "no qualified wol sender for ${node}"
+    fi
+
     # Any unknown poisons "could not wake": an unverified send may well have
     # worked, so the honest ending is unverified, not failed. The per-sender
     # lines above already say which is which; the header just must not lie.
+    # A skipped sender was never tried, so it counts for neither claim.
+    local skipped=$(( total - attempted ))
     if [[ "$n_unknown" -gt 0 ]]; then
-        if [[ "$n_unknown" -eq "$total" ]]; then
+        if [[ "$n_unknown" -eq "$attempted" && "$skipped" -eq 0 ]]; then
             echo "could not verify whether ${node} woke — every sender unverified:"
         else
             echo "could not verify whether ${node} woke:"
         fi
+    elif [[ "$skipped" -gt 0 ]]; then
+        echo "could not wake ${node} — every sender that could send failed:"
     else
         echo "could not wake ${node} — every sender failed:"
     fi
@@ -1454,7 +1489,13 @@ cmd_wake() {
     if [[ "$n_unknown" -gt 0 ]]; then
         die "wake result unknown for ${node} — check 'mlp ls' to verify"
     fi
-    die "all ${total} wake sender(s) failed for ${node}"
+    # Count what was actually tried: a sender that was never sent to did not
+    # "fail". The count keeps the `all N wake sender(s) failed` shape so the
+    # number is machine-checkable, and the skipped count rides along.
+    if [[ "$skipped" -gt 0 ]]; then
+        die "all ${attempted} wake sender(s) failed for ${node} (${skipped} skipped: no wol)"
+    fi
+    die "all ${attempted} wake sender(s) failed for ${node}"
 }
 
 cmd_down() {
@@ -3139,6 +3180,24 @@ cap_verify_summary() {
 
 # cap_verify_one <node> — View: resolve one node and render its rows.
 #   Returns 0 all-ok, 1 any fail, 3 unverifiable-only.
+# node_wol_state <node> — 0 declares wol, 1 does not, 2 declaration unreadable.
+#   The one place in this file that names the key: `wol` is what the wake
+#   consumer needs, so it lives here and nowhere else.
+node_wol_state() {
+    local json
+    json="$("$POOL_RESOLVE" "$1" 2>/dev/null)" || return 2
+    [[ -n "$json" ]] || return 2
+    jq -e '(.capabilities // {}) | (type == "object") and has("wol")' \
+        >/dev/null 2>&1 <<< "$json" || return 1
+    return 0
+}
+
+# wake_sender_names <node_json> — the via senders, in via order.
+wake_sender_names() {
+    wake_senders "$1" >/dev/null 2>&1 || return 1
+    printf '%s\n' "${WAKE_SENDERS[@]}"
+}
+
 cap_verify_one() {
     local node="$1" json caps
     json="$("$POOL_RESOLVE" "$node" 2>/dev/null)" || { echo "mlp: no such node: ${node}" >&2; return 1; }
@@ -3166,6 +3225,21 @@ cap_verify_one() {
         esac
         printf '  %-14s %-14s %s\n' "$key" "$mark" "$detail"
     done
+    # D6: which of this node's via senders cannot be used — same declaration
+    # check wake uses, so the two can't disagree.
+    local s wst
+    while IFS= read -r s; do
+        [[ -n "$s" ]] || continue
+        node_wol_state "$s"; wst=$?
+        [[ "$wst" -eq 0 ]] && continue
+        if [[ "$wst" -eq 2 ]]; then
+            printf '  %-14s %-14s %s\n' "via:$s" "${C_YELLOW}unverifiable${C_RESET}" \
+                "cannot read its declaration — not usable as a wol sender"
+        else
+            printf '  %-14s %-14s %s\n' "via:$s" "${C_YELLOW}unverifiable${C_RESET}" \
+                "does not declare wol — mlp wake will skip it"
+        fi
+    done < <(wake_sender_names "$json")
     return "$rc"
 }
 
