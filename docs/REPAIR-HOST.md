@@ -13,10 +13,6 @@
 
 > **本文件不含任何私鑰、權杖與 IP。** 範例裡的位址一律寫
 > `<Gateway IP>`。repo 是公開的（tasks 8c），不要往這份文件裡填真的。
->
-> **「待實作確認」**＝VM 端或 `mlp` 那半還沒落地，寫的是設計（design D9–D14
-> 與 `EPHEMERAL-INTERFACE.md`），不是量過的行為。`mlp` 的輸出範例一律標
-> 「示意」，不要當真。
 
 ## 1. 一次性設定：共用隧道金鑰
 
@@ -93,16 +89,21 @@ VirtualBox；不要用「以系統管理員身分執行」；修好之前不要�
 家人那邊顯示已連上之後：
 
 ```bash
-mlp ls             # 在 provider／worker 之外多一區 repair：名字／port／up（待實作確認）
-mlp ssh <名字>     # 名字唯一時連上；同名多台時拒絕並列出 port，改用 mlp ssh <port>（待實作確認）
+mlp ls             # provider／worker／gateway／repair 都在同一張表裡（repair 是 TYPE 欄的一種）
+mlp ssh <名字>     # 名字唯一時連上；同名多台時拒絕並列出 port，改用 mlp ssh <port>
 ```
 
-輸出示意（**示意**——`mlp` 那半還沒實作）：
+repair 跳板是**主表裡的一列**，不是另外一區（曾經設計成獨立的 `repair:` 分區，
+但那個分區永遠對不齊主表的欄位，所以合併了）：
 
 ```text
-repair:
-  dad-pc   2403   up
+NAME    TYPE      PROVIDER PORT   STATE
+dad-pc  repair    -        2403   up
 ```
+
+`PROVIDER` 是 `-`：repair 跳板不經過任何 provider，它自己就是通往家人區網的那一段，
+所以沒有「掛在哪台 provider 底下」這件事。`STATE` 沒有被動探測——`mlp ls` 只會列出
+它**已經觀察到**在線的 repair 跳板，所以不會為了畫這張表多開一條 ssh。
 
 進去之後：登入的使用者是 `repair`，有**免密碼 sudo**（整台，
 `sudo -i` 直接 root），能改網路設定、抓封包、連家人區網。登入用的金鑰是
@@ -138,9 +139,12 @@ port 的別台機器，所以要再轉一次就自己重下一次 `fwd add`。�
 mlp fwd rm 8080
 ```
 
-> 待實作確認：`mlp` 掃描 Gateway 的做法（一次連線讀名牌＋listener）、同名判
-> `?` 的顯示字樣，以落地為準。機制不變的是：走 Gateway 跳板進
-> `127.0.0.1:<當次挑到的 port>`，登入 `repair`。
+> `mlp` 掃描 Gateway 的做法是**一條連線**同時讀兩樣東西：實際綁在
+> `127.0.0.1` 的 listener（`ss -tln`）與跳板的名牌檔（`/home/sshproxy/repair/*`，
+> 需要 `sudo -n`）。**listener 才是事實**，名牌只負責把那個 port 叫出名字來——
+> 讀不到名字時 `mlp ls` 顯示 `?`（不是「同名」，是「這條 listener 沒有名牌」）。
+> 兩台跳板取同一個名字時 `mlp ls` 會列出**兩列同名**；要連哪一台由 port 決定。
+> 機制不變的是：走 Gateway 跳板進 `127.0.0.1:<當次挑到的 port>`，登入 `repair`。
 
 ## 5. Gateway rotate 之後
 
@@ -196,8 +200,8 @@ Remove-Item -Recurse -Force "$env:LOCALAPPDATA\MyLinuxPool\repair-host"
 ## 8. 同名與手機
 
 - **同名怎麼辦**：名字是家人自己打的，沒有認證——兩台取同一個名字也能連上。
-  `mlp ssh <名字>` 遇到同名會拒絕並列出 port，改用 `mlp ssh <port>` 直達
-  （待實作確認）。連上後仍要你的金鑰才能登入，但**你可能登入到冒名的那台**，
+  `mlp ssh <名字>` 遇到同名會拒絕並列出 port，改用 `mlp ssh <port>` 直達。
+  連上後仍要你的金鑰才能登入，但**你可能登入到冒名的那台**，
   动手前先對一下家人那邊的狀態（design 已知風險）。
 - **手機（MyAiEntry）看不到**：跳板不寫 `NODE_*`、不進 state 快取、不出現在
   MyAiEntry 讀的任何資料裡（design D14）。AI 不會把它列出來，也不會在上面
@@ -224,7 +228,8 @@ Remove-Item -Recurse -Force "$env:LOCALAPPDATA\MyLinuxPool\repair-host"
 - **D2 埠固定 `18080`**：被佔用就大聲拒絕，沒有備案（VM 只認這個埠）。
 - **整包無簽名**：家人只能靠「收到的管道」信任它；`MANIFEST.sha256` 是給你
   複驗的，不是給家人的。
-- **名牌是快取**：`mlp` 以 Gateway 上的實際 listener 為準（待實作確認）；
-  非常態關機（斷電）可能留下名牌殘留，看到名字卻連不上時先叫家人重開一次。
+- **名牌是快取**：`mlp` 以 Gateway 上的實際 listener 為準，沒有 listener 的名牌
+  不會被列出來；非常態關機（斷電）可能留下名牌殘留，看到名字卻連不上時先叫家人
+  重開一次。
 - **`pool-status` 的 `2000–2999` 摘要行會列出跳板 port**：只有數字沒有名字，
   不報警（沿舊行為）。

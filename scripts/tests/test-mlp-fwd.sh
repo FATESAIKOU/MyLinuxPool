@@ -1434,23 +1434,36 @@ else
     fi
 fi
 
-# 22-inj4（D3 的 notfound 說明行 ＋ TARGET_DETAIL 印出被**拿掉**）。R5a/R5b 必須轉紅。
-#   方向同 22-inj3（工單 test-repair-fwd-injections-2）：改成做壞它。理由與量到的
-#   死碼證據見 OUT-test-repair-fwd-injections.md §4（那時這條報的行數從實作前的
-#   2/3 變成 3/5——多的那行就是突變重複印的，滿足判準的仍是真實程式碼）。
-#   **兩行一起拿掉**：只拿掉離線說明那一行，R5b 還剩 TARGET_DETAIL 的警告行撐著
-#   （2 行）不會紅；兩行都拿掉，兩格一起掉回 1 行（只剩 generic 那句），R5b 的
-#   ports.repair 警告也一起消失——R5a／R5b 同時翻紅。
+# 22-inj4：把 notfound 路徑上的說明行 ＋ TARGET_DETAIL 印出拿掉 → R5a/R5b 必須轉紅。
+#   兩行一起拿掉：只拿掉說明行，R5b 還剩 TARGET_DETAIL 的警告行撐著，不會紅。
+#   錨點認角色不認位置：generic 往上連續兩個有意義的行，依序必須是「會印說明行」
+#   的與「TARGET_DETAIL 的印出」。不能改成掃整個分支——unreachable 子路徑也有一行
+#   TARGET_DETAIL，掃到兩行就分不出要拿哪一行。
 INJ_R4="$SANDBOX/rp-mut-offline.sh"
 python3 - "$MLP" "$INJ_R4" <<'PY'
-import sys
+import re, sys
+
 lines = open(sys.argv[1], encoding="utf-8").read().split("\n")
-hits = [k for k, l in enumerate(lines) if l.startswith("            printf 'note: a repair host shows up only")]
-assert len(hits) == 1, "offline-note anchor count=%d" % len(hits)
-j = hits[0]
-prev = lines[j - 1]
-assert "TARGET_DETAIL" in prev and ">&2" in prev, "expected the TARGET_DETAIL print right before the note, got %r" % prev
-del lines[j - 1:j + 1]
+
+def meaningful(k):
+    s = lines[k].strip()
+    return bool(s) and not s.startswith("#")
+
+def is_note_emitter(s):
+    t = s.strip()
+    return bool(re.search(r"\brepair_note\b\s*$", t)) or t.startswith("printf 'note: a repair host")
+
+dies = [k for k, l in enumerate(lines) if l.strip() == 'die "no such node or worker: ${node}"']
+assert len(dies) == 1, "fwd-generic count=%d" % len(dies)
+j = dies[0]
+above = [k for k in range(j - 1, -1, -1) if meaningful(k)][:2]
+assert len(above) == 2, "expected two meaningful lines above the generic, got %d" % len(above)
+note, detail = above
+assert is_note_emitter(lines[note]), "line %d is not a note emitter: %r" % (note + 1, lines[note])
+assert "TARGET_DETAIL" in lines[detail] and ">&2" in lines[detail], \
+    "line %d is not the TARGET_DETAIL print: %r" % (detail + 1, lines[detail])
+for k in sorted(above, reverse=True):
+    del lines[k]
 open(sys.argv[2], "w", encoding="utf-8").write("\n".join(lines))
 PY
 if [[ $? -ne 0 ]]; then
@@ -1464,13 +1477,19 @@ else
     gotb="$(rp_view rinj4b "$INJ_R4" "$RP_GW_JSON_NOPORTS" ghost-pc 8080)"
     lb="$(rp_lines "$SANDBOX/rinj4b-err")"
     lb_last="$(rp_tail "$SANDBOX/rinj4b-err")"
+    # 用 R5a/R5b 自己的判準式（:1246／:1255）評一次突變後的值：兩式都必須為 false。
+    r5a_holds=1; r5b_holds=1
+    [[ "$la" -ge 2 && "$la_last" == *"no such node or worker: ghost-pc"* ]] || r5a_holds=0
+    [[ "$lb" -ge 2 && "$lb_last" == *"no such node or worker: ghost-pc"* ]] \
+        && grep -q 'ports.repair' "$SANDBOX/rinj4b-err" || r5b_holds=0
     # 兩格都該掉回「只剩 generic 那一句」：R5a 的 ≥2 行、R5b 的 ≥2 行＋ports.repair
     # 警告同時失效。
     if [[ "$la" == "1" && "$lb" == "1" \
        && "$la_last" == *"no such node or worker: ghost-pc"* \
        && "$lb_last" == *"no such node or worker: ghost-pc"* ]] \
-       && ! grep -q 'ports.repair' "$SANDBOX/rinj4b-err"; then
-        inj_ok "22-inj4. 拿掉說明行與 TARGET_DETAIL 後兩格都只剩 generic 那一句（行數 ${la}/${lb}）——R5a/R5b 會紅"
+       && ! grep -q 'ports.repair' "$SANDBOX/rinj4b-err" \
+       && [[ "$r5a_holds" -eq 0 && "$r5b_holds" -eq 0 ]]; then
+        inj_ok "22-inj4. 拿掉說明行與 TARGET_DETAIL 後 R5a/R5b 的判準式都轉 false（行數 ${la}/${lb}）——兩格都會紅"
     else
         inj_bad "22-inj4. 拿掉那兩行後 R5 仍綠（行數 ${la}/${lb} 末行 [${la_last}]/[${lb_last}]）——護欄是空的"
     fi

@@ -139,13 +139,23 @@ repair_port_p() {
     [[ "$1" -ge "$GW_REPAIR_LO" && "$1" -le "$GW_REPAIR_HI" ]]
 }
 
+# Not keyed on TARGET_DETAIL: the ControlMaster's stderr also lands there.
+repair_range_configured_p() {
+    [[ -n "${GW_REPAIR_LO:-}" && -n "${GW_REPAIR_HI:-}" ]]
+}
+
+# Shared by mlp ssh and mlp fwd add so the wording cannot drift.
+repair_note() {
+    printf 'note: a repair host shows up only while we can see its listener on the Gateway, so one that is powered off or just closed looks the same as one that never existed — check the TYPE=repair rows of "mlp ls".\n' >&2
+}
+
 usage() {
     cat <<'EOF'
 usage: mlp [command]
 
   (no command)     interactive main menu
-  ls               list providers/workers with live state
-  ssh [name]       connect to a node or worker (menu if name omitted)
+  ls               list providers/workers and repair hosts with live state
+  ssh [name]       connect to a node, worker or repair host (menu if name omitted)
   wake [name]       wake a node declaring power.launch (fzf pick if none given / more than one)
   down [name]       shut down a node declaring power.shutdown (fzf pick if none given / more than one)
   state            compare master (GitHub) vs Gateway state.json vs local snapshot
@@ -1105,6 +1115,7 @@ do_connect() {
                         ;;
                     *)
                         [[ -n "$TARGET_DETAIL" ]] && printf '%s\n' "$TARGET_DETAIL" >&2
+                        repair_range_configured_p && repair_note
                         die "no such node or worker: $1"
                         ;;
                 esac
@@ -2710,7 +2721,7 @@ fwd_view_add() {
                 die "repair name '${node}' matches multiple hosts (ports: ${TARGET_CANDIDATES}) — use the port instead: 'mlp fwd add <port> ...'"
             fi
             [[ -n "$TARGET_DETAIL" ]] && printf '%s\n' "$TARGET_DETAIL" >&2
-            printf 'note: a repair host shows up only while we can see its listener on the Gateway, so one that is powered off or just closed looks the same as one that never existed — check the repair section of "mlp ls".\n' >&2
+            repair_range_configured_p && repair_note
             die "no such node or worker: ${node}"
             ;;
         inuse)
