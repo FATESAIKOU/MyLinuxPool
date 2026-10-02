@@ -2962,142 +2962,87 @@ cap_shape_ok() {
     jq -e 'type == "object" and all(.[]; type == "object")' >/dev/null 2>&1 <<< "${1:-null}"
 }
 
-# cap_verify_worker_host <node> <value_json> — Model: verify `worker-host`.
-#   Sets CAP_STATE (pass|fail|unverifiable) and CAP_DETAIL. The criterion is
-#   §2's: run `docker info` AS the declared user, never `id -nG` — a group
-#   can be present while the socket is unreadable, and then id -nG answers
-#   the same as when everything is fine. The check runs through the same
-#   node hop (run_on_node), as the node's own user, so it verifies the
-#   declaration where it matters. `runtime` must be `docker`; anything else
-#   is unverifiable by this implementation, NOT a pass.
-cap_verify_worker_host() {
-    local node="$1" value_json="$2" runtime out rc
-    # Starts unverifiable, like cap_verify_github: only a path that actually
-    # observed something may raise the verdict to pass (2026-09-25 qa
-    # finding — an initial pass leaks "never inspected" out as "true").
-    CAP_STATE="unverifiable"; CAP_DETAIL=""
-    runtime="$(jq -r '.runtime // empty' 2>/dev/null <<< "$value_json")"
-    if [[ "$runtime" != "docker" ]]; then
-        CAP_STATE="unverifiable"
-        CAP_DETAIL="runtime '${runtime:-<missing>}' has no verification defined"
-        return 0
-    fi
-    out="$(run_on_node "$node" "docker info >/dev/null 2>&1 && printf MLP_DOCKER_OK" 2>&1)"
-    rc=$?
-    if [[ $rc -ne 0 ]]; then
-        CAP_STATE="unverifiable"
-        CAP_DETAIL="could not run docker info on ${node} (hop/ssh failed)"
-    elif [[ "$out" == *MLP_DOCKER_OK* ]]; then
-        CAP_STATE="pass"
-        CAP_DETAIL="docker info answered as the declared user"
-    elif [[ -n "$out" ]]; then
-        CAP_STATE="fail"
-        CAP_DETAIL="docker info failed on ${node}: $(printf '%s' "$out" | head -c 160)"
-    else
-        CAP_STATE="fail"
-        CAP_DETAIL="docker info failed on ${node} (no output)"
-    fi
-}
-
-# cap_verify_github <node> <value_json> — Model: verify `github`.
-#   For each declared repo, `read` is checked with a real API call
-#   (`gh api repos/<owner>/<repo>`), per §2. `write` and `trigger-actions`
-#   have no defined verification yet, so they are reported unverifiable —
-#   never passed. The API call runs through run_on_node (the provider holds
-#   the token; the caller's machine may not), reading the node's own
-#   ~/.mylinuxpool/gh_token.
-#
-#   Two lesson-shaped details (qa 2026-09-25):
-#   - CAP_STATE starts at `unverifiable`, not `pass`. "Not observed yet" is
-#     not "true": a malformed .repos makes the jq below exit 5, the process
-#     substitution yields nothing, the loop body never runs, and an initial
-#     `pass` would then be reported for a declaration that was never even
-#     looked at. Only the paths that actually performed an observation may
-#     raise the verdict to pass.
-#   - The value's schema is validated first, and violations are `fail`
-#     (the declaration itself is broken), not `unverifiable` ("no
-#     verification defined" is a different thing from "the declaration is
-#     malformed").
-cap_verify_github() {
-    local node="$1" value_json="$2" repo perms schema_err out rc observed=0
-    CAP_STATE="unverifiable"
-    CAP_DETAIL=""
-
-    # schema: .repos must be an object, every value an array, every element
-    # one of the defined permission words; .repos absent == no repos.
-    schema_err="$(jq -r '
-        if (has("repos") | not) then ""
-        elif (.repos | type) != "object" then ".repos must be an object"
-        elif [.repos[] | select(type != "array")] | length > 0 then "every .repos value must be an array"
-        elif [.repos[][] | select(. != "read" and . != "write" and . != "trigger-actions")] | length > 0
-          then "permission values must be read/write/trigger-actions"
-        else "" end' 2>/dev/null <<< "$value_json")"
-    if [[ -z "$schema_err" ]] && ! jq -e 'type == "object"' >/dev/null 2>&1 <<< "$value_json"; then
-        schema_err="capability value must be an object"
-    fi
-    if [[ -n "$schema_err" ]]; then
-        CAP_STATE="fail"
-        CAP_DETAIL="malformed github declaration: ${schema_err}"
-        return 0
-    fi
-
-    if [[ "$(jq '.repos // {} | length' 2>/dev/null <<< "$value_json")" == "0" ]]; then
-        CAP_STATE="pass"
-        CAP_DETAIL="no repos declared — nothing this capability claims to reach"
-        return 0
-    fi
-
-    while IFS=$'\t' read -r repo perms; do
-        [[ -n "$repo" ]] || continue
-        observed=1
-        # only `read` has a defined verification (§2)
-        if [[ "$perms" == *write* || "$perms" == *trigger-actions* ]]; then
-            [[ "$CAP_STATE" != "fail" ]] && CAP_STATE="unverifiable"
-            CAP_DETAIL="repo ${repo}: write/trigger-actions have no defined verification"
-            continue
-        fi
-        out="$(run_on_node "$node" \
-            "GH_TOKEN=\"\$(cat ~/.mylinuxpool/gh_token 2>/dev/null)\" gh api repos/${repo} >/dev/null 2>&1 && printf MLP_GH_OK" 2>&1)"
-        rc=$?
-        if [[ $rc -ne 0 ]]; then
-            [[ "$CAP_STATE" != "fail" ]] && CAP_STATE="unverifiable"
-            CAP_DETAIL="repo ${repo}: could not run the check (hop/ssh failed)"
-        elif [[ "$out" == *MLP_GH_OK* ]]; then
-            [[ "$CAP_STATE" == "unverifiable" ]] && CAP_STATE="pass"
-            [[ -z "$CAP_DETAIL" ]] && CAP_DETAIL="repo ${repo}: read verified"
-        else
-            CAP_STATE="fail"
-            CAP_DETAIL="repo ${repo}: gh api failed${out:+ ($(printf '%s' "$out" | head -c 120))}"
-        fi
-    done < <(jq -r '.repos // {} | to_entries[] | [.key, (.value | join(","))] | @tsv' 2>/dev/null <<< "$value_json")
-    # belt and braces: if the loop never observed anything, stay
-    # unverifiable — never promote to pass from an empty run.
-    if [[ "$observed" -eq 0 && "$CAP_STATE" == "pass" ]]; then
-        CAP_STATE="unverifiable"
-        CAP_DETAIL="nothing was observed"
-    fi
-    return 0
-}
-
 # cap_verify_node <node> <capabilities_json> — Model. Sets CAP_ROWS, each
 #   `key<TAB>state<TAB>detail`. No output, no picker. A declared key with no
 #   defined verification returns `unverifiable` — NEVER `pass`; that is the
 #   core of the design (a flag nobody can check must not be reported as
 #   true).
+# cap_unit_dir <repo根> <鍵> — 哪個單位實作這個鍵。現場查 unit.json，不建快取。
+cap_unit_dir() {
+    local root="${1:-}" key="${2:-}" uj
+    for uj in "$root"/shared-configs/*/unit.json; do
+        [[ -f "$uj" ]] || continue
+        if [[ "$(jq -r '.capability // empty' "$uj" 2>/dev/null)" == "$key" ]]; then
+            dirname "$uj"
+            return 0
+        fi
+    done
+    return 1
+}
+
+# cap_unit_check_on_node <節點> <單位目錄> <鍵> <參數JSON> -> 以回傳碼回報該單位結果
+#
+# 注意：**它不印任何東西**，結果是 run_on_node 的回傳碼。呼叫端必須直接呼叫再用
+# $? 取，不能寫 rc="$(cap_unit_check_on_node …)"——命令替換只收 stdout，只會拿到空字串。
+#
+# 驗證必須在**目標機器上**跑（docker／gh／pool-wol 都在那裡）。而 provider 上沒有
+# 持久的 repo clone（pool-sync 用完就刪），所以把單位整個送過去：tar -cz → base64，
+# 與參數一起嵌進同一條命令字串。**不走 stdin**——run_on_node 的 stdin 接 /dev/null。
+# 兩個檔案都在 base64 裡，遠端只需要 base64 與 tar。
+cap_unit_check_on_node() {
+    local node="$1" unit_dir="$2" key="$3" params="${4:-{\}}"
+    local tar_b64 param_b64 cmd out rc hop_rc=0
+    tar_b64="$(tar -cz -C "$unit_dir" . 2>/dev/null | base64 | tr -d '\n')" || return 2
+    [[ -n "$tar_b64" ]] || return 2
+    param_b64="$(printf '%s' "$params" | base64 | tr -d '\n')"
+    # 只有 --check 真的跑完才印 sentinel。解開失敗就 exit 3 且不印——那樣呼叫端
+    # 拿不到 sentinel，判成 unverifiable，而不是把「傳輸失敗」說成「不成立」
+    # （hop 鏈失敗時 run_on_node 自己也會回 1，兩者光看回傳碼分不出來）。
+    cmd="d=\$(mktemp -d) && printf '%s' '$tar_b64' | base64 -d | tar -xz -C \"\$d\" || exit 3; "\
+"MLP_CAPABILITY_PARAMS=\$(printf '%s' '$param_b64' | base64 -d) "\
+"bash \"\$d/install.sh\" --check; rc=\$?; rm -rf \"\$d\"; "\
+"printf 'MLP_CAP_RC=%s\n' \"\$rc\"; exit \$rc"
+    local hop_rc=0
+    out="$(run_on_node "$node" "$cmd" 2>/dev/null)" || hop_rc=$?
+    rc="$(printf '%s\n' "$out" | sed -n 's/^MLP_CAP_RC=\([0-9]\)$/\1/p' | tail -1)"
+    if [[ -z "$rc" ]]; then
+        # 傳輸層失敗：hop/ssh 回 1 與單位的 rc=1 光看回傳碼分不出來，所以判定靠
+        # sentinel 有沒有回來。兩種都報 unverifiable；255 另外帶回去當診斷。
+        [[ "$hop_rc" -eq 255 ]] && return 255
+        return 2
+    fi
+    case "$rc" in 0|1|2) return "$rc" ;; *) return 2 ;; esac
+}
+
 cap_verify_node() {
     local node="$1" caps="$2" key value n=0
     CAP_ROWS=()
+    # 1.2b／D3：不寫死能力鍵。有單位的鍵把**同一份**單位的 --check 送到目標機器
+    # 上去跑（三態），沒有單位的鍵報 unverifiable——新增能力不必改 mlp。
+    # 跟 runner 自己的順序一致：MLP_REPO_ROOT（沙箱／測試用）→ repo 根。
+    local cap_root="${MLP_REPO_ROOT:-${SCRIPT_DIR}/..}"
+    local unit_dir rc
     while IFS=$'\t' read -r key value; do
         [[ -n "$key" ]] || continue
         n=$((n + 1))
-        case "$key" in
-            worker-host) cap_verify_worker_host "$node" "$value" ;;
-            github)      cap_verify_github "$node" "$value" ;;
-            *)
-                CAP_STATE="unverifiable"
-                CAP_DETAIL="no verification is defined for '${key}'"
-                ;;
-        esac
+        # 通用形狀檢查：能力值必須是 object。各能力自己的形狀／權限規則在
+        # 該單位的 --check 裡——mlp 不寫任何能力專屬的邏輯。
+        if ! printf '%s' "$value" | jq -e 'type == "object"' >/dev/null 2>&1; then
+            CAP_STATE="fail"
+            CAP_DETAIL="capability value is not an object"
+        elif unit_dir="$(cap_unit_dir "$cap_root" "$key")"; then
+            cap_unit_check_on_node "$node" "$unit_dir" "$key" "$value"
+            rc=$?
+            case "$rc" in
+                0) CAP_STATE="pass"; CAP_DETAIL="unit $(basename "$unit_dir"): capability established" ;;
+                1) CAP_STATE="fail"; CAP_DETAIL="unit $(basename "$unit_dir"): not established" ;;
+                2) CAP_STATE="unverifiable"; CAP_DETAIL="unit $(basename "$unit_dir"): could not be confirmed" ;;
+                *) CAP_STATE="unverifiable"; CAP_DETAIL="unit $(basename "$unit_dir"): check returned ${rc} (or the node was unreachable)" ;;
+            esac
+        else
+            CAP_STATE="unverifiable"
+            CAP_DETAIL="no unit implements '${key}'"
+        fi
         CAP_ROWS+=("${key}"$'\t'"${CAP_STATE}"$'\t'"${CAP_DETAIL}")
     done < <(jq -r 'to_entries[] | [.key, (.value | tojson)] | @tsv' 2>/dev/null <<< "$caps")
     # If the walk itself failed to enumerate anything (malformed caps, or

@@ -195,6 +195,63 @@ main() {
         fi
     done
 
+    # --- declare this machine's capabilities (D4) ------------------------
+    # A separate path from convergence: nothing is installed here, and only
+    # the `capabilities` field of NODE_<NAME> is ever written. Every failure
+    # here is WARN-only — a broken declaration must not cost this machine its
+    # convergence, its authorized_keys or its tunnel key.
+    #
+    # No workflow dispatch: telling the Gateway to re-read its keys is not
+    # what this does, and dispatching here would put back the ~96 refresh
+    # runs a day that issue #7 removed.
+    local cap_runner="${TMP_DIR}/repo/scripts/lib/capability.sh"
+    local cap_tok=""
+    cap_tok="$(cat "$GH_TOKEN_FILE" 2>/dev/null || true)"
+    if [[ -r "$cap_runner" ]]; then
+        # shellcheck source=/dev/null
+        source "$cap_runner"
+        local cur_caps="" cur_decl="" new_caps="" cap_stderr=""
+        cur_caps="$(GH_TOKEN="$cap_tok" gh api "repos/${REPO}/actions/variables/${var_name}" \
+            --jq '.value // empty' 2>/dev/null || true)"
+        if [[ -z "$cur_caps" ]] || ! printf '%s' "$cur_caps" | jq -e . >/dev/null 2>&1; then
+            log WARN "capability declaration: cannot read a usable ${var_name} — leaving it alone"
+        else
+            # capability_declaration 的第二個引數是**現有宣告**，不是整份 var。
+            cur_decl="$(printf '%s' "$cur_caps" | jq -Sc '.capabilities // {}')"
+            # 一個 tick 只驗一次：狀態由 capability_declaration 順帶報到 stderr
+            #（「capability <key>: rc=<n>」），這裡只翻譯成 WARN／INFO。
+            if new_caps="$(MLP_REPO_ROOT="${TMP_DIR}/repo" \
+                              capability_declaration "$profile_json" "$cur_decl" 2>"${TMP_DIR}/cap.err")"; then
+                cap_stderr="$(cat "${TMP_DIR}/cap.err" 2>/dev/null || true)"
+                while read -r pk prc; do
+                    [[ -n "$pk" ]] || continue
+                    case "$prc" in
+                        1) log WARN "capability '${pk}' is not established — dropping it from ${var_name}.capabilities" ;;
+                        2) log INFO "capability '${pk}' could not be confirmed this tick — keeping the declared value" ;;
+                    esac
+                done < <(printf '%s\n' "$cap_stderr" | sed -n 's/^capability \(.*\): rc=\([0-9]\)$/\1 \2/p')
+
+                if [[ "$cur_decl" == "$(printf '%s' "$new_caps" | jq -Sc .)" ]]; then
+                    log INFO "capabilities already match the profile's verified state — nothing to write"
+                else
+                    # 比較才正規化；寫入不排序，保留既有鍵序（與 tunnel-key.sh 一致）。
+                    local merged
+                    merged="$(printf '%s' "$cur_caps" | jq -c --argjson caps "$new_caps" '. + {capabilities: $caps}')"
+                    if printf '%s' "$merged" | GH_TOKEN="$cap_tok" \
+                        gh variable set "$var_name" --repo "$REPO" >/dev/null 2>&1; then
+                        log INFO "wrote ${var_name}.capabilities = ${new_caps}"
+                    else
+                        log WARN "capability declaration: could not write ${var_name} — leaving it alone"
+                    fi
+                fi
+            else
+                log WARN "capability declaration: runner failed — leaving ${var_name} alone"
+            fi
+        fi
+    else
+        log WARN "capability declaration: ${cap_runner} missing in the fetched repo — skipping"
+    fi
+
     # --- converge this machine's authorized_keys from CLIENT_* ---------
     # (KEY-DESIGN §3.4: the provider's login list converges itself on
     # every tick — no repair-provider run, no FILE_CRYPTO_KEY needed, the

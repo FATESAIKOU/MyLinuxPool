@@ -104,18 +104,42 @@ block_of() { awk '/^# Resolve this script.s REAL location/,/^unset _mlp_self _ml
 OPS_SCRIPTS=()
 while IFS= read -r f; do
     [ -n "$f" ] && OPS_SCRIPTS+=("${f##*/}")
-done < <(git ls-files --cached --others --exclude-standard -- ops-scripts/ | LC_ALL=C sort)
+# `-c safe.directory=*`：容器／CI 上 repo 由別的使用者持有時，git 會整個拒絕
+#   （fatal: detected dubious ownership），於是這條列舉回 0 支——而第 1／2-4／5 條
+#   在 0 支上會全部回報「通過」。那不是通過，是什麼都沒看到（第 0 條就是為了
+#   擋這個）。這裡只是讓讀取成立，沒有改變斷言的對象。
+done < <(git -c safe.directory='*' ls-files --cached --others --exclude-standard -- ops-scripts/ | LC_ALL=C sort)
 
 NEEDS_LOC=()
 NO_LOC=()
+# 判準要認「**這個變數名本身**」，不是任何含有這個字串的名字。
+# 2026-10-02：register-provider.sh 的 step7_5_capabilities 出現 MLP_REPO_ROOT=
+# （交給 runner 的環境變數），而 REPO_ROOT 是 MLP_REPO_ROOT 的子字串——於是
+# 一支**不需要**自我定位的腳本被算成 A 類，然後因為沒有解析區塊而報
+# 「漂移」。這不是被測物的問題，是判準的問題。
+# 寫法用左邊界比對：前一個字元不能是 [A-Za-z0-9_]。
 if [[ "${#OPS_SCRIPTS[@]}" -gt 0 ]]; then
     for s in "${OPS_SCRIPTS[@]}"; do
-        if grep -qE 'SCRIPT_DIR|REPO_ROOT' "${REPO}/ops-scripts/$s" 2>/dev/null; then
+        if grep -qE '(^|[^A-Za-z0-9_])(SCRIPT_DIR|REPO_ROOT)' "${REPO}/ops-scripts/$s" 2>/dev/null; then
             NEEDS_LOC+=("$s")
         else
             NO_LOC+=("$s")
         fi
     done
+fi
+
+# 判準自測：同一個樣式必須分得出 REPO_ROOT 與 MLP_REPO_ROOT。
+# 沒有這條，下一個讀這支測試的人會把邊界「簡化」回來，然後又是一次
+# 「被測物沒問題、判準有問題」的三紅——而那三紅看起來完全像真的。
+CRIT_FILE="$SANDBOX/crit-probe.sh"
+printf '%s\n' 'REPO_ROOT=/x' > "$CRIT_FILE"
+crit_a="$(grep -qE '(^|[^A-Za-z0-9_])(SCRIPT_DIR|REPO_ROOT)' "$CRIT_FILE" && echo A || echo B)"
+printf '%s\n' 'MLP_REPO_ROOT=/x' > "$CRIT_FILE"
+crit_b="$(grep -qE '(^|[^A-Za-z0-9_])(SCRIPT_DIR|REPO_ROOT)' "$CRIT_FILE" && echo A || echo B)"
+if [[ "$crit_a" == "A" && "$crit_b" == "B" ]]; then
+    ok "0c. 判準分得出 REPO_ROOT 與 MLP_REPO_ROOT（前者的引用是 A 類、後者不是）"
+else
+    bad "0c. 判準的前綴測試壞了（REPO_ROOT→${crit_a}、MLP_REPO_ROOT→${crit_b}）——第 1/2-4/5b 條在錯的集合上判斷"
 fi
 
 echo "=== 0. 列舉 ==="

@@ -28,6 +28,20 @@ usage() {
     echo "usage: install.sh [--key <FILE_CRYPTO_KEY>] [--home <dir>] [--user <name>] [--check]" >&2
 }
 
+# install_file <source> <target> <mode>
+#   換檔取代原地覆寫：bash 邊執行邊讀腳本，cp -f 會改寫正在執行的那個 inode（D10）。
+#   同目錄暫存 → chmod → mv -f（同檔案系統的 rename 是原子的）；失敗不留暫存檔。
+install_file() {
+    local src="$1" dst="$2" mode="$3" dir tmp
+    dir="${dst%/*}"
+    tmp="$(mktemp "${dir}/.${dst##*/}.XXXXXX")" || return 1
+    if ! cp "$src" "$tmp" || ! chmod "$mode" "$tmp"; then
+        rm -f "$tmp"
+        return 1
+    fi
+    mv -f "$tmp" "$dst" || { rm -f "$tmp"; return 1; }
+}
+
 # 這一版 pool-wol 支援的 method。改 pool-wol 的時候要一起改這裡——
 # 這是「不送封包」換來的唯一成本：宣告說支援哪個 method，是這份清單決定的。
 SUPPORTED_METHODS="unicast"
@@ -100,7 +114,7 @@ if [[ "$CHECK_ONLY" -eq 1 ]]; then
 fi
 
 mkdir -p "$BIN_DIR"
-cp -f "${FILES_DIR}/pool-wol" "$WOL_BIN"
-chmod +x "$WOL_BIN"
+install_file "${FILES_DIR}/pool-wol" "$WOL_BIN" 755 || {
+    log ERROR "could not install ${WOL_BIN}"; exit 1; }
 chown "${TARGET_USER}:${TARGET_USER}" "$WOL_BIN" 2>/dev/null || true
 log INFO "installed ${WOL_BIN}"

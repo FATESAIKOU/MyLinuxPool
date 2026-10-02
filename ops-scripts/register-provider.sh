@@ -525,7 +525,7 @@ step5_register_var() {
             key_secret: $key_secret,
             gateway_port: $gateway_port,
             hops: $hops,
-            capabilities: ($existing.capabilities // {"worker-host": {"runtime": "docker"}})
+            capabilities: ($existing.capabilities // {})
         }')"
 
     # No --body-file on gh 2.45.0 — `gh variable set` reads the body from
@@ -779,43 +779,82 @@ step7_5_docker_group() {
     exit 1
 }
 
-# step7_5_capabilities — walk the DECLARED capabilities (read back from the
-#   variable step5 just wrote) and run each key's verification. This is the
-#   contract wiring (CAPABILITY-DESIGN.md §2/§4): a declaration that nothing
-#   verifies can be silently false, which is the whole reason this design
-#   exists. worker-host dispatches to step7_5_docker_group — the ONE
-#   implementation of the docker check; a key with no defined verification
-#   is reported, not passed and not failed (nothing here can judge it).
-#   Name deliberately avoids "verify": main's step order is asserted by
-#   test-register-provider-tempclone.sh, which looks for the tunnel verify
-#   (step9_verify) as the first function matching that word.
+# step7_5_capabilities — 對 profile 宣告的每個能力跑 runner 的 capability_check，
+# 然後把 capability_declaration 的結果寫進 NODE_<NAME>.capabilities（D8）。
+# 這裡不寫死任何能力鍵：新增一個能力只要新增一個單位、在 profile 列它。
 step7_5_capabilities() {
-    local caps key value runtime
-    caps="$(gh api "repos/${REPO}/actions/variables/${VAR_NAME}" --jq .value 2>/dev/null \
-        | jq -c '.capabilities // {}' 2>/dev/null || true)"
-    [[ -n "$caps" ]] || caps='{}'
+    local runner="${REPO_DIR}/scripts/lib/capability.sh"
+    if [[ ! -r "$runner" ]]; then
+        log ERROR "${runner} is missing — cannot verify or declare capabilities"
+        return 1
+    fi
+    # shellcheck source=/dev/null
+    source "$runner"
 
-    if [[ "$(printf '%s' "$caps" | jq 'length' 2>/dev/null)" == "0" ]]; then
-        log INFO "no capabilities declared — nothing to verify"
-        return 0
+    local profile_json="${REPO_DIR}/profiles/provider/${PROFILE_NAME}/profile.json"
+    if [[ ! -f "$profile_json" ]]; then
+        log ERROR "profile '${PROFILE_NAME}' not found — cannot verify or declare capabilities"
+        return 1
     fi
 
-    while IFS=$'\t' read -r key value; do
+    # root 之下要換一個 process 驗證：register-provider 是先 usermod -aG docker，
+    # 當下這個 session 的群組還是舊的，worker-host 會回 2。但只在真的需要換 user 時
+    # 才用 sudo：NO_SUDO=1 是這支腳本自己「哪裡都沒有 root」的約定（見
+    # step7_5_docker_group），而 who 已經是 root 時再 sudo -u root 只是多一個
+    # 沒有回報價值的依賴——沒有 sudo 的環境會整個回 127。
+    local who
+    who="$(whoami)"
+
+    # 1 = 確定不成立，2 = 無法確認。兩者都不能帶著「已宣告」走出去。
+    # rc=0 … || rc=$? ：set -e 之下不能用 `cmd; rc=$?`，cmd 非 0 會直接中止整支
+    # 腳本，case 與 D8 要求的訊息就永遠印不出來。
+    local key params rc failed=""
+    while IFS= read -r key; do
         [[ -n "$key" ]] || continue
-        case "$key" in
-            worker-host)
-                runtime="$(printf '%s' "$value" | jq -r '.runtime // empty')"
-                if [[ "$runtime" != "docker" ]]; then
-                    log WARN "worker-host.runtime is '${runtime:-<missing>}' — no verification is defined for it; not verified"
-                    continue
-                fi
-                step7_5_docker_group
-                ;;
-            *)
-                log WARN "capability '${key}' has no verification defined — not verified (CAPABILITY-DESIGN.md §2)"
-                ;;
+        params="$(jq -c --arg k "$key" '.capabilities[$k] // {}' "$profile_json" 2>/dev/null)"
+        if [[ "$NO_SUDO" -ne 1 && "$(id -u)" -eq 0 && "$who" != "root" ]]; then
+            rc=0
+            sudo -n -u "$who" env \
+                MLP_REPO_ROOT="$REPO_DIR" MLP_CAPABILITY_PARAMS="$params" HOME="$HOME" \
+                bash "${REPO_DIR}/scripts/lib/capability.sh" --check "$key" >/dev/null 2>&1 || rc=$?
+        else
+            rc=0
+            MLP_REPO_ROOT="$REPO_DIR" capability_check "$key" "$params" >/dev/null 2>&1 || rc=$?
+        fi
+        case "$rc" in
+            0) log INFO "capability '${key}': established" ;;
+            1) log ERROR "capability '${key}': NOT established (the check says so)"; failed="${failed} ${key}" ;;
+            2) log ERROR "capability '${key}': could not be confirmed (unreachable? group change not in effect?)"; failed="${failed} ${key}" ;;
+            *) log ERROR "capability '${key}': check returned ${rc}"; failed="${failed} ${key}" ;;
         esac
-    done < <(printf '%s' "$caps" | jq -r 'to_entries[] | [.key, (.value | tojson)] | @tsv')
+    done < <(jq -r '(.capabilities // {}) | keys_unsorted[]' "$profile_json" 2>/dev/null)
+
+    if [[ -n "$failed" ]]; then
+        log ERROR "capabilities not established:${failed} — registration stops here (a declaration nothing verified is the thing this design exists to prevent)"
+        return 1
+    fi
+
+    # 2. 全部是 0 → 寫入 runner 算出來的宣告（與 pool-sync 同一個函式）。
+    # capability_declaration 的第二個引數是**現有宣告**，不是整份 var。
+    local existing="" existing_caps decl
+    existing="$(gh api "repos/${REPO}/actions/variables/${VAR_NAME}" --jq .value 2>/dev/null || true)"
+    if ! printf '%s' "$existing" | jq -e . >/dev/null 2>&1; then existing='{}'; fi
+    existing_caps="$(printf '%s' "$existing" | jq -Sc '.capabilities // {}')"
+    decl="$(MLP_REPO_ROOT="$REPO_DIR" capability_declaration "$profile_json" "$existing_caps" 2>/dev/null)" || {
+        log ERROR "capability_declaration failed — cannot write the declaration"
+        return 1
+    }
+    if [[ "$existing_caps" == "$(printf '%s' "$decl" | jq -Sc .)" ]]; then
+        log INFO "capabilities already match — nothing to write"
+        return 0
+    fi
+    local merged
+    merged="$(printf '%s' "$existing" | jq -c --argjson caps "$decl" '. + {capabilities: $caps}')"
+    printf '%s' "$merged" | gh variable set "$VAR_NAME" --repo "$REPO" || {
+        log ERROR "could not write ${VAR_NAME}.capabilities"
+        return 1
+    }
+    log INFO "wrote ${VAR_NAME}.capabilities = ${decl}"
 }
 
 # ---- step 8: write this machine's authorized_keys from CLIENT_* ----------
