@@ -43,14 +43,15 @@
 - [x] 2.4 紅燈：create-worker 照 profile 寫入，沒有就寫 `{}`
 - [x] 2.5 實作 D4、D8，provider profile 加 `capabilities`
 - [x] 2.5b D10：`pool-runtime`／`wol` 安裝改成換檔，不再原地覆寫（附測試：安裝後目標檔是新的 inode；正在執行的舊版不受影響）
-- [ ] 2.6 review、閘門、PR-B
-- [ ] 2.7 merge 後真機驗收：三台收斂成預期的宣告；停掉一台的 docker 再恢復，宣告會跟著消失、出現
+- [x] 2.6 review、閘門、PR-B
+- [x] 2.7 merge 後真機驗收：三台收斂成預期的宣告；停掉一台的 docker 再恢復，宣告會跟著消失、出現
+  - 2026-10-02 實測：三台在兩個 tick 內收斂；fh-l 停 docker（含 docker.socket）→ worker-host 被拿掉並記 WARN → 恢復後加回；全程零 dispatch、tunnel 沒有重啟
 
 ## 3. PR-C：wake 與文件
 
-- [ ] 3.1 紅燈：`mlp wake` 只試宣告了 `wol` 的代送方，被略過的也佔序號；沒有任何一台有資格時明確失敗；`verify-capabilities` 會回報 `via` 裡沒宣告 `wol` 的機器
-- [ ] 3.2 實作 D6
-- [ ] 3.3 改寫 `docs/CAPABILITY-DESIGN.md`，清理 `docs/ARCHITECTURE.md:138-145`
+- [x] 3.1 紅燈：`mlp wake` 只試宣告了 `wol` 的代送方，被略過的也佔序號；沒有任何一台有資格時明確失敗；`verify-capabilities` 會回報 `via` 裡沒宣告 `wol` 的機器
+- [x] 3.2 實作 D6
+- [x] 3.3 改寫 `docs/CAPABILITY-DESIGN.md`，清理 `docs/ARCHITECTURE.md:138-145`
 - [ ] 3.4 review、閘門、PR-C
 - [ ] 3.5 merge 後：
   - `mlp wake fh-l` 照常能用

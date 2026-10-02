@@ -154,8 +154,17 @@ chmod +x "$SHIMS/ssh" "$SHIMS/gh" "$SHIMS/fzf" "$SHIMS/sleep"
 # ---- 節點夾具 ---------------------------------------------------------------
 # fh-proxy-asus：健康的代送者（up）；fh-l：宣告 power.launch（有 target_ip
 # 與 via），是 2026-09-25 那台的形狀；plainp：沒宣告，down 時無從問起。
+#
+# D6 之後（PR-C）代送方還多了一件事：它必須**宣告 `wol`**，`mlp wake` 才會真的
+# 送封包（沒宣告 → 略過並說明，宣告讀不到 → 一樣略過）。所以這個夾具以前少了一
+# 個形狀——那時 `mlp wake` 根本不需要知道代送方是誰。
+#
+# 少了它，5a 會得到 **0 次** nc 探測而不是 60 次，而且紅的原因看起來像
+# 「cmd_wake 不輪詢了」——其實是「一台都沒試」。這正是 test-wake-via.sh §16.4
+# 說的那件事：宣告讀不到不能當成有資格。所以這裡要補的是**現實的形狀**，
+# 不是放寬 5a 的命題（5a 仍然要求 inconclusive 不叫成功、且輪詢滿 60 次）。
 cat > "$NODES_DIR/fh_proxy_asus.json" <<'JSON'
-{"name":"fh-proxy-asus","role":"provider","gateway_port":2300,"user":"worker"}
+{"name":"fh-proxy-asus","role":"provider","gateway_port":2300,"user":"worker","capabilities":{"worker-host":{"runtime":"docker"},"wol":{"methods":["unicast"]}}}
 JSON
 cp -p "$NODES_DIR/fh_proxy_asus.json" "$NODES_DIR/fh-proxy-asus.json"
 cat > "$NODES_DIR/fh_l.json" <<'JSON'
