@@ -9,7 +9,7 @@ repair 跳板與 `mlp fwd` 已經可以用了，但 `mlp` 自己的說明沒有�
 - `mlp --help` 的 `ls`、`ssh` 兩行說明提到 repair。
 - `docs/REPAIR-HOST.md` 的 `mlp ls` 示範改成真正的輸出（主表裡 `TYPE repair` 的一列），並刪掉「示意／還沒實作」。
 
-另外 16 處建議不在這次範圍內（使用者決定）。
+這次做的是 review 列的三個必修，加上 `REPAIR-HOST.md` 那一處；其餘 15 處建議不在範圍內（使用者決定）。
 
 ## Capabilities
 

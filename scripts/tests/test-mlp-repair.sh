@@ -1495,6 +1495,419 @@ else
     inj_bad "10a-inj. mutant unexpectedly contains 'repair' — injection itself is broken"
 fi
 
+
+# ===========================================================================
+# H（openspec/changes/mlp-help-repair）：說明文字的三個必修點
+#   D1 ssh 與 fwd add 共用同一句；D2 指向 mlp ls 的 TYPE=repair 列而非已廢的
+#   repair section（本檔 :527 擋的就是那個標題）；D3 usage() 的 ls／ssh 兩行。
+#   generic 那行維持最後一行、措辭不變（§1d 與 fwd 的 R5 釘著它），本節只加行。
+#   h_ssh／h_fwd 在同一個行程裡量，H3 比的兩條路因此是同一批 fixture。
+# ===========================================================================
+H_OFFLINE="mom-pc"        # 名牌存在過、但現在沒在線（fixture 的掃描回放裡沒有它）
+H_UNKNOWN="totally-unknown-name"
+
+# h_ssh <mlp檔> <前綴> <gwjson> <名字>：打 do_connect，rc 與 stderr 分開拿。
+h_ssh() {
+    local mf="$1" pfx="$2" gwjson="$3" node="$4"
+    : > "$SANDBOX/$pfx-argv.log"
+    printf '{"name":"fh-l","role":"provider","hops":[{"via":"gateway"}],"power":{"wol":"aa:bb"},"capabilities":["docker"]}\n' > "$SANDBOX/h-nodes.json"
+    printf '[]\n' > "$SANDBOX/h-workers.json"
+    H_RC=0
+    env MLP_FILE="$mf" FAKE_GW_JSON="$gwjson" FAKE_GW_RC=0 \
+        FAKE_NODES_JSON="$SANDBOX/h-nodes.json" FAKE_WORKERS_FILE="$SANDBOX/h-workers.json" \
+        FAKE_REPAIR_SCAN_FILE="$SANDBOX/repair-scan-main.txt" \
+        ARGV_LOG="$SANDBOX/$pfx-argv.log" SCAN_LOG="$SANDBOX/$pfx-scan.log" \
+        GH_LOG="$SANDBOX/$pfx-gh.log" \
+        HOME="$SANDBOX/home" PATH="$SANDBOX/shims:$PATH" \
+        bash -c '
+            source "$MLP_FILE" >/dev/null 2>&1
+            POOL_RESOLVE="'"$SANDBOX"'/shims/pool-resolve"
+            resolve_gateway >/dev/null 2>&1
+            do_connect "$1"
+        ' _ "$node" >/dev/null 2>"$SANDBOX/$pfx-err" || H_RC=$?
+}
+
+# h_fwd <mlp檔> <前綴> <gwjson> <名字>：打 fwd_view_add，同樣的 fixture。
+h_fwd() {
+    local mf="$1" pfx="$2" gwjson="$3" node="$4"
+    : > "$SANDBOX/$pfx-argv.log"
+    H_RC=0
+    env MLP_FILE="$mf" FAKE_GW_JSON="$gwjson" FAKE_GW_RC=0 \
+        FAKE_NODES_JSON="$SANDBOX/h-nodes.json" FAKE_WORKERS_FILE="$SANDBOX/h-workers.json" \
+        FAKE_REPAIR_SCAN_FILE="$SANDBOX/repair-scan-main.txt" \
+        ARGV_LOG="$SANDBOX/$pfx-argv.log" SCAN_LOG="$SANDBOX/$pfx-scan.log" \
+        GH_LOG="$SANDBOX/$pfx-gh.log" \
+        HOME="$SANDBOX/home" PATH="$SANDBOX/shims:$PATH" \
+        bash -c '
+            source "$MLP_FILE" >/dev/null 2>&1
+            POOL_RESOLVE="'"$SANDBOX"'/shims/pool-resolve"
+            FWD_DIR="'"$SANDBOX"'/h-fwd"; mkdir -p "$FWD_DIR"
+            resolve_gateway >/dev/null 2>&1
+            fwd_view_add "$1" "8080"
+        ' _ "$node" >/dev/null 2>"$SANDBOX/$pfx-err" || H_RC=$?
+}
+
+# h_note <err檔>：最後一行之前那一行＝說明行。少於兩行就回空——那正是「沒有說明行」。
+h_note() {
+    local n; n="$(h_lines "$1")"
+    [[ "${n:-0}" -ge 2 ]] || return 0
+    grep '[^[:space:]]' "$1" 2>/dev/null | tail -2 | head -1
+}
+h_last() { grep '[^[:space:]]' "$1" 2>/dev/null | tail -1; }
+h_lines() { grep -c '[^[:space:]]' "$1" 2>/dev/null || true; }
+# 認「只有連得到時才看得到」那句：不看前綴，H1／H2 共用一個認法，措辭改了不會分歧。
+h_has_offline_note() { grep -qiE 'only while|online|powered off' "$1" 2>/dev/null; }
+
+# H1／H2 的判準式本體，斷言與注入對照共用：注入的「牙」就是「拿掉它所斷的東西
+# 之後這一式變 false」，兩邊各寫一份會漂移。h1_why／h2_why 只解釋哪條子句壞了。
+h1_holds() {
+    local rc="$1" err="$2" note last
+    note="$(h_note "$err")"; last="$(h_last "$err")"
+    [[ "$rc" -ne 0 ]] || return 1
+    [[ -n "$note" ]] || return 1
+    [[ "$last" == "mlp: no such node or worker: ${H_OFFLINE}" ]] || return 1
+    printf '%s' "$note" | grep -qiE 'only while|online|powered off' || return 1
+    printf '%s' "$note" | grep -q 'mlp ls' || return 1
+    printf '%s' "$note" | grep -qi 'repair' || return 1
+}
+h1_why() {
+    local rc="$1" err="$2" note last
+    note="$(h_note "$err")"; last="$(h_last "$err")"
+    if [[ "$rc" -eq 0 ]]; then printf '段已設定、名字不在線時應該非零，卻回 0'
+    elif [[ "$last" != "mlp: no such node or worker: ${H_OFFLINE}" ]]; then printf 'generic 必須是最後一行且措辭不變（實際末行 [%s]）' "$last"
+    elif [[ -z "$note" ]]; then printf 'generic 之前沒有說明行（err 只有 [%s]）——使用者分不出『沒這台』與『它只是沒在線』' "$(tr '\n' '|' < "$err")"
+    elif ! printf '%s' "$note" | grep -qiE 'only while|online|powered off'; then printf '說明行沒說出『只在線上時看得到』（[%s]）' "$note"
+    else printf '說明行沒有指向 mlp ls 裡 TYPE 為 repair 的列（[%s]）' "$note"; fi
+}
+h2_holds() {
+    local rc="$1" err="$2" last
+    last="$(h_last "$err")"
+    [[ "$rc" -eq 1 ]] || return 1
+    h_has_offline_note "$err" && return 1
+    grep -qF 'ports.repair' "$err" || return 1
+    [[ "$last" == "mlp: no such node or worker: ${H_UNKNOWN}" ]]
+}
+h2_why() {
+    local rc="$1" err="$2" last
+    last="$(h_last "$err")"
+    if [[ "$rc" -ne 1 ]]; then printf '段未設定時應該維持 notfound 的回 1，卻回 %s' "$rc"
+    elif h_has_offline_note "$err"; then printf '段未設定卻印了『只在線上』的說明（err=[%s]）——沒有段就無從談在不在線' "$(tr '\n' '|' < "$err")"
+    elif ! grep -qF 'ports.repair' "$err"; then printf '段未設定時少了 ports.repair 的警告（1d 釀的那格）'
+    else printf 'generic 不是最後一行（[%s]）' "$last"; fi
+}
+
+# --- H1. 段已設定 + 名字不在線 → 非零、有說明行、generic 仍是最後一行 -------
+echo "── H1. mlp ssh <不在線的 repair 名字>：多一行說明，generic 留最後 ──"
+h_ssh "$MLP_FILE" h1 "$GW_JSON_OK" "$H_OFFLINE"
+if h1_holds "$H_RC" "$SANDBOX/h1-err"; then
+    H1_NOTE="$(h_note "$SANDBOX/h1-err")"
+    ok "H1. 段已設定、名字不在線 → 非零${H_RC}、先印說明行、最後一行仍是 generic"
+else
+    bad "H1. $(h1_why "$H_RC" "$SANDBOX/h1-err")"
+fi
+
+# --- H2. 段未設定 → 不印那行說明（回歸護欄）---------------------------------
+echo "── H2. 段未設定 → 不印 repair 的說明行 ──"
+h_ssh "$MLP_FILE" h2 "$GW_JSON_NOPORTS" "$H_UNKNOWN"
+if h2_holds "$H_RC" "$SANDBOX/h2-err"; then
+    ok "H2. 段未設定 → 不印說明行、照舊印 ports.repair 警告、generic 最後一行"
+else
+    bad "H2. $(h2_why "$H_RC" "$SANDBOX/h2-err")"
+fi
+
+# --- H3. ssh 與 fwd add 的說明行一字不差，而且不含 repair section ----------
+echo "── H3. 兩條路印的說明行必須一字不差，且不含 repair section ──"
+h_fwd "$MLP_FILE" h3f "$GW_JSON_OK" "$H_OFFLINE"
+H3F_NOTE="$(h_note "$SANDBOX/h3f-err")"
+H3F_LAST="$(h_last "$SANDBOX/h3f-err")"
+if [[ -z "$H1_NOTE" && -n "$H3F_NOTE" ]]; then
+    bad "H3. ssh 完全沒印說明行、fwd add 有——兩邊不一致（fwd=[${H3F_NOTE}]）"
+elif [[ -n "$H1_NOTE" && -z "$H3F_NOTE" ]]; then
+    bad "H3. ssh 有說明行、fwd add 沒有——兩邊不一致（ssh=[${H1_NOTE}]）"
+elif [[ -n "$H1_NOTE" && "$H1_NOTE" != "$H3F_NOTE" ]]; then
+    bad "H3. ssh 與 fwd add 印的說明行不一致（ssh=[${H1_NOTE}] fwd=[${H3F_NOTE}]）——D1 要的是同一句"
+elif printf '%s' "$H1_NOTE" | grep -qi 'repair section'; then
+    bad "H3. 說明行仍然叫使用者去看 repair section（[${H1_NOTE}]）——那個分區已經併進主表了"
+elif [[ "$H3F_LAST" != "mlp: no such node or worker: ${H_OFFLINE}" ]]; then
+    bad "H3c. fwd 那邊的 generic 不是最後一行（[${H3F_LAST}]）"
+else
+    ok "H3. ssh 與 fwd add 印出**同一句**說明、都不提 repair section、兩邊 generic 都在最後一行"
+fi
+# --- H4. usage() 的 ls 與 ssh 兩行提到 repair ------------------------------
+echo "── H4. usage() 的 ls / ssh 兩行提到 repair ──"
+usage_out="$(MLP_FILE="$MLP_FILE" HOME="$SANDBOX/home" PATH="$SANDBOX/shims:$PATH" \
+    bash -c 'source "$MLP_FILE" >/dev/null 2>&1; usage' 2>/dev/null)"
+# usage() 的長 entry 會折行，所以抓「一條 entry」＝該行 + 縮排更深的續行；只抓
+# 第一行的話 fwd add 的關鍵字不在第一行，H4a 的正對照就是防這個。
+usage_entry() {
+    local pat="$1" line head cur out="" hit=0
+    while IFS= read -r line; do
+        if [[ $hit -eq 0 ]]; then
+            [[ $line =~ $pat ]] || continue
+            hit=1
+            head="${line%%[^ ]*}"
+        else
+            cur="${line%%[^ ]*}"
+            [[ -n $line && ${#cur} -gt ${#head} ]] || break
+        fi
+        out+="$line "
+    done <<< "$usage_out"
+    printf '%s' "$out"
+}
+u_ls="$(usage_entry '^[[:space:]]+ls[[:space:]]')"
+u_ssh="$(usage_entry '^[[:space:]]+ssh \[name\]')"
+u_fwd="$(usage_entry '^[[:space:]]+fwd add')"
+if [[ -z "$u_ls" || -z "$u_ssh" ]]; then
+    bad "H4a. usage() 抓不到 ls / ssh 兩行（ls=[${u_ls}] ssh=[${u_ssh}]）——harness 抓錯，H4 沒意義"
+else
+    # 正對照：fwd add 那行**今天就**提到 repair。這證明「從 usage 輸出裡挑出
+    # 某一列再看它有沒有某個字」這件事本身是量得到的，不是 grep 永遠回綠。
+    if printf '%s' "$u_fwd" | grep -qi 'repair'; then
+        ok "H4a. 正對照：usage 的 fwd add 那行本來就提到 repair（抽取用法有效）"
+    else
+        bad "H4a. 正對照失敗：連本來就提 repair 的 fwd add 那行都抓不到——抽取用法壞了"
+    fi
+    h4_ls_ok=1; h4_ssh_ok=1
+    printf '%s' "$u_ls"   | grep -qi 'repair' || h4_ls_ok=0
+    printf '%s' "$u_ssh"  | grep -qi 'repair' || h4_ssh_ok=0
+    if [[ "$h4_ls_ok" -eq 1 && "$h4_ssh_ok" -eq 1 ]]; then
+        ok "H4. usage() 的 ls 與 ssh 兩行都提到 repair"
+    else
+        bad "H4. usage() 有漏（ls=[${u_ls}] ssh=[${u_ssh}]）——ls/ssh 是最常被查的兩行，repair 在實際行為裡卻沒寫"
+    fi
+fi
+
+# ===========================================================================
+# H-inj：對照突變。紅燈格做出目標行為要轉綠，綠燈格做壞要轉紅。
+# 錨點只用程式碼形狀（函式名／呼叫點／printf 開頭）＋ assert，不比對註解或整段
+# 文字：實作改註解不該報假警，形狀變了必須大聲壞掉。
+# ===========================================================================
+
+# do_connect 的 notfound 分支有兩個可各自拿掉的東西：說明行（H1）與範圍閘門（H2），
+# 各拿掉一個，對應斷言就必須轉紅。錨點認角色不認位置：generic 往上第一個有意義的
+# 行是不是「會印說明行」（repair_note 呼叫，或舊形狀的內嵌 printf）；角色消失時
+# assert 直接報，不會退化成看起來有效果的空注入。H1-inj 的方向也換成「拿掉」——
+# D1 已把那個形狀送進產品碼，「做出來」會變成空轉。
+INJ_H1="$SANDBOX/mlp-h1-note-removed.sh"
+INJ_H2="$SANDBOX/mlp-h2-gate-removed.sh"
+python3 - "$MLP_FILE" "$INJ_H1" "$INJ_H2" <<'PYH12'
+import re, sys
+
+lines = open(sys.argv[1], encoding="utf-8").read().split("\n")
+
+def meaningful(k):
+    s = lines[k].strip()
+    return bool(s) and not s.startswith("#")
+
+def is_note_emitter(s):
+    """這一行會不會印出 repair 的說明行。認角色，不認縮排、不認整句文字。"""
+    t = s.strip()
+    return bool(re.search(r"\brepair_note\b\s*$", t)) or t.startswith("printf 'note: a repair host")
+
+dies = [k for k, l in enumerate(lines) if l.strip() == 'die "no such node or worker: $1"']
+assert len(dies) == 1, "ssh-generic count=%d" % len(dies)
+j = dies[0]
+note = next((k for k in range(j - 1, -1, -1) if meaningful(k)), None)
+assert note is not None and is_note_emitter(lines[note]), \
+    "nothing above the generic prints the note (line %r)" % (lines[note] if note is not None else None)
+# 說明行必須緊鄰 generic 的上一行，否則拿掉的可能不是 notfound 路徑上那一行。
+between = [k for k in range(note + 1, j) if meaningful(k)]
+assert not between, "something meaningful sits between the note and the generic: %r" % [lines[k] for k in between]
+indent = lines[note][:len(lines[note]) - len(lines[note].lstrip())]
+
+# 突變一：整行拿掉 → H1 轉紅。
+open(sys.argv[2], "w", encoding="utf-8").write("\n".join(lines[:note] + lines[note + 1:]))
+
+# 突變二：拿掉閘門留裸呼叫 → H2 轉紅。已是裸呼叫就是空轉，大聲壞掉。
+assert "repair_range_configured_p" in lines[note], \
+    "line %d is already an unconditional call — this injection would be a no-op" % (note + 1)
+open(sys.argv[3], "w", encoding="utf-8").write(
+    "\n".join(lines[:note] + [indent + "repair_note"] + lines[note + 1:]))
+PYH12
+if [[ $? -ne 0 ]]; then
+    inj_bad "H1-inj/H2-inj. 突變腳本失敗（do_connect 的 notfound 分支形狀變了，或範圍閘門已不存在）——harness 問題"
+fi
+
+# --- H1-inj：拿掉說明行 → H1 必須轉紅 ---------------------------------------
+if [[ ! -s "$INJ_H1" ]]; then
+    inj_bad "H1-inj. 突變副本沒產出——harness 問題"
+elif ! bash -n "$INJ_H1" 2>/dev/null; then
+    inj_bad "H1-inj. 突變版語法錯誤——harness 問題"
+else
+    h_ssh "$INJ_H1" h1i "$GW_JSON_OK" "$H_OFFLINE"
+    # 判準用 **H1 自己那一式**（h1_holds），不是另外寫一句比較：拿掉說明行之後
+    # 它必須變 false。這就是「突變後對應斷言轉紅」的字面版本。
+    if h1_holds "$H_RC" "$SANDBOX/h1i-err"; then
+        inj_bad "H1-inj. 拿掉 do_connect 的說明行之後 H1 的判準式仍然成立——注入沒作用（still holds: $(h1_why "$H_RC" "$SANDBOX/h1i-err")）"
+    else
+        inj_ok "H1-inj. 拿掉說明行之後 H1 的判準式轉 false → H1 會紅（H1 的『有說明行』有牙）"
+    fi
+fi
+
+# --- H2-inj：拿掉範圍閘門 → H2 必須轉紅 -------------------------------------
+if [[ ! -s "$INJ_H2" ]]; then
+    inj_bad "H2-inj. 突變副本沒產出（閘門可能已不存在，這支注入會是空轉）——harness 問題"
+elif ! bash -n "$INJ_H2" 2>/dev/null; then
+    inj_bad "H2-inj. 突變版語法錯誤——harness 問題"
+else
+    h_ssh "$INJ_H2" h2i "$GW_JSON_NOPORTS" "$H_UNKNOWN"
+    # 同樣用 H2 自己那一式（h2_holds）。
+    if h2_holds "$H_RC" "$SANDBOX/h2i-err"; then
+        inj_bad "H2-inj. 拿掉範圍閘門之後 H2 的判準式仍然成立——注入沒作用（still holds: $(h2_why "$H_RC" "$SANDBOX/h2i-err")）"
+    else
+        inj_ok "H2-inj. 拿掉閘門之後 H2 的判準式轉 false → H2 會紅（H2 的『段沒設定就不印』有牙）"
+    fi
+fi
+
+# H3-inj：fwd 換成帶 repair section 的另一句 → H3 的不一致與含 repair section 兩半都要紅。
+INJ_H3="$SANDBOX/mlp-h3-divergent.sh"
+python3 - "$MLP_FILE" "$INJ_H3" <<'PYH3'
+import sys
+lines = open(sys.argv[1], encoding="utf-8").read().split("\n")
+notes = [i for i, l in enumerate(lines) if l.lstrip().startswith("printf 'note: a repair host")]
+assert len(notes) == 1, "note-line count=%d" % len(notes)
+i = notes[0]
+indent = lines[i][:len(lines[i]) - len(lines[i].lstrip())]
+lines[i] = indent + "printf 'note: INJECTED fwd-only wording — check the repair section of \"mlp ls\".\\n' >&2"
+open(sys.argv[2], "w", encoding="utf-8").write("\n".join(lines))
+PYH3
+if [[ $? -ne 0 ]]; then
+    inj_bad "H3-inj. 突變腳本失敗（fwd 的說明行形狀變了）——harness 問題"
+elif ! bash -n "$INJ_H3" 2>/dev/null; then
+    inj_bad "H3-inj. 突變版語法錯誤——harness 問題"
+else
+    h_fwd "$INJ_H3" h3i "$GW_JSON_OK" "$H_OFFLINE"
+    if printf '%s' "$(h_note "$SANDBOX/h3i-err")" | grep -qi 'repair section' \
+       && [[ "$(h_note "$SANDBOX/h3i-err")" != "${H1_NOTE}" ]]; then
+        inj_ok "H3-inj. fwd 換成帶 repair section 的另一句之後 H3 兩半都紅（不一致 ＋ 含 repair section）"
+    else
+        inj_bad "H3-inj. 換掉措辭後 H3 仍綠——H3 的比對抓不到分歧"
+    fi
+fi
+
+# H4-inj：把 usage() 的 ls / ssh 兩行補上 repair → H4 必須轉綠。
+INJ_H4="$SANDBOX/mlp-h4-usage.sh"
+python3 - "$MLP_FILE" "$INJ_H4" <<'PYH4'
+import sys
+lines = open(sys.argv[1], encoding="utf-8").read().split("\n")
+# 錨點只用形狀：usage() 的函式定義 → 它的 heredoc → 裡面以 ls / ssh 開頭的兩行。
+# 不看說明文字，所以 help 改寫不會讓這支注入失效。
+u = [i for i, l in enumerate(lines) if l.startswith("usage() {")]
+assert len(u) == 1, "usage() count=%d" % len(u)
+h = next(i for i in range(u[0], len(lines)) if "<<'EOF'" in lines[i])
+e = next(i for i in range(h + 1, len(lines)) if lines[i].strip() == "EOF")
+hits = 0
+for i in range(h + 1, e):
+    if lines[i].startswith("  ls "):
+        lines[i] = "  ls               list providers/workers and repair hosts with live state"
+        hits += 1
+    elif lines[i].startswith("  ssh [name]"):
+        lines[i] = "  ssh [name]       connect to a node, worker or repair host (menu if name omitted)"
+        hits += 1
+assert hits == 2, "ls/ssh lines inside the usage heredoc: %d" % hits
+open(sys.argv[2], "w", encoding="utf-8").write("\n".join(lines))
+PYH4
+if [[ $? -ne 0 ]]; then
+    inj_bad "H4-inj. 突變腳本失敗（usage 的 ls / ssh 行形狀變了）——harness 問題"
+elif ! bash -n "$INJ_H4" 2>/dev/null; then
+    inj_bad "H4-inj. 突變版語法錯誤——harness 問題"
+else
+    u2="$(MLP_FILE="$INJ_H4" HOME="$SANDBOX/home" PATH="$SANDBOX/shims:$PATH" \
+        bash -c 'source "$MLP_FILE" >/dev/null 2>&1; usage' 2>/dev/null)"
+    n2=0
+    usage_out="$u2"
+    printf '%s' "$(usage_entry '^[[:space:]]+ls[[:space:]]')"    | grep -qi repair && n2=$((n2+1))
+    printf '%s' "$(usage_entry '^[[:space:]]+ssh \[name\]')" | grep -qi repair && n2=$((n2+1))
+    if [[ "$n2" -eq 2 ]]; then
+        inj_ok "H4-inj. usage 的 ls / ssh 補上 repair 之後 H4 的兩格都成立——H4 的紅是真的"
+    else
+        inj_bad "H4-inj. 補上 repair 之後只成立 ${n2}/2 格——H4 的量法抓不全"
+    fi
+fi
+
+
+# --- H5. 文件護欄（D4）：REPAIR-HOST.md 的示範必須是合併後的表 --------------
+#   判準寫成吃檔名的函式，實檔與突變副本走同一套。
+echo "── H5. REPAIR-HOST.md 的示範：沒有 repair: 分區、有真的表頭與 repair 列 ──"
+DOC_REL="docs/REPAIR-HOST.md"
+DOC="$REPO_ROOT/$DOC_REL"
+
+# 判準一：整份文件沒有任何一行「恰好是」repair:。用 -qxF（整行）不是 -F（字串）：
+# 敘述裡會提到那個舊格式，要擋的是又把它畫回來。跟本檔 :527 同一個形狀。
+doc_no_repair_header() { ! grep -qxF 'repair:' "$1" 2>/dev/null; }
+
+# 判準二：某個 ``` block 裡同時有 NAME 開頭的表頭與一列 TYPE=repair，且必須是同一個
+# block——分屬兩個 block 就不叫一份示範輸出。
+doc_ls_sample_ok() {
+    awk '
+        /^```/ { if (inb && nh && rr) found=1; nh=0; rr=0; inb=!inb; next }
+        inb {
+            if ($0 ~ /^NAME[[:space:]]/ && $0 ~ /TYPE/) nh=1
+            if ($0 ~ /^[^[:space:]]+[[:space:]]+repair([[:space:]]|$)/) rr=1
+        }
+        END { if (inb && nh && rr) found=1; exit(found ? 0 : 1) }
+    ' "$1" 2>/dev/null
+}
+
+if [[ ! -r "$DOC" ]]; then
+    bad "H5. 讀不到 ${DOC_REL}——harness 問題（不是產品或文件的問題）"
+elif ! doc_no_repair_header "$DOC"; then
+    bad "H5a. 文件第 $(grep -nxF 'repair:' "$DOC" | head -1 | cut -d: -f1) 行恰好是 'repair:'——那是本檔 :527 擋掉的舊分區格式，ls 已經併進主表了"
+elif ! doc_ls_sample_ok "$DOC"; then
+    bad "H5b. 文件示範的 mlp ls 輸出沒有同時具備『NAME 開頭的表頭』與『一列 TYPE 為 repair 的資料列』——讀者照抄會得到一個不存在的畫面"
+else
+    ok "H5. REPAIR-HOST.md 沒有 repair: 分區標題，示範輸出有 NAME 表頭與一列 TYPE=repair"
+fi
+
+# H5-inj：把舊格式加回副本（插在唯一的 NAME…TYPE 表頭之前，那正是舊格式的位置）
+# → 判準一必須轉紅。
+INJ_H5="$SANDBOX/REPAIR-HOST-h5a.md"
+python3 - "$DOC" "$INJ_H5" <<'PYH5'
+import sys
+lines = open(sys.argv[1], encoding="utf-8").read().split("\n")
+hits = [i for i, l in enumerate(lines) if l.startswith("NAME") and "TYPE" in l]
+assert len(hits) == 1, "NAME-header hits=%d" % len(hits)
+lines.insert(hits[0], "repair:")
+open(sys.argv[2], "w", encoding="utf-8").write("\n".join(lines))
+PYH5
+if [[ $? -ne 0 ]]; then
+    inj_bad "H5-inj. 突變腳本失敗（文件的 NAME 表頭不是一處／形狀變了）——harness 問題"
+elif [[ ! -r "$INJ_H5" ]]; then
+    inj_bad "H5-inj. 突變副本沒產出——harness 問題"
+elif ! grep -qxF 'repair:' "$INJ_H5"; then
+    inj_bad "H5-inj. 突變副本裡沒有那一行 repair:——harness 問題"
+elif doc_no_repair_header "$INJ_H5"; then
+    inj_bad "H5-inj. 把舊分區標題加回去之後判準一仍綠——這條護rail等於沒有牙"
+else
+    inj_ok "H5-inj. 副本加回 repair: 那行之後判準一轉紅——文件護欄有牙"
+fi
+
+# H5-inj2：拿掉 repair 那一列 → 判準二必須轉紅。判準二今天是綠的，沒這條就沒人
+# 知道它會不會紅；兩半都要有牙。
+INJ_H5B="$SANDBOX/REPAIR-HOST-h5b.md"
+python3 - "$DOC" "$INJ_H5B" <<'PYH5B'
+import sys, re
+lines = open(sys.argv[1], encoding="utf-8").read().split("\n")
+# 只在含 NAME…TYPE 表頭的那個 block 裡找，跟判準二同範圍；全檔掃會誤中中文敘述。
+hdr = [i for i, l in enumerate(lines) if l.startswith("NAME") and "TYPE" in l]
+assert len(hdr) == 1, "NAME-header hits=%d" % len(hdr)
+b = next(i for i in range(hdr[0] - 1, -1, -1) if lines[i].startswith("```"))
+e = next(i for i in range(hdr[0] + 1, len(lines)) if lines[i].startswith("```"))
+rows = [i for i in range(b + 1, e) if re.match(r"^\S+\s+repair(\s|$)", lines[i])]
+assert len(rows) == 1, "repair-row hits=%d" % len(rows)
+del lines[rows[0]]
+open(sys.argv[2], "w", encoding="utf-8").write("\n".join(lines))
+PYH5B
+if [[ $? -ne 0 ]]; then
+    inj_bad "H5-inj2. 突變腳本失敗（文件裡 TYPE=repair 的列不是一處／形狀變了）——harness 問題"
+elif [[ ! -r "$INJ_H5B" ]]; then
+    inj_bad "H5-inj2. 突變副本沒產出——harness 問題"
+elif doc_ls_sample_ok "$INJ_H5B"; then
+    inj_bad "H5-inj2. 拿掉 repair 資料列之後判準二仍綠——表頭還在就過，判準太鬆"
+else
+    inj_ok "H5-inj2. 副本拿掉那列 TYPE=repair 之後判準二轉紅——判準二有牙"
+fi
+
 echo
 echo "passed ${pass} / failed ${fail} / injection-pass ${injpass} / injection-fail ${injfail}"
 [[ "$fail" -eq 0 && "$injfail" -eq 0 ]]

@@ -12,7 +12,7 @@
 ## Goals / Non-Goals
 
 **Goals：** 上面四處跟實際行為一致。
-**Non-Goals：** 盤點出的其他 16 處建議（使用者決定）。
+**Non-Goals：** 盤點出的其餘 15 處建議（使用者決定）。
 
 ## Decisions
 
