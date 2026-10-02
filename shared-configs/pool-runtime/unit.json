@@ -1,7 +1,12 @@
 {
   "name": "pool-runtime",
-  "description": "pool-resolve/pool-tunnel/pool-wol/pool-status/pool-port-alloc + the pool-tunnel systemd user unit",
+  "description": "pool-resolve/pool-tunnel/pool-status/pool-port-alloc + the pool-tunnel systemd user unit",
   "needs_key": false,
   "needs_root": false,
-  "provides": ["pool-resolve", "pool-tunnel", "pool-wol", "pool-status", "pool-port-alloc"]
+  "provides": [
+    "pool-resolve",
+    "pool-tunnel",
+    "pool-status",
+    "pool-port-alloc"
+  ]
 }

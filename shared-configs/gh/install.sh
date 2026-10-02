@@ -56,7 +56,55 @@ check_installed() {
     command -v gh >/dev/null 2>&1
 }
 
+# --- github 能力（D2／D5）-------------------------------------------------
+# --check 的回傳碼是「能力成立嗎」：0 成立、1 確定不成立、2 無法確認。token 走
+# pool-sync 的 ~/.mylinuxpool/gh_token 慣例——宣告要能驗證同一份憑證。
+cap_check() {
+    local token
+    token="$(cat "$TOKEN_FILE" 2>/dev/null)" || token=""
+    [ -n "$token" ] || token="${GH_TOKEN:-${GITHUB_TOKEN:-}}"
+    # 沒有憑證就確定讀不到（私有庫），不是「無法確認」。
+    if [ -z "$token" ]; then
+        log INFO "github: 沒有憑證（${TOKEN_FILE}）—— 能力不成立"
+        return 1
+    fi
+    local rc=0 repo out code one
+    while IFS= read -r repo; do
+        [ -n "$repo" ] || continue
+        # --include 讓失敗時也有狀態碼可讀；比對訊息文字是退而求其次（403 與
+        # rate limit 共用同一個狀態碼，文字反而分得開，見下面的 case）。
+        out="$(GH_TOKEN="$token" gh api --include "repos/${repo}" --jq .full_name 2>&1)"
+        if [ $? -eq 0 ]; then
+            log INFO "github: ${repo} 可讀"
+            continue
+        fi
+        code="$(printf '%s\n' "$out" | grep -oE '^HTTP/[0-9.]+ [0-9]{3}' | tail -1 | grep -oE '[0-9]{3}$')"
+        one=2
+        case "$code" in
+            401|403|404) one=1 ;;
+            2*)          one=0 ;;
+        esac
+        if [ -z "$code" ]; then
+            # 拿不到狀態碼（舊版 gh、或輸出被改寫）才比對文字。403 有兩種意思：
+            # 無權存取、以及被 rate limit——限流時回 1 會讓 github 從三台機器
+            # 的宣告裡同時消失，那正是三態要防的事。
+            case "$out" in
+                *"rate limit"*|*"Rate limit"*|*"secondary rate"*) one=2 ;;
+                *403*|*"Resource not accessible"*|*"Not Found"*|*404*) one=1 ;;
+            esac
+        fi
+        # 1 一旦出現就不被 2 蓋掉：已經確定有一個庫讀不到，2 的「保留」不該救它。
+        [ "$one" -eq 1 ] && rc=1 || { [ "$rc" -eq 0 ] && rc="$one"; }
+        log INFO "github: ${repo} → ${one}（code=${code:-none} ${out}）"
+    done < <(jq -r '(.repos // {}) | keys_unsorted[]' <<< "${MLP_CAPABILITY_PARAMS:-{\}}" 2>/dev/null)
+    return "$rc"
+}
+
 if [[ "$CHECK_ONLY" -eq 1 ]]; then
+    if [ -n "${MLP_CAPABILITY_PARAMS+x}" ]; then
+        cap_check
+        exit "$?"
+    fi
     if check_installed; then
         log INFO "gh already installed"
         exit 0

@@ -28,7 +28,13 @@ BINARIES="$(sed -n 's/^BINARIES="\(.*\)"$/\1/p' "$INSTALL_SH" | head -1)"
 LIBS="$(sed -n 's/^LIBS="\(.*\)"$/\1/p' "$INSTALL_SH" | head -1)"
 [ -n "$BINARIES" ] || { echo "ERROR: could not read BINARIES from $INSTALL_SH" >&2; exit 1; }
 [ -n "$LIBS" ] || { echo "ERROR: could not read LIBS from $INSTALL_SH" >&2; exit 1; }
-UNITS="pool-tunnel.service pool-sync.service pool-sync.timer"
+UNITS="$(sed -n 's/^UNITS="\(.*\)"$/\1/p' "$INSTALL_SH" | head -1)"
+[ -n "$UNITS" ] || { echo "ERROR: could not read UNITS from $INSTALL_SH" >&2; exit 1; }
+# 預期數量由上面的清單算出來，不寫死：wol 單位從 pool-runtime 拆走之後
+# bin/ 的檔案數本來就會少一支，寫死的數字會在設計變更時紅，卻與本檔要守的
+# 「安裝內容與宣告一致」無關。
+EXPECTED_FILES=$(( $(printf '%s\n' $BINARIES $LIBS | wc -l | tr -d ' ') ))
+EXPECTED_UNITS=$(printf '%s\n' $UNITS | wc -l | tr -d ' ')
 
 SANDBOX="$(mktemp -d "${TMPDIR:-/tmp}/test-install-check.XXXXXX")"
 trap 'rm -rf "$SANDBOX"' EXIT INT TERM
@@ -110,7 +116,7 @@ for f in $BINARIES $UNITS; do
     [[ -f "${FILES_DIR}/${f}" ]] || missing="${missing} ${f}"
 done
 if [[ -z "$missing" ]]; then
-    ok_line "files/ 內有 7 支 bin + 3 個 unit 來源檔"
+    ok_line "files/ 內有 ${EXPECTED_FILES} 支 bin + ${EXPECTED_UNITS} 個 unit 來源檔（數量由 install.sh 的清單算出）"
 else
     fail_line "files/ 缺少來源檔：${missing}"
 fi
@@ -202,8 +208,11 @@ if fresh_installed_home "$H6"; then
     else
         fail_line "bin/tunnel-identity.sh 未安裝——pool-tunnel/pool-status/pool-sync 會 source 失敗，機器失去隧道"
     fi
-    if [[ "$inst_count" -eq 7 ]]; then ok_line "bin/ 恰好 7 支檔案"
-    else fail_line "bin/ 應該恰好 7 支，實際 ${inst_count} 支"; fi
+    if [[ "$inst_count" -eq "$EXPECTED_FILES" ]]; then
+        ok_line "bin/ 恰好 ${EXPECTED_FILES} 支檔案（與 install.sh 宣告的清單一致）"
+    else
+        fail_line "bin/ 應該恰好 ${EXPECTED_FILES} 支，實際 ${inst_count} 支"
+    fi
 
     m=0
     for f in $UNITS; do
@@ -215,8 +224,11 @@ if fresh_installed_home "$H6"; then
         fi
     done
     unit_count="$(ls -A "$H6/.config/systemd/user" 2>/dev/null | wc -l | tr -d ' ')"
-    if [[ "$unit_count" -eq 3 ]]; then ok_line "unit 目錄恰好 3 個檔案"
-    else fail_line "unit 目錄應該恰好 3 個，實際 ${unit_count} 個"; fi
+    if [[ "$unit_count" -eq "$EXPECTED_UNITS" ]]; then
+        ok_line "unit 目錄恰好 ${EXPECTED_UNITS} 個檔案（與 install.sh 宣告的清單一致）"
+    else
+        fail_line "unit 目錄應該恰好 ${EXPECTED_UNITS} 個，實際 ${unit_count} 個"
+    fi
 else
     fail_line "安裝失敗，無法驗證 6+3 的安裝內容"
 fi

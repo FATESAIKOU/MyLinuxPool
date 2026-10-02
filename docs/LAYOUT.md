@@ -93,7 +93,8 @@ install.sh [--key <FILE_CRYPTO_KEY>] [--home <dir>] [--user <name>] [--check]
 
 | unit | 內容 | needs_root |
 |---|---|---|
-| `pool-runtime` | `pool-resolve` `pool-tunnel` `pool-wol` `pool-status` `pool-port-alloc` `pool-sync` + 3 個 systemd unit（`pool-tunnel.service`、`pool-sync.service`、`pool-sync.timer`） | false |
+| `pool-runtime` | `pool-resolve` `pool-tunnel` `pool-status` `pool-port-alloc` `pool-sync` + 3 個 systemd unit（`pool-tunnel.service`、`pool-sync.service`、`pool-sync.timer`） | false |
+| `wol` | `pool-wol`（D7：從 `pool-runtime` 拆出來，自帶 `wol` 能力的判準） | false |
 | `rclone` | rclone 本體 + `rclone.conf.crypted` | true |
 | `gh` | gh 本體 + token 檔 + git credential helper | true |
 | `dotfiles` | `.bashrc` `.vimrc` `.tmux.conf` | false |

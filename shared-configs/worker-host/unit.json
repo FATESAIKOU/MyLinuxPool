@@ -1,0 +1,8 @@
+{
+  "name": "worker-host",
+  "description": "worker-host 能力：以宣告的使用者身分驗證 docker 可用",
+  "needs_key": false,
+  "needs_root": false,
+  "provides": [],
+  "capability": "worker-host"
+}
