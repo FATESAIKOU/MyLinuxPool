@@ -7,32 +7,51 @@
   - `via` 保留當叫醒順序，`wol` 只代表資格
   - 鍵名 `wol`，形狀 `{"methods":["unicast"]}`
   - fh-l 也宣告 `github`
+  - 驗證無法確認時保留原值
+  - 分三個 PR
   - 註解要少
-  - 做到 PR，等使用者看過再 merge
-- [x] 0.2 唯讀調查：`team/OUT-recon-capability.md`、`team/OUT-impl-recon-myaientry-caps.md`、`team/OUT-test-recon-capability-tests.md`
-- [x] 0.3 通知 MyAiEntry#4（這一輪要變的部分與要對方確認的事）
-- [ ] 0.4 唯讀：`mlp verify-capabilities fh-proxy`。no-sudo 那台的 `worker-host` 驗證過不過，要在實作前知道
+  - 每個 PR 都等使用者看過再 merge
+- [x] 0.2 唯讀調查：`team/OUT-recon-capability.md`、`team/OUT-impl-recon-myaientry-caps.md`、`team/OUT-test-recon-capability-tests.md`、`team/OUT-impl-recon-selecthost-online.md`
+- [x] 0.3 通知 MyAiEntry#4
+- [x] 0.4 唯讀實測（2026-10-02）：
+  - `mlp verify-capabilities --all`：fh-proxy（no-sudo）與 fh-proxy-asus 的 `worker-host` 都 ok；fh-l 關機
+  - 兩台的 systemd user manager 都已經有 docker 群組
+- [x] 0.5 propose 審查：`team/OUT-review-capability-proposal.md`，修訂已併入 design 與 spec
 
-## 1. 紅燈測試
+## 1. PR-A：單位與 runner
 
-- [ ] 1.1 契約測試：每個帶 `capability` 的單位都有 `install.sh --check`；每個鍵只由一個單位實作；值的形狀；preflight 會擋重複的鍵
-- [ ] 1.2 runner：`capability_plan`、`capability_check`、`capability_declaration`。參數經環境變數傳入；check 失敗的能力不進宣告
-- [ ] 1.3 pool-sync：宣告已一致時零寫入（附正對照）；能力壞掉時拿掉；恢復時加回；只 merge `capabilities` 欄位
-- [ ] 1.4 register-provider：check 失敗時註冊失敗，而且訊息指出是哪個能力
-- [ ] 1.5 create-worker：照 profile 寫入，沒有就寫 `{}`
-- [ ] 1.6 `mlp wake`：只試宣告了 `wol` 的代送方，並說明略過原因
-- [ ] 1.7 `mlp verify-capabilities`：改用 runner，對現有宣告的輸出不退化
+- [ ] 1.1 紅燈：契約測試。至少要涵蓋 `worker-host`、`github`、`wol` 三個鍵各由一個單位實作；preflight 會擋重複的鍵、沒有單位的鍵、不是 object 的值；`shared-configs/wol/files/pool-wol` 與 `pool-runtime` 舊版逐位元組相同，而且 `pool-runtime` 已經不裝它
+- [ ] 1.2 紅燈：runner 的三態與參數傳遞（`MLP_CAPABILITY_PARAMS`）。`capability_declaration` 遇到 0、1、2 的組合要算對
+- [ ] 1.3 紅燈：各單位的 `--check` 判準（D5），用假的 `docker`、`gh`、`id`、`getent`
+- [ ] 1.4 實作 D1、D2、D3、D5、D7、preflight
+- [ ] 1.5 review、閘門、PR-A
 
-## 2. 實作
+## 2. PR-B：自動宣告
 
-- [ ] 2.1 D1–D7
+- [ ] 2.1 紅燈：pool-sync 的宣告路徑
+  - 已經一致時零寫入，要附正對照
+  - 結果 1 就拿掉、2 就保留、恢復就加回
+  - 只 merge `capabilities`
+  - `needs_root` 的單位照樣驗證但不安裝
+  - 宣告失敗不影響 tick
+- [ ] 2.2 紅燈：register-provider
+  - 結果不是 0 就失敗，並且指名是哪個能力
+  - 全部通過就寫入 runner 的宣告
+  - 不再補 `worker-host` 預設
+- [ ] 2.3 紅燈：`mlp verify-capabilities` 改用 runner，現有的三態輸出與回傳碼不退化；新鍵不用改 mlp 就能報 pass
+- [ ] 2.4 紅燈：create-worker 照 profile 寫入，沒有就寫 `{}`
+- [ ] 2.5 實作 D4、D8，provider profile 加 `capabilities`
+- [ ] 2.6 review、閘門、PR-B
+- [ ] 2.7 merge 後真機驗收：三台收斂成預期的宣告；停掉一台的 docker 再恢復，宣告會跟著消失、出現
 
-## 3. 驗收
+## 3. PR-C：wake 與文件
 
-- [ ] 3.1 review：獨立驗收
-- [ ] 3.2 PM 閘門、PR
-- [ ] 3.3 merge 後真機驗收：
-  - 三台的宣告收斂成預期值
+- [ ] 3.1 紅燈：`mlp wake` 只試宣告了 `wol` 的代送方，被略過的也佔序號；沒有任何一台有資格時明確失敗；`verify-capabilities` 會回報 `via` 裡沒宣告 `wol` 的機器
+- [ ] 3.2 實作 D6
+- [ ] 3.3 改寫 `docs/CAPABILITY-DESIGN.md`，清理 `docs/ARCHITECTURE.md:138-145`
+- [ ] 3.4 review、閘門、PR-C
+- [ ] 3.5 merge 後：
   - `mlp wake fh-l` 照常能用
-  - 能力壞掉再恢復時，宣告跟著消失、出現
   - 刪掉 `NODE_FH_PROXY.wol_sender`（執行前再跟使用者確認）
+  - 更新 MyAiEntry#4
+  - archive

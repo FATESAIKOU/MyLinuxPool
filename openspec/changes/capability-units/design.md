@@ -1,72 +1,116 @@
 ## Context
 
-調查報告在 `team/OUT-recon-capability.md`（程式碼）、`team/OUT-impl-recon-myaientry-caps.md`（MyAiEntry）、`team/OUT-test-recon-capability-tests.md`（測試）。重點：
+調查報告：`team/OUT-recon-capability.md`（程式碼）、`team/OUT-impl-recon-myaientry-caps.md`（MyAiEntry）、`team/OUT-test-recon-capability-tests.md`（測試）。審查報告：`team/OUT-review-capability-proposal.md`。重點：
 
-- 形狀契約（`key: object`，空能力寫 `{}`，`null` 永遠不合法）、兩個驗證器（`worker-host` 與 `github`）、遷移器都已經存在，三台的 live var 也已經是新形狀（`docs/CAPABILITY-DESIGN.md`）。
-- 能力鍵寫死在五處：`mlp` 兩處、`register-provider.sh` 兩處、`scripts/lib/profile.sh` 一處。驗證的分派點是 `mlp` 裡一個寫死的 `case`。
-- `unit.json` 的 `provides` 寫的是**指令名稱**（例如 pool-runtime 寫 `pool-wol`、`pool-tunnel`），而且沒有任何程式讀它。
-- pool-sync 只收斂「不需金鑰、不需 root」的單位，實際上只有 `pool-runtime`。
-- `pool-wol` 由 `pool-runtime` 裝到每台 provider，**也裝在 Gateway**。
-- `POOL_WORKERS` 的三筆都沒有 `capabilities` 欄位，也沒有任何 backfill。
-- MyAiEntry 只用 `parseCapabilities()` 這一個地方解析能力，未知的鍵原樣保留；它實際只檢查 `worker-host` 與 `github`；不讀 `POOL_WORKERS[].capabilities`；`via` 一不見就會丟掉整個 `launch`。
-- CI 只跑 `scripts/tests/`，`shared-configs/*/tests/` 從來沒被 CI 跑過（已補進 issue #13）。
+- 已經有的：形狀契約（`key: object`，空能力寫 `{}`，`null` 永遠不合法）、兩個驗證器（`worker-host`、`github`）、遷移器。三台的 live var 也已經是新形狀（`docs/CAPABILITY-DESIGN.md`）。
+- 能力鍵寫死在五處：`mlp` 兩處、`register-provider.sh` 兩處、`scripts/lib/profile.sh` 一處。驗證的分派點是 `mlp` 的 `cap_verify_node` 和 `register-provider.sh` 的 `step7_5_capabilities`，兩個都是寫死的 `case`。
+- `unit.json` 的 `provides` 寫的是**指令名稱**，沒有任何程式讀它。
+- pool-sync 的收斂迴圈會跳過需要金鑰或 root 的單位，`--check` 沒過就重裝，重裝失敗就 `exit 1`（`pool-sync:148-196`）。pool-sync 已經會用 provider 自己的 `gh_token` 寫 `NODE_*`（`tunnel_key_ensure_published`）。
+- `pool-runtime` 的 `--check` 是逐位元組比對檔案（`cmp -s`），沒有任何清理邏輯。`pool-wol` 是它的比對項之一，裝在每台 provider，也裝在 Gateway。
+- `register-provider.sh:528` 在 `capabilities` 缺值時補 `worker-host`，之後永遠不覆寫。
+- `POOL_WORKERS` 的三筆都沒有 `capabilities`。
+- MyAiEntry：未知的能力鍵原樣保留；能力名稱直接顯示在承載機說明裡（`poolSnapshot.ts:243-244`）；挑 `github` 機器時不看在不在線（`team/OUT-impl-recon-selecthost-online.md`）。
+- CI 只跑 `scripts/tests/`，`shared-configs/*/tests/` 沒被 CI 跑過（issue #13）。
+- 實測（2026-10-02，唯讀）：fh-proxy 與 fh-proxy-asus 上，systemd user manager 的 groups 已經含 docker 的 gid，所以 pool-sync 跑 `docker info` 看得到 docker 群組。
 
 ## Goals / Non-Goals
 
 **Goals：**
-- 新增一個能力只要新增一個單位，再在 profile 列出它
-- provider 的宣告永遠跟驗證結果一致
+- 新增一個能力，只要新增一個單位，再在 profile 列出它
+- provider 的宣告跟驗證結果一致；暫時驗不到時不抖動
 - worker 的宣告就是它的 profile
 
 **Non-Goals：**
-- 拿掉 `power.launch.via`（使用者決定保留它當叫醒順序）
-- 回頭補寫現有 worker 的 `capabilities`：現有容器重建時才會補上
-- `github` 的 `write`、`trigger-actions` 這些權限（沒有驗證方式，照設計不得使用）
+- 拿掉 `power.launch.via`
+- 回頭補寫現有 worker 的 `capabilities`
+- `github` 的 `write`、`trigger-actions` 權限
+- 改 `mlp migrate-capabilities`：它是一次性的遷移工具，pool-sync 接手宣告之後就不需要再跑，維持原樣
 
 ## Decisions
 
-**D1. 能力用一個新欄位 `capability` 對應到單位，不重新定義 `provides`。**
-`unit.json` 新增 `"capability": "<鍵>"`。`provides` 照舊列指令名稱，兩者意思不同，不要混在一起。preflight 檢查每個鍵只由一個單位實作。
+**D1. 新欄位 `capability`，不重用 `provides`。**
+`unit.json` 加上 `"capability": "<鍵>"`，`provides` 不變。preflight 要擋三件事：
+- 兩個單位實作同一個鍵
+- profile 的 `capabilities` 裡有沒有單位實作的鍵
+- 值不是 object
 
-**D2. `--check` 的介面：參數以 JSON 經環境變數傳入。**
-單位的 `install.sh --check` 從 `MLP_CAPABILITY_PARAMS` 讀 JSON 參數，例如 `{"repos":{...}}`。回傳 0 代表能力成立。有能力的單位，`--check` 的語意就是「能力成立」，不再只是「檔案是不是最新的」；需要比對內容的單位，兩件事都要檢查。
+**D2. `--check` 分三態，參數從 `MLP_CAPABILITY_PARAMS` 傳入。**
+有 `capability` 的單位，`install.sh --check` 從 `MLP_CAPABILITY_PARAMS` 讀 JSON 參數，回傳值的意思是：
+- `0`：能力成立
+- `1`：確定不成立
+- `2`：這次無法確認，例如網路逾時、群組變更還沒在這個 session 生效
+
+沒有 `capability` 的單位，`--check` 的語意不變（檔案是否最新）。
 
 **D3. 共用 runner：`scripts/lib/capability.sh`。**
-對外只有三個函式：
-- `capability_plan <profile.json>`：從 profile 列出 `{鍵 → 單位、參數}`
-- `capability_check <鍵> <參數>`：找到單位並跑它的 `--check`
-- `capability_declaration <profile.json>`：對每個能力跑 check，組出宣告 JSON
+- `capability_plan <profile.json>`：列出 profile 裡的每個能力，以及它的單位和參數。profile `capabilities` 的值**就是**參數本身，單位每次都從 `shared-configs/*/unit.json` 現場查，不建快取。
+- `capability_check <鍵> <參數>`：跑單位的 `--check`，回傳 0、1 或 2。
+- `capability_declaration <profile.json> <現有宣告>`：組出新的宣告。
+  - 0 的能力：放進宣告，值是 profile 的參數。
+  - 1 的能力：不放。
+  - 2 的能力：保留現有宣告裡的值；現有宣告裡沒有的話就不加。
 
-pool-sync、register-provider、`mlp verify-capabilities`、create-worker 都只呼叫這三個。
+pool-sync、register-provider、`mlp verify-capabilities` 只呼叫這三個函式，create-worker 只用 `capability_plan`。`mlp` 是從使用者電腦對遠端機器驗證，所以要在那台機器上跑**同一份**單位的 `--check`。具體怎麼送過去由 impl 決定，只有一條要求：不能另外寫一份驗證邏輯。
 
-**D4. pool-sync 的寫入照 `tunnel-key.sh` 的做法。**
-讀出 `NODE_<NAME>`，只 merge `capabilities` 欄位，內容相同就不寫。寫入失敗只警告，不讓 tick 失敗。
+**D4. pool-sync 的宣告是一條獨立的路徑，永遠不安裝。**
+收斂迴圈完全不動。收斂結束後另外跑一段：
+1. 對 profile 的每個能力呼叫 `capability_check`，不管單位要不要金鑰或 root、有沒有列在 `shared_config` 裡。
+2. 用 `capability_declaration` 組出宣告。
+3. 把它跟 `NODE_<NAME>.capabilities` 用 `jq -S` 正規化之後比對，不同才 merge 這一個欄位（照 `tunnel-key.sh` 的寫法）。
 
-**D5. 單位分工。**
+宣告這一段發生任何失敗都只記 WARN，不讓 tick 失敗，也不影響收斂、authorized_keys、隧道金鑰。結果是 1 的能力記 WARN，是 2 的能力記 INFO。
 
-| 單位 | 能力 | 誰安裝 | 參數 |
-|---|---|---|---|
-| `worker-host`（新） | `worker-host` | register-provider（要 root） | `{"runtime":"docker"}` |
-| `gh` | `github` | register-provider（要 root） | `{"repos":{"FATESAIKOU/MyBrain":["read"]}}` |
-| `wol`（新，從 `pool-runtime` 拆出 `pool-wol`） | `wol` | pool-sync（不要金鑰、不要 root） | `{"methods":["unicast"]}` |
+**D5. 單位與 `--check` 的判準。**
 
-provider 的 `default` 與 `no-sudo` 兩個 profile 都列這三個能力；Gateway 的 profile 不列 `wol` 單位。
+| 單位 | 能力 | 誰安裝 | 參數 | `--check` |
+|---|---|---|---|---|
+| `worker-host`（新） | `worker-host` | register-provider | `{"runtime":"docker"}` | 以宣告的使用者身分跑 `docker info`，成功回 0。失敗的話：如果 `/etc/group` 的 docker 群組有這個使用者，但目前這個 process 的群組沒有 docker 的 gid，回 2；其他情況回 1。`runtime` 不是 `docker` 回 1 |
+| `gh` | `github` | register-provider | `{"repos":{"FATESAIKOU/MyBrain":["read"]}}` | **改寫**：對參數裡的每個 repo，用 `gh_token` 打一次 API 驗證權限。拒絕存取回 1；網路錯誤或 5xx 回 2 |
+| `wol`（新） | `wol` | pool-sync | `{"methods":["unicast"]}` | `~/.mylinuxpool/bin/pool-wol` 存在、可執行，並且支援參數列的每個 method。**不送封包**，因為 `pool-wol` 回 0 只代表封包送出去了 |
+
+provider 的 `default` 與 `no-sudo` 兩個 profile 都列這三個能力；Gateway 的 profile 不列 `wol`。
 
 **D6. `mlp wake`：`via` 決定順序，`wol` 決定資格。**
-依 `via` 的順序，只嘗試宣告了 `wol` 的代送方。跳過的那一台照 `WAKE-VIA-DESIGN.md` 的輸出格式印出原因。四態與時間預算的邏輯都不動。
+照 `via` 的順序走，沒宣告 `wol` 的那台直接略過，並印出原因，例如「via 裡有它，但它沒有宣告 wol」。略過的那台**照樣佔一個 `(n/m)` 的序號**。四態與時間預算都不動。如果 `via` 裡沒有任何一台宣告 `wol`，就明確報錯，不能靜靜結束。另外，`mlp verify-capabilities` 遇到 `via` 指向沒宣告 `wol` 的機器時，平常就要報出來。
 
-**D7. 拆掉 `pool-wol` 時的相容。**
-過渡期間，有些 provider 的 pool-runtime 還是舊的，`pool-wol` 會同時存在兩處。新的 `wol` 單位要裝到同一個路徑（`~/.mylinuxpool/bin/pool-wol`），這樣兩者共存也不衝突；舊版 pool-runtime 收斂到新版之後，就不再裝 `pool-wol` 了。
+**D7. `pool-wol` 移出 `pool-runtime`，同一個 PR 做完。**
+- 用 `git mv` 移到 `shared-configs/wol/files/pool-wol`，內容一個位元組都不改。
+- 同時從 `pool-runtime/install.sh` 的 `BINARIES` 和 `cp`／`chmod` 清單拿掉它。
+- provider 的 `default` 與 `no-sudo` 兩個 profile 的 `shared_config` 加上 `wol`，讓 pool-sync 的收斂迴圈接手安裝，`mlp wake` 才不會有空窗。Gateway 的 profile 不加。Gateway 上已經裝好的 `pool-wol` 會留著不動，因為沒有清理邏輯，而且也沒有人會從 Gateway 送 wol。
+
+舊版 pool-runtime 的 `--check` 是 `cmp -s`。只要兩份檔案不一樣，舊版就會把新單位裝的檔案蓋回去，而且每 30 分鐘一次。所以測試要斷言兩份檔案逐位元組相同。
+
+**D8. register-provider 照 runner 的結果寫宣告。**
+拿掉 `:528` 那個「缺值才補 `worker-host`」的預設。註冊時對每個能力跑 `capability_check`：
+- 任何一個不是 0，註冊就失敗，並指出是哪個能力，以及它是不成立還是無法確認。
+- 全部是 0，就把 `capability_declaration` 的結果寫進 `NODE_<NAME>.capabilities`。
+
+這樣 register-provider 和 pool-sync 寫的是同一個函式算出來的值，不會互相打架。
+
+**D9. 程式註解要少。** 理由寫在這份文件和 commit 裡。
 
 ## Risks / Trade-offs
 
-- [`--check` 不穩，宣告就會來回跳，而 MyAiEntry 是照宣告挑機器的] → 驗證要做成可重現、不依賴網路短暫狀態；`github` 的驗證只打一次 API
-- [fh-l 關機時，它的宣告停在上一次開機的值] → 使用者接受；已在 MyAiEntry#4 請 app 挑機器時先看在不在線
-- [no-sudo 的 fh-proxy 能不能通過 `worker-host` 驗證，現在不知道] → 實作前先跑一次 `mlp verify-capabilities fh-proxy`（唯讀）。不過的話，它的宣告就會少 `worker-host`，承載機選單也會少這一台，要先告訴使用者
-- [pool-sync 開始寫 `NODE_*.capabilities`，等於主本多了一個自動寫入者] → 只 merge 這個欄位，其他欄位不碰；寫入記一條 INFO
+- **[宣告抖動]**：驗證暫時失敗時（例如 GitHub API 5xx），宣告的值不能跟著變。→ 用三態處理，「無法確認」就保留原值（使用者 2026-10-02 裁定）。代價是宣告停在舊值的時間可能比較久，這跟 fh-l 關機時宣告停在舊值是同一種取捨。
+- **[宣告一變，app 跟著變]**：能力真的壞掉時（例如 docker 停了），`worker-host` 會從宣告消失，app 的承載機選單就會少一台。這是設計上要的結果，但要先讓 MyAiEntry 知道。
+- **[fh-l 關機時，宣告停在上一次開機的值]**：使用者接受。app 挑機器時沒有看在不在線，而 fh-l 照字典序排第一。不過今天的 fallback 就是 fh-l，所以最後拿到的機器跟今天一樣，差別只在錯誤訊息。修法與落地順序已寫在 MyAiEntry#4。
+- **[剛註冊完，user manager 的群組是舊的]**：`docker info` 會失敗。`worker-host` 的 `--check` 會回 2，宣告維持 register-provider 寫的值。實測：兩台現有 provider 的 user manager 已經有 docker 群組。
+- **[pool-sync 多了一個寫入者]**：只 merge `capabilities` 這一個欄位。register-provider 和 pool-sync 用同一個函式算值（D8），兩邊同時寫的機率很低，就算同時寫，寫的也是同一個值。
+- **[`wol` 會直接顯示在 app 和 AI 看得到的文字裡]**（`承載機，提供能力：worker-host、github、wol。`）：要不要給它一個顯示名稱，由 app 那邊決定。已在 MyAiEntry#4 提醒。
 
 ## Migration Plan
 
-1. merge 後，provider 下一個 tick 收斂到新的 pool-runtime，並裝上 `wol` 單位；再下一個 tick 開始寫宣告。
-2. 刪掉 `NODE_FH_PROXY.wol_sender`。這是對 live var 的變更，使用者在 issue #3 已經裁定，執行前再跟使用者確認一次。
-3. 真機驗收：三台的 `capabilities` 收斂成預期的值；`mlp wake fh-l` 照常能用；停掉一台的 docker 再恢復，宣告會跟著消失、出現。
+分三個 PR，每個都能單獨上線、單獨回退（使用者 2026-10-02 裁定）。
+
+- **PR-A：單位與 runner**
+  - 內容：D1、D2、D3、D5 的三個單位與 `gh --check` 改寫、D7、preflight。
+  - 沒有任何 profile 列 `capabilities`，所以沒有任何宣告會變。
+  - 唯一的線上行為變化：provider 上的 `pool-wol` 改由 `wol` 單位安裝，檔案內容一樣。
+- **PR-B：自動宣告**
+  - 內容：provider profile 加 `capabilities`、D4、D8、`mlp verify-capabilities` 改用 runner、create-worker 改用 runner。
+  - merge 之後的第一個 tick 就會改到三台的 live var。
+  - 回退方式：revert，或停掉 pool-sync timer。宣告會停在最後一次寫入的值。
+  - merge 後真機驗收：三台收斂成 `worker-host`＋`github`＋`wol`；停掉一台的 docker 再恢復，宣告會跟著消失、出現。
+- **PR-C：wake 與文件**
+  - 內容：D6，改寫 `docs/CAPABILITY-DESIGN.md`，清掉 `docs/ARCHITECTURE.md:138-145` 的 `wol_sender` 和舊的陣列形狀。
+  - merge 後：刪掉 `NODE_FH_PROXY.wol_sender`（執行前再跟使用者確認），`mlp wake fh-l` 照常能用，archive 這個 change。
