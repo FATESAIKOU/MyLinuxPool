@@ -1497,7 +1497,7 @@ fi
 
 
 # ===========================================================================
-# H（openspec/changes/mlp-help-repair）：說明文字的三個必修點
+# H（openspec/changes/archive/2026-10-02-mlp-help-repair）：說明文字的三個必修點
 #   D1 ssh 與 fwd add 共用同一句；D2 指向 mlp ls 的 TYPE=repair 列而非已廢的
 #   repair section（本檔 :527 擋的就是那個標題）；D3 usage() 的 ls／ssh 兩行。
 #   generic 那行維持最後一行、措辭不變（§1d 與 fwd 的 R5 釘著它），本節只加行。
