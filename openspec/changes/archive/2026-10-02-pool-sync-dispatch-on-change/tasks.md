@@ -19,3 +19,6 @@
 - [x] 3.1 （`team/OUT-review-issue7-impl.md`、`-tests.md`：必修 0）review：獨立驗收（呼叫端相容、條件邊界、排程與 refresh-wait 的互動、文件）
 - [x] 3.2 PM 閘門（preflight、全套 53 支 `</dev/null`、CI 36899848670 綠），PR #11
 - [ ] 3.3 merge 後（使用者 merge）：量 refresh 的 run 紀錄——`workflow_dispatch` 從每 30 分鐘兩次降到 0；隔天確認有一筆 `schedule` 的 run。spec「一次 dispatch 失敗後」屬人工驗收：要量的話，在 Gateway 上對照「var 有、authorized_keys 沒有」的狀態經過一次排程後是否收斂
+  - 實測（2026-10-02，唯讀 `gh run list`）：#11 在 02:49:49Z merge 後，還有 02:52、03:10 兩筆 dispatch（新的 run-name；生效要晚兩個 tick，符合預期）。03:10:49Z 之後到 04:32Z 都是 0 筆；照舊節奏，這段時間應該有約 5 筆。同一個查詢看得到 03:10 那筆，所以「0」不是因為工具看不到。
+  - 沒驗到：pool-sync 對 GitHub 只有讀取、沒有心跳；在不 ssh 的前提下，無法證明兩台 provider 這段時間仍在 tick。所以「降到 0」也可能是 provider 停了。
+  - 排程：20:00Z 那筆 `schedule` run 還沒到，待隔天確認。所以本項不打勾。
