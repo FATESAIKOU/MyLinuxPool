@@ -669,24 +669,11 @@ fi
 
 
 echo "=== 7. 金鑰已發布時重跑註冊：仍然成功、仍然派 refresh（issue #7 tasks 1.4）==="
-# 為什麼要有這格：openspec D1 決定用**輸出變數**（TUNNEL_KEY_CHANGED）回報
-# 「有沒有寫入」，**回傳碼照舊**。若改成用回傳碼區分，
-# `tunnel_key_ensure_published ... || exit 1` 就會在「已經發布過」的機器上把整個
-# 註冊打斷：一台已經有可用隧道身分的 provider，再註冊一次卻失敗。
-# 而 register-provider 這條路**必須**無條件 dispatch：它是「剛建立」這條路上
-# 唯一保證 Gateway 會授權新鑰的地方（pool-sync 只在有寫入時派，而這裡沒有寫入）。
-# 所以這格把兩個後果一起釘住：exit 0、以及 dispatch 確實有發生。
-#
-# 手法：直接打 step6_5_tunnel_identity（它用 exit 結束，跑在子殼層）。
-#
-# **兩個必須避開的地雷（第一版都踩到了）**：
-#   1. register-provider.sh:9 自己有 `STATE_DIR="${HOME}/.mylinuxpool"`。我的假 gh
-#      一開始也用 STATE_DIR 當它的記帳目錄 → 被頂層初始化蓋掉，nonce 與 run 列表
-#      寫到別處（或寫不進去），於是等待端永遠認不出自己那次，一路輪詢到
-#      `dispatch_refresh_and_wait 300` 的 300 秒 deadline。**症狀是整支測試卡住，
-#      不是紅燈**——那種失敗形狀最難查，所以這裡用自己的變數名 RP14_STATE。
-#   2. register-provider.sh:22 有 `trap 'rm -rf "$REPO_DIR"' EXIT INT TERM`。
-#      被測物結束時會**把我放進去的那份 lib 刪掉**，所以每次呼叫都要現做一份。
+# D1 用輸出變數 TUNNEL_KEY_CHANGED 回報有無寫入、回傳碼照舊，所以已發布過的
+# provider 再註冊一次仍須成功；這條路也必須無條件 dispatch（它是唯一保證
+# Gateway 授權新鑰的地方）。
+# 兩個地雷：假 gh 的記帳目錄不可用 STATE_DIR（被覆蓋 → 等待端認不出自己那次，
+# 測試卡 300 秒而不是紅燈）；被測物的 trap 會刪掉放進去的 lib，每次呼叫都要現做。
 RP14_LIB_SRC="$SANDBOX/rp14-lib"
 mkdir -p "$RP14_LIB_SRC/scripts/lib" "$SANDBOX/home14/.ssh"
 cp -p "$REPO_ROOT/scripts/lib/tunnel-key.sh" "$RP14_LIB_SRC/scripts/lib/tunnel-key.sh"
@@ -697,9 +684,7 @@ RP14_PUB="$(tr -d '\r\n' < "$SANDBOX/home14/.ssh/id_tunnel.pub" 2>/dev/null)"
 
 RP14_STUB="$SANDBOX/rp14-stub"
 mkdir -p "$RP14_STUB"
-# **必須真的套用 --jq / --json**（照 test-refresh-attribution.sh 的形狀）：等待端把
-# 「哪一筆是我們的」整個交給 gh 的 --jq。第一版直接 cat 原始 JSON，row 變成整份
-# 陣列字串，同樣一路輪詢到 300 秒。
+# 假 gh 必須真的套用 --jq/--json：等待端靠它認出自己那筆。
 cat > "$RP14_STUB/gh" <<'FAKE_GH14'
 #!/usr/bin/env bash
 printf 'args=%s\n' "$*" >> "${RP14_LOG:-/dev/null}"
@@ -714,8 +699,7 @@ case "${1:-} ${2:-}" in
         for a in "$@"; do
             case "$a" in nonce=*) printf '%s' "${a#nonce=}" > "${RP14_STATE}/nonce" ;; esac
         done
-        # 立刻放一筆「我們的 run」進列表：標題含本次 nonce（run-name 內插的形狀）、
-        # completed/success —— 等待端因此第一次查詢就收工，不會碰到 300 秒 deadline。
+        # 立刻放一筆含本次 nonce 的 completed/success run，等待端第一次查詢就收工。
         n="$(cat "${RP14_STATE}/nonce" 2>/dev/null)"
         printf '[{"databaseId":321,"status":"completed","conclusion":"success","displayTitle":"refresh-authorized-keys workflow_dispatch %s"}]' "$n" \
             > "${RP14_STATE}/runs.json"

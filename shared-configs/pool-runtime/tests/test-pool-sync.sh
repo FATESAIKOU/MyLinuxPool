@@ -98,16 +98,10 @@ if [[ "${FAKE_GH_MODE:-ok}" == "writefail" ]]; then
             exit 1 ;;
     esac
 fi
-# dispatchfail (issue #7 的 R 群): **只有** `workflow run` 失敗，讀與寫都正常
-# ——這是「金鑰已經寫進 var、但 refresh 派不出去」的形狀，spec 的
-# 「dispatch 失敗」情境要量它。
-#
-# 為什麼不能拿 writefail 代替（實測，不是推論）：writefail 讓 `variable set`
-# 也回 1，於是 tunnel_key_publish 在 tunnel-key.sh:98 就 return 1 →
-# tunnel_key_ensure_published 非 0 → pool-sync:383 走「tunnel key convergence
-# failed」那條 else，**根本走不到 :377 的 dispatch**。實測既有案例 Q7
-# （GH_MODE=writefail）的 gh.log 裡 `workflow run` 出現 0 次。而且 var 從來
-# 沒落過盤，「下次 tick 認為已發布」的前提也不成立。
+# dispatchfail（issue #7 的 R 群）：**只有** `workflow run` 失敗、讀寫都正常——
+# 這是「金鑰已寫進 var、但 refresh 派不出去」的形狀。
+# 不能用 writefail 代替（實測）：它讓 `variable set` 也回 1，於是 publish 提前
+# return 非 0，pool-sync 走 convergence failed 那條分支，根本走不到 dispatch。
 if [[ "${FAKE_GH_MODE:-ok}" == "dispatchfail" ]]; then
     case "${1:-} ${2:-}" in
         "workflow run")
@@ -1324,27 +1318,12 @@ else
     fi
 fi
 
-# ===========================================================================
 # R1–R3（issue #7 / openspec D2）：dispatch 只在「這一次真的寫入了」時發生。
-#
-# 現況就是本 bug：pool-sync 只看 tunnel_key_ensure_published 的回傳碼就
-# dispatch，而 tunnel_key_publish 在「已一致」時也回 0（tunnel-key.sh:89-92），
-# 所以每台 provider 每 30 分鐘無條件派一次 refresh。
-#
-# 量法：`gh.log` 每次呼叫一行 `args=…`，所以 dispatch 次數就是
-# `grep -c 'workflow run' gh.log`。**要數不要只 grep**——「0 次」與
-# 「量不到」在只 grep 的寫法裡長得一模一樣，而這三格全是關於「沒有發生」的
-# 斷言。三格互相提供正對照：R2（剛寫入）用同一個計數器量到 1，所以 R1/R3 的
-# 0 是量出來的，不是 stub 沒接上。
-#
-# 這三格**刻意清掉 FAKE_CLIENT_VARS**（而不是「不呼叫 write_clients」）：A 群
-# 呼叫過 write_clients，那個全域會一路留到後面，pool-sync 於是順手寫出
-# ~/.mylinuxpool/clients/authorized_keys —— 而 check_no_new_state 正是拿
-# ~/.mylinuxpool 的檔案清單前後比對。留著它，R3d 量到的就不再是「有沒有為了
-# retry 留檔」，而是那個無關的 clients 檔（S9 之所以過，也是因為它同樣沒有
-# CLIENT_* 在場）。隧道金鑰那一段不依賴 CLIENT_*。
-# FAKE_POOL_WORKERS / FAKE_DOCKER_PS 同理清掉，免得上一段的狀態滲進來。
-# ===========================================================================
+# 現況就是本 bug：只看重傳碼就 dispatch，而 publish 在「已一致」時也回 0。
+# 量法是 `grep -c 'workflow run' gh.log`——要數不要只 grep，「0 次」與「量不到」
+# 在只 grep 的寫法裡長得一樣。三格互為正對照：R2 量到 1，所以 R1/R3 的 0 是量出來的。
+# 這三格刻意清掉 FAKE_CLIENT_VARS：否則 write_clients 留下的 clients 檔會被
+# check_no_new_state 量到，R3d 量的就不再是「有沒有為了 retry 留檔」。
 # dispatch_count — 這一輪真的派了幾次 refresh。
 dispatch_count() {
     grep -c 'workflow run' "$SANDBOX/gh.log" 2>/dev/null || true
@@ -1363,7 +1342,7 @@ FAKE_CLIENT_VARS=""; FAKE_POOL_WORKERS=""; FAKE_DOCKER_PS=""
 : > "$SANDBOX/check-rc"; : > "$SANDBOX/install-rc"
 R_NODE_JSON='{"name":"testnode","role":"provider","registered_with":"register-provider.sh","gateway_port":2301,"hops":[{"via":"gateway"}],"power":{"launch":"wake"},"capabilities":["docker"]}'
 GH_VALUE="$R_NODE_JSON"
-# 第一輪：把金鑰發布出去（今天與修好之後，這一輪都該 dispatch 一次）。
+# 第一輪：把金鑰發布出去（這一輪本來就該 dispatch 一次）。
 run_sync
 R1_PUB="$(cat "$TUNNEL_PUB_FILE" 2>/dev/null | tr -d '\r\n')"
 if [[ "$RAN" -ne 1 || -z "$R1_PUB" ]]; then
@@ -1446,22 +1425,13 @@ fi
 check_no_new_state "R3d. dispatch 失敗也沒在 ~/.mylinuxpool 底下留任何檔（spec 明文；沒留 retry 標記）"
 
 
-# ===========================================================================
-# R-inj. 對照突變：每一條都證明 R1b／R2b／R3c 紅得起來（review 建議 7）。
-#
-# 為什麼需要：R1–R3 全是「**沒有發生**」的斷言（0 次 dispatch、警告提到排程）。
-# 沒有對照的話，它們可能在斷言壞掉、被 harness 壞掉、或者根本沒被量到的情況下
-# 一起變綠——TESTPLAN 開頭那條「每個檢查都必須有能力失敗」講的就是這件事。
-#
-# 手法：形狀錨點（找特定行 → 連同同縮排的 fi/分支一起取代）＋ assert，不是
-# 整段文字比對。實作改了註解或換行時不該報假警，但**分支形狀**變了必須大聲
-# 壞掉。突變檔用 run_sync 的注入點 POOL_SYNC_SUBJECT（:439）跑，repo 的
-# pool-sync 一個字都不動。
-# ===========================================================================
+# R-inj：對照突變，證明 R1b／R2b／R3c 紅得起來。R1–R3 全是「沒有發生」的斷言，
+# 沒有對照就可能在斷言壞掉或根本沒被量到的情況下一起變綠。
+# 手法：形狀錨點（找特定行 → 連同同縮排的分支一起取代）＋ assert，不整段文字
+# 比對。突變檔經 POOL_SYNC_SUBJECT 跑，repo 的 pool-sync 一個字都不動。
 
 # --- R1-inj：拿掉 TUNNEL_KEY_CHANGED 的條件 → 無條件 dispatch --------------
-#   期望：R1b 轉紅（「沒有變動卻派了 N 次」），而 **R2b 仍綠**（剛寫入本來就該
-#   派 1 次，無條件派也是 1 次——這一條順便證明 R1b 紅的不是「計數壞掉」）。
+#   期望：R1b 轉紅而 R2b 仍綠（剛寫入本來就該派 1 次），順便證明紅的不是「計數壞掉」。
 INJ_R1="$SANDBOX/rp-mut-nogate.sh"
 python3 - "$POOL_SYNC" "$INJ_R1" <<'PYINJ1'
 import sys
@@ -1472,8 +1442,7 @@ assert len(hits) == 1, "gate-anchor count=%d" % len(hits)
 start = hits[0]
 end = next(k for k in range(start + 1, len(lines)) if lines[k] == "            fi")
 block = "\n".join(lines[start:end + 1])
-# 形狀斷言：這個分支必須真的做 dispatch、也必須真的在失敗時講排程——
-# 否則這個突變會連帶弄壞 R3c，兩條注入就糾在一起、分不清誰紅。
+# 形狀斷言：這個分支必須真的 dispatch、也必須真的在失敗時講排程，否則會連帶弄壞 R3c。
 assert "gh workflow run refresh-authorized-keys.yml" in block, "gate block does not dispatch"
 assert "daily schedule" in block, "gate block lost the schedule warning"
 warn = next(l for l in lines if l.lstrip().startswith('log WARN "could not dispatch'))
@@ -1513,14 +1482,13 @@ else
         POOL_SYNC_SUBJECT="$INJ_R1" run_sync
         mut_dispatch="$(dispatch_count)"
         mut_writes="$(write_count)"
-        # R1b 的判準是「dispatch == 0」。無條件派之後它必須變成非 0＝R1b 轉紅。
+        # R1b 的判準是 dispatch == 0；無條件派之後必須變成非 0。
         if [[ "$mut_dispatch" != "0" ]]; then
             inj_ok "R1-inj. 拿掉條件後「沒有變動卻派了 ${mut_dispatch} 次」（want 0）——R1b 會紅（本輪寫入 ${mut_writes} 次）"
         else
             inj_bad "R1-inj. 拿掉條件後 R1b 仍綠（0 次）——R1b 抓不到『無條件 dispatch』這個退化"
         fi
-        # R2b 的判準是「恰好 1」。無條件派在剛寫入時**也是** 1 次，所以它必須
-        # 仍然是綠的——這是 R1b 的紅不是「計數壞掉」的對照。
+        # R2b 的判準是恰好 1；無條件派在剛寫入時也是 1，所以它必須仍綠。
         reset_home
         build_fixture "unit-a unit-b" "unit-b" ""
         FAKE_CLIENT_VARS=""; FAKE_POOL_WORKERS=""; FAKE_DOCKER_PS=""
@@ -1536,9 +1504,7 @@ else
     fi
 fi
 
-# --- R3c-inj：失敗的警告不提排程 → R3c 必須轉紅 ---------------------------
-#   期望：R3c 的「警告提到每日排程」抓不到；而 R3a（仍 exit 0）與 R3d（不留檔）
-#   不受影響——所以這條突變只該翻紅 R3c。
+# --- R3c-inj：失敗的警告不提排程 → 只該翻紅 R3c，R3a／R3d 不受影響 ---------
 INJ_R2="$SANDBOX/rp-mut-noschedulewarn.sh"
 python3 - "$POOL_SYNC" "$INJ_R2" <<'PYINJ2'
 import sys

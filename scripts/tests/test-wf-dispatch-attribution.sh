@@ -249,30 +249,16 @@ else
 fi
 
 
-# ===========================================================================
 # 0c–0e（issue #7 tasks 1.3 / openspec D3）：refresh workflow 的排程形狀。
-#
-# 為什麼放在這支檔：它已經用真 YAML parser 讀四支 workflow，refresh 也已經在
-# 0b 的清單裡。**不要**用 grep 讀 workflow——註解、縮排、多個 `on:` 都會骗過
-# grep；這支檔的 0b 已經示範了正確做法。
-#
-# 一個必須知道的坑（PyYAML / YAML 1.1）：裸 `on:` 會被讀成**布林 True**，
-# `doc["on"]` 會 KeyError。0b 用 `doc.get("on") or doc.get(True)` 繞過，
-# 下面沿用同一行。
-#
-# 形狀來源：design D3 與 review 的 OUT-review-issue7-schedule-title.md
-# §3.1（run-name 加上 github.event_name，讓每日那筆自我識別）。
-# ===========================================================================
+# 放在這支檔是因為它已經用真 YAML parser 讀 workflow；不要改用 grep 讀 YAML。
+# 坑：YAML 1.1 把裸 `on:` 讀成布林 True，所以要 `doc.get("on") or doc.get(True)`。
 WF_REFRESH="$REPO_ROOT/.github/workflows/refresh-authorized-keys.yml"
 
 # wf_refresh_shape <yml路徑> — 四件事一起查，印 "ok" 或問題清單：
 #   1. on.schedule 存在且 cron == "0 20 * * *"（UTC 每日一次）
-#   2. 沒有 concurrency（非目標：使用者裁示不加，釘住「不要有人順手加」）
-#   3. run-name 有字面前綴、不是空白-only（空白-only 會讓 GitHub 默默換成
-#      event-specific 資訊，整套 nonce 認領機制就建立在這個字串上）
-#   4. **沒有任何 step 讀 inputs.\***：排程事件不帶 input，`inputs.nonce` 在
-#      schedule 下求值成空字串，所以有 step 讀它就是「排程那筆會不會失敗」
-#      的實際風險。允許 inputs.* 出現在 run-name 裡（那正是認領機制要的）。
+#   2. 沒有 concurrency（釘住「不要有人順手加」）
+#   3. run-name 有字面前綴、非空白-only（nonce 認領機制建立在它上面）
+#   4. 沒有任何 step 讀 inputs.*：排程事件不帶 input，讀它就是空字串的風險
 wf_refresh_shape() {
     python3 - "$1" <<'PY'
 import sys, yaml
@@ -301,11 +287,8 @@ if not isinstance(rn, str) or not rn.strip():
     bad.append("run-name missing or whitespace-only")
 
 # 4. 沒有任何地方讀 inputs.*（run-name 裡的 inputs.* 是設計要的，不算）。
-#    掃描面要蓋住所有能拿到 `inputs` 上下文並在**排程事件下求值成空字串**的
-#    位置：step 的 with／run／uses／if／env，job 的 if／env／container.env。
-#    （第一版只掃 with/run/uses，漏掉 if 與 env——那是這個檢查器真正的洞，
-#     `if: ${{ inputs.x == 'y' }}` 在排程那筆就是空值。）job/step 層的
-#    `runs-on`、`timeout-minutes`、`permissions` 不吃 inputs 上下文，不掃。
+#    掃描面要含 step 的 with／run／uses／if／env 與 job 的 if／env／container.env：
+#    `if: ${{ inputs.x }}` 在排程那筆就是空值。
 def _blob(d):
     out = []
     for k in ("if", "run", "uses"):
@@ -338,8 +321,7 @@ else
     bad "0c. workflow 形狀不符：[$sh]"
 fi
 
-# 0f. **正對照**：這個檢查器不能是「永遠回問題」——拿一份**已知合格**的合成
-#     workflow 餵它，必須回 ok。沒有這條，0c 的紅有可能只是檢查器寫壞。
+# 0f. 正對照：拿一份已知合格的合成 workflow 餵它必須回 ok，否則 0c 的紅可能只是檢查器寫壞。
 cat > "$SANDBOX/good-refresh.yml" <<'YML'
 name: Refresh Authorized Keys
 on:
@@ -369,23 +351,16 @@ else
     inj_bad "0f. 檢查器連合格檔案都判不合格（[$SANDBOX/good-refresh.yml]）——0c 的紅沒意義"
 fi
 
-# 注入：每一條都要證明 0c 抓得到。突變寫在沙箱裡，repo 的 workflow 沒動。
-# wf_mut <名字> <python片段檔> <輸出路徑> — 片段檔是一段 python，只做
-#   `src = src.replace(...)`，在這裡執行後**寫出**結果。repo 的 workflow 不動。
-# 注入：每一條都要證明 0c 抓得到。三個突變各自是一段 python、直接寫出突變後的
-# yml（不經過「片段檔」那一層——多一層就多一次跳脫地雷，而且出錯時不會報錯，
-# 只會看起來像「注入沒抓到」）。突變檔都在沙箱裡，repo 的 workflow 沒動。
+# 注入：每一條都要證明 0c 抓得到。三個突變各自直接寫出突變後的 yml，repo 的
+# workflow 不動。
 mkdir -p "$SANDBOX/wfmut"
 
 # m1：cron 改成每 5 分鐘（正是這次燒掉額度的頻率）。
 python3 - "$WF_REFRESH" "$SANDBOX/wfmut/m1.yml" <<'PYM1'
 import sys
 src = open(sys.argv[1], encoding="utf-8").read()
-# **改現有的那一筆 cron**，不要「再插一個 schedule:」——第一版就是插一個，
-# 結果 PyYAML 的重複鍵語意（後者覆蓋前者）讓 `*/5` 被檔案裡本來就有的
-# `0 20 * * *` 蓋掉，突變靜靜變成 no-op，而檢查器（正確地）回 ok。
-# 教訓：注入必須證明自己真的改到檔案，否則「檢查器沒抓到」分不清是檢查器
-# 壞掉還是突變沒生效。這裡用 `!= -1` 當場驗收。
+# 改現有的那一筆 cron，不要「再插一個 schedule:」——PyYAML 重複鍵是後者覆蓋
+# 前者，突變會靜靜變成 no-op。所以注入必須驗收自己真的改到檔案（`!= -1`）。
 old = 'cron: "0 20 * * *"'
 new = 'cron: "*/5 * * * *"'
 i = src.find(old)
@@ -404,8 +379,8 @@ assert src.count(old) >= 1, "m2 needle missing"
 open(sys.argv[2], "w", encoding="utf-8").write(src.replace(old, new, 1))
 PYM2
 
-# m3：有 step 用 `if:` 讀 inputs.nonce —— 排程那筆會拿到空值。
-#     刻意用 `if:` 而不是 `run:`：掃描面若只看 run/with/uses 就漏掉它。
+# m3：有 step 用 `if:` 讀 inputs.nonce（排程那筆拿到空值）；刻意不用 run:，
+#     掃描面若只看 run/with/uses 就會漏掉它。
 python3 - "$WF_REFRESH" "$SANDBOX/wfmut/m3.yml" <<'PYM3'
 import sys
 src = open(sys.argv[1], encoding="utf-8").read()
@@ -422,8 +397,7 @@ for m in m1 m2 m3; do
         m3) why="有 step 用 if 讀 inputs.nonce" ;;
     esac
     if [[ ! -s "$SANDBOX/wfmut/$m.yml" ]]; then
-        # 突變沒產出檔案＝needle 落空。這時候**不能**拿檢查器對著空檔案的結論
-        # 當證據——那會是「檔案壞掉」而不是「形狀被抓」。
+        # 突變沒產出檔案＝needle 落空；不能拿檢查器對空檔案的結論當證據。
         inj_bad "0-inj-${m}. 突變沒產出檔案（needle 落空？）——harness 問題，這條注入等於沒測"
         continue
     fi

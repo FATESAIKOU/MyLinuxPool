@@ -283,17 +283,8 @@ else
 fi
 
 echo "=== 4. 每日排程的 run 與手動 dispatch 並存（issue #7 / openspec D3）==="
-# 排程那筆的 displayTitle 是 run-name 在 schedule 事件下的求值結果。
-# D3 更新後的 run-name 是
-#   refresh-authorized-keys ${{ github.event_name }} ${{ inputs.nonce }}
-# schedule 事件不帶 input → inputs.nonce 求值成空字串 → 標題是
-#   "refresh-authorized-keys schedule "（有尾隨空白）
-# GitHub 是否保留那個尾隨空白無法離線確認，所以**兩種形狀都測**
-# （OUT-review-issue7-schedule-title.md §1 的未確認項）。
-#
-# 排程那筆刻意排成：(a) 比我們的**新**（新到舊排序時在前面——「信任最新那筆」
-# 的壞寫法會挑中它）、(b) conclusion=**failure**（被認領就會讓等待端回 1）。
-# 於是這一格是雙向的：認 ours → rc 0；認排程那筆 → rc 1。兩個結果不會撞。
+# 排程那筆的 displayTitle 是否留尾隨空白，離線無法確認 → 兩種形狀都測（4a/4b）。
+# 它刻意比我們的新且 conclusion=failure：認錯就會回 1，兩個結果不會撞。
 sched_case() {   # sched_case <標題> <ours_id> <ours_conclusion> <sched_id>
     local title="$1" oid="$2" oconcl="$3" sid="$4"
     cat > "${STATE}/other_runs.json" <<JSON
@@ -312,7 +303,6 @@ JSON
         OUR_CREATED_AT="2026-09-26T12:00:00Z" FAKE_CREATE_OUR_RUN=1 run_dispatch 5
 }
 
-# 4a. 排程那筆帶尾隨空白、比較新、failure；我們的 success。
 sched_case "refresh-authorized-keys schedule " 100 success 900
 if [[ "${SUB_RC}" == "0" ]] && printf '%s' "${SUB_OUT}" | grep -qF "refresh workflow 100 succeeded" \
    && ! printf '%s' "${SUB_GOT}" | grep -qF "refresh workflow 900"; then
@@ -321,7 +311,6 @@ else
     bad "4a. 排程 run 被誤認（或我們那次沒認到）（got [${SUB_GOT}]）"
 fi
 
-# 4b. 同一個情境，標題被 trim 過（沒有尾隨空白）。
 sched_case "refresh-authorized-keys schedule" 100 success 900
 if [[ "${SUB_RC}" == "0" ]] && printf '%s' "${SUB_OUT}" | grep -qF "refresh workflow 100 succeeded" \
    && ! printf '%s' "${SUB_GOT}" | grep -qF "refresh workflow 900"; then
@@ -330,8 +319,7 @@ else
     bad "4b. 排程 run（trim 版）被誤認（或我們那次沒認到）（got [${SUB_GOT}]）"
 fi
 
-# 4c. 反向：我們那次失敗、排程那次成功。認錯方向會變成**假綠**（回 0 並拿
-#     別人的成功當自己的結論）——那是這支檔最早存在的理由，順手一起釘。
+# 4c. 反向：我們那次失敗、排程那次成功——認錯方向會變成假綠。
 sched_case "refresh-authorized-keys schedule " 100 failure 900
 if [[ "${SUB_RC}" != "0" ]] && ! printf '%s' "${SUB_GOT}" | grep -qF "refresh workflow 900"; then
     ok "4c. 我們那次失敗時：回非 0，且沒有拿排程那筆的成功當成自己的結論"
@@ -339,9 +327,8 @@ else
     bad "4c. 我們那次 failure 卻回 ${SUB_RC}／報了 900（假綠形狀）（got [${SUB_GOT}]）"
 fi
 
-# 4-inj. 把比對條件從 contains(<nonce>) 改成 contains("")——那是 refresh-wait
-#   自己在註解裡點名的失效模式（空 nonce 會命中每一筆）。改完 4a 必須紅：
-#   它會挑中窗裡最新的那筆（排程那筆），於是回 1 而非 0。
+# 4-inj. 比對條件改成 contains("")（空 nonce 命中每一筆）→ 會挑中窗裡最新那筆
+#   （排程那筆）而回 1，4a 必須紅。
 INJ_RW="$SANDBOX/refresh-wait-emptycontains.sh"
 python3 - "$REPO_ROOT/scripts/lib/refresh-wait.sh" "$INJ_RW" <<'PYINJ'
 import sys
