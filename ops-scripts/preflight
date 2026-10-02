@@ -407,7 +407,11 @@ NOEXEC=""
 while read -r mode f; do
     head -c2 "$f" 2>/dev/null | grep -q '#!' || continue
     [ "$mode" = "100644" ] || continue
-    git grep -qE "source[^|]*$(basename "$f")" -- ":!${f}" >/dev/null 2>&1 && continue
+    # pool-sync runs units' install.sh only when -x, and the basename is shared by every unit.
+    case "$f" in
+        shared-configs/*/install.sh) ;;
+        *) git grep -qE "source[^|]*$(basename "$f")" -- ":!${f}" >/dev/null 2>&1 && continue ;;
+    esac
     NOEXEC="${NOEXEC}${f}
 "
 done < <(git ls-files -s | awk '{print $1, $4}')
