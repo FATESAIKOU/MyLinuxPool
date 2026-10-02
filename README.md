@@ -14,25 +14,25 @@
 ## 全景
 
 ```
-                GitHub Actions（控制平面）
-                repo vars = 定址的唯一真實來源
-                          │ ssh
-                          ▼
-        ┌─────────────────────────────────────┐
-        │ GATEWAY (Linode)    [:2100 唯一公開埠] │
-        │ 127.0.0.1                            │
-        │   :2222  :2226  │  :2300 :2301 …     │
-        │   provider 固定段 │  worker 動態段     │
-        └────▲───────▲──────────────▲──────────┘
-             │       │              │
-- - - - - - -│- - - -│- - - - - - - │- - - - - - -
+                          GitHub Actions（控制平面）
+                        repo vars = 定址的唯一真實來源
+                                       │ ssh
+                                       ▼
+        ┌──────────────────────────────────────────────────────┐
+        │ GATEWAY (Linode)    [:2100 唯一公開埠]               │
+        │ 127.0.0.1                                            │
+        │   :2222   :2226   │  :2300 :2301 … │  :24xx          │
+        │   provider 固定段 │  worker 動態段 │  repair 段      │
+        └────▲───────────▲─────────────▲───────────────▲───────┘
+             │           │             │               │
+-------------│-----------│-------------│---------------│
    家用 NAT 邊界 — 以下無公開 IP，一律由下往上撥出
-             │       │              │
-        ┌────┴───┐ ┌─┴────────┐ ┌───┴──────────┐
-        │ Fh-l   │ │ Fh-proxy │ │ Worker 容器   │
-        │ 裸機   │ │ WSL2     │ │ 拋棄式        │
-        │ WoL 喚醒│ │ 常駐     │ │              │
-        └────────┘ └──────────┘ └──────────────┘
+             │           │             │               │
+        ┌────┴────┐ ┌────┴────┐ ┌──────┴─────┐ ┌───────┴───────┐
+        │ Fh-l    │ │ Fh-proxy│ │ Worker 容器│ │ 家人 Windows  │
+        │ 裸機    │ │ WSL2    │ │ 拋棄式     │ │ VirtualBox NAT│
+        │ WoL 喚醒│ │ 常駐    │ │            │ │ VM，臨時      │
+        └─────────┘ └─────────┘ └────────────┘ └───────────────┘
 ```
 
 | 角色 | 機器 | 說明 |
@@ -40,6 +40,7 @@
 | Gateway | Linode `fws` | 唯一有公開 IP 的機器。它自己不跑運算，只當跳板與反向隧道的落點。可整台丟棄重建 |
 | Provider | `fh-l`（裸機，平常關機）<br>`fh-proxy`（WSL2，常駐） | 真正跑東西的機器。在 NAT 後面，由自己撥出反向隧道到 Gateway |
 | Worker | Docker 容器 | 跑在某個 provider 上的拋棄式環境，一樣有自己的 Gateway 埠 |
+| Repair 跳板 | 家人電腦上的 VirtualBox NAT VM | 臨時的，登入的是 `repair`（免密碼 sudo）。**不寫任何 `NODE_*`、不進 state 快取**，所以手機讀的資料裡沒有它；`mlp` 是掃 Gateway 的 listener 與名牌發現它的。全家共用一把隧道金鑰與一份安裝包，見 `docs/REPAIR-HOST.md` |
 
 **進入任何節點的唯一路徑**：`ssh -J <gateway> -p <port> <user>@127.0.0.1`
 
@@ -216,8 +217,9 @@ provider 邊緣刻意不放解密金鑰；KEY-DESIGN §8 之後也不再有任�
 
 ```bash
 ops-scripts/mlp                # 互動式選單（fzf）
-ops-scripts/mlp ls             # 列出所有節點與即時狀態
-ops-scripts/mlp ssh [name]     # 登入節點或 worker，省略 name 就跳選單
+ops-scripts/mlp ls             # 列出所有節點與即時狀態（provider／worker／repair）
+ops-scripts/mlp ssh [name]     # 登入節點、worker 或 repair 跳板，省略 name 就跳選單
+                               # （repair 可用名字或它自己的 port；同名多台會拒絕並列 port）
 ops-scripts/mlp wake           # 喚醒 fh-l（經 fh-proxy 送 unicast WoL）
 ops-scripts/mlp down           # 關閉 fh-l（會先確認）
 ops-scripts/mlp status         # 完整健康檢查
@@ -225,6 +227,10 @@ ops-scripts/mlp rotate         # Gateway dry run（不碰現役機器）
 ops-scripts/mlp rotate --real  # 真的換掉 Gateway，要打現役 IP 確認
 ops-scripts/mlp worker new     # 選 provider、選 image，開一個 worker
 ops-scripts/mlp worker rm      # 從清單挑一個刪掉、釋放埠
+ops-scripts/mlp fwd add <node|port> <spec>
+                               # 把本機一個 port 轉到某台機器（或經它轉到第三方主機）
+ops-scripts/mlp fwd ls         # 看本機轉發的即時狀態
+ops-scripts/mlp fwd rm [port]  # 收掉一條（省略就用 fzf 挑）
 ops-scripts/mlp ssh-config     # 匯出 ssh_config，讓 ssh/scp/rsync 直接可用
 ops-scripts/mlp trust-gateway  # 通常不用跑了（每條指令都會自動釘選）
 ops-scripts/mlp register client    # 把「這台機器」註冊成 client（見下面「加一台 client」）
@@ -280,6 +286,42 @@ step 逐一串流回終端機**。分界線是：需要憑證或需要編排的�
 
 唯一要注意的是 **fail2ban**：在陌生網路重複打錯會被 Gateway 封 IP。
 退路是 Linode LISH 主控台（見「維護方式 §出事時」）。
+
+### 把遠端 port 帶到本機：`mlp fwd`
+
+臨時戳某個只有內網才看得到的埠，不必每次手寫 `ssh -L`：
+
+```bash
+ops-scripts/mlp fwd add 2301 8080                   # 本機 8080 → port 2301 那個 worker 的 8080
+ops-scripts/mlp fwd add fh-proxy 9000:9000          # 本機 9000 → fh-proxy 的 9000
+ops-scripts/mlp fwd add mom-pc 18088:192.168.0.1:80
+                                                    # 經家人的跳板，看家人那邊的路由器管理頁
+ops-scripts/mlp fwd ls                              # 有哪些、還通不通、對端什麼狀態
+ops-scripts/mlp fwd rm 18088
+```
+
+目標要寫**容器名或它的 port**（`2301` 這種），不是 `ssh-config` 的別名——
+`worker-2300` 只有 `ssh` 認得，`fwd` 不認。
+
+最後一列是 repair 跳板：第二段在 VM 上解析，所以 `192.168.0.1` 是**家人那邊**的
+閘道，不是你家這邊。repair 可以用名字，也可以用它在 repair 段裡的 port。
+
+轉發**只存在於你的 Mac**：池裡零狀態，Gateway 不知道，別人連不到；重開機後
+不記得（刻意不做的），`fwd ls` 會留下幾列 `down` 的殘留，`fwd rm` 清掉即可。repair 跳板離線時那條轉發就**自然斷掉**、不會自動改接到
+別台機器，要再轉就自己重下一次。設計與取捨見 `docs/FWD-DESIGN.md`。
+
+### 家人維修跳板
+
+臨時開一台 VM 當家人那條網路的入口，讓你 ssh 進去看設定、排查網路——
+**不需要把家裡的機器交給你管理**。
+
+1. 一次性：`bash ops-scripts/setup-repair-key`（全家只做一次）
+2. 打包：`bash ops-scripts/package-repair-host --key-dir ~/.config/mlp/repair-tunnel …`
+3. 家人點兩下 `Install.cmd`，之後用桌面上的「維修連線」隨時開關
+
+`mlp ls` 會自己看到在線的跳板（名字與 port），`mlp ssh <名字>` 進去。全家共用
+一把隧道金鑰，所以換鑰匙的代價是**每一位家人都要重跑一次 `Install.cmd`**。
+完整步驟、同名與手機的限制見 `docs/REPAIR-HOST.md`。
 
 ## 四個核心操作（GitHub Actions）
 
@@ -505,3 +547,4 @@ scp installer.sh host:/tmp/ && cat crypto_key | ssh host 'bash /tmp/installer.sh
 | [`docs/REQ.md`](docs/REQ.md) | 原始需求 |
 | [`docs/AUDIT.md`](docs/AUDIT.md) | provider 宿主機稽核的覆蓋範圍與盲區 |
 | [`docs/REPAIR-HOST.md`](docs/REPAIR-HOST.md) | 家人維修跳板：設共用金鑰、打包、家人步驟、連入、rotate、換鑰、撤銷 |
+| [`docs/FWD-DESIGN.md`](docs/FWD-DESIGN.md) | `mlp fwd`（把遠端 port 帶到本機）：介面、健康檢測的判準與取捨 |
