@@ -34,6 +34,7 @@
   - 只 merge `capabilities`
   - `needs_root` 的單位照樣驗證但不安裝
   - 宣告失敗不影響 tick
+  - 寫入宣告不觸發任何 workflow（`gh workflow run` 零次）；只有隧道金鑰真的寫入時才 dispatch refresh，跟 #11 一樣
 - [ ] 2.2 紅燈：register-provider
   - 結果不是 0 就失敗，並且指名是哪個能力
   - 全部通過就寫入 runner 的宣告
