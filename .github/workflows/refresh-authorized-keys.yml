@@ -33,17 +33,8 @@ on:
         default: ''
         type: string
 
-  # The daily safety net. pool-sync only dispatches when it really wrote a
-  # new tunnel key, so whatever drifts without a dispatch converges here: a
-  # dispatch that failed, someone editing CLIENT_*/NODE_* straight in the
-  # GitHub UI, or a key added on the Gateway by hand. 20:00 UTC = 04:00
-  # Asia/Taipei. GitHub delays scheduled runs when the platform is busy and
-  # skips them entirely if Actions are disabled, so "once a day" is the
-  # intent, not a guarantee.
-  #
-  # Added NEXT TO workflow_dispatch, never replacing it: the `inputs`
-  # context exists only because workflow_dispatch is declared. Drop that
-  # block and inputs.nonce becomes an unrecognized named-value.
+  # Daily catch-all for drift pool-sync no longer dispatches for (04:00 Taipei).
+  # Keep workflow_dispatch: the `inputs` context below depends on it.
   schedule:
     - cron: "0 20 * * *"
 
@@ -62,16 +53,7 @@ on:
 # exactly what to run and what counts as passing). If it does not appear,
 # this attribution silently degrades to "never recognize" (safe non-zero),
 # never to guessing somebody else's run.
-#
-# Two things about the line below are load-bearing, do not "tidy" them:
-#   * The literal prefix. scripts/lib/refresh-wait.sh:127 picks its own run
-#     out of the list by matching the 16-hex nonce inside this string (and
-#     ops-scripts/mlp's wf_dispatch fallback matches the same way). An
-#     omitted or whitespace-only run-name makes GitHub silently fall back
-#     to event-specific text, which kills the whole mechanism.
-#   * github.event_name. A scheduled run has no inputs, so without it the
-#     daily insurance run carries the same title as a hand dispatch and
-#     nobody can tell them apart without asking for --json event.
+# Never empty it: an empty run-name falls back to event text and breaks that match.
 run-name: refresh-authorized-keys ${{ github.event_name }} ${{ inputs.nonce }}
 
 permissions:

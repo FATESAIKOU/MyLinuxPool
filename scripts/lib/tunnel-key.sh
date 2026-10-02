@@ -71,10 +71,6 @@ tunnel_key_mint() {
         return 1
     fi
 
-    # Explicit. Without it the return value is whatever the `if` above
-    # happens to leave behind, so adding a line below (a flag reset, a log)
-    # would silently become this function's return value. Kept last on
-    # purpose — do not append anything after it.
     return 0
 }
 
@@ -82,18 +78,7 @@ tunnel_key_mint() {
 #   MERGES tunnel_public_key into NODE_<NAME>. Never writes the whole var:
 #   overwriting hops/power/capabilities would take the machine offline.
 #   Returns 0 and logs nothing new when the var already holds this key.
-#
-#   Also reports, in the global TUNNEL_KEY_CHANGED, whether THIS call
-#   actually wrote: 0 on entry and on every early return, 1 only after the
-#   write landed. The return code is unchanged and stays 0 on both success
-#   paths — the flag is the only way to tell them apart, because
-#   register-provider.sh treats any non-zero as fatal
-#   (ops-scripts/register-provider.sh:670) and pool-sync used to read the
-#   0 as "go dispatch a refresh" on every single tick.
-#
-#   Deliberately not `local`, and deliberately reset here rather than unset
-#   by callers: the two call sites wrap this in a prefix assignment
-#   (GH_TOKEN=…), whose shell semantics are not worth depending on.
+#   Sets the global TUNNEL_KEY_CHANGED to 1 only when this call wrote.
 tunnel_key_publish() {
     local var_name="$1" repo="$2" pub="$3"
     local current merged
@@ -108,7 +93,7 @@ tunnel_key_publish() {
 
     if [[ "$(printf '%s' "$current" | jq -r '.tunnel_public_key // empty')" == "$pub" ]]; then
         log INFO "tunnel_public_key already published for ${var_name}"
-        return 0            # TUNNEL_KEY_CHANGED stays 0
+        return 0
     fi
 
     merged="$(printf '%s' "$current" | jq -c --arg pk "$pub" '. + {tunnel_public_key: $pk}')" || {
@@ -128,12 +113,7 @@ tunnel_key_publish() {
 #   authorize it; who dispatches the refresh, and whether they wait for
 #   it, is the caller's decision — pool-sync fires and forgets, while
 #   register-provider must wait or its own verification races the refresh.
-#
-#   Passes TUNNEL_KEY_CHANGED straight through: the publish call below is
-#   the last statement, so both its exit status and the flag arrive.
-#   Nothing may be appended after that call — a `return 0` here would be
-#   wrong for the same reason tunnel_key_mint needs an explicit one, and
-#   swallowing the publish exit status would hide a failed write.
+#   Keep the publish call last: its status and TUNNEL_KEY_CHANGED pass through.
 tunnel_key_ensure_published() {
     local node_name="$1" var_name="$2" repo="$3"
     tunnel_key_mint "$node_name" || return 1

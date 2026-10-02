@@ -19,10 +19,7 @@
 # No state is kept under ~/.mylinuxpool and no new file is ever created:
 # convergence is judged purely by the units' own --check, so even a
 # manually tampered bin/ is repaired. Logs go to stdout/stderr (journald),
-# never to a file. That includes the tunnel-key refresh below: it is
-# requested only when a new key was actually written, and everything else
-# is left to refresh-authorized-keys.yml's own daily schedule — so a
-# failed dispatch leaves no retry marker to forget about.
+# never to a file.
 #
 # Also responsible for one migration: register-provider.sh used to leave a
 # resident ~/.mylinuxpool/repo on the machine; once a fresh copy is
@@ -375,25 +372,9 @@ main() {
             source "${TMP_DIR}/repo/scripts/lib/tunnel-key.sh"
         if GH_TOKEN="$(cat "$GH_TOKEN_FILE")" \
                 tunnel_key_ensure_published "$node_name" "$var_name" "$REPO"; then
-            # The Gateway has to authorize a NEW key before it is of any
-            # use, so this is the one case worth a refresh: dispatch when
-            # this tick actually wrote the key, not on every tick. Two
-            # providers x 48 ticks meant ~96 refresh runs a day that
-            # authorized nothing, and refresh means "a new key was just
-            # published, please authorize it", not "have another look".
-            #
-            # Fire and forget: the tunnel is already up on a key the
-            # Gateway knows, so there is nothing here to wait for. A
-            # dispatch that fails is WARN-only and leaves nothing behind —
-            # refresh-authorized-keys.yml also runs on its own daily
-            # schedule, which is what converges the leftovers.
-            #
-            # Unset flag = a tunnel-key.sh older than the flag (pool-sync
-            # updated before the lib, the mixed state D4 describes). Fail
-            # OPEN there: keep dispatching as before, because a published
-            # but unauthorized key is a dead tunnel and the daily schedule
-            # is a day away. A new lib always sets it, so "unset" only
-            # ever means "old lib".
+            # Refresh only for a key this tick wrote; a failed dispatch is
+            # left to the daily schedule. An unset flag means an older lib,
+            # so dispatch as before.
             if [[ -z "${TUNNEL_KEY_CHANGED+x}" ]]; then
                 log INFO "tunnel-key.sh predates TUNNEL_KEY_CHANGED — dispatching as before"
                 tunnel_key_changed=1
