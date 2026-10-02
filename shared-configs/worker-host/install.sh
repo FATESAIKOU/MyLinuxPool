@@ -1,8 +1,7 @@
 #!/usr/bin/env bash
 # shared-configs/worker-host/install.sh — docs/LAYOUT.md §1
 #
-# 這個單位不安裝任何檔案（沒有 files/）。它存在是為了帶著 worker-host 能力的
-# 判準：--check 的回傳碼是「能力成立嗎」，不是「檔案齊全嗎」（D2）。
+# --check 的回傳碼是「能力成立嗎」，不是「檔案齊全嗎」（D2）——這個單位沒有 files/。
 #
 # 兩個 why：
 # 1. 不 sudo -u——sudo 會重置 PATH，而 PATH 是 docker 從哪裡來的線索。
@@ -65,7 +64,6 @@ group_has_user() {
     return 1
 }
 
-# 這個 process 的群組有沒有 docker。用 id -nG（名單，不是 gid）比對群組名。
 process_in_group() {
     local groups
     groups="$(id -nG 2>/dev/null)" || return 1

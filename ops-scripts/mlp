@@ -947,7 +947,7 @@ cmd_ls() {
     # format there is no separate section left to omit; this is now the
     # ENTIRE repair-specific behavior for the unconfigured case.
     if [[ "$repair_unconfigured" -eq 1 ]]; then
-        echo "mlp: NODE_GATEWAY.ports.repair not configured — skipping repair section" >&2
+        echo "mlp: NODE_GATEWAY.ports.repair not configured — repair hosts will not be listed" >&2
     fi
 }
 
@@ -1157,7 +1157,7 @@ connect_by_name() {
 cmd_ssh() {
     local target="${1:-}"
     if [[ "$target" == -* ]]; then
-        echo "usage: mlp ssh [<node-name|worker-name|port>]  (fzf pick when omitted)" >&2
+        echo "usage: mlp ssh [<node-name|worker-name|repair-name|port>]  (fzf pick when omitted)" >&2
         exit 2
     fi
     # NOTE: the non-interactive guard for the omitted-name case lives at
@@ -1489,9 +1489,8 @@ cmd_wake() {
     if [[ "$n_unknown" -gt 0 ]]; then
         die "wake result unknown for ${node} — check 'mlp ls' to verify"
     fi
-    # Count what was actually tried: a sender that was never sent to did not
-    # "fail". The count keeps the `all N wake sender(s) failed` shape so the
-    # number is machine-checkable, and the skipped count rides along.
+    # Count what was actually tried — a sender never sent to did not "fail". Keep
+    # the `all N wake sender(s) failed` shape so the number is machine-checkable.
     if [[ "$skipped" -gt 0 ]]; then
         die "all ${attempted} wake sender(s) failed for ${node} (${skipped} skipped: no wol)"
     fi
@@ -3004,7 +3003,7 @@ cap_shape_ok() {
 }
 
 # cap_verify_node <node> <capabilities_json> — Model. Sets CAP_ROWS, each
-#   `key<TAB>state<TAB>detail`. No output, no picker. A declared key with no
+#   `key<TAB>state<TAB>detail`. A declared key with no
 #   defined verification returns `unverifiable` — NEVER `pass`; that is the
 #   core of the design (a flag nobody can check must not be reported as
 #   true).
@@ -3036,9 +3035,6 @@ cap_unit_check_on_node() {
     tar_b64="$(tar -cz -C "$unit_dir" . 2>/dev/null | base64 | tr -d '\n')" || return 2
     [[ -n "$tar_b64" ]] || return 2
     param_b64="$(printf '%s' "$params" | base64 | tr -d '\n')"
-    # 只有 --check 真的跑完才印 sentinel。解開失敗就 exit 3 且不印——那樣呼叫端
-    # 拿不到 sentinel，判成 unverifiable，而不是把「傳輸失敗」說成「不成立」
-    # （hop 鏈失敗時 run_on_node 自己也會回 1，兩者光看回傳碼分不出來）。
     cmd="d=\$(mktemp -d) && printf '%s' '$tar_b64' | base64 -d | tar -xz -C \"\$d\" || exit 3; "\
 "MLP_CAPABILITY_PARAMS=\$(printf '%s' '$param_b64' | base64 -d) "\
 "bash \"\$d/install.sh\" --check; rc=\$?; rm -rf \"\$d\"; "\
@@ -3046,9 +3042,10 @@ cap_unit_check_on_node() {
     local hop_rc=0
     out="$(run_on_node "$node" "$cmd" 2>/dev/null)" || hop_rc=$?
     rc="$(printf '%s\n' "$out" | sed -n 's/^MLP_CAP_RC=\([0-9]\)$/\1/p' | tail -1)"
+    # sentinel 而非 run_on_node 的回傳碼：hop 鏈失敗時它也回 1，與單位的 rc=1
+    # 光看回傳碼分不出來（解開失敗會 exit 3 且不印 sentinel）。沒有 sentinel →
+    # unverifiable；255 另外帶回去當診斷。
     if [[ -z "$rc" ]]; then
-        # 傳輸層失敗：hop/ssh 回 1 與單位的 rc=1 光看回傳碼分不出來，所以判定靠
-        # sentinel 有沒有回來。兩種都報 unverifiable；255 另外帶回去當診斷。
         [[ "$hop_rc" -eq 255 ]] && return 255
         return 2
     fi
@@ -3299,8 +3296,8 @@ main_menu() {
     while true; do
         choice="$(
             printf '%s\n' \
-                "ls      list providers/workers and their live state" \
-                "ssh     pick a node/worker and connect" \
+                "ls      list providers/workers/repair with live state" \
+                "ssh     pick a node/worker/repair and connect" \
                 "wake           wake fh-l" \
                 "down           shut down fh-l" \
                 "status         run pool-status" \
@@ -3309,7 +3306,7 @@ main_menu() {
                 "rotate-real    replace the live Gateway for real (asks you to type its IP)" \
                 "worker-new     build and start a worker on a provider" \
                 "worker-rm      stop a worker and release its port" \
-                "fwd-add        forward a local port to a node (pick node, type spec)" \
+                "fwd-add        forward a local port to a node, worker or repair host (pick node, type spec)" \
                 "fwd-ls         list local forwards with live state" \
                 "fwd-rm         remove a local forward (pick)" \
                 "ssh-config     write an ssh_config so plain ssh/scp/rsync work" \
@@ -3372,7 +3369,7 @@ main() {
             # note): refuse before anything resolves.
             if [[ $# -eq 0 ]]; then
                 interactive_only || {
-                    echo "usage: mlp ssh [<node-name|worker-name|port>]  (fzf pick when omitted)" >&2
+                    echo "usage: mlp ssh [<node-name|worker-name|repair-name|port>]  (fzf pick when omitted)" >&2
                     exit 2
                 }
             fi

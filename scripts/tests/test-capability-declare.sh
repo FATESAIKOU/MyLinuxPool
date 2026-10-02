@@ -1,9 +1,6 @@
 #!/usr/bin/env bash
 # test-capability-declare.sh — PR-B tasks 2.1（pool-sync 的宣告路徑）＋ tasks 1.2b。
 #
-# 草稿，放在 scratchpad；PR-A commit 之後由 PM 放進 scripts/tests/（CI 的
-# ci.yml:198 glob 只吃 scripts/tests/，所以 pool-sync 這條不能放
-# shared-configs/pool-runtime/tests/）。
 #
 # 前提：PR-A 的 runner（scripts/lib/capability.sh）與三個單位已存在。
 # 沙箱裡用 MLP_REPO_ROOT 指向工作樹就能先跑。
@@ -44,12 +41,7 @@ FAKE_GIT
 # 假 gh：記錄每一行 argv（workflow run 的次數就從這裡數），讀寫 NODE_* var。
 # 寫入會真的存進 VAR_STORE，之後的讀取看得見——「零寫入」才量得準。
 #
-# stdin **只讀一次**：真實的 `gh variable set` 收的是呼叫端管進來的那份 body。
-# 這裡原本寫了兩個 `$(cat)`，第一個把 stdin 抽乾、第二個讀到 EOF，於是
-# VAR_STORE 裡被寫成空字串——後面每一個讀 var 的步驟（金鑰路徑、宣告路徑的
-# 下一輪比較）都因此讀到空值，看起來像「var 不存在」。宣告路徑跑起來之後才看
-# 得到：那時一個 tick 裡有兩次寫入，第一次（宣告）把 store 清空，第二個
-# （金鑰）就死在「cannot read NODE_FH_TEST」。
+# stdin 只讀一次：第一個 $(cat) 抽乾之後，後面每一個讀 var 的步驟都讀到空值。
 cat > "$FAKEBIN/gh" <<'FAKE_GH'
 #!/usr/bin/env bash
 printf 'args=%s\n' "$*" >> "${GH_LOG:?}"
@@ -108,13 +100,7 @@ exit 0
 SH
 chmod +x "$FAKEBIN"/*
 
-# 假單位：--check 回 FAKE_CAP_RC_<鍵>（預設 0），並把參數落盤。
-#   變數名由**能力鍵**推導（plain-cap → FAKE_CAP_RC_PLAIN_CAP），因為驅動
-#   測試情境的環境變數是照「宣告裡的鍵」寫的，不是照目錄名。
-#   這裡原本寫死 `exit "${FAKE_CAP_RC_THIS:-0}"`——一個沒有任何東西設定的
-#   變數，於是 `FAKE_CAP_RC_PLAIN_CAP=1/2` 從來沒有生效過：2.1c（結果 1 要拿掉）
-#   與 2.1d（結果 2 要保留原值）量到的都是「rc 永遠是 0」那一條路。
-#   2.1f 的訊息也跟著誤導（它印 params=<unset>，因為量到的是收斂迴圈那種呼叫）。
+# 變數名由能力鍵推導；寫死成一個沒人設定的變數，2.1c／2.1d 量到的都是 rc 恆 0。
 make_unit() {  # make_unit <目錄名> <能力鍵> [needs_root]
     local name="$1" key="$2" d="$FIXTURE/shared-configs/$1" rc_var
     rc_var="FAKE_CAP_RC_$(printf '%s' "$key" | tr 'a-z-' 'A-Z_')"
@@ -125,16 +111,7 @@ make_unit() {  # make_unit <目錄名> <能力鍵> [needs_root]
 #!/usr/bin/env bash
 printf 'argv=%s\n' "\$*" >> "\${UNIT_LOG:?}"
 printf 'params=%s\n' "\${MLP_CAPABILITY_PARAMS:-<unset>}" >> "\${UNIT_LOG:?}"
-# FAKE_CAP_RC_<鍵> 只管 --check（D2：那是「能力成立嗎」的三態）。
-# 安裝路徑必須回 0：pool-sync 的收斂迴圈把「--check 非 0」當成漂移，然後
-# 重跑一次安裝；安裝也回 1 的話整個 tick 會死在這裡（install of unit ... failed
-# / exit 1 for systemd to record），宣告那一段根本沒機會跑，於是 2.1c 量到的
-# 是「tick 死掉」而不是「結果 1 的能力從宣告裡拿掉」。
-# 這段註解在**未加引號**的 heredoc 裡：反引號會被當成命令替換執行掉（第一版在
-# 這裡引用了一行 install of unit ... failed，於是每輪都在跑真正的 /usr/bin/install，
-# 噴出一堆 usage），而半形的 $ 也不能緊接著全形符號——bash 3.2 會把那個字元的
-# 前幾個位元組讀成變數名，整段 heredoc 變成空檔（install.sh 0 bytes，於是所有
-# 能力檢查都「回 0」，看起來像綠）。
+# 安裝路徑必須回 0：收斂迴圈把 --check 非 0 當漂移，安裝也非 0 就整個 tick 死掉。
 case " \$* " in
     *" --check "*) exit "\${${rc_var}:-0}" ;;
 esac
@@ -200,11 +177,7 @@ run_sync() {
     mkdir -p "$SANDBOX/home/.mylinuxpool"
     printf 'NODE_NAME=%s\n' "$node" > "$SANDBOX/home/.mylinuxpool/config"
     [[ -n "${KEEP_TOKEN:-}" ]] || printf 'ghp_FAKE_TOKEN_not_a_real_credential\n' > "$SANDBOX/home/.mylinuxpool/gh_token"
-    # SEED_VAR_JSON：讓呼叫端決定這一輪的 var 從**什麼**開始。
-    #   沒有它，run_sync 一律用 NODE_VALUE 覆寫——於是 2.1b2（宣告已一致 → 零寫入）
-    #   與 2.1d（var 裡是 level 7、profile 寫 level 1）種進 store 的值在
-    #   同一個函式裡被自己蓋掉，那兩條量到的都不是它宣稱的情境。
-    #   這是「量測的前提沒有真的成立」，不是產品的問題。
+# SEED_VAR_JSON：沒有它，2.1b2／2.1d 種進去的值會被自己蓋掉。
     if [[ -n "${SEED_VAR_JSON:-}" ]]; then
         printf '%s' "$SEED_VAR_JSON" | jq -c --arg n "$node" '.name = $n' \
             > "$VAR_STORE/NODE_$(printf '%s' "$node" | tr 'a-z-' 'A-Z_')"
@@ -262,15 +235,7 @@ run_sync() {
 
 # ---- 觀察 helpers -------------------------------------------------------
 decl_writes() { grep -c '^PAYLOAD|NODE_' "$GH_PAYLOAD_LOG" 2>/dev/null || true; }
-# 宣告路徑的寫入 = 「**capabilities 變了，而且沒有動 tunnel_public_key**」的寫入。
-#
-# 為什麼兩個條件都要：D4 說宣告是「收斂結束後另外跑一段」，而同一個 tick 裡
-# 隧道金鑰路徑也可能寫一次同一個 var（送的是「同一份 capabilities ＋ 新的
-# tunnel_public_key」）。只看第一個條件時，那一筆會被算成第 2 次宣告寫入
-# ——2.1a 的「恰好寫 1 次」於是永遠紅，而且紅的原因是對的產品。
-# 加上第二個條件之後：金鑰那筆（動了 tunnel_public_key）不算，宣告那筆算，
-# 而**同一份宣告寫兩次**仍然會被數成 2 次（兩筆都沒動金鑰欄位）。
-# 解析 payload：格式是 PAYLOAD|<NAME>|<JSON>。
+# 宣告寫入＝「capabilities 變了而且沒動 tunnel_public_key」；兩個條件都要，否則金鑰那筆會被算成第 2 次。
 decl_write_payloads() {   # decl_write_payloads <寫入前的 capabilities> <寫入前的 tunnel_public_key>
     local pre="$1" pre_key="$2" line caps key
     while IFS= read -r line; do
@@ -336,8 +301,7 @@ fi
 
 echo "=== 2.1 pool-sync 的宣告路徑 ==="
 
-# 2.1a：推導出的宣告與 var 不同 → 恰好寫 1 次，而且只動 capabilities 欄位。
-#   同時當作 2.1b 的正對照（同一個 fixture、同一個計數器）。
+# 2.1a 同時是 2.1b 的正對照（同一個 fixture、同一個計數器）。
 run_sync fh-test
 A_WRITES="$(decl_writes_that_change_caps "$PRE_CAPS")"
 A_CAPS="$(stored_caps FH_TEST)"
@@ -408,7 +372,6 @@ else
     bad "2.1a-keyorder. 寫回去之後鍵序被重排了（寫入=${key_order_now} / 原=${key_order_want}）——整份 var 會 churn"
 fi
 
-# 2.1c：結果 1 → 那個鍵從宣告裡消失，而且有警告
 run_sync fh-test FAKE_CAP_RC_PLAIN_CAP=1
 C_CAPS="$(stored_caps FH_TEST)"
 if printf '%s' "$C_CAPS" | grep -q 'plain-cap'; then
@@ -424,10 +387,7 @@ else
     bad "2.1c. 沒有指名 plain-cap 的警告（combined 尾段：$(tail -3 "$SANDBOX/combined" | tr '\n' ' ' | head -c 160)）"
 fi
 
-# 2.1d：結果 2 → 保留**原來那個值**（不是用 profile 的參數覆蓋）。
-#   關鍵是這一輪的 var 裡 plain-cap 是 {"level":7}，而 profile 寫的是 {"level":1}：
-#   「保留」與「重新推導」才分得開。
-#   用 SEED_VAR_JSON 帶進去（直接寫 var store 會被 run_sync 的重新播種蓋掉）。
+# 2.1d：要量的是「保留原值」而不是「重新推導」，兩者分得開才有意義。
 D_SEED="$(printf '%s' "$NODE_VALUE" | jq -c '.capabilities = {"plain-cap":{"level":7}}')"
 SEED_VAR_JSON="$D_SEED" run_sync fh-test FAKE_CAP_RC_PLAIN_CAP=2
 D_CAPS="$(stored_caps FH_TEST)"
@@ -440,7 +400,6 @@ else
     bad "2.1d. 結果 2 之後 plain-cap 變成 [${D_CAPS}]（level=${D_LEVEL}）——應該原樣保留 level 7"
 fi
 
-# 2.1e：恢復（1 → 0）→ 鍵回來
 run_sync fh-test FAKE_CAP_RC_PLAIN_CAP=0
 E_CAPS="$(stored_caps FH_TEST)"
 if printf '%s' "$E_CAPS" | grep -q 'plain-cap'; then
@@ -449,7 +408,6 @@ else
     bad "2.1e. 恢復後宣告裡沒有 plain-cap（[${E_CAPS}]）"
 fi
 
-# 2.1f：needs_root 的單位照樣被**宣告路徑**驗證，但不被安裝。
 #   「有帶參數的 --check」才是宣告路徑的證據——收斂迴圈本來就會直接叫 --check，
 #   那不算數（它本來就跳過 needs_root）。
 run_sync fh-test
@@ -469,7 +427,6 @@ else
     bad "2.1f. needs_root 的 wolk 被安裝了 ${F_INSTALLS}次——pool-sync 沒有 root"
 fi
 
-# 2.1g：宣告步驟失敗不影響 tick。
 #   前提是「pool-sync 真的有宣告那一段」——PR-B 之前它會假綠（沒有宣告步驟，
 #   tick 當然不會因此失敗）。
 run_sync fh-test GH_MODE=missing
@@ -481,7 +438,6 @@ else
     bad "2.1g. 宣告步驟失敗讓整個 tick 回 ${SYNC_RC}——一格壞掉不該拖垮收斂"
 fi
 
-# 2.1h：寫宣告不觸發任何 workflow run。
 #   兩件事缺一不可：
 #   (1) 前提——這一輪**真的寫入了帶 capabilities 的 payload**。沒有寫入時，
 #       「0 次 workflow run」只是因為什麼都沒發生，不是因為宣告不 dispatch。
@@ -508,7 +464,6 @@ else
     bad "2.1h. 寫入宣告時觸發了 ${H_WF} 次 workflow run（金鑰路徑已隔離）——那會把 refresh 的頻率拉回 #7 那個樣子"
 fi
 
-# 2.1h-pc（正對照）：不種金鑰 → 金鑰路徑真的寫入 → 必須看得到 dispatch。
 #   沒有這一格，2.1h 的「0 次」可能只是探針壞掉。
 run_sync fh-test
 PC_WF="$(workflow_runs)"
@@ -518,7 +473,6 @@ else
     bad "2.1h-pc. 金鑰路徑寫入了，探針卻數到 0 次 workflow run——探針壞掉，2.1h 的 0 次不算證明"
 fi
 
-# 2.1i：宣告路徑要把 profile 的參數接到單位的 --check（D2）
 if [[ "$F_PARAMS" == params=*'{'* ]]; then
     ok "2.1i. 單位的 --check 真的收到 MLP_CAPABILITY_PARAMS（${F_PARAMS}）"
 else
@@ -544,8 +498,7 @@ fi
 
 echo "=== 注入 ==="
 
-# INJ-A：把假單位的 --check 改成「不管參數、一律回 0」→ 2.1d（結果 2 保留原值）
-#   必須轉紅。證明 2.1d 真的在看單位的回碼，不是無論如何都保留。
+# INJ-A：needle 由 make_unit 現算，不要手寫一份會漂的字串。
 #   needle 由 make_unit 產生（rc 變數名是照能力鍵推導的），所以這裡現算，
 #   不要手寫一份會跟 make_unit 漂移的字串。
 INJA_RC_LINE="$(printf 'exit "${FAKE_CAP_RC_PLAIN_CAP:-0}"')"
@@ -575,8 +528,7 @@ else
     fi
 fi
 
-# INJ-B：把假 gh 改成「variable set 不記 payload」→ 寫入帳本必須歸零。
-#   這是給「零寫入」用的探針自測：如果連寫入都記不到，2.1b2 的 0 就不算證明。
+# INJ-B：探針自測——連寫入都記不到時，「零寫入」不算證明。
 #   **這一條以前從來沒有真的注入過**（突變版寫出來了卻沒有裝到 $FAKEBIN/gh 上），
 #   所以它的訊息是過度宣稱。現在真的換上去、真的跑、量的是 **2.1b2 用的那一個**
 #   探針（decl_writes_that_left_the_key_alone），跑完換回來。
@@ -611,20 +563,7 @@ else
     fi
 fi
 
-# INJ-C：讓 pool-sync 算不出宣告 → 2.1a 必須轉紅（宣告的寫入不是別的寫入者做的）。
-#
-#   **錨點換掉了，命題沒變。** 原錨點是「刪掉呼叫 capability_declaration 的
-#   那一行」，而實作是把那個呼叫寫成**跨兩行的接續行**：
-#       if new_caps="$(MLP_REPO_ROOT="${TMP_DIR}/repo" \
-#                         capability_declaration "$profile_json" "$cur_caps" …)"; then
-#   刪掉第二行會留下懸空的 `if`（`then` 一起被帶走），於是突變版語法錯——
-#   這一條從 PR-B 的宣告步驟落地之後就一直只報「harness 問題」，等於從沒跑過。
-#   新錨點是同一條路徑上**更前面的一行**：宣告路徑把 runner 載進來的那一行
-#   `source "$cap_runner"`（單行、命中數剛好 1、刪掉不會破語法）。拿掉它，
-#   capability_declaration 不存在 → pool-sync 記 WARN、不寫 → 2.1a 必須紅。
-#   命題相同：「2.1a 數到的那筆寫入是由宣告路徑算出來的」。
-#   順帶修掉另一個讓這一條從沒生效的問題：突變版寫出來了，run_sync 卻永遠跑
-#   未突變的 pool-sync（它沒有看 POOL_SYNC_SUBJECT）。
+# INJ-C：錨在宣告路徑載入 runner 的那一行（單行、命中數 1、刪掉不破語法）。
 python3 - "$POOL_SYNC" "$SANDBOX/injC-sync.sh" <<'INJC'
 import sys
 lines = open(sys.argv[1], encoding="utf-8").read().split("\n")

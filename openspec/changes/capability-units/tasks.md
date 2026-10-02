@@ -11,12 +11,12 @@
   - 分三個 PR
   - 註解要少
   - 每個 PR 都等使用者看過再 merge
-- [x] 0.2 唯讀調查：`team/OUT-recon-capability.md`、`team/OUT-impl-recon-myaientry-caps.md`、`team/OUT-test-recon-capability-tests.md`、`team/OUT-impl-recon-selecthost-online.md`
+- [x] 0.2 唯讀調查（**內部審查報告，未進版控**；下列只是檔名，不在 repo 裡）：`OUT-recon-capability.md`、`OUT-impl-recon-myaientry-caps.md`、`OUT-test-recon-capability-tests.md`、`OUT-impl-recon-selecthost-online.md`
 - [x] 0.3 通知 MyAiEntry#4
 - [x] 0.4 唯讀實測（2026-10-02）：
   - `mlp verify-capabilities --all`：fh-proxy（no-sudo）與 fh-proxy-asus 的 `worker-host` 都 ok；fh-l 關機
   - 兩台的 systemd user manager 都已經有 docker 群組
-- [x] 0.5 propose 審查：`team/OUT-review-capability-proposal.md`，修訂已併入 design 與 spec
+- [x] 0.5 propose 審查：`OUT-review-capability-proposal.md`，修訂已併入 design 與 spec
 
 ## 1. PR-A：單位與 runner
 
@@ -55,6 +55,8 @@
 - [ ] 3.4 review、閘門、PR-C
 - [ ] 3.5 merge 後：
   - `mlp wake fh-l` 照常能用
-  - 刪掉 `NODE_FH_PROXY.wol_sender`（執行前再跟使用者確認）
+  - [x] 刪掉 `NODE_FH_PROXY.wol_sender`（執行前再跟使用者確認）—— **2026-10-03 完成**：
+    使用者同意後刪除，刪除前有備份；repo 內已無任何程式讀它（`grep wol_sender` 零命中），
+    取代它的是該機器的 `wol` 能力（由 `wol` 單位自己的 `--check` 判定）
   - 更新 MyAiEntry#4
   - archive

@@ -1149,20 +1149,9 @@ inj_gate() {
 
 # 18-21、23、24. 注入：拿掉 D6 的修正，斷言必須轉紅。
 #
-#   D6 落地之後，這幾條的性質變了：紅燈階段它們是**正向對照**（把 D6 注進沒有篩選
-#   的產品碼，斷言必須轉綠，用來排除「斷言寫錯」）；現在產品碼自己就是那份正確版本，
-#   正向對照變成**拿掉修正**（OUT-test-capability-prc-red.md §4 限制 2 指定的改法）。
-#   **命題不變**：每一條仍然是同一個命題的有牙證明，18／23 從「注進去會綠」翻成
-#   「拿掉會紅」是同一件事的兩面——證明斷言量到的就是 D6，不是別的。
-#
-#   錨點全部重新對到 impl 實際的形狀（`node_wol_state`、wake 迴圈裡的篩選、
-#   `cap_verify_one` 裡的 via 回報），每一個都用 python `assert count == 1` 守著，
-#   突變版都過 `bash -n`。錨點是程式碼行，不是註解。
+# 18-21、23、24：D6 落地後這幾條是「拿掉修正」；命題不變。錨點全部對到 impl 實際的形狀。
 
-# 18. 拿掉 wake 迴圈裡的整段篩選（node_wol_state 的判斷＋略過行＋continue）
-#     → 16.1／16.3／16.4／16.6a／16.6b 必須紅，16.2 必須**仍綠**。
-#     16.2 仍綠是這條的另一半：它證明「兩台都有資格」時本來就與篩選無關，
-#     所以它綠不是因為篩選不存在。
+# 18：16.2 必須仍綠——它證明「兩台都有資格」時本來就與篩選無關。
 INJP="$SANDBOX/mutant-no-wol-gate.sh"
 python3 - "$MLP" "$INJP" <<'PY'
 import sys
@@ -1195,7 +1184,6 @@ if inj_gate 18 "$INJP"; then
     fi
 fi
 
-# 19. 略過行不帶序號 → 16.1／16.4 紅（被略過的照樣佔一個 (n/m) 的序號），其餘仍綠。
 INJQ="$SANDBOX/mutant-wol-noordinal.sh"
 python3 - "$MLP" "$INJQ" <<'PY'
 import sys
@@ -1221,8 +1209,7 @@ if inj_gate 19 "$INJQ"; then
     fi
 fi
 
-# 20. 「宣告讀不到」也當成有資格（wst 2 不再被篩掉）→ 16.4 紅，16.1／16.3 仍綠。
-#     這是這個 repo 反覆在守的方向錯誤：把「不知道」當成「可以」。
+# 20：把「不知道」當成「可以」，是這個 repo 反覆在守的方向錯誤。
 INJR="$SANDBOX/mutant-wol-readok.sh"
 python3 - "$MLP" "$INJR" <<'PY'
 import sys
@@ -1244,7 +1231,6 @@ if inj_gate 20 "$INJR"; then
     fi
 fi
 
-# 21. via 順序被弄反 → 16.2 紅，而且實測送出順序真的反過來。
 INJS="$SANDBOX/mutant-wol-reversed.sh"
 python3 - "$MLP" "$INJS" <<'PY'
 import sys
@@ -1270,7 +1256,6 @@ if inj_gate 21 "$INJS"; then
     fi
 fi
 
-# 23. 拿掉 cap_verify_one 裡的 via 回報 → 16.5a／16.5b 紅。
 INJT="$SANDBOX/mutant-no-via-wol-report.sh"
 python3 - "$MLP" "$INJT" <<'PY'
 import sys
@@ -1302,7 +1287,6 @@ if inj_gate 23 "$INJT"; then
     fi
 fi
 
-# 24. via 回報固定只看第一台 → 16.5b 紅、16.5a 仍綠（回報確實照宣告，不是照位置）。
 INJU="$SANDBOX/mutant-via-firstonly.sh"
 python3 - "$MLP" "$INJU" <<'PY'
 import sys
@@ -1324,12 +1308,7 @@ if inj_gate 24 "$INJU"; then
     fi
 fi
 
-# 25. 混合情境的結語被寫回 over-claim 版 → 16.7 紅，其餘仍綠。
-#     錨點用 regex 而不是字串：只要那句標題還是
-#     `echo "could not wake ${node}…"` 這個形狀（impl 怎麼加限定詞都還在），
-#     就整句換成沒有限定詞的版本。這樣 impl 把結語改成什麼措辭都不必重錨。
-#     若他改成一句不以 `could not wake` 開頭的話，這條注入會如實報 harness 問題，
-#     那時要重錨——**不會**默默通過。
+# 25：錨點用 regex，impl 改措辭就不必重錨；形狀真的變了會報 harness 問題，不會默默通過。
 INJV="$SANDBOX/mutant-overclaim-heading.sh"
 python3 - "$MLP" "$INJV" <<'PY'
 import re
@@ -1362,11 +1341,7 @@ if inj_gate 25 "$INJV"; then
 fi
 
 # 26. die 訊息改回用 `total`（`all 2 wake sender(s) failed`，實際只試了 1 台）
-#     → 16.7 紅在 die 子句，heading 子句必須仍是綠的。
-#     這一條專抓 stdout 對、stderr 把它抵消掉的情況：兩邊都「看起來有寫」，
-#     使用者讀到的結論卻是錯的。錨點是程式碼行，不是註解。
-#     錨在**變數**（`${attempted}` → `${total}`）而不是整行文字：混合情境走的是
-#     哪一個 die 分支會隨 impl 的寫法變動，錨變數就不受影響。
+# 26：專抓 stdout 對、stderr 抵消掉的情況。錨在變數（attempted→total），分支怎麼寫都不受影響。
 INJW="$SANDBOX/mutant-die-total.sh"
 python3 - "$MLP" "$INJW" <<'PY'
 import re

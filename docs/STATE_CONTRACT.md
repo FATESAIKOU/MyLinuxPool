@@ -30,6 +30,8 @@
 | `image` | string | ✅ | `profiles/worker/<image>` |
 | `container` | string | ✅ | provider 上的容器名 |
 | `created_at` | string | ✅ | RFC3339 UTC |
+| `tunnel_public_key` | string | | 該 worker 自己的隧道金鑰公鑰（KEY-DESIGN §3.2）；`ledger_add` 第 7 個引數，缺省不出現 |
+| `capabilities` | object | | 該 worker 的能力宣告，等於 image profile 的 `capabilities`；沒有宣告時是 `{}`，**永不為 `null`**（spec.md:75） |
 
 規則：
 
