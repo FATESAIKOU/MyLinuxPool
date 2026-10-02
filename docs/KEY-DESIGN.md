@@ -89,6 +89,15 @@ worker 則是每次 `create-worker` 產一把新的——worker 本來就是每�
 之後就不需要金鑰，於是**登入清單變成自癒的**。這比 `repair-provider` 更好：
 不是「有人記得跑一次」，而是每 30 分鐘自動收斂。
 
+> **「每 30 分鐘」是收斂的週期，不是 dispatch 的週期。** pool-sync 每個 tick 都
+> 會呼叫 `tunnel_key_ensure_published` 去確保這台機器的隧道公鑰在
+> `NODE_*` 裡，但**只有真的寫入了新金鑰時才 dispatch**
+> `refresh-authorized-keys.yml` 請 Gateway 授權；金鑰沒變就什麼都不做。
+> dispatch 失敗只記警告、不留標記檔，其餘漂移（含有人在 GitHub UI 直接改
+> `CLIENT_*`／`NODE_*`）由那條每日排程（UTC 20:00）收斂，**最晚在下一次每日排程
+> 之後**（排程會被延遲，Actions 停用時不會跑，所以「一天」不是上界）。
+> 完整敘述與不加 `concurrency` 的理由見 `RUNBOOK.md` §3.5。
+
 **第四個修正：沒有 `repair-worker`。** worker 容器裡沒有 token，不能自己讀 var。
 但它所在的 provider 有。provider 已經在發布
 `~/.mylinuxpool/gateway/gateway.json` 到一個唯讀 bind mount 給容器；

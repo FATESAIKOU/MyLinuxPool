@@ -70,15 +70,20 @@ tunnel_key_mint() {
         log ERROR "cannot read ${TUNNEL_KEY}.pub"
         return 1
     fi
+
+    return 0
 }
 
 # tunnel_key_publish <var_name> <repo> <public_key>
 #   MERGES tunnel_public_key into NODE_<NAME>. Never writes the whole var:
 #   overwriting hops/power/capabilities would take the machine offline.
 #   Returns 0 and logs nothing new when the var already holds this key.
+#   Sets the global TUNNEL_KEY_CHANGED to 1 only when this call wrote.
 tunnel_key_publish() {
     local var_name="$1" repo="$2" pub="$3"
     local current merged
+
+    TUNNEL_KEY_CHANGED=0
 
     current="$(gh api "repos/${repo}/actions/variables/${var_name}" --jq .value 2>/dev/null || true)"
     if [[ -z "$current" ]] || ! printf '%s' "$current" | jq empty >/dev/null 2>&1; then
@@ -100,6 +105,7 @@ tunnel_key_publish() {
         return 1
     fi
     log INFO "published tunnel_public_key into ${var_name}"
+    TUNNEL_KEY_CHANGED=1
 }
 
 # tunnel_key_ensure_published <node_name> <var_name> <repo>
@@ -107,6 +113,7 @@ tunnel_key_publish() {
 #   authorize it; who dispatches the refresh, and whether they wait for
 #   it, is the caller's decision — pool-sync fires and forgets, while
 #   register-provider must wait or its own verification races the refresh.
+#   Keep the publish call last: its status and TUNNEL_KEY_CHANGED pass through.
 tunnel_key_ensure_published() {
     local node_name="$1" var_name="$2" repo="$3"
     tunnel_key_mint "$node_name" || return 1

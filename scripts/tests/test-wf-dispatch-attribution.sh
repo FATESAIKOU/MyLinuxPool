@@ -53,10 +53,10 @@ HOME_DIR="$SANDBOX/home"
 STATE="$HOME_DIR/state"
 mkdir -p "$SHIMS" "$HOME_DIR" "$STATE"
 
-pass=0; fail=0; injfail=0
+pass=0; fail=0; injfail=0; injpass=0
 ok()  { pass=$((pass+1)); printf '  ok    %s\n' "$1"; }
 bad() { fail=$((fail+1)); printf '  FAIL  %s\n' "$1"; }
-inj_ok()  { printf '  ok    (注入) %s\n' "$1"; }
+inj_ok()  { injpass=$((injpass + 1)); printf '  ok    (注入) %s\n' "$1"; }
 inj_bad() { injfail=$((injfail+1)); printf '  FAIL  (注入) %s\n' "$1"; }
 
 # ---- 假 gh：記 argv、套 --json／--jq（真 gh 的語意） -------------------------
@@ -247,6 +247,167 @@ if [[ "$guard_py" == "ok" ]]; then
 else
     bad "0b. workflow 端結構不完整：[$guard_py]"
 fi
+
+
+# 0c–0e（issue #7 tasks 1.3 / openspec D3）：refresh workflow 的排程形狀。
+# 放在這支檔是因為它已經用真 YAML parser 讀 workflow；不要改用 grep 讀 YAML。
+# 坑：YAML 1.1 把裸 `on:` 讀成布林 True，所以要 `doc.get("on") or doc.get(True)`。
+WF_REFRESH="$REPO_ROOT/.github/workflows/refresh-authorized-keys.yml"
+
+# wf_refresh_shape <yml路徑> — 四件事一起查，印 "ok" 或問題清單：
+#   1. on.schedule 存在且 cron == "0 20 * * *"（UTC 每日一次）
+#   2. 沒有 concurrency（釘住「不要有人順手加」）
+#   3. run-name 有字面前綴、非空白-only（nonce 認領機制建立在它上面）
+#   4. 沒有任何 step 讀 inputs.*：排程事件不帶 input，讀它就是空字串的風險
+wf_refresh_shape() {
+    python3 - "$1" <<'PY'
+import sys, yaml
+
+doc = yaml.safe_load(open(sys.argv[1], encoding="utf-8"))
+on = doc.get("on") or doc.get(True)   # YAML 1.1：裸 on: 讀成布林 True
+on = on or {}
+bad = []
+
+# 1. 每日排程 + cron
+sched = on.get("schedule")
+if not isinstance(sched, list) or not sched:
+    bad.append("no on.schedule block")
+else:
+    crons = [c.get("cron") for c in sched if isinstance(c, dict)]
+    if crons != ["0 20 * * *"]:
+        bad.append("schedule cron is %r, want ['0 20 * * *']" % (crons,))
+
+# 2. 沒有 concurrency
+if doc.get("concurrency") is not None:
+    bad.append("concurrency present (%r) — not in scope for this change" % (doc.get("concurrency"),))
+
+# 3. run-name 有字面前綴（非空白-only）
+rn = doc.get("run-name")
+if not isinstance(rn, str) or not rn.strip():
+    bad.append("run-name missing or whitespace-only")
+
+# 4. 沒有任何地方讀 inputs.*（run-name 裡的 inputs.* 是設計要的，不算）。
+#    掃描面要含 step 的 with／run／uses／if／env 與 job 的 if／env／container.env：
+#    `if: ${{ inputs.x }}` 在排程那筆就是空值。
+def _blob(d):
+    out = []
+    for k in ("if", "run", "uses"):
+        if isinstance(d.get(k), str):
+            out.append(d[k])
+    for k in ("with", "env", "container"):
+        v = d.get(k)
+        if isinstance(v, dict):
+            out += [str(x) for x in v.values()]
+            if isinstance(v.get("env"), dict):
+                out += [str(x) for x in v["env"].values()]
+    return out
+
+for jn, job in (doc.get("jobs") or {}).items():
+    for b in _blob(job):
+        if "inputs." in b:
+            bad.append("job %r reads inputs.* (%r)" % (jn, b[:60]))
+    for step in (job.get("steps") or []):
+        for b in _blob(step):
+            if "inputs." in b:
+                bad.append("step %r reads inputs.* (%r)" % (step.get("name"), b[:60]))
+print("; ".join(bad) if bad else "ok")
+PY
+}
+
+sh="$(wf_refresh_shape "$WF_REFRESH")"
+if [[ "$sh" == "ok" ]]; then
+    ok "0c. refresh workflow：每天 20:00 UTC 排程、沒有 concurrency、run-name 非空白、沒有 step 讀 inputs.*"
+else
+    bad "0c. workflow 形狀不符：[$sh]"
+fi
+
+# 0f. 正對照：拿一份已知合格的合成 workflow 餵它必須回 ok，否則 0c 的紅可能只是檢查器寫壞。
+cat > "$SANDBOX/good-refresh.yml" <<'YML'
+name: Refresh Authorized Keys
+on:
+  workflow_dispatch:
+    inputs:
+      nonce:
+        required: false
+        default: ''
+        type: string
+  schedule:
+    - cron: "0 20 * * *"
+run-name: refresh-authorized-keys ${{ github.event_name }} ${{ inputs.nonce }}
+permissions:
+  contents: read
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Refresh
+        run: echo hi
+YML
+if [[ "$(wf_refresh_shape "$SANDBOX/good-refresh.yml")" == "ok" ]]; then
+    ok "0f. 正對照：合成出的一份合格 workflow 讓同一個檢查器回 ok（0c 的紅不是檢查器壞掉）"
+else
+    inj_bad "0f. 檢查器連合格檔案都判不合格（[$SANDBOX/good-refresh.yml]）——0c 的紅沒意義"
+fi
+
+# 注入：每一條都要證明 0c 抓得到。三個突變各自直接寫出突變後的 yml，repo 的
+# workflow 不動。
+mkdir -p "$SANDBOX/wfmut"
+
+# m1：cron 改成每 5 分鐘（正是這次燒掉額度的頻率）。
+python3 - "$WF_REFRESH" "$SANDBOX/wfmut/m1.yml" <<'PYM1'
+import sys
+src = open(sys.argv[1], encoding="utf-8").read()
+# 改現有的那一筆 cron，不要「再插一個 schedule:」——PyYAML 重複鍵是後者覆蓋
+# 前者，突變會靜靜變成 no-op。所以注入必須驗收自己真的改到檔案（`!= -1`）。
+old = 'cron: "0 20 * * *"'
+new = 'cron: "*/5 * * * *"'
+i = src.find(old)
+assert i != -1, "m1 needle missing"
+src = src[:i] + new + src[i + len(old):]
+open(sys.argv[2], "w", encoding="utf-8").write(src)
+PYM1
+
+# m2：加一個 concurrency group（非目標，釘住「不要有人順手加」）。
+python3 - "$WF_REFRESH" "$SANDBOX/wfmut/m2.yml" <<'PYM2'
+import sys
+src = open(sys.argv[1], encoding="utf-8").read()
+old = "permissions:"
+new = "concurrency:\n  group: refresh-authkeys\n  cancel-in-progress: true\n\npermissions:"
+assert src.count(old) >= 1, "m2 needle missing"
+open(sys.argv[2], "w", encoding="utf-8").write(src.replace(old, new, 1))
+PYM2
+
+# m3：有 step 用 `if:` 讀 inputs.nonce（排程那筆拿到空值）；刻意不用 run:，
+#     掃描面若只看 run/with/uses 就會漏掉它。
+python3 - "$WF_REFRESH" "$SANDBOX/wfmut/m3.yml" <<'PYM3'
+import sys
+src = open(sys.argv[1], encoding="utf-8").read()
+old = "      - name: Checkout"
+new = '      - name: Gate\n        if: ${{ inputs.nonce != \'\' }}\n      - name: Checkout'
+assert src.count(old) == 1, "m3 needle count=%d" % src.count(old)
+open(sys.argv[2], "w", encoding="utf-8").write(src.replace(old, new, 1))
+PYM3
+
+for m in m1 m2 m3; do
+    case "$m" in
+        m1) why="cron 改成每 5 分鐘" ;;
+        m2) why="加了 concurrency group" ;;
+        m3) why="有 step 用 if 讀 inputs.nonce" ;;
+    esac
+    if [[ ! -s "$SANDBOX/wfmut/$m.yml" ]]; then
+        # 突變沒產出檔案＝needle 落空；不能拿檢查器對空檔案的結論當證據。
+        inj_bad "0-inj-${m}. 突變沒產出檔案（needle 落空？）——harness 問題，這條注入等於沒測"
+        continue
+    fi
+    got="$(wf_refresh_shape "$SANDBOX/wfmut/$m.yml" 2>/dev/null)"
+    if [[ "$got" == "ok" ]]; then
+        inj_bad "0-inj-${m}. ${why}之後檢查器仍回 ok——它抓不到這個"
+    else
+        inj_ok "0-inj-${m}. ${why} → 檢查器抓到（[$got]）——0c 紅得有效"
+    fi
+done
 
 echo "=== 1. 主路徑：gh 印出 run URL → 直接認領（有證據） ==="
 # 舊 1a（「恰好一筆新 run → 認領」）的翻轉：認領的理由從「窗內唯一」變成
@@ -776,7 +937,7 @@ else
 fi
 
 echo
-printf 'passed %d / failed %d / injection-fail %d\n' "$pass" "$fail" "$injfail"
+printf 'passed %d / failed %d / injection-pass %d / injection-fail %d\n' "$pass" "$fail" "$injpass" "$injfail"
 if [[ "$fail" -ne 0 ]]; then exit "$fail"; fi
 if [[ "$injfail" -ne 0 ]]; then exit 2; fi
 exit 0

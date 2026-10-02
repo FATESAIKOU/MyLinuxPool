@@ -332,6 +332,38 @@ provider 上的 `~/.mylinuxpool/bin/` 是註冊那一刻裝上去的。rotate �
 每個 unit 跑 `install.sh --check`（內容比對），有落差才裝，**只有真的裝了才
 重啟 `pool-tunnel`**。它同時會刪掉舊版留下的 `~/.mylinuxpool/repo`。
 
+#### 它什麼時候才會 dispatch refresh
+
+`pool-sync` 每個 tick 都會呼叫 `tunnel_key_ensure_published`，而那支在
+「var 裡的值已經一樣、什麼都沒寫」時也回 0。**所以判斷要不要 dispatch 的不是
+回傳碼，是「這一次有沒有真的寫入」**（`TUNNEL_KEY_CHANGED`）：
+
+- **只有真的寫進了新的隧道金鑰才 dispatch 一次** `refresh-authorized-keys.yml`。
+  金鑰沒變的那 30 分鐘不會動——這是 issue #7 的修掉的那件事：兩個 provider 加起來
+  原本每天約 96 次無用 refresh，把 Actions 的 run 紀錄淹沒，而 refresh 的語意
+  本來是「剛發布新金鑰，請 Gateway 授權它」，不是「例行巡一下」。
+- **dispatch 失敗只記一條 WARN**（`could not dispatch refresh-authorized-keys.yml —
+  the Gateway will pick the key up on the daily schedule (refresh-authorized-keys.yml
+  runs at 20:00 UTC)`，逐字見 `shared-configs/pool-runtime/files/pool-sync` 的
+  `log WARN`），tick 本身仍然成功，而且**不留任何標記檔**。
+  `pool-sync`「`~/.mylinuxpool` 底下不保存狀態」這條原則不變，所以沒有
+  「下一輪記得補發」這種東西——漏網的由下面那條每日排程收斂。
+- **其餘漂移由每日排程收斂**：`refresh-authorized-keys.yml` 有一條
+  `cron: "0 20 * * *"`（UTC 20:00，台灣時間 04:00）。dispatch 失敗、有人直接在
+  GitHub UI 改 `CLIENT_*`／`NODE_*`、或有人手動在 Gateway 上加金鑰——這些過去是靠
+  pool-sync 那個 bug 順手收斂的，修掉之後改由排程收斂，**最晚在下一次每日排程之後**。
+  「一天」是意圖不是上界：GitHub 忙碌時會延遲排程，Actions 被停用時排程根本不會跑。
+  會產生新金鑰的只有「首次 sync」與「金鑰重建」，而 `register-provider.sh` 自己
+  會 dispatch 並等待，所以註冊那條路不等排程。
+- **不加 `concurrency` group。** 加了之後排隊中的 refresh 會被取消，結論變成
+  `cancelled`，於是 `register-provider.sh`、`create-worker`、`delete-worker`
+  這三條**等結果的硬失敗**路徑會被誤傷；而修掉這個 bug 之後它原本要解決的
+  「refresh 太密」問題已經不存在。
+
+> 這些步驟要在下一個 tick 才生效：provider 每個 tick 都從 master 的新 clone 拿
+> `tunnel-key.sh`，同一個 tick 也收斂 `pool-runtime`，但**那個 tick 執行的仍是舊版
+> pool-sync**。從 merge 到行為改變最壞約 60 分鐘，中間最多多派一次 refresh。
+
 ### 日常檢查
 
 ```bash

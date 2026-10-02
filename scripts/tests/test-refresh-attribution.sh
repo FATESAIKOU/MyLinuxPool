@@ -42,6 +42,9 @@ mkdir -p "${SHIMS}" "${STATE}"
 pass=0; fail=0
 ok()  { pass=$((pass + 1)); printf '  ok    %s\n' "$1"; }
 bad() { fail=$((fail + 1)); printf '  FAIL  %s\n' "$1"; }
+injpass=0; injfail=0
+inj_ok()  { injpass=$((injpass + 1)); printf '  ok    (注入) %s\n' "$1"; }
+inj_bad() { injfail=$((injfail + 1)); printf '  FAIL  (注入) %s\n' "$1"; }
 
 # 假 sleep：立即結束，不浪費等待時間
 printf '#!/usr/bin/env bash\nexit 0\n' > "${SHIMS}/sleep"
@@ -177,7 +180,7 @@ run_dispatch() {
     FAKE_CREATE_OUR_RUN="${FAKE_CREATE_OUR_RUN:-1}" \
     /bin/bash -c '
         source "'"${REPO_ROOT}"'/scripts/lib/log.sh"
-        source "'"${REPO_ROOT}"'/scripts/lib/refresh-wait.sh"
+        source "'"${REFRESH_WAIT_LIB:-${REPO_ROOT}/scripts/lib/refresh-wait.sh}"'"
         ( dispatch_refresh_and_wait "'"${timeout_sec}"'" >"'"${SANDBOX}"'/sub.out" 2>"'"${SANDBOX}"'/sub.err" )
         printf "%s" "$?" > "'"${SANDBOX}"'/sub.rc"
     ' </dev/null >/dev/null 2>&1
@@ -279,9 +282,93 @@ else
     bad "3. 情境 C（認不出）：預期回非 0 且訊息宣告認不出，但目前回 ${SUB_RC} 且回報 201（got [${SUB_GOT}]）"
 fi
 
+echo "=== 4. 每日排程的 run 與手動 dispatch 並存（issue #7 / openspec D3）==="
+# 排程那筆的 displayTitle 是否留尾隨空白，離線無法確認 → 兩種形狀都測（4a/4b）。
+# 它刻意比我們的新且 conclusion=failure：認錯就會回 1，兩個結果不會撞。
+sched_case() {   # sched_case <標題> <ours_id> <ours_conclusion> <sched_id>
+    local title="$1" oid="$2" oconcl="$3" sid="$4"
+    cat > "${STATE}/other_runs.json" <<JSON
+[
+  {
+    "databaseId": ${sid},
+    "status": "completed",
+    "conclusion": "failure",
+    "displayTitle": "${title}",
+    "createdAt": "2026-09-26T12:05:00Z"
+  }
+]
+JSON
+    rm -f "${STATE}/our_run.json"
+    OUR_RUN_ID="${oid}" OUR_STATUS=completed OUR_CONCLUSION="${oconcl}" \
+        OUR_CREATED_AT="2026-09-26T12:00:00Z" FAKE_CREATE_OUR_RUN=1 run_dispatch 5
+}
+
+sched_case "refresh-authorized-keys schedule " 100 success 900
+if [[ "${SUB_RC}" == "0" ]] && printf '%s' "${SUB_OUT}" | grep -qF "refresh workflow 100 succeeded" \
+   && ! printf '%s' "${SUB_GOT}" | grep -qF "refresh workflow 900"; then
+    ok "4a. 排程 run（有尾隨空白、比較新、failure）在窗裡：仍只認我們那筆 100 → rc 0"
+else
+    bad "4a. 排程 run 被誤認（或我們那次沒認到）（got [${SUB_GOT}]）"
+fi
+
+sched_case "refresh-authorized-keys schedule" 100 success 900
+if [[ "${SUB_RC}" == "0" ]] && printf '%s' "${SUB_OUT}" | grep -qF "refresh workflow 100 succeeded" \
+   && ! printf '%s' "${SUB_GOT}" | grep -qF "refresh workflow 900"; then
+    ok "4b. 排程 run（尾隨空白被 trim 的形狀）：仍只認我們那筆 100 → rc 0"
+else
+    bad "4b. 排程 run（trim 版）被誤認（或我們那次沒認到）（got [${SUB_GOT}]）"
+fi
+
+# 4c. 反向：我們那次失敗、排程那次成功——認錯方向會變成假綠。
+sched_case "refresh-authorized-keys schedule " 100 failure 900
+if [[ "${SUB_RC}" != "0" ]] && ! printf '%s' "${SUB_GOT}" | grep -qF "refresh workflow 900"; then
+    ok "4c. 我們那次失敗時：回非 0，且沒有拿排程那筆的成功當成自己的結論"
+else
+    bad "4c. 我們那次 failure 卻回 ${SUB_RC}／報了 900（假綠形狀）（got [${SUB_GOT}]）"
+fi
+
+# 4-inj. 比對條件改成 contains("")（空 nonce 命中每一筆）→ 會挑中窗裡最新那筆
+#   （排程那筆）而回 1，4a 必須紅。
+INJ_RW="$SANDBOX/refresh-wait-emptycontains.sh"
+python3 - "$REPO_ROOT/scripts/lib/refresh-wait.sh" "$INJ_RW" <<'PYINJ'
+import sys
+src = open(sys.argv[1], encoding="utf-8").read()
+old = "contains(\"'\"${nonce}\"'\")"
+new = "contains(\"\")"
+assert src.count(old) == 1, "contains-nonce needle count=%d" % src.count(old)
+open(sys.argv[2], "w", encoding="utf-8").write(src.replace(old, new, 1))
+PYINJ
+if [[ $? -ne 0 ]]; then
+    inj_bad "4-inj. 突變腳本失敗（refresh-wait 的比對條件形狀變了）——harness 問題"
+elif ! bash -n "$INJ_RW" 2>/dev/null; then
+    inj_bad "4-inj. 突變版語法錯誤——harness 問題"
+else
+    cat > "${STATE}/other_runs.json" <<JSON
+[
+  {
+    "databaseId": 900,
+    "status": "completed",
+    "conclusion": "failure",
+    "displayTitle": "refresh-authorized-keys schedule ",
+    "createdAt": "2026-09-26T12:05:00Z"
+  }
+]
+JSON
+    rm -f "${STATE}/our_run.json"
+    REFRESH_WAIT_LIB="$INJ_RW" OUR_RUN_ID=100 OUR_STATUS=completed OUR_CONCLUSION=success \
+        OUR_CREATED_AT="2026-09-26T12:00:00Z" FAKE_CREATE_OUR_RUN=1 run_dispatch 5
+    if [[ "${SUB_RC}" == "0" ]] && printf '%s' "${SUB_OUT}" | grep -qF "refresh workflow 100 succeeded"; then
+        inj_bad "4-inj. 比對條件改成 contains(\"\")（空 nonce 命中每一筆）之後 4a 仍綠——這條斷言抓不到誤認"
+    else
+        inj_ok "4-inj. contains(\"\") 之後挑中窗裡最新那筆（rc=${SUB_RC}）——4a/4b 會紅"
+    fi
+fi
 echo
-printf 'passed %d / failed %d\n' "${pass}" "${fail}"
+printf 'passed %d / failed %d / injection-pass %d / injection-fail %d\n' "${pass}" "${fail}" "${injpass}" "${injfail}"
 if [[ "${fail}" -ne 0 ]]; then
     exit "${fail}"
+fi
+if [[ "${injfail}" -ne 0 ]]; then
+    exit 2
 fi
 exit 0

@@ -20,7 +20,8 @@
 | `test-ssh-admin-install.sh` | 15 | 不再佈署私鑰、既有私鑰不被刪、drift 回報 |
 | `test-delete-worker.sh` | 9 | 兩種 worker 名稱寫法 |
 | `test-pool-resolve.sh` | 13 | 跳板鏈展開 |
-| `test-pool-sync.sh` | 47 | 收斂邏輯：GitHub 掛掉必須 exit 0、無變更不得重啟 tunnel、`needs_key` 的 unit 跳過、暫存目錄三種離開路徑都清、token 不入 argv 與 log、**跑完不新增任何檔案** |
+| `test-pool-sync.sh` | 112 | 收斂邏輯：GitHub 掛掉必須 exit 0、無變更不得重啟 tunnel、`needs_key` 的 unit 跳過、暫存目錄三種離開路徑都清、token 不入 argv 與 log、**跑完不新增任何檔案**；issue #7 加了「已發布零 dispatch／剛寫入恰好一次／dispatch 失敗只警告」（2026-10-02 實跑 112 條） |
+| `test-tunnel-key-lib.sh` | 13 | 隧道金鑰的 mint／publish／ensure；issue #7 加了 `TUNNEL_KEY_CHANGED` 的「已一致＝0／剛寫入＝1／連呼兩次不殘留」與 `tunnel_key_mint` 顯式 `return 0` 的斷言（2026-10-02 實跑 13 條＋4 條注入） |
 | `test-install-check.sh` | 18 + 3 injection | `pool-runtime` 的 `--check` 做的是**內容比對**而非存在性檢查（整個 pool-sync 設計的地基） |
 | `test-register-provider-tempclone.sh` | 9 | 註冊後不留 `~/.mylinuxpool/repo`、舊的會被刪、`gh_token` 保留、暫存目錄失敗時也清 |
 | `test-mlp-fwd.sh` | 68（含 13 注入） | `mlp fwd` 的四態健康檢測、bind 重疊判準、分層邊界、上色後的欄寬 |
@@ -319,6 +320,7 @@ mv ~/.mylinuxpool/gh_token{.bak,}
 | B3 `mlp state` | 未做——顯示主本與快取的差異，也是 V11 的工具 |
 | I1–I3 整合測試 | 未做 |
 | V5 / V10 / V11 | 未測 |
+| issue #7 的紅燈測試 | 未做——`TUNNEL_KEY_CHANGED` 的兩次斷言＋注入、`test-pool-sync.sh` 的「已一致時不得有 `gh workflow run`」與「有 dispatch 要收緊成恰好一筆」、dispatch 失敗的新案例（**`FAKE_GH_MODE=dispatchfail`，不能用 `writefail`**——後者連 `variable set` 一起失敗，`tunnel_key_publish` 會先 return 1，走不到 dispatch 那一步）、以及 `refresh-authorized-keys.yml` 的每日排程：**行為測試**（`test-refresh-attribution.sh` 新增一個情境——一筆排程 run ＋ 我們自己那筆，必須仍然認出我們的）＋**回歸護欄**（**仍然**沒有任何 step 讀 `inputs.*`；排程 run 的 `run-name` nonce 是空的，靜態標題不可能被 `contains()` 認領）。實作與實機驗收都要在這些斷言之後 |
 
 ---
 

@@ -33,10 +33,10 @@ POOL_SYNC="shared-configs/pool-runtime/files/pool-sync"
 SANDBOX="$(mktemp -d "${TMPDIR:-/tmp}/test-tunnel-key-lib.XXXXXX")"
 trap 'rm -rf "$SANDBOX"' EXIT INT TERM
 
-pass=0; fail=0; injfail=0
+pass=0; fail=0; injfail=0; injpass=0
 ok()  { pass=$((pass+1)); printf '  ok    %s\n' "$1"; }
 bad() { fail=$((fail+1)); printf '  FAIL  %s\n' "$1"; }
-inj_ok()  { printf '  ok    (注入) %s\n' "$1"; }
+inj_ok()  { injpass=$((injpass+1)); printf '  ok    (注入) %s\n' "$1"; }
 inj_bad() { injfail=$((injfail+1)); printf '  FAIL  (注入) %s\n' "$1"; }
 
 echo "=== 1-4. 只有一份實作，而且沒有死路徑 ==="
@@ -102,13 +102,15 @@ cat > "$GH_VAR_FILE" <<'JSON'
 JSON
 : > "$GH_SET_FILE"
 
-run_lib() {   # 在 sandbox HOME 下執行一段用到 lib 的程式
+# run_lib <程式碼> [lib路徑] — 在 sandbox HOME 執行一段用到 lib 的程式；第二參數給注入段用。
+run_lib() {
+    local _lib="${2:-$REPO_ROOT/$LIB}"
     HOME="$SANDBOX/home" PATH="$SANDBOX/bin:$PATH" \
     TUNNEL_KEY="$SANDBOX/home/.ssh/id_tunnel" \
     bash -c '
         set -uo pipefail
         log() { printf "%s %s\n" "$1" "${*:2}" >&2; }
-        . "'"$REPO_ROOT/$LIB"'"
+        . "'"$_lib"'"
         eval "$1"
     ' _ "$1" 2>"$SANDBOX/err"
 }
@@ -150,9 +152,165 @@ else
     bad "8. 公鑰沒變卻又寫了一次"
 fi
 
+# 11-15（issue #7 / openspec D1）：回報「這一次有沒有寫入」，回傳碼語意不變。
+# publish 在「已一致」時也回 0，所以只看重傳碼會讓 pool-sync 每個 tick 都 dispatch。
+# D1 因此用輸出變數回報；回傳碼一改，register-provider 會在「已一致」時 exit 1。
+BASE_VAR="$SANDBOX/base-var.json"
+printf '%s\n' '{"name":"fh-l","role":"provider","hops":[{"via":"gateway"}],"power":{"wol":"aa:bb"},"capabilities":["docker"]}' > "$BASE_VAR"
+
+changed_after() {   # changed_after <lib路徑> <var> <repo> <pub>
+    GH_VAR_FILE="$SANDBOX/var-read.json" \
+    run_lib "TUNNEL_KEY_CHANGED=; . '$1' >/dev/null 2>&1; tunnel_key_publish '$2' '$3' '$4' >/dev/null 2>&1; printf '%s' \"\${TUNNEL_KEY_CHANGED:-<unset>}\""
+}
+
+# mint_rc <lib路徑> — 只量 tunnel_key_mint 的回傳碼；log() 必須有定義且輸出丟掉。
+mint_rc() {
+    HOME="$SANDBOX/home" PATH="$SANDBOX/bin:$PATH" \
+    TUNNEL_KEY="$SANDBOX/home/.ssh/id_tunnel" \
+    bash -c 'set -uo pipefail; log() { :; }; . "$1" >/dev/null 2>&1; tunnel_key_mint fh-l >/dev/null 2>&1; printf "%s" "$?"' _ "$1" 2>/dev/null
+}
+
+echo "=== 11-15. issue #7：CHANGED 旗標與回傳碼 ==="
+
+printf '%s\n' "$(cat "$BASE_VAR")" > "$SANDBOX/var-read.json"
+: > "$GH_SET_FILE"
+got="$(changed_after "$REPO_ROOT/$LIB" NODE_FH_L owner/repo "$PUB1")"
+if [[ "$got" == "1" ]]; then
+    ok "11. 真的寫入之後 TUNNEL_KEY_CHANGED=1"
+else
+    bad "11. 寫入之後沒有回報「有寫入」（got [$got] want [1]）——pool-sync 無法判斷要不要 dispatch"
+fi
+
+# 12. 已一致 → 旗標是 0（var 已含同一把公鑰，鋪法同第 8 條）。
+printf '%s\n' "$(jq -c --arg pk "$PUB1" '. + {tunnel_public_key:$pk}' "$BASE_VAR")" > "$SANDBOX/var-read.json"
+: > "$GH_SET_FILE"
+got="$(changed_after "$REPO_ROOT/$LIB" NODE_FH_L owner/repo "$PUB1")"
+if [[ "$got" == "0" ]]; then
+    ok "12. 已一致（沒有寫入）之後 TUNNEL_KEY_CHANGED=0"
+else
+    bad "12. 沒有寫入卻回報有寫入（got [$got] want [0]）——那會讓 pool-sync 繼續每輪 dispatch"
+fi
+
+# 13. 回傳碼語意不變：成功＝0（兩條路都是）、讀不到 var＝非 0。
+printf '%s\n' "$(cat "$BASE_VAR")" > "$SANDBOX/var-read.json"
+rc_wrote="$(GH_VAR_FILE="$SANDBOX/var-read.json" run_lib "tunnel_key_publish NODE_FH_L owner/repo '$PUB1' >/dev/null 2>&1; printf '%s' \$?")"
+printf '%s\n' "$(jq -c --arg pk "$PUB1" '. + {tunnel_public_key:$pk}' "$BASE_VAR")" > "$SANDBOX/var-read.json"
+rc_same="$(GH_VAR_FILE="$SANDBOX/var-read.json" run_lib "tunnel_key_publish NODE_FH_L owner/repo '$PUB1' >/dev/null 2>&1; printf '%s' \$?")"
+rc_noRead="$(GH_VAR_FILE="$SANDBOX/does-not-exist.json" run_lib "tunnel_key_publish NODE_FH_L owner/repo '$PUB1' >/dev/null 2>&1; printf '%s' \$?")"
+if [[ "$rc_wrote" == "0" && "$rc_same" == "0" && -n "$rc_noRead" && "$rc_noRead" != "0" ]]; then
+    ok "13. 回傳碼不變：寫入 0／已一致 0／讀不到 var ${rc_noRead}（非 0）"
+else
+    bad "13. 回傳碼語意被改動（寫入=${rc_wrote} 已一致=${rc_same} 讀不到=${rc_noRead}；前三者應為 0/0/非0）"
+fi
+
+# 14. tunnel_key_mint 的回傳值不會被「後面多一行程式碼」改掉：結尾必須是顯式的
+#     return 0，否則在它後面加任何一行都會變成這個函式的回傳值。
+#     錨點取「函式本體最後一行」而非整段文字比對，實作加註解不會讓針落空。
+MINT_LIB="$SANDBOX/mint-trailing-stmt.sh"
+python3 - "$REPO_ROOT/$LIB" "$MINT_LIB" <<'PYMUT'
+import sys
+lines = open(sys.argv[1], encoding="utf-8").read().split("\n")
+start = next(k for k, l in enumerate(lines) if l == "tunnel_key_mint() {")
+end = next(k for k in range(start + 1, len(lines)) if lines[k] == "}")
+last = next(l for l in reversed(lines[start + 1:end]) if l.strip())
+assert "return 0" in last, "mint does not end with an explicit return 0 (last=%r)" % last
+lines[end:end] = ["    false  # INJECTED: 尾巴被加了一行——顯式 return 0 必須蓋掉它"]
+open(sys.argv[2], "w", encoding="utf-8").write("\n".join(lines))
+PYMUT
+if [[ $? -ne 0 ]]; then
+    bad "14. 注入腳本失敗（tunnel_key_mint 的結尾形狀變了）——harness 問題"
+elif ! bash -n "$MINT_LIB" 2>/dev/null; then
+    bad "14. 注入版語法錯誤——harness 問題"
+else
+    rc_mut="$(mint_rc "$MINT_LIB")"
+    rc_real="$(mint_rc "$REPO_ROOT/$LIB")"
+    if [[ "$rc_mut" == "0" ]]; then
+        ok "14. tunnel_key_mint 在結尾被加一行非零陳述式之後仍然回 0（結尾是顯式的 return 0；真實碼也回 ${rc_real}）"
+    else
+        bad "14. tunnel_key_mint 的回傳值會被後面加的程式碼改掉（突變版回 ${rc_mut}，真實碼回 ${rc_real}）"
+    fi
+    # 14b. 正對照：拿明確 return 1 的突變版當量尺，必須被讀成 1，否則 14 沒有牙。
+    MINT_LIB2="$SANDBOX/mint-explicit-rc1.sh"
+    python3 - "$REPO_ROOT/$LIB" "$MINT_LIB2" <<'PYMUT2'
+import sys
+lines = open(sys.argv[1], encoding="utf-8").read().split("\n")
+start = next(k for k, l in enumerate(lines) if l == "tunnel_key_mint() {")
+end = next(k for k in range(start + 1, len(lines)) if lines[k] == "}")
+# 量尺必須取代結尾的 return 0；加在它後面會被擋掉而永遠讀不到。
+last = max(k for k in range(start + 1, end) if lines[k].strip())
+assert "return 0" in lines[last], "mint does not end with an explicit return 0 (last=%r)" % lines[last]
+lines[last] = "    return 1  # 量尺：明確的非零回傳必須被讀得到"
+open(sys.argv[2], "w", encoding="utf-8").write("\n".join(lines))
+PYMUT2
+    if [[ $? -ne 0 ]]; then
+        inj_bad "14b. 量尺突變版造不出來（形狀變了）——harness 問題"
+    else
+        rc_scale="$(mint_rc "$MINT_LIB2")"
+        if [[ "$rc_scale" == "1" ]]; then
+            inj_ok "14b. 量尺讀得到 1（明確 return 1 的突變版回 1）——14 的判定有牙"
+        else
+            inj_bad "14b. 量尺讀成 [${rc_scale}]——這個量法根本沒在讀 tunnel_key_mint 的回傳碼"
+        fi
+    fi
+fi
+
+# 15. 旗標是全域變數，長壽的 shell 連續兩次呼叫會殘留 1（開頭沒歸零就會）。
+#     手法：兩次呼叫在同一個 eval 裡，中間把假 gh 寫出的檔案搬回 var。
+RP15_VAR="$SANDBOX/rp15-var.json"
+RP15_SET="$SANDBOX/rp15-set.json"
+printf '%s\n' "$(cat "$BASE_VAR")" > "$RP15_VAR"
+: > "$RP15_SET"
+RP15_CODE='tunnel_key_publish NODE_FH_L owner/repo "$RP_PUB" >/dev/null 2>&1
+printf "after-write=%s " "${TUNNEL_KEY_CHANGED:-<unset>}"
+cp -f "$RP15_SET" "$RP15_VAR"; : > "$RP15_SET"
+tunnel_key_publish NODE_FH_L owner/repo "$RP_PUB" >/dev/null 2>&1
+printf "after-noop=%s" "${TUNNEL_KEY_CHANGED:-<unset>}"'
+got="$(GH_VAR_FILE="$RP15_VAR" RP15_VAR="$RP15_VAR" RP15_SET="$RP15_SET" RP_PUB="$PUB1" \
+    run_lib "$RP15_CODE")"
+if [[ "$got" == "after-write=1 after-noop=0" ]]; then
+    ok "15. 同一個 shell 連續兩次：寫入後=1、接著已一致後=0（旗標不殘留）"
+else
+    bad "15. 旗標帶著上一次的值或寫入沒被回報（got [$got] want [after-write=1 after-noop=0]）"
+fi
+
+# 15-inj. 拿掉 publish 開頭的歸零 → 第二次殘留 1 → 15 必須轉紅。
+#     只有 15 抓得到：11/12/14 都是單次呼叫，一次呼叫裡沒有前一次可殘留。
+INJ_R3="$SANDBOX/tk-noreset.sh"
+python3 - "$REPO_ROOT/$LIB" "$INJ_R3" <<'PYR3'
+import sys
+src = open(sys.argv[1], encoding="utf-8").read()
+old = "    TUNNEL_KEY_CHANGED=0\n\n"
+assert src.count(old) == 1, "reset needle count=%d" % src.count(old)
+open(sys.argv[2], "w", encoding="utf-8").write(src.replace(old, "", 1))
+PYR3
+if [[ $? -ne 0 ]]; then
+    inj_bad "15-inj. 突變腳本失敗（publish 開頭的歸零形狀變了）——harness 問題"
+elif ! bash -n "$INJ_R3" 2>/dev/null; then
+    inj_bad "15-inj. 突變版語法錯誤——harness 問題"
+else
+printf '%s\n' "$(cat "$BASE_VAR")" > "$RP15_VAR"
+    : > "$RP15_SET"
+    got="$(GH_VAR_FILE="$RP15_VAR" RP15_VAR="$RP15_VAR" RP15_SET="$RP15_SET" RP_PUB="$PUB1" \
+        run_lib "$RP15_CODE" "$INJ_R3")"
+    # 只看 after-noop：突變版第一次照樣是 1（那是 11 的事），重點是它必須是 1。
+    if [[ "$got" == *"after-noop=1"* ]]; then
+        inj_ok "15-inj. 拿掉開頭歸零後第二次殘留 1（got [$got]）——15 會紅，而且只有 15 抓得到"
+    else
+        inj_bad "15-inj. 拿掉歸零後第二次沒有殘留（got [$got] want after-noop=1）——15 或這個注入沒在量這件事"
+    fi
+fi
 echo "=== 9-10. 注入 ==="
 inj="$SANDBOX/regp-idpool.sh"
-sed 's|# TUNNEL_KEY is resolved in step 6.5, once the repo clone exists.|PRIVATE_KEY="${SSH_DIR}/id_pool"|' "$REGP" > "$inj"
+python3 - "$REGP" "$inj" <<'PYIDPOOL'
+import sys
+lines = open(sys.argv[1], encoding="utf-8").read().split("\n")
+# 錨點是程式碼形狀（宣告 GH_TOKEN_FILE 的那一行），不是註解文字——註解被刪掉
+# 時這支注入仍然要成立。
+hits = [k for k, l in enumerate(lines) if l.startswith("GH_TOKEN_FILE=")]
+assert len(hits) == 1, "GH_TOKEN_FILE anchor count=%d" % len(hits)
+lines[hits[0]:hits[0]] = ['PRIVATE_KEY="${SSH_DIR}/id_pool"']
+open(sys.argv[2], "w", encoding="utf-8").write("\n".join(lines))
+PYIDPOOL
 if grep -q 'PRIVATE_KEY="${SSH_DIR}/id_pool"' "$inj"; then
     if grep -E '=[[:space:]]*"?[^"]*id_pool' "$inj" | grep -qv '^\s*#'; then
         inj_ok "9. 把 id_pool 放回去後第 1 條會紅"
@@ -173,7 +331,7 @@ else
 fi
 
 echo
-printf 'passed %d / failed %d / injection-fail %d\n' "$pass" "$fail" "$injfail"
+printf 'passed %d / failed %d / injection-pass %d / injection-fail %d\n' "$pass" "$fail" "$injpass" "$injfail"
 if [[ "$fail" -ne 0 ]]; then exit "$fail"; fi
 if [[ "$injfail" -ne 0 ]]; then exit 2; fi
 exit 0

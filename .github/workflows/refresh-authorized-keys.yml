@@ -33,6 +33,11 @@ on:
         default: ''
         type: string
 
+  # Daily catch-all for drift pool-sync no longer dispatches for (04:00 Taipei).
+  # Keep workflow_dispatch: the `inputs` context below depends on it.
+  schedule:
+    - cron: "0 20 * * *"
+
 # Lets a dispatcher recognize its own run: dispatch_refresh_and_wait
 # (scripts/lib/refresh-wait.sh) passes an unpredictable nonce as `nonce`
 # and polls displayTitle for it, instead of trusting "the newest run is
@@ -48,7 +53,8 @@ on:
 # exactly what to run and what counts as passing). If it does not appear,
 # this attribution silently degrades to "never recognize" (safe non-zero),
 # never to guessing somebody else's run.
-run-name: refresh-authorized-keys ${{ inputs.nonce }}
+# Never empty it: an empty run-name falls back to event text and breaks that match.
+run-name: refresh-authorized-keys ${{ github.event_name }} ${{ inputs.nonce }}
 
 permissions:
   contents: read
