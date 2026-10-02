@@ -1,13 +1,9 @@
 #!/usr/bin/env bash
 # shared-configs/pool-runtime/files/pool-sync — spec: task D
 #
-# Converges a provider's installed pool-* scripts to what the repo
-# declares. register-provider.sh installs ~/.mylinuxpool/bin once, and
-# nothing ever updates it (rotate touches only the Gateway; pool-tunnel's
-# 30s self-heal loop only rebuilds the three derived files). Running every
-# 30 minutes via pool-sync.timer, this script re-checks every
-# profile-declared, non-secret unit with `install.sh --check` — a CONTENT
-# comparison, not an existence check — and reinstalls whatever drifted.
+# Converges a provider's installed pool-* scripts to what the repo declares,
+# every 30 minutes (pool-sync.timer), by re-checking each profile-declared
+# unit — a CONTENT comparison, not an existence check.
 #
 # WHY main() wraps the whole script (this is load-bearing): this file is
 # installed to ~/.mylinuxpool/bin/pool-sync, and pool-runtime's install.sh
@@ -17,23 +13,16 @@
 # the running instance is immune to the file under it being rewritten.
 #
 # No state is kept under ~/.mylinuxpool and no new file is ever created:
-# convergence is judged purely by the units' own --check, so even a
-# manually tampered bin/ is repaired. Logs go to stdout/stderr (journald),
-# never to a file.
-#
-# Also responsible for one migration: register-provider.sh used to leave a
-# resident ~/.mylinuxpool/repo on the machine; once a fresh copy is
-# fetched here, that stale persistent clone is deleted so the repo's
-# declarations live only on GitHub (one source of truth, N7).
+# convergence is judged purely by the units' own --check.
 
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
 
 REPO="${POOL_REPO:-FATESAIKOU/MyLinuxPool}"
-# How old a worker container must be before the orphan sweep will touch it.
-# create-worker's whole flow (build, run, collect the key, record it) takes
-# a couple of minutes; 15 gives that plenty of room. Overridable for tests.
+# How old a worker container must be before the orphan sweep will touch it:
+# create-worker's whole flow takes a couple of minutes, so 15 is room to spare.
+# Overridable for tests.
 SWEEP_MIN_AGE="${POOL_SWEEP_MIN_AGE:-900}"
 BRANCH="${POOL_BRANCH:-master}"
 STATE_DIR="${HOME}/.mylinuxpool"
@@ -42,8 +31,7 @@ GH_TOKEN_FILE="${STATE_DIR}/gh_token"
 
 # The tunnel identity path is the SINGLE source in tunnel-identity.sh —
 # the same file pool-tunnel and rotate's tunnel probe read, so the minted
-# key path can never diverge from the path the tunnel actually uses
-# (RUNBOOK §7.12, third incident).
+# key path can never diverge from the path the tunnel actually uses.
 # shellcheck source=tunnel-identity.sh
 source "${SCRIPT_DIR}/tunnel-identity.sh"
 
@@ -79,9 +67,7 @@ main() {
     # --- fetch a fresh copy of the repo ------------------------------
     # The credential helper reads the token from the file at invocation
     # time (register-provider.sh's exact pattern) — the token never
-    # appears on a command line or in any log. POOL_REPO may be a full
-    # URL (local file:// repo in tests); otherwise it is owner/branch
-    # on github.com.
+    # appears on a command line or in any log.
     TMP_DIR="$(mktemp -d)"
     trap 'rm -rf "$TMP_DIR"' EXIT
 
@@ -99,13 +85,9 @@ main() {
     fi
 
     # --- migration: drop the old persistent clone ---------------------
-    # register-provider.sh used to leave a resident ~/.mylinuxpool/repo
-    # (the second copy of the repo's declarations on the machine). New
-    # registration removes it, but machines registered before that fix
-    # keep it forever unless re-registered. Once we have successfully
-    # fetched a fresh copy, that stale copy has no remaining purpose, so
-    # remove it here: any old machine converges on its own after the first
-    # timer tick — no re-registration needed.
+    # One-off migration: drop the resident clone register-provider.sh used
+    # to leave behind, so a machine registered before that fix converges on
+    # its own instead of needing re-registration.
     if [[ -d "${STATE_DIR}/repo" ]]; then
         rm -rf "${STATE_DIR}/repo"
         log INFO "removed the old persistent repo clone at ${STATE_DIR}/repo — declarations now live only on GitHub"
@@ -163,11 +145,10 @@ main() {
             log INFO "skipped: ${unit} needs FILE_CRYPTO_KEY, only handled at registration"
             continue
         fi
-        # 生產觸發條件：目前 100% 走此路（每個 provider tick 都會）。兩台
-        # provider 的 profile 都宣告 gh，而 gh 的 unit.json 是 needs_root=true，
-        # 所以每一輪都在這裡被跳過；退場條件是 gh 的 needs_root 不再為 true
-        # （例如改成使用者層級安裝），那時它才會落到下面的 --check/install。
         if [[ "$(jq -r '.needs_root // false' "$unit_json" 2>/dev/null || true)" == "true" ]]; then
+            # 生產觸發條件：目前 100% 走此路（每個 provider tick 都會）。兩台
+            # provider 的 profile 都宣告 gh，而 gh 的 unit.json 是 needs_root=true，
+            # 所以每一輪都在這裡被跳過；退場條件是 gh 的 needs_root 不再為 true。
             # pool-sync runs as the ordinary user from a systemd user
             # timer — it has no root. Installing a needs_root unit would
             # fail (and then retry every 30 minutes); a missing `gh`
@@ -254,32 +235,20 @@ main() {
     fi
 
     # --- converge this machine's authorized_keys from CLIENT_* ---------
-    # (KEY-DESIGN §3.4: the provider's login list converges itself on
-    # every tick — no repair-provider run, no FILE_CRYPTO_KEY needed, the
-    # gh_token can read the variables this machine already holds.)
-    #
-    # Since KEY-DESIGN §8 (task U) this is the ONLY writer: ssh-admin and
-    # its static encrypted list are gone, so there is no coexistence to
-    # keep in sync — CLIENT_* is the single source.
+    # (KEY-DESIGN §3.4: the provider's login list converges itself on every
+    # tick — no repair-provider run, no FILE_CRYPTO_KEY needed.)
+    # Since KEY-DESIGN §8 (task U) this is the ONLY writer: ssh-admin and its
+    # static encrypted list are gone, so CLIENT_* is the single source.
     #
     # This is a FULL REPLACE, deliberately NOT a union. The point is
     # revocation: with a union, a `register-client --remove` would delete
     # the var but the key would stay on every provider forever. Replacing
     # means removing the var removes the key.
     #
-    # Guards, all mandatory (brief-O):
-    #   - authkeys_assemble non-zero  -> do NOT write, log ERROR, but keep
-    #     going (other convergence work still runs)
-    #   - assembled list empty        -> do NOT write
-    #   - GitHub unreachable          -> do NOT write, log WARN, exit 0
-    #     (N6: GitHub being down must never become a provider fault)
-    #
     # The assembly + install is ONE shared implementation,
     # refresh_sync_local_authorized_keys (scripts/refresh-authkeys.sh) —
-    # register-provider calls the same function at registration time, so
-    # there is never a second copy of this rule that could drift out of
-    # sync with its guards (RUNBOOK §7.12). Here, a non-zero return is a
-    # WARN and convergence continues; registration treats it as fatal.
+    # register-provider calls the same function, so there is never a second
+    # copy of this rule that could drift out of sync with its guards.
     sync_authorized_keys() {
         local vars_json
 
@@ -311,10 +280,7 @@ main() {
         # The same list again, into the directory every worker container on
         # this provider bind-mounts read-only. Their sshd reads it through
         # AuthorizedKeysCommand on each login, so this is what makes adding
-        # OR REVOKING a client reach workers that are already running —
-        # before this, the list was injected once as -e
-        # WORKER_AUTHORIZED_KEYS and a revoked key stayed valid for the life
-        # of the container.
+        # OR REVOKING a client reach workers that are already running.
         #
         # Deliberately the same function, called twice, rather than a second
         # assembly: one implementation of "what belongs in an
@@ -331,15 +297,11 @@ main() {
     sync_authorized_keys
 
     # --- remove worker containers the ledger no longer lists -----------
-    # delete-worker removes the container over ssh, but that step is
-    # best-effort on purpose: fh-l is normally powered OFF, so deleting one
-    # of its workers routinely cannot reach it. The port is freed and the
-    # POOL_WORKERS entry removed anyway, which leaves the container on disk
-    # with --restart unless-stopped — it comes back on the next boot and
-    # retries a tunnel whose key the Gateway no longer authorizes, forever.
-    #
-    # This is the other half of that best-effort: what the ledger does not
-    # list, this machine should not be running.
+    # delete-worker removes the container over ssh, and that step is
+    # best-effort on purpose (fh-l is normally powered OFF, so it routinely
+    # cannot be reached) — which can leave a container on disk with
+    # --restart unless-stopped. This is the other half of that: what the
+    # ledger does not list, this machine should not be running.
     sweep_orphan_workers() {
         command -v docker >/dev/null 2>&1 || return 0
 
@@ -368,15 +330,12 @@ main() {
             # it — it has to, because the worker mints its own key and only
             # then can the ledger entry be written. A young container is
             # therefore probably one being created right now, not an orphan.
-            # If the age cannot be determined at all, leave it alone.
             created="$(docker inspect -f '{{.Created}}' "$container" 2>/dev/null)"
-            # RFC3339 -> epoch. GNU `date -d` is what providers have; the
-            # BSD form keeps this parseable on a developer Mac so the age
-            # guard can actually be tested — TZ=UTC because BSD date reads
-            # a bare timestamp as LOCAL time, which made every container
-            # look hours old and defeated the guard entirely.
-            # Unparseable means age 0, i.e. leave it alone — never delete
-            # on a number we could not read.
+            # RFC3339 -> epoch. GNU `date -d` is what providers have; the BSD
+            # form keeps this parseable on a developer Mac. TZ=UTC because
+            # BSD date reads a bare timestamp as LOCAL time, which made every
+            # container look hours old and defeated the guard entirely.
+            # Unparseable means age 0 — never delete on a number we could not read.
             created_epoch=""
             if [[ -n "$created" ]]; then
                 created_trim="${created%%.*}"; created_trim="${created_trim%Z}"
@@ -404,22 +363,14 @@ main() {
     # --- ensure the per-machine tunnel key exists and is published -----
     # KEY-DESIGN §3.2/§3.3 + MIGRATION.md §3: providers generate their own
     # tunnel identity once (at first sync, not at registration — fh-l's
-    # re-registration would need a sudo password we do not have, and this
-    # timer is already running on every provider), and publish the public
-    # half into their own NODE_<NAME> var so the Gateway refresh can
-    # authorize it. The migration keeps the shared key working meanwhile,
-    # so any failure here is WARN-only: the tunnel still connects with the
-    # old key, and the next tick retries. Idempotent by construction:
-    # id_tunnel is only generated when absent; the var is only rewritten
-    # when its tunnel_public_key is missing or differs.
+    # re-registration would need a sudo password we do not have), and publish
+    # the public half into their own NODE_<NAME> var so the Gateway refresh can
+    # authorize it. The migration keeps the shared key working meanwhile, so any
+    # failure here is WARN-only: a running machine must never be broken by a bad
+    # tick, and the next tick retries.
     # The mint-and-publish rule itself lives in scripts/lib/tunnel-key.sh,
     # sourced from the clone fetched above — the same sharing pattern as
-    # refresh-authkeys.sh. It used to live only here, which is why
-    # register-provider never had it and registering a NEW provider could
-    # not work at all (RUNBOOK §7.12, seventh incident).
-    #
-    # WARN-only on this side: a running machine must never be broken by a
-    # bad tick, and the next tick retries.
+    # refresh-authkeys.sh.
     local tunnel_key_changed=1
     if [[ -f "${TMP_DIR}/repo/scripts/lib/tunnel-key.sh" ]]; then
         # shellcheck source=/dev/null
@@ -459,12 +410,9 @@ main() {
     # pool-tunnel holds every worker's reverse tunnel; an unnecessary
     # restart drops all of them for nothing (spec §3.5: restarts are
     # costly, so the sync must be able to run with no change at all).
-    # The order is load-bearing: daemon-reload MUST come before restart.
-    # The install above may have replaced the pool-tunnel.service unit
-    # file itself; restarting first would run against the STALE in-memory
-    # definition (systemd only re-reads unit files on daemon-reload, and
-    # it prints "unit file changed on disk" otherwise) — reload first,
-    # then restart, so the new definition is the one that takes effect.
+    # The order is load-bearing: daemon-reload MUST come before restart —
+    # the install above may have replaced the pool-tunnel.service unit file
+    # itself, and systemd only re-reads unit files on daemon-reload.
     if [[ "$changed" -eq 1 ]]; then
         systemctl --user daemon-reload
         systemctl --user restart pool-tunnel
