@@ -1,6 +1,6 @@
 ## Context
 
-調查報告：`team/OUT-recon-capability.md`（程式碼）、`team/OUT-impl-recon-myaientry-caps.md`（MyAiEntry）、`team/OUT-test-recon-capability-tests.md`（測試）。審查報告：`team/OUT-review-capability-proposal.md`。重點：
+調查報告（**內部審查報告，未進版控**；下列只是檔名，不在 repo 裡）：`OUT-recon-capability.md`（程式碼）、`OUT-impl-recon-myaientry-caps.md`（MyAiEntry）、`OUT-test-recon-capability-tests.md`（測試）。審查報告：`OUT-review-capability-proposal.md`。重點：
 
 - 已經有的：形狀契約（`key: object`，空能力寫 `{}`，`null` 永遠不合法）、兩個驗證器（`worker-host`、`github`）、遷移器。三台的 live var 也已經是新形狀（`docs/CAPABILITY-DESIGN.md`）。
 - 能力鍵寫死在五處：`mlp` 兩處、`register-provider.sh` 兩處、`scripts/lib/profile.sh` 一處。驗證的分派點是 `mlp` 的 `cap_verify_node` 和 `register-provider.sh` 的 `step7_5_capabilities`，兩個都是寫死的 `case`。
@@ -9,7 +9,7 @@
 - `pool-runtime` 的 `--check` 是逐位元組比對檔案（`cmp -s`），沒有任何清理邏輯。`pool-wol` 是它的比對項之一，裝在每台 provider，也裝在 Gateway。
 - `register-provider.sh:528` 在 `capabilities` 缺值時補 `worker-host`，之後永遠不覆寫。
 - `POOL_WORKERS` 的三筆都沒有 `capabilities`。
-- MyAiEntry：未知的能力鍵原樣保留；能力名稱直接顯示在承載機說明裡（`poolSnapshot.ts:243-244`）；挑 `github` 機器時不看在不在線（`team/OUT-impl-recon-selecthost-online.md`）。
+- MyAiEntry：未知的能力鍵原樣保留；能力名稱直接顯示在承載機說明裡（`poolSnapshot.ts:243-244`）；挑 `github` 機器時不看在不在線（`OUT-impl-recon-selecthost-online.md`）。
 - CI 只跑 `scripts/tests/`，`shared-configs/*/tests/` 沒被 CI 跑過（issue #13）。
 - 實測（2026-10-02，唯讀）：fh-proxy 與 fh-proxy-asus 上，systemd user manager 的 groups 已經含 docker 的 gid，所以 pool-sync 跑 `docker info` 看得到 docker 群組。
 

@@ -2,7 +2,6 @@
 # test-capability-consumers.sh — PR-B tasks 2.2／2.3／2.4：
 # register-provider、mlp verify-capabilities、create-worker 三個消費端改用 runner。
 #
-# 草稿，放在 scratchpad；PR-A commit 之後由 PM 放進 scripts/tests/。
 # 前提：PR-A 的 runner（scripts/lib/capability.sh）與三個單位已存在。
 set -uo pipefail
 REPO_ROOT="${MLP_CAPABILITY_TEST_REPO_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")/../.." && pwd)}"
@@ -53,9 +52,7 @@ cat > "$SHIMS/sudo" <<'SH'
 while [[ $# -gt 0 ]]; do case "$1" in -n) shift ;; -u) shift 2 ;; --) shift; break ;; *) break ;; esac; done
 exec "$@"
 SH
-# `id -u` 要真的印一個數字。舊的假 id 什麼都不印，而 `[[ "" -eq 0 ]]` 在 bash 的
-# 算術語意裡是 **0 -eq 0 → true**——於是整個沙箱一直被當成 root，測試量的是
-# register-provider 的「sudo 那條路」，而這支測試想量的是 no-sudo 那條。
+# `id -u` 必須真的印數字：`[[ "" -eq 0 ]]` 在 bash 裡是 true，於是整個沙箱被當成 root。
 cat > "$SHIMS/id" <<'SH'
 #!/usr/bin/env bash
 case "${1:-}" in
@@ -83,11 +80,7 @@ printf 'fake-token-not-real\n' > "$SANDBOX/home/.mylinuxpool/gh_token"
 
 # 沙箱裡呼叫 runner／產品碼：MLP_REPO_ROOT 指到假 repo 根
 #
-# RP_NO_MAIN 是 register-provider.sh 剝掉最後一行 `main` 的副本。**必須剝**：
-# 直接 source 整份檔案會把 main 也跑掉——於是「呼叫能力步驟」其實是跑了一次
-# 完整的註冊（preflight、clone、sudoers、隧道金鑰、ssh…），量到的 rc 與輸出
-# 混著十幾個步驟的東西。剝掉之後，量到的就只有能力步驟。
-# 剝的正確性有保真檢查（下面）：副本必須與原檔只差一行。
+# RP_NO_MAIN 必須剝掉 main：直接 source 會跑一次完整註冊，量到的 rc 混著十幾個步驟。
 RP_NO_MAIN="$SANDBOX/rp-nomain.sh"
 if [[ -f "$RP" ]]; then
     sed -e '$d' "$RP" > "$RP_NO_MAIN"
@@ -102,12 +95,7 @@ else
     RP_NO_MAIN=""
 fi
 
-# 假節點：run_on_node 會把 mlp 送出來的那一條命令字串**真的執行**在這裡。
-#   為什麼必須真的執行（impl 的第三輪補給的寫法）：cap_unit_check_on_node 送的是
-#   `d=$(mktemp -d) && …base64… | tar -xz -C "$d" && MLP_CAPABILITY_PARAMS=… bash "$d/install.sh"
-#   --check; rc=$?; …`，解開的就是真的 install.sh。只回 0 的話，2.3b 量到的
-#   是「假件說什麼就是什麼」，而單位的回傳碼從來沒有真的回來過。
-#   一次 eval 就好（不要再包一層 eval：那會把字串裡的引號吃掉）。
+# 假 run_on_node 要真的 eval 那條命令字串；只回 0 的話單位的回傳碼從來沒回來過。
 FAKE_NODE_DIR="$SANDBOX/node"; mkdir -p "$FAKE_NODE_DIR"
 RUN_ON_NODE_LOG="$SANDBOX/run_on_node.log"
 in_fakeroot() {  # in_fakeroot <bash片段>
@@ -161,22 +149,7 @@ else
     #   否則這一步會在讀 profile 之前就結束（量到的不是能力檢查的結果）。
     rp_env() {  # rp_env <片段>：剝掉 main 的 RP + 能力步驟需要的前置
         # set -- 與 GH_POOL_TOKEN 必須在 source **之前**：register-provider.sh 的
-        # 參數解析與 token 檢查寫在 main 之外（source 就會執行），沒有它們的話
-        # source 會印 usage 並 exit 2——於是「量到的」是參數解析，能力步驟一行
-        # 都還沒跑到（這正是 2.2b 之前 rc=2、輸出為空的原因）。
-        # REPO_DIR 要在 source **之後**設：register-provider.sh 在 main 之外就有
-        # `REPO_DIR=$(mktemp -d ...)`，source 會把它蓋掉，於是能力步驟讀的是一個
-        # 空目錄（「capability.sh is missing」）。
-        # 設完必須 **把 EXIT trap 拿掉**：register-provider.sh 的 trap 是
-        # `rm -rf "$REPO_DIR"`，而且變數在 trap 執行時才展開——REPO_DIR 一旦被改成
-        # 假 fetched repo，那個子殼層結束時就去刪整個假 repo（連同後面 2.3 要用的
-        # 單位與 pool-resolve）。這是「沙箱自己把自己刪掉」，症狀是 2.3 全部空輸出。
-        # REPO_DIR 必須指向假 fetched repo（能力步驟是從**它**裡讀 runner 與
-        # profile 的），所以不能隨便換一個空目錄。但 register-provider.sh 在
-        # `main` 之外就有 `trap 'rm -rf "$REPO_DIR"' EXIT`，而變數是在 trap 執行時
-        # 才展開——所以設定完之後必須把 trap 拿掉，否則那個子殼層一結束就把整棵
-        # 假 repo 刪掉（症狀：後面的注入拿不到 runner／profile／lib，2.4 的假
-        # lib 也會被清空）。
+# REPO_DIR 要在 source 之後設，而且必須拿掉 EXIT trap——它指向測試組的假 fetched repo。
         in_fakeroot "set -- --name t --gateway-port 2323; GH_POOL_TOKEN=dummy;
                      source '$RP_NO_MAIN' >/dev/null 2>&1 || true;
                      trap - EXIT INT TERM;
@@ -198,7 +171,6 @@ else
     fi
 fi
 
-# 2.2d：沒有 capabilities 時不得補 worker-host 預設（register-provider.sh:528 的行為）
 if grep -q 'capabilities // {"worker-host"' "$RP" 2>/dev/null; then
     bad "2.2d. register-provider.sh 還在 capabilities 缺值時補 worker-host 預設——D8 說拿掉"
 else
@@ -207,8 +179,7 @@ fi
 
 echo "=== 2.3 mlp verify-capabilities ==="
 
-# 2.3a：既有的三態與回傳碼不退化（0／1／3）
-#   直接呼叫 cmd_verify_capabilities，節點 JSON 由 POOL_RESOLVE 提供。
+# 2.3a：直接呼叫 cmd_verify_capabilities，節點 JSON 由 POOL_RESOLVE 提供。
 cat > "$FAKEROOT/pool-resolve" <<'PR'
 #!/usr/bin/env bash
 cat <<'JSON'
@@ -235,14 +206,12 @@ else
     bad "2.3a. verify-capabilities 沒有用 runner，輸出=[$(printf '%s' "$V_ALL" | tr '\n' '|' | head -c 140)]"
 fi
 
-# 2.3b：新鍵（有單位）→ pass，而且不需改 mlp
 if printf '%s' "$V_ALL" | grep -E 'alpha' | grep -qE 'ok|pass'; then
     ok "2.3b. 有單位的鍵 alpha 報 pass"
 else
     bad "2.3b. 有單位的鍵 alpha 沒報 pass（verify 仍然靠 mlp 裡寫死的 case）——[$(printf '%s' "$V_ALL" | grep alpha | tr '\n' '|')]"
 fi
 
-# 2.3c：沒有單位的鍵 → unverifiable
 V_CHARLIE="$(printf '%s\n' "$V_ALL" | grep charlie)"
 if printf '%s' "$V_CHARLIE" | grep -q 'unverifiable'; then
     ok "2.3c. 沒有單位的鍵 charlie 報 unverifiable"
@@ -252,15 +221,7 @@ fi
 
 echo "=== 2.4 create-worker ==="
 
-# 2.4c：**換掉被重構的對象**（review §4.5 + spec.md:75「worker 的能力 MUST NOT
-#   另外驗證」）。原本這一條量的是「create-worker 呼叫 capability_plan」。
-#   命題換成同一件事的正確形狀：
-#     「照 profile **原樣**寫入，而且**不驗證**」。
-#   為什麼必須換：capability_plan 會對 profile 裡的每個鍵真的跑該單位的
-#   `--check`——在 Actions runner 上那會真的 `gh api repos/…`、真的 `docker info`，
-#   結果被丟掉（jq 只取第 3 欄參數）。那不是「多跑一次」，那是每次建 worker
-#   都白打一次網路呼叫，而 worker 的能力本來就不由 worker 自己驗證。
-#   「零呼叫」在 2.4c2 量（假單位的呼叫帳本 + 假 gh 的 api 呼叫數）。
+# 2.4c：capability_plan 會對每個鍵真的跑 --check，那是每次建 worker 白打一次網路。
 if grep -q 'capability_plan' "$CW" 2>/dev/null; then
     bad "2.4c. create-worker 還在呼叫 capability_plan——那會對每個鍵真的跑單位的 --check（建 worker 時白打 GitHub API），而 worker 的能力 MUST NOT 另外驗證（spec.md:75）"
 else
@@ -311,10 +272,7 @@ ledger_add_run() {  # ledger_add_run <profile路徑>
                  create_worker_ledger_add '[]' 2301 prov img ctr \
                    2026-01-01T00:00:00Z 'ssh-ed25519 AAA' '$prof'" 2>/dev/null </dev/null )
 }
-# 2.4c2：建 worker 時**零次**單位的 --check、**零次** GitHub API。
-#   數兩個地方：假單位把每次被執行寫進 CAP_LOG；假 gh 把每次被呼叫寫進 GH_LOG
-#   （`gh <args>` 一行）。2.4a 是這裡的正對照——它證明那些帳本抓得到寫入，
-#   所以「零」有意義（否則「零」可能只是探針壞掉）。
+# 2.4c2 數兩個帳本；2.4a 是它們的正對照，證明帳本抓得到寫入。
 printf '{"capabilities":{"alpha":{"a":1},"bravo":{"b":2}}}\n' > "$SANDBOX/prof-verified.json"
 : > "$CAP_LOG"; : > "$GH_LOG"
 V_OUT="$(ledger_add_run "$SANDBOX/prof-verified.json")"
@@ -348,8 +306,7 @@ fi
 
 echo "=== 注入 ==="
 
-# INJ-D：把「能力檢查非 0 就失敗」放成無條件成功 → 2.2b 必須轉紅。
-#   形狀錨點：RP 裡呼叫 capability_check 的那一步中，判斷回碼的那一行。
+# INJ-D：形狀錨點＝RP 裡呼叫 capability_check 的那一步中判斷回碼的那一行。
 if [[ -z "$RP_STEP" ]]; then
     inj_bad "INJ-D. register-provider 的能力步驟還不存在，沒有可注入的判斷"
 else
@@ -413,8 +370,7 @@ INJD
     fi
 fi
 
-# INJ-E：把假單位改成永遠回 0 → 2.3c（沒有單位的鍵報 unverifiable）必須仍成立，
-#   而 2.3b 的 pass 必須仍成立。證明那兩格的差異不是被 fixture 決定。
+# INJ-E：證明那兩格的差異不是被 fixture 決定。
 if [[ ! -r "$RUNNER" ]]; then
     inj_bad "INJ-E. 缺 runner，無法驗證"
 else

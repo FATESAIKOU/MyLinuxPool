@@ -1,23 +1,11 @@
 #!/usr/bin/env bash
 # test-install-replace-file.sh — D10：安裝時**換檔**取代原地覆寫。
 #
-# 為什麼要有這條（2026-10-02 fh-l 實例）：bash 是**邊執行邊讀腳本**的。
-# pool-sync 收斂到新版時，`cp -f` 會改寫**正在執行**的那個檔案（同一個 inode），
-# 還在跑的舊版 process 接下來讀到的就是新內容，於是錯位出錯
-# （`line 410: syntax error`，那一輪 tick 失敗）。`mv` 換的是目錄項，舊版
-# process 手上的 fd 仍然是原來那個 inode，所以完全不受影響。
+# 為什麼要這條：bash 邊執行邊讀腳本，cp -f 改寫的就是正在執行的那個 inode。
 #
-# 三層斷言，由形狀到行為：
-#   D10-1  換檔的**形狀**：重裝之後每個目標檔都是新的 inode。
-#   D10-2  換檔的**行為**：一個正在執行的舊版 process，在自己被換掉之後，
-#           仍然照原本的內容跑完、沒有 syntax error。這是 D10 真正要買的東西——
-#           inode 換了只是它的**充分**條件，不是命題本身。
-#   D10-3  換檔的**副作用**：權限還在、沒有殘留暫存檔。
+# D10-2 才是命題（inode 換掉只是它的充分條件）。
 #
-# 兩件事讓這支測試有意義，缺了任一條它就只是「看起來有牙」：
-#   1. D10-2 的探針是**真的在跑一��腳本**，不是模擬。舊版 process 是真的
-#      睡著、真的被換掉、真的繼續讀自己的檔案。
-#   2. D10-1 與 D10-2 各有一條注入，證明它們在 `cp -f` 的形狀下會紅。
+# D10-2 的探針是真的在跑一支腳本；D10-1／D10-2 各有一條注入。
 #
 # 手法：所有安裝都對著 mktemp 出來的假 HOME（`--home`），真機的
 # `~/.mylinuxpool/bin` 不會被碰到。D10-2 需要一個「內容可以被換掉」的來源檔，
@@ -59,11 +47,7 @@ fi
 
 # inode_of <file> → 印 inode，印不出數字就印空字串。
 #
-# 兩種 stat 語意（BSD `-f %i`／GNU `-c %i`）**都要驗證輸出是不是數字**：
-# GNU coreutils 的 `stat -f` 是「顯示檔案系統狀態」，它會忽略檔名參數、把 `%i`
-# 當檔案系統的格式字串，然後**回 0**並印一整頁 FS 資訊。第一版就是這樣：
-# 容器（bash 5.2）上每一個「inode」都是那頁垃圾，於是每次比較都不相等，
-# D10-1a 報成「原地覆寫」——一個假的全軍覆沒。
+# inode_of：兩種 stat 語意都要驗證輸出是不是數字——GNU 的 stat -f 會回 0 並印一整頁 FS 資訊。
 inode_of() {
     local f="$1" v
     if v="$(stat -c %i "$f" 2>/dev/null)" && [[ "$v" =~ ^[0-9]+$ ]]; then
@@ -185,13 +169,7 @@ else
 fi
 
 echo "=== D10-2 行為面：正在執行的舊版 process 不受換檔影響 ==="
-# 一支「先印一行、睡幾秒、再印自己後面那幾行」的腳本。bash 是邊執行邊讀的，
-# 所以 sleep 醒來之後讀到的位元組取決於**那個 inode 此刻的內容**：
-#   原地覆寫（cp -f）→ 讀到新版 → 這裡是語法錯誤 → syntax error、非 0
-#   換檔（mv）      → 讀到舊版 → 照原本的內容跑完 → rc=0
-#
-# 兩版的**前綴長度必須一樣長**，否則舊 process 的讀取位移會落在新版尾端之外，
-# 那就量不到「讀到新內容」這件事了（新版要留成明顯不同的語法錯誤）。
+# 探針：兩版前綴必須等長，否則舊 process 的讀取位移落在新版尾端之外。
 PROBE_OLD='#!/usr/bin/env bash
 echo OLD-HEAD
 sleep 3
@@ -211,13 +189,7 @@ else
     ok "D10-2-pre. 兩版前綴等長（${#old_head} bytes），舊 process 的讀取位移會落在新版內容裡"
 fi
 
-# run_replace_probe <install-sh> <home> <probe-dest-in-files>
-#   1) 把「舊版」放進沙箱單位的 files/pool-sync，安裝出去
-#   2) 啟動**裝好的那一支**（它就是正在執行的舊版 pool-sync）
-#   3) 睡一下，等它進入 sleep
-#   4) 把 sources 換成「新版」（語法錯誤版），再跑一次 install.sh —— 覆寫發生
-#   5) 等舊 process 結束，看它的輸出與退出碼
-#   印：<舊 process 的 rc>|<它的輸出>
+# run_replace_probe：放舊版→裝→啟動→換新版→重裝→看舊 process 的 rc 與輸出。
 run_replace_probe() {  # <install.sh> <home> <files/ 裡那一支> <沙箱單位目錄> [已安裝的檔名]
     local install_sh="$1" home="$2" src_file="$3" sandbox_unit_dir="$4"
     local bin_name="${5:-pool-sync}"
@@ -240,7 +212,6 @@ run_replace_probe() {  # <install.sh> <home> <files/ 裡那一支> <沙箱單位
     printf '%s|%s' "$rc" "$out"
 }
 
-# 2a：pool-runtime（用沙箱副本當來源，install.sh 原封不動）
 PR_SB_UNIT="$SANDBOX/pr-unit"
 sandbox_unit "$PR_UNIT" "$PR_SB_UNIT"
 got="$(run_replace_probe "$PR_SB_UNIT/install.sh" "$SANDBOX/pr-home2" "$PR_UNIT/files/pool-sync" "$PR_SB_UNIT")"
@@ -252,8 +223,7 @@ else
     bad "D10-2a. 舊版 process 被換檔影響到了（got [$got]）—— rc 應該 0 且印 OLD-TAIL；syntax error 表示安裝時是原地覆寫"
 fi
 
-# 2b：wol 的 pool-wol（同一個形狀；pool-wol 不是被 source 的，但「正在執行中的
-#     檔案被覆寫」是同一件事，所以同一個探針直接套在 wol 單位上）
+# 2b：同一個探針直接套在 wol 上（不是被 source，但「執行中的檔被覆寫」是同一件事）。
 if [[ -f "$WOL_UNIT/files/pool-wol" ]]; then
     WOL_SB_UNIT="$SANDBOX/wol-unit"
     sandbox_unit "$WOL_UNIT" "$WOL_SB_UNIT"
@@ -270,10 +240,7 @@ else
 fi
 
 echo "=== D10-3 換檔的副作用：權限還在、沒有殘留暫存檔 ==="
-# bin/ 與 unit 目錄的檔案集合必須**剛好**是宣告的那些。
-# D10 用 `mktemp "${dst}.XXXXXX.new"` 當暫存檔：換檔成功時它必須被 mv 掉，
-# 失敗時必須被 rm -f 掉。任何一個留下來，下一次 pool-sync 的 --check 與
-# 「bin/ 底下有什麼」的假設就會對不上，而且那是使用者看得見的垃圾檔。
+# 暫存檔必須被 mv 掉或 rm -f 掉；留下一個就會與 --check 的假設對不上。
 check_no_leftovers() {  # check_no_leftovers <label> <dir> <預期檔案…>
     local label="$1" dir="$2"; shift 2
     local want have extra missing
@@ -298,9 +265,7 @@ PR_UNITS="$(sed -n 's/^UNITS="\(.*\)"$/\1/p' "$PR_INSTALL" | head -1)"
 if [[ -d "$PR_BIN_DIR" && -d "$PR_UNIT_DIR" ]]; then
     check_no_leftovers "D10-3a" "$PR_BIN_DIR" $PR_BINARIES $PR_LIBS
     check_no_leftovers "D10-3b" "$PR_UNIT_DIR" $PR_UNITS
-    # 迴圈變數刻意不叫 f：上面 declare_pr_inodes 沒有把 f 宣告為 local，
-    # 共用同一個名字會讓兩段的「看見的東西」互相污染（第一版就因此報了四支
-    # 假紅：實際上那些檔都是 755）。
+# 迴圈變數刻意不叫 f：與 declare_pr_inodes 共用會讓四支報假紅。
     notx=""
     for one in $PR_BINARIES; do
         one_path="$PR_BIN_DIR/$one"
@@ -332,8 +297,7 @@ fi
 
 echo "=== 注入：證明 D10-1／D10-2 在原地覆寫的形狀下會紅 ==="
 
-# INJ-R1：把 install_file 換回 `cp -f` → D10-1a 與 D10-2a 必須轉紅。
-#   這是 D10 的命題在**實作側**的對照：換檔的形狀一消失，兩條斷言就抓得到。
+# INJ-R1：命題在實作側的對照——換檔的形狀一消失，兩條斷言就抓得到。
 #   形狀錨點：install.sh 裡 install_file 的本體（`install_file() {` … `^}`），
 #   整個換成 cp 版本。命中數必須剛好 1，突變版必須 bash -n 過。
 if [[ ! -f "$PR_INSTALL" ]]; then
@@ -380,9 +344,7 @@ INJR1
     fi
 fi
 
-# INJ-R2：讓 install_file 失敗時**不留**暫存檔的保證破掉 → D10-3 必須轉紅。
-#   突變：把失敗分支的 `rm -f "$tmp"` 拿掉，於是安裝失敗後 tmp 會留在 bin/ 裡。
-#   D10-3a 是「內容剛好是宣告的那些」，多一個檔就紅。
+# INJ-R2：拿掉失敗分支的 rm -f，D10-3 的「剛好是宣告的那些」就會多出暫存檔。
 if [[ ! -f "$PR_INSTALL" ]]; then
     inj_bad "INJ-R2. ${PR_INSTALL} 不存在，無法注入"
 else

@@ -22,11 +22,16 @@
 | `test-pool-resolve.sh` | 13 | 跳板鏈展開 |
 | `test-pool-sync.sh` | 112 | 收斂邏輯：GitHub 掛掉必須 exit 0、無變更不得重啟 tunnel、`needs_key` 的 unit 跳過、暫存目錄三種離開路徑都清、token 不入 argv 與 log、**跑完不新增任何檔案**；issue #7 加了「已發布零 dispatch／剛寫入恰好一次／dispatch 失敗只警告」（2026-10-02 實跑 112 條） |
 | `test-tunnel-key-lib.sh` | 13 | 隧道金鑰的 mint／publish／ensure；issue #7 加了 `TUNNEL_KEY_CHANGED` 的「已一致＝0／剛寫入＝1／連呼兩次不殘留」與 `tunnel_key_mint` 顯式 `return 0` 的斷言（2026-10-02 實跑 13 條＋4 條注入） |
-| `test-install-check.sh` | 18 + 3 injection | `pool-runtime` 的 `--check` 做的是**內容比對**而非存在性檢查（整個 pool-sync 設計的地基） |
-| `test-register-provider-tempclone.sh` | 9 | 註冊後不留 `~/.mylinuxpool/repo`、舊的會被刪、`gh_token` 保留、暫存目錄失敗時也清 |
-| `test-mlp-fwd.sh` | 68（含 13 注入） | `mlp fwd` 的四態健康檢測、bind 重疊判準、分層邊界、上色後的欄寬 |
-| `test-wake-via.sh` | 20（含 11 注入） | `via` 清單的 fallback：觸發條件是機器有沒有真的醒、等待預算、「無法驗證」不得說成「沒醒」 |
+| `test-install-check.sh` | 20 + 3 injection | `pool-runtime` 的 `--check` 做的是**內容比對**而非存在性檢查（整個 pool-sync 設計的地基） |
+| `test-register-provider-tempclone.sh` | 27 | 註冊後不留 `~/.mylinuxpool/repo`、舊的會被刪、`gh_token` 保留、暫存目錄失敗時也清 |
+| `test-mlp-fwd.sh` | 83（含 19 注入） | `mlp fwd` 的四態健康檢測、bind 重疊判準、分層邊界、上色後的欄寬 |
+| `test-wake-via.sh` | 29（含 19 注入，含 D6 的 16–26 整節：wol 資格篩選、略過佔序號、四態不降級、verify 的 via 回報） | `via` 清單的 fallback：觸發條件是機器有沒有真的醒、等待預算、「無法驗證」不得說成「沒醒」 |
 | `test-register-provider-checks.sh` | 17（含 6 注入） | 登錄流程的三個宣告：埠、curl、docker 群組，各自都要有能失敗的檢查 |
+| `test-capability-flags.sh` | 34 | 能力形狀契約（`key: object`、`{}` 不是 `null`、未知鍵保留）、遷移表、worker 的 github 禁令 |
+| `test-capability-units.sh` | 40 + 9 injection | 三個能力單位的 `--check` 契約、三態、`MLP_CAPABILITY_PARAMS` 傳遞、`pool-wol` 位元組相同 |
+| `test-capability-consumers.sh` | 13 + 2 injection | `mlp verify-capabilities` 用同一份單位的 `--check`；新增能力不必改 mlp |
+| `test-capability-declare.sh` | 16 + 3 injection | pool-sync／register-provider 的宣告路徑：只 merge capabilities、零 dispatch、相同時零寫入、三態的 2 保留原值 |
+| `test-install-replace-file.sh` | 10 + 2 injection | `install_file` 換檔取代原地覆寫，正在執行的舊版 process 不受影響（D10） |
 
 執行：`FILE_CRYPTO_KEY=$(cat crypto_key) scripts/tests/<file>`
 

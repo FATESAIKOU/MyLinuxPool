@@ -797,11 +797,9 @@ step7_5_capabilities() {
         return 1
     fi
 
-    # root 之下要換一個 process 驗證：register-provider 是先 usermod -aG docker，
-    # 當下這個 session 的群組還是舊的，worker-host 會回 2。但只在真的需要換 user 時
-    # 才用 sudo：NO_SUDO=1 是這支腳本自己「哪裡都沒有 root」的約定（見
-    # step7_5_docker_group），而 who 已經是 root 時再 sudo -u root 只是多一個
-    # 沒有回報價值的依賴——沒有 sudo 的環境會整個回 127。
+    # root 之下要換 process 驗證：register-provider 剛 usermod -aG docker，當下
+    # 這個 session 的群組還是舊的，worker-host 會回 2（所以不是可選的）。
+    # NO_SUDO=1 沒有 root 可用；who 已是 root 時再 sudo -u 只是多一個會回 127 的依賴。
     local who
     who="$(whoami)"
 

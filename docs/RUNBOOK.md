@@ -112,8 +112,8 @@ bash ops-scripts/register-provider.sh --name fh-l --gateway-port 2222 --branch f
 |---|---|---|
 | 1 | 前置檢查 | bash、`systemctl --user`、網路；缺 `rclone`/`git`/`gh`/`docker`/`openssh-server` 就以 apt 安裝（`--no-sudo` 下改成使用者層級安裝 `jq`/`gh`，見上） |
 | 2 | 存 gh token | 把 `GH_POOL_TOKEN` 寫進 `~/.mylinuxpool/gh_token`（600），並 `export GH_TOKEN`；**不呼叫** `gh auth login`（見上方 `read:org` 說明） |
-| 3 | 取得 runtime | clone repo（`--branch` 指定分支，預設 `master`）到 `~/.mylinuxpool/repo`；讀 `profiles/provider/{default,no-sudo}/profile.json`（依 `--no-sudo` 選一份）的 `shared_config` 陣列，逐一呼叫 `shared-configs/<unit>/install.sh` 裝好（今天是 `pool-runtime`、`ssh-tunnel-client`、`gh`）——裝哪些 unit 由 profile 宣告決定，不是寫死在腳本裡 |
-| 4 | Actions 的 authorized_keys | 從 `shared-configs/ssh-admin/files/authorized_keys.crypted` 解密，只抽出標記 `mylinuxpool-actions` 的那一行，附加進 `~/.ssh/authorized_keys`（讓 Actions 能直接連進這台機器）。sshproxy 的隧道私鑰（`~/.ssh/id_pool`）已在上一步由 `ssh-tunnel-client` unit 裝好，所有 provider 共用同一把，公鑰已在 Gateway 的 `authorized_keys` |
+| 3 | 取得 runtime | clone repo（`--branch` 指定分支，預設 `master`）到 `~/.mylinuxpool/repo`；讀 `profiles/provider/{default,no-sudo}/profile.json`（依 `--no-sudo` 選一份）的 `shared_config` 陣列，逐一呼叫 `shared-configs/<unit>/install.sh` 裝好（**今天是 `pool-runtime`、`gh`、`wol`**；`worker-host` 沒有檔案要裝，由 `step7_5` 直接驗）——裝哪些 unit 由 profile 宣告決定，不是寫死在腳本裡 |
+| 4 | Actions 的 authorized_keys | 從 `shared-configs/ssh-admin/files/authorized_keys.crypted` 解密，只抽出標記 `mylinuxpool-actions` 的那一行，附加進 `~/.ssh/authorized_keys`（讓 Actions 能直接連進這台機器）。sshproxy 的隧道私鑰由 `scripts/lib/tunnel-key.sh` 在**每台機器自己**產生（pool-sync 的第一個 tick），公鑰寫進該機自己的 `NODE_<NAME>.tunnel_public_key`，再由 refresh 讓 Gateway 授權（KEY-DESIGN §3.2／§3.3） |
 | 5 | 身分 | 寫 `~/.mylinuxpool/config`：`NODE_NAME=<name>` |
 | 6 | 登記 | `gh variable set NODE_<NAME>`，內容依 `ARCHITECTURE.md` §3 schema；已存在則合併 |
 | 7 | sudoers | 寫 `/etc/sudoers.d/mylinuxpool`（440）：只放行 `systemctl poweroff` 與 `ethtool`。**這步會互動要 sudo 密碼**；`--no-sudo` 下整步跳過 |
@@ -382,12 +382,11 @@ journalctl --user -u pool-sync -n 50 --no-pager   # 它做了什麼
 | unit 的 `needs_root: true` | 跳過 | 它由 systemd **user** timer 啟動，沒有 root |
 | 沒有任何落差 | 不重啟 tunnel | 重啟會斷掉該機所有 worker 的隧道 |
 
-實際上今天能被它收斂的只有 `pool-runtime` 一個 unit——`ssh-tunnel-client`
-要金鑰、`gh` 要 root，兩個都只在註冊時處理。這是邊界，不是缺口：會漂移的
-本來就是 `bin/`。
+實際上今天能被它收斂的是 `pool-runtime` 與 `wol` 兩個 unit——`gh` 要 root，
+只在註冊時處理。這是邊界，不是缺口：會漂移的本來就是 `bin/`。
 
-> 換句話說：**改了 `shared-configs/ssh-tunnel-client/` 或 `gh/` 的東西，
-> 還是要人手重跑 `register-provider.sh`。** 只有 `pool-runtime` 會自己跟上。
+> 換句話說：**改了 `shared-configs/gh/` 的東西，還是要人手重跑
+> `register-provider.sh`。** `pool-runtime` 與 `wol` 會自己跟上。
 
 ## 4. Fh-proxy 的 Windows 側設定
 

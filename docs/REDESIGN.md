@@ -310,7 +310,7 @@ N7 要求「主本只有一個地方」。目前狀態盤查（2026-09-15）：
 | 節點定址 | `NODE_*` var | Gateway `state.json`、節點本機快取 | ✅ 快取，會自動同步 |
 | 埠帳本 | `POOL_WORKERS` | Gateway `workers.d/`、`state.json` | ✅ 同上 |
 | **可用 provider 清單** | `NODE_*` var | **`create-worker.yml` 的 choice 選項寫死 `fh-l`/`fh-proxy`** | ❌ 新增 provider 要改 workflow |
-| **哪台可以 wake/down** | `NODE_FH_L.power` | **`mlp` 的 `cmd_wake`/`cmd_down` 寫死 fh-l** | ❌ var 裡已有 `power` 與 `capabilities` 可判斷 |
+| **哪台可以 wake/down** | `NODE_FH_L.power` | **`mlp` 的 `cmd_wake`/`cmd_down` 寫死 fh-l** | ❌ var 裡已有 `power` 與 `capabilities` 可判斷（**已部分實作**：`mlp wake` 現在讀 senders 的 `wol` 能力決定資格（D6）；被喚醒的目標仍寫死 `fh-l`）|
 | GitHub 憑證 | `GH_POOL_TOKEN` secret | 各 provider 的 `gh_token` | ⚠️ 目前必要（Gateway 換人時的退路），§2.8 有消除它的路 |
 
 前兩項是真正的違規：**它們讓「加一台 provider」變成要改兩個地方**，

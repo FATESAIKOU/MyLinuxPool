@@ -84,7 +84,7 @@
 >
 > 家人維修跳板**沒有** `NODE_*`：全家共用一把隧道金鑰，公鑰放在單獨的
 > `REPAIR_TUNNEL_PUBKEY` var（一行 OpenSSH 公鑰，不是 JSON）；
-> `mlp` 直接掃 Gateway 的 listener 找在線的跳板（待實作確認）。
+> `mlp` 直接掃 Gateway 的 listener 找在線的跳板。
 > 操作見 [`docs/REPAIR-HOST.md`](REPAIR-HOST.md)。
 
 ### NODE_FH_L（provider，含跳板鏈與電源控制）
@@ -174,7 +174,7 @@
 | `FILE_CRYPTO_KEY` | 保留 | 對稱解密 `.crypted`；維持 aes-256-cbc，現有檔案不動 |
 | `LINODE_TOKEN` | 保留 | Rotate 時建／刪／改名機器 |
 | `SSH_KEY_ACTIONS` | 新增（取代 `SSH_KEY_GATEWAY`/`SSH_KEY_FH_L`/`SSH_KEY_FH_PROXY`） | Actions 對整座叢集的**唯一**管理身分；每個 node var 的 `key_secret`（含每一跳）都指向它，不再依目的地各配一把 |
-| ~~`SSH_KEY_SSHPROXY`~~ | 2026-09-14 刪除 | 隧道身分本身仍然存在且**與 `SSH_KEY_ACTIONS` 不可合併**，但它不需要當成 secret 保存：同一把私鑰已經以 `shared-configs/ssh-tunnel-client/files/id_rsa.crypted` 隨 repo 分發，Actions 用 `FILE_CRYPTO_KEY` 自己解得開 |
+| ~~`SSH_KEY_SSHPROXY`~~ | 2026-09-14 刪除 | 隧道身分本身仍然存在且**與 `SSH_KEY_ACTIONS` 不可合併**，但它不需要當成 secret 保存：每台機器自己產生私鑰（`~/.ssh/id_tunnel`），只把公鑰發佈到自己的 `NODE_<NAME>.tunnel_public_key` |
 | `CSIE_IO_TOKEN` | 刪除 | DDNS 廢除後無用 |
 | `SSHPROXY_PASS` | 刪除 | 改純金鑰認證，Gateway 關閉 `PasswordAuthentication` |
 | `GH_POOL_TOKEN` | 加密佈署 | 放 `static_secret_files`，給 provider 讀 var／clone repo |

@@ -96,15 +96,7 @@ fi
 #   形狀，--jq .value 才有作用）、讀 repo（回 .full_name，gh 能力就是「讀得到這些
 #   repo」）；variable set 寫 GH_SET_FILE。
 #
-# 單一 var 為什麼要改成信封（2026-10-02）：step5_register_var 與
-# step7_5_capabilities 都是 `gh api …/variables/<NAME> --jq .value`。舊的假 gh
-# 直接吐裸值、**完全忽略 --jq**，於是那兩個步驟讀到的 var 內容其實是「假 gh 自己
-# 印的東西」，等於沒有驗證讀取路徑。回信封之後形狀才對得上真實 gh。
-# 讀取分支**必須自己套 --jq**（真實 gh 就是這樣：`--jq` 是 gh 端的過濾器）。
-# 舊的假 gh 完全忽略 --jq、直接印裸值，於是 step5_register_var 與
-# step7_5_capabilities 的 `gh api … --jq .value` 讀到的是「假 gh 自己印的東西」，
-# 讀取路徑等於沒被驗證。回信封之後這一條特別關鍵：沒有套 --jq，呼叫端會把
-# 整個信封 {"name":…,"value":"…"} 當成 var 的內容。
+# 假 gh 的單一 var 讀取必須回信封，而且讀取分支要自己套 --jq（真實 gh 就是這樣）。
 cat > "$SHIMS/gh" <<'FAKE'
 #!/usr/bin/env bash
 printf 'GH %s\n' "$*" >> "${GH_LOG:-/dev/null}"
@@ -326,11 +318,7 @@ else
     bad "1b. docker 通竟失敗（got [$got_b]）"
 fi
 
-# 1a：docker 不通 → step7_5_capabilities 非 0，且訊息指名 worker-host 是
-#     「確定不成立」（NOT established），不是「無法確認」。
-#   後半段是 D8 的字面要求：「註冊就失敗，並指出是哪個能力，以及它是不成立
-#   還是無法確認」。只有非 0 的話，1 與 2 分不出來——而那兩者的處置完全相反
-#   （1 是確定壞掉、2 要保留舊值不要抖動）。
+# 1a：只有非 0 不足以分辨 1 與 2，而那兩者的處置完全相反。
 got="$(rp_step7 "$SANDBOX/rp/rp.sh" "$PROF_DOCKER" "$VAR_WH" 1 '')"
 if [[ "$got" == RC=0* ]]; then
     bad "1a. docker 不通竟回報通過（got [$got]）"
@@ -340,10 +328,7 @@ elif [[ "$got" == RC=1* ]] && printf '%s' "$got" | grep -qF "capability 'worker-
 else
     bad "1a. docker 不通的結果不對：必須是 RC=1 且指名 worker-host NOT established（got [$got]）"
 fi
-# 1c：群組在、socket 不通 → 經 runner 仍然是 1（「在群組裡」不是證據）。
-#   前提先把謊言擺出來：同一個夾具下 id -nG 確實說有 docker 群組，而且
-#   /etc/group 的 docker 群組也有這個使用者（否則單位會走「群組變更沒生效」
-#   那條分支回 2，這一條就量不到它要量的東西）。
+# 1c：前提先把謊言擺出來（id -nG 與 /etc/group 都得有 docker 群組），否則量不到 1 那一格。
 if ! PATH="$SHIMS:$PATH" FAKE_GROUPS='staff docker everyone' id -nG 2>/dev/null | grep -qw docker; then
     bad "1c. 對照組沒成立——夾具無效（id -nG 沒說有 docker 群組）"
 else
@@ -354,13 +339,7 @@ else
         bad "1c. 群組在、socket 不通，經 runner 回 [${fix_rc}]——預期 1（「在群組裡」不算證據）"
     fi
 fi
-# 1d：runtime:podman → 不去碰 docker。探針是 docker 的呼叫紀錄本身
-#     （舊的 1d 是覆寫 step7_5_docker_group 當 sentinel，而那個函式已經不在
-#     能力路徑上了；現在量的是「docker 有沒有真的被呼叫」）。
-#   為什麼需要 1b 當前提：非 0 本身證明不了「是 podman 造成的」——任何原因
-#   的非 0 都長一樣（PROFILE 拼字錯、夾具缺檔…）。1b 是同一個夾具、同一個
-#   runner、只把 runtime 換回 docker 的對照組：1b 綠而 1d 非 0，差異才歸得到
-#   runtime 那一個參數上。
+# 1d：非 0 證明不了「是 podman 造成的」，所以要 1b 當同一個夾具的對照組。
 : > "$SANDBOX/docker.log"
 got="$(rp_step7 "$SANDBOX/rp/rp.sh" \
         '{"worker-host":{"runtime":"podman"},"github":{"repos":{"FATESAIKOU/MyBrain":["read"]}},"wol":{"methods":["unicast"]}}' \
@@ -601,17 +580,13 @@ if [[ "$got" == "RC=3 APICALLS="* ]] && printf '%s' "$got" | grep -qF 'unverifia
 else
     bad "5b. write 被當成有驗證：預期 unverifiable＋could not be confirmed（got [$got]）"
 fi
-# 5c：未知 key → unverifiable＋exit 3。
 got="$(verify_caps '{"name":"t","capabilities":{"mystery":{"x":1}}}' '')"
 if [[ "$got" == "RC=3 APICALLS=0"* ]] && printf '%s' "$got" | grep -qF 'unverifiable'; then
     ok "5c. 未知 key → unverifiable 且 exit 3"
 else
     bad "5c. 未知 key 靜靜通過（got [$got]）"
 fi
-# 5d：hop 失敗（真的 ssh 失敗）→ unverifiable，而且**不是** fail。
-#   夾具改成 return 255：真的 ssh 的失敗碼就是 255，而 run_on_node 的回傳碼會
-#   原樣穿回來。回 1 的話 mlp 會判成 fail（1 = 確定不成立），那是另一個意思——
-#   節點根本沒送到，跟「能力不成立」無關。
+# 5d：夾具要 return 255——真的 ssh 的失敗碼就是 255，而回 1 會被 mlp 判成「確定不成立」。
 got="$(verify_caps '{"name":"t","capabilities":{"worker-host":{"runtime":"docker"}}}' 'run_on_node() { return 255; }')"
 if [[ "$got" == "RC=3 APICALLS="* ]] && printf '%s' "$got" | grep -qF 'unverifiable' \
 && printf '%s' "$got" | grep -qF 'check returned 255'; then
@@ -641,23 +616,14 @@ if [[ "$got" == "RC=0 APICALLS=0"* ]] && printf '%s' "$got" | grep -qF 'ok'; the
 else
     bad "5e. 全 pass 竟非 0（got [$got]）——護欄會永遠紅"
 fi
-# 5f：github read → **真的**打 GitHub API，而且恰好一次。
-#   這條是「零呼叫」那些斷言的正對照：計數器看得到呼叫，零才有意義。
+# 5f：「零呼叫」那些斷言的正對照。
 got="$(verify_caps '{"name":"t","capabilities":{"github":{"repos":{"owner/repo":["read"]}}}}' '')"
 if [[ "$got" == "RC=0 APICALLS=1"* ]] && grep -qF 'GH api --include repos/owner/repo' "$GH_LOG" 2>/dev/null; then
     ok "5f. github read → 真的打 gh api repos/owner/repo 恰好 1 次（不是看 token 檔）"
 else
     bad "5f. github read 沒真的打 API（got [$got] log [$(grep -a '^GH api' "$GH_LOG" 2>/dev/null | head -c 120)])"
 fi
-# 5g–5k：五種畸形 github value → **不能報 pass，而且 GitHub API 零呼叫**。
-#   換掉的是被重構的對象（形狀檢查搬進 gh 單位的 --check，畸形時回 1 且不打 API）。
-#   命題沒變，而且更強了兩分：
-#     (a) 「不能報 pass」從「報 fail」放寬成「狀態不是 pass」——因為單位的
-#         1／2 分別對應 fail／unverifiable，兩者都滿足「沒報 pass」；
-#     (b) 零呼叫的**計數對象換了**：舊版數 run_on_node 的呼叫（畸形時 mlp 根本
-#         不會送出東西，所以那個數字只證明「沒送出」）；新版數**假 gh 的 api
-#         呼叫**——單位的 --check 是在假節點上真的跑起來的，所以這個數字證明
-#         「連 GitHub 都沒去碰」。5f 是它的正對照。
+# 5g–5k：畸形 github value → 不能報 pass，而且 GitHub API 零呼叫。零呼叫數的是假 gh 的 api 帳本。
 schema_case() {
     local label="$1" caps="$2" want_state="$3" got
     got="$(verify_caps2 "$REPO_ROOT/$MLP" "{\"name\":\"t\",\"capabilities\":${caps}}" '')"
@@ -801,15 +767,7 @@ PY
 }
 mktmpf() { printf '%s' "$2" > "$SANDBOX/nd-$1"; }
 
-# 7. 能力檢查的結果被忽略掉 → 1a（docker 不通不得回報通過）必須轉紅。
-#   **錨點換掉了，命題沒換。** 舊錨點是 RP 裡 `worker-host)` 這個寫死的 case
-#   分支，D8 把它整段換成走 runner 的迴圈，於是 needle 命中數變 0。
-#   新錨點＝同一個函式（step7_5_capabilities，2.2a 認得出來的那一個）本體裡
-#   **呼叫 capability_check 的那一行**（非註解、剛好一行），把它換成 `rc=0`——
-#   語意就是「檢查跑完了，但結果不看」。docker 不通時所有能力都會被判成 0。
-#   形狀要跟著實作走：那一行現在是 `… >/dev/null 2>&1 || rc=$?`（把回傳碼收進
-#   rc，順便擋掉 set -e），所以注入是「把收到 rc 的那一格換成 0」——檢查照跑、
-#   結果照收，只是被丟掉。命中數必須剛好 1。
+# 7：錨點換掉，命題沒換。新錨＝同一函式本體裡呼叫 capability_check 的那一行（非註解、剛好一行）。
 mktmpf o7 '            MLP_REPO_ROOT="$REPO_DIR" capability_check "$key" "$params" >/dev/null 2>&1 || rc=$?
 '
 mktmpf n7 '            MLP_REPO_ROOT="$REPO_DIR" capability_check "$key" "$params" >/dev/null 2>&1 || rc=0  # INJECTED
@@ -826,13 +784,7 @@ else
     fi
 fi
 # 8. 驗證改成檢查 id -nG → 群組在、socket 不通時通過。
-#   **錨點換掉了，命題沒換。** 舊錨點在 mlp 裡（`run_on_node … docker info`），
-#   D3 把判準整個搬進 shared-configs/worker-host/install.sh，於是那裡 0 命中。
-#   新錨點＝該單位 install.sh 裡的 `if docker info >/dev/null 2>&1; then`，
-#   換成 `id -nG | grep -qw docker`——那個「看起來很合理、其實會在壞掉的時候
-#   照過」的判準。
-#   盯的斷言是 **1c**（群組在、socket 不通 → 經 runner 仍然是 1）：它問的是
-#   同一個問題，只是從 register-provider 那一側改成直接問 runner。
+# 8：錨點換到單位的 install.sh，命題沒換。盯的是 1c。
 mktmpf o8 'if docker info >/dev/null 2>&1; then
 '
 mktmpf n8 'if id -nG 2>/dev/null | grep -qw docker; then
@@ -878,17 +830,7 @@ else
         fi
     fi
 fi
-# 10. 不認得的 key 被刪掉 → 保留規則失效（3a 唯一的牙）。
-#   **needle 換掉了，命題沒換。** 舊的第二枚 needle 是
-#   `capabilities: ($existing.capabilities // {"worker-host": {"runtime": "docker"}})`
-#   ——D8 拿掉了那個預設，現在是 `capabilities: $existing.capabilities`，命中數 0。
-#   忠實的「刪掉未知 key」仍然是兩半都退化：運算子改成淺層覆蓋（`*` → `+`）
-#   ＋ capabilities 只留空 object。兩枚 needle 命中數各剛好 1。
-#   第二枚 needle 跟著實作走過一次：impl 把
-#   `capabilities: $existing.capabilities` 改成
-#   `capabilities: ($existing.capabilities // {})`（拿掉 worker-host 預設、
-#   保留空 object 預設），於是舊 needle 又落空一次——這是本檔第三次因為
-#   D8 的形狀變動而換錨點，命題（3a：未知 key 必須原樣保留）從未變過。
+# 10：兩枚 needle，命中數各 1。第二枚跟著實作走過一次。
 python3 - "$SANDBOX/rp/rp.sh" "$SANDBOX/rp/rp-inj10.sh" <<'PY10'
 import sys
 src = open(sys.argv[1], encoding="utf-8").read()
@@ -951,15 +893,7 @@ else
     fi
 fi
 
-# 12. unverifiable 被當成 pass → 沒驗到卻回報通過（**字串與碼都要轉**）。
-#   **錨點換掉了，命題沒換。** 舊的兩枚 needle 是 `CAP_STATE` 的初始值與
-#   `*) mark=…; [[ "$rc" -eq 0 ]] && rc=3`：前者死在 D5＋impl 刪死碼
-#   （cap_verify_node 現在沒有初始值），後者還在，但搬進了 cap_verify_one。
-#   現在「字串」與「碼」是在**同一個 case 分支**裡決定的，所以兩半合成一枚：
-#   把 `*)` 那一格從「印 unverifiable、rc 設 3」換成「印 ok、rc 設 0」。
-#   這與舊的雙 needle 等價：舊的兩個突變合起來也是「unverifiable 變成 pass 且
-#   exit 0」，而現在要證明的命題一字未變——**沒有驗到的東西不得被回報成通過**，
-#   而且字面與退出碼必須一起轉（自動化只看退出碼）。
+# 12：字面與退出碼現在在同一個 case 分支裡決定，所以兩半合成一枚 needle。
 mktmpf o12 '            *)    mark="${C_YELLOW}unverifiable${C_RESET}"; [[ "$rc" -eq 0 ]] && rc=3 ;;
 '
 mktmpf n12 '            *)    mark="${C_GREEN}ok${C_RESET}"; rc=0 ;;   # INJECTED: unverifiable reported as pass
@@ -986,12 +920,7 @@ else
         inj_bad "12. 突變後 rc=${inj_got} out=[$(tr '\n' '|' < "$SANDBOX/vc12.out" 2>/dev/null | head -c 140)]——不是預期的假通過"
     fi
 fi
-# 14. 根因針：把「無條件的 unverifiable」改成「無條件的 pass」→ 5n 必須轉紅。
-#   **錨點換掉了，命題沒換。** 舊針是改 `CAP_STATE` 的**初始值**；cap_verify_node
-#   已經沒有初始值（每一個分支都自己賦值），所以改成做同一件事的另一個形狀：
-#   把「沒有單位實作 → unverifiable」那一行變成「沒有單位實作 → pass」。
-#   那正是 2026-09-25 qa 的根因形狀——**沒有觀察到任何東西卻回報 true**，
-#   而 5n 的新判準（pass 只准出現在 case 分支）應該抓得到。
+# 14：把「沒有單位 → unverifiable」改成「→ pass」，那正是 2026-09-25 qa 的根因形狀。
 python3 - "$REPO_ROOT/$MLP" "$SANDBOX/mlp-inj14.sh" <<'INJ14'
 import re, sys
 lines = open(sys.argv[1], encoding="utf-8").read().split("\n")

@@ -49,16 +49,20 @@
 #      （wake 另明列 pool-wol 為 0）。
 #   2. 合理用法不被擋：真的造出「stdin 是 TTY、stdout 是管線」的情境
 #      （python pty），mlp ls | tail、mlp state | grep 照常。
-#   3. 受守衛的路徑在「stdin 是 TTY、stdout 是管線」時也不得被拒
-#      （menu canary；stdout 判定會在這裡現形）＋ 靜態釘住判定是 -t 0。
+#   4. §3b：說明文字（repair 主機）。量的是使用者實際看的輸出——
+#      `mlp ssh` 的 usage 與主選單三行，後者靠 fzf stub 存下它的 stdin。
+#      不 grep 原始碼：ls 的說明在 mlp 裡有兩份且措辭不同。
+#      主選單）且措辭不同，grep 分不出使用者讀到哪一份——而「兩份不一致」
+#      正是 #8 的病灶本身。
 #
 # 全離線：pool-resolve / ssh / gh / fzf / sleep 全 PATH stub；jq 用真的。
 # bash 3.2 相容（無陣列、無 ${var,,}、無 nameref）。
 #
 # Run: scripts/tests/test-mlp-noninteractive.sh
 set -uo pipefail
-cd "$(dirname "${BASH_SOURCE[0]}")/../.." || exit 1
-REPO_ROOT="$PWD"
+# 草稿副本在 repo 之外，所以 repo 根要多這個出口；進 repo 後自動走原本的 ../..。
+REPO_ROOT="${MLP_TEST_REPO_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}"
+cd "$REPO_ROOT" || exit 1
 
 MLP="ops-scripts/mlp"
 SSH_LIB="scripts/lib/ssh.sh"
@@ -148,8 +152,15 @@ esac
 exit 0
 FAKE
 # fzf：記帳；不讀 stdin（真 fzf 被叫到就會卡，這裡直接拒答）。
+#
+# §3b 起多存一份 **stdin**：主選單是把項目逐行 printf 餵給 fzf 的，所以
+# fzf 的 stdin 就是「使用者看到的選單」。不存它，主選單的說明文字就只能
+# 去 grep 原始碼量——那量的是實作的字串形狀，不是使用者讀到的東西；而且
+# 同一句話在檔案裡有兩份拷貝時，grep 分不出該量哪一份。
+# 對既有各條斷言 invisible：它們只看 rc 與 FZF_LOG 的呼叫次數。
 cat > "$SHIMS/fzf" <<'FAKE'
 #!/usr/bin/env bash
+if [[ -n "${MENU_LOG:-}" ]]; then cat > "$MENU_LOG"; fi
 printf 'FZF\n' >> "${FZF_LOG:-/dev/null}"
 exit 1
 FAKE
@@ -361,6 +372,148 @@ else
     bad "3. 判定不是 stdin（body [$(printf '%s' "$io_body" | tr '\n' ' ')）"
 fi
 
+echo "=== 3b. 說明文字（repair 主機）：gap #4／#8／#9／#10 ==="
+# 來源：OUT-review-mlp-help-gap.md 的 #4（`mlp ssh` 的 usage）、#8／#9／#10
+# （互動主選單的 ls／ssh／fwd-add 三行）。那個報告 §7 建議 3 說得很直白：
+# 「這七處沒有任何測試釘著，所以改動是零風險的——但也代表沒有測試會提醒未來
+# 又漂走」。**這一段就是那個「提醒」。**
+#
+# 量的是**使用者實際看到的輸出**，不是原始碼：
+#   * 3b-1／3b-2 → 真的跑 `mlp ssh`，讀它的 stderr 與 rc；
+#   * 3b-3..3b-5 → 用既有的 pty 夾具真的跑一次無參數的 `mlp`，主選單把項目餵給
+#                  fzf stub，讀 fzf 收到的 stdin（使用者看到的選單）。
+# 為什麼不 grep 原始碼：`ls` 的說明在這個檔案裡有**兩份**（`usage()` 與主選單），
+# 措辭還不一樣。grep 分不出使用者讀到哪一份，而「兩份不一致」正是 #8 的病灶本身。
+#
+# 判準只綁「該條目必須提到 repair」，不綁整句措辭——那是文案，不是契約。
+#
+# 每條斷言寫成函式、回 0/1，並把紅的原因放進 LAST_WHY。理由有兩個：
+#   * 底下那條注入要用**同一段**斷言跑突變版（否則驗的是複寫的檢查，不是護欄）；
+#   * 只有兩種結果（「紅了」）時，一個壞掉的斷言看起來跟一個真的斷言一樣。
+LAST_WHY=""; LAST_GOT=""
+
+# 3b-1／3b-2：`mlp ssh` 的非互動 usage。兩條不同路徑、同一個字串：
+#   3b-1 = 無參數      → main 的 ssh 分派處（mlp:3374）
+#   3b-2 = `-` 開頭參數 → cmd_ssh 的開頭守衛（mlp:1160）
+# 兩條都要，否則只改一份仍然會有一份停在 repair 之前。
+ssh_usage_case() {   # ssh_usage_case <標籤> <mlp 引數…>；回 0 = 符合
+    local label="$1"; shift
+    local line
+    LAST_WHY=""; LAST_GOT=""
+    run_mlp "$label" "$@"
+    line="$(grep -m1 '^usage: mlp ssh ' "$SANDBOX/$label.err" 2>/dev/null || true)"
+    LAST_GOT="rc=${MLP_RC} usage=[${line:-<none>}] err=[$(tr '\n' '|' < "$SANDBOX/$label.err" 2>/dev/null | head -c 120)]"
+    if [[ "$MLP_RC" -ne 2 ]]; then
+        LAST_WHY="rc"; return 1
+    fi
+    if [[ -z "$line" ]]; then
+        LAST_WHY="no-usage-line"; return 1
+    fi
+    if ! printf '%s' "$line" | grep -qi 'repair'; then
+        LAST_WHY="no-repair"; return 1
+    fi
+    if [[ "$MLP_SSH" != "0" || "$MLP_FZF" != "0" || "$MLP_GH" != "0" ]]; then
+        LAST_WHY="side-effect"; return 1
+    fi
+    LAST_GOT="${LAST_GOT} side-effects=0"
+    return 0
+}
+
+# 主選單：跑一次無參數的 `mlp`（2c 已證明 stdin 是 tty 時那條路徑會放行），
+# 把 fzf 收到的清單存成檔。呼叫端負責先 `menu_capture`。
+menu_capture() {
+    : > "$SANDBOX/menu.txt"
+    pty_run "$SANDBOX/inner-menutext.sh"
+    MENU_TEXT="$SANDBOX/menu.txt"
+    MENU_LINES="$(wc -l < "$MENU_TEXT" 2>/dev/null | tr -d ' ')"
+    MENU_RC="$(printf '%s' "$pty_out" | sed -n 's/^--PTY-RC--//p')"
+    case "$MENU_RC" in
+        ''|*[!0-9]*) MENU_RC="$(printf '%s' "$pty_out" | sed -n 's/.*MLPRC=\([0-9]*\).*/\1/p')" ;;
+    esac
+}
+
+# 3b-3..3b-5：逐條比對。`^ls[[:space:]]` 而不是 `^ls`——選單裡還有 `fwd-ls`；
+# `^fwd-add` 而不是 `^fwd`——還有 `fwd-ls`／`fwd-rm`。
+menu_case() {   # menu_case <條目 regex> <短名>；回 0 = 該行提到 repair
+    local pat="$1" name="$2" line
+    LAST_WHY=""; LAST_GOT=""
+    line="$(awk -v pat="$pat" '$0 ~ "^"pat {print; exit}' "$MENU_TEXT" 2>/dev/null || true)"
+    LAST_GOT="line=[${line:-<none>}]"
+    if [[ -z "$line" ]]; then
+        LAST_WHY="no-line"; return 1
+    fi
+    if ! printf '%s' "$line" | grep -qi 'repair'; then
+        LAST_WHY="no-repair"; return 1
+    fi
+    return 0
+}
+
+# usage 的一個條目**會捲行**：條目行本身縮排 2（或 3）個空格，續行縮排更多。
+# 只看第一行會漏掉續行——第一版就是這樣，於是 `fwd add` 那條被誤判成「沒提到
+# repair」，而 repair 明明在它的第二行。**那時紅的理由是「我的 grep 錯了」，
+# 不是產品錯了**——正是本 repo 對假紅的定義。
+# 抓法：條目行 ＋ 後面所有縮排**比它更深**的行（下一個條目縮排相同或更淺）。
+usage_block() {   # usage_block <條目 regex>：印整個條目（第一行＋續行）
+    awk -v pat="$1" '
+        !grab && $0 ~ pat { grab=1; ind=match($0,/[^ ]/)-1; print; next }
+        grab==1 {
+            if ($0 ~ /^[[:space:]]*$/) next
+            ind2=match($0,/[^ ]/)-1
+            if (ind2 > ind) { print; next }
+            exit
+        }' "$2" 2>/dev/null || true
+}
+
+# 3b-6（正向對照，現在就綠）：頂層 `usage()` 的 ls／ssh／fwd add **已經**提到
+# repair。作用是證明「mentions repair」這個量法在真的輸出上會亮——沒有它，
+# 3b-1..3b-5 的紅有可能只是量法壞掉。
+usage_aware_case() {
+    local ls_blk ssh_blk fwd_blk miss=""
+    LAST_WHY=""; LAST_GOT=""
+    run_mlp 3b6
+    ls_blk="$(usage_block '^[[:space:]]*ls[[:space:]]' "$SANDBOX/3b6.err")"
+    ssh_blk="$(usage_block '^[[:space:]]*ssh[[:space:]]' "$SANDBOX/3b6.err")"
+    fwd_blk="$(usage_block '^[[:space:]]*fwd add[[:space:]]' "$SANDBOX/3b6.err")"
+    LAST_GOT="ls=[$(printf '%s' "$ls_blk" | tr '\n' '|')] ssh=[$(printf '%s' "$ssh_blk" | tr '\n' '|')] fwd=[$(printf '%s' "$fwd_blk" | tr '\n' '|')]"
+    printf '%s' "$ls_blk"  | grep -qi 'repair' || miss="${miss} ls"
+    printf '%s' "$ssh_blk" | grep -qi 'repair' || miss="${miss} ssh"
+    printf '%s' "$fwd_blk" | grep -qi 'repair' || miss="${miss} fwd-add"
+    if [[ -n "$miss" ]]; then
+        LAST_WHY="${miss}"; return 1
+    fi
+    return 0
+}
+
+# 先決條件（3b-0）：夾具真的把選單餵進 fzf 了。少了這條，3b-3..3b-5 的紅會被
+# 誤讀成「mlp 沒印選單」（夾具壞掉），而真正的問題（說明文字 stale）不會被
+# 任何地方講出來。2z 是同類的自我驗證（那是給 pty 用的，這一條是給 fzf 用的）。
+cat > "$SANDBOX/inner-menutext.sh" <<EOF
+cd $REPO
+: > "$SANDBOX/menu.txt"
+MENU_LOG="$SANDBOX/menu.txt" PATH="$SHIMS:\$PATH" HOME=$HOME_DIR bash $REPO/$MLP >/dev/null 2>&1
+printf 'MLPRC=%s\n' "\$?"
+EOF
+menu_capture
+if [[ "${MENU_LINES:-0}" -ge 10 ]] && printf '%s' "$pty_out" | grep -q 'MLPRC=0'; then
+    ok "3b-0. pty＋fzf stub 真的餵到主選單（${MENU_LINES} 行；pty 本身的自我驗證在 2z）"
+else
+    bad "3b-0. 沒有拿到主選單（${MENU_LINES:-0} 行）——3b-3..3b-5 的紅會是假的（pty_out [$(printf '%s' "$pty_out" | tr '\n' ' ' | head -c 160)]）"
+fi
+
+R1_LABEL="3b-1. mlp ssh（無參數）的 usage 提到 repair 主機（gap #4，main 分派處）"
+R2_LABEL="3b-2. mlp ssh -x 的 usage 提到 repair 主機（gap #4，cmd_ssh 守衛）"
+R3_LABEL="3b-3. 主選單的 ls 說明提到 repair 主機（gap #8）"
+R4_LABEL="3b-4. 主選單的 ssh 說明提到 repair 主機（gap #9）"
+R5_LABEL="3b-5. 主選單的 fwd-add 說明提到 repair 主機（gap #10）"
+R6_LABEL="3b-6. 頂層 usage() 的 ls／ssh／fwd add 都已提到 repair（正向對照：量法會亮）"
+
+if ssh_usage_case 3b1 ssh; then ok "$R1_LABEL"; else bad "$R1_LABEL [$LAST_WHY] (got [$LAST_GOT])"; fi
+if ssh_usage_case 3b2 ssh -not-a-target; then ok "$R2_LABEL"; else bad "$R2_LABEL [$LAST_WHY] (got [$LAST_GOT])"; fi
+if menu_case 'ls[[:space:]]' ls; then ok "$R3_LABEL"; else bad "$R3_LABEL [$LAST_WHY] (got [$LAST_GOT])"; fi
+if menu_case 'ssh[[:space:]]' ssh; then ok "$R4_LABEL"; else bad "$R4_LABEL [$LAST_WHY] (got [$LAST_GOT])"; fi
+if menu_case 'fwd-add[[:space:]]' fwd-add; then ok "$R5_LABEL"; else bad "$R5_LABEL [$LAST_WHY] (got [$LAST_GOT])"; fi
+if usage_aware_case; then ok "$R6_LABEL"; else bad "$R6_LABEL [$LAST_WHY] (got [$LAST_GOT])"; fi
+
 echo "=== 4-6. 注入：拿掉修正，斷言必須轉紅 ==="
 # 4. 拿掉 wake 守衛 → 非互動下真的送出 WoL（不是只有退出碼變）。
 INJ1="$SANDBOX/mutant-noguard.sh"
@@ -502,6 +655,78 @@ else
         inj_ok "7. 反轉 [[ -t 0 ]] → 2c（受守衛）紅、2a/2b（未受守衛的 ls/state）不紅——2c 確實在讀 tty，而且只有它能讀"
     else
         inj_bad "7. 反轉後 guarded_red=${g_red} 2a_red=${u_ls_red} 2b_red=${u_st_red}（期望 1/0/0）——2c 的覆蓋或本檔對 2a/2b 的理解有問題"
+    fi
+fi
+
+# 8. 拿掉四處說明文字裡的 repair（repaired → stale）→ 3b-1..3b-5 必須轉紅。
+#    **方向在 D6/§3b 修正落地之後翻過來了。** 它原本是 stale → repaired 的正向對照
+#    （那時產品碼還是舊的，「拿掉修正」沒有意義——要移除的東西還不存在）。
+#    修正落地後舊字串的 count 變成 0，python 的 assert 在突變版還沒產生出來就炸掉，
+#    整個檔案 `injection-fail 1`。命題不變：**證明 3b-1..3b-5 量到的就是那四行字**，
+#    只是從「注進去會綠」翻成「拿掉會紅」——同一件事的兩面。
+#
+#    needle 用的是 **impl 實際寫的措辭**，不是 gap 報告建議欄的：菜單 ls 是
+#    `…/repair with live state`（沒有 hosts）、菜單 ssh 是 `node/worker/repair and
+#    connect`（沒有 host）、`mlp ssh` 的 usage 是 `repair-name`（不是 repair-host）。
+#    3b-1..3b-6 只綁「該條目提到 repair」，所以措辭差異對它們無關；但 needle 是
+#    **逐字比對 src.count()**，寫錯就會再次 count=0。
+#    3b-6（正向對照）必須**維持綠**——突變只動主選單那三行與 `mlp ssh` 的 usage，
+#    頂層 `usage()` 的三行沒有被碰。
+INJ5="$SANDBOX/mutant-help-stale.sh"
+python3 - "$REPO/$MLP" "$INJ5" <<'PY'
+import sys
+src = open(sys.argv[1], encoding="utf-8").read()
+pairs = [
+    # #8 主選單 ls
+    ('"ls      list providers/workers/repair with live state"',
+     '"ls      list providers/workers and their live state"', 1),
+    # #9 主選單 ssh
+    ('"ssh     pick a node/worker/repair and connect"',
+     '"ssh     pick a node/worker and connect"', 1),
+    # #10 主選單 fwd-add
+    ('"fwd-add        forward a local port to a node, worker or repair host (pick node, type spec)"',
+     '"fwd-add        forward a local port to a node (pick node, type spec)"', 1),
+    # #4 mlp ssh 的 usage（main 分派處與 cmd_ssh 守衛各一份）
+    ('usage: mlp ssh [<node-name|worker-name|repair-name|port>]',
+     'usage: mlp ssh [<node-name|worker-name|port>]', 2),
+]
+for new_text, old_text, want in pairs:
+    got = src.count(new_text)
+    assert got == want, "needle %r count=%d want=%d" % (new_text[:44], got, want)
+    src = src.replace(new_text, old_text)
+open(sys.argv[2], "w", encoding="utf-8").write(src)
+PY
+if [[ $? -ne 0 ]]; then
+    inj_bad "8. 注入腳本失敗（needle 落空）——harness 問題"
+elif ! bash -n "$INJ5" 2>/dev/null; then
+    inj_bad "8. 注入版語法錯誤——harness 問題"
+else
+    cp -p "$REPO/$MLP" "$SANDBOX/mlp-fixed-keep2"
+    cp -p "$INJ5" "$REPO/$MLP"
+    menu_capture
+    # 紅的原因要一起記下來：只報「轉紅了」分不出「斷言抓到缺陷」與「夾具壞掉」。
+    #
+    # 下面三行的 `"ssh"` **刻意加引號**。`ssh-port-audit.py` 的規則是「一個指令裡
+    # 出現 `ssh` 後面接空白、而且同一段裡有 `@$VAR`／`:$VAR`，就必須帶 -p／-J」。
+    # 這三行的 `ssh` 是 **mlp 的子命令名**（`mlp ssh`），不是對池裡的機器發 ssh；
+    # 但它旁邊的 `why="${why} …:${LAST_WHY}"` 正好提供了 `:$VAR`，於是被判成
+    # 「對池裡的機器發 ssh 沒指定埠」。加引號讓那個 token 不再是「指令開頭的
+    # 裸字」，稽核就看不到它——**不是**去改稽核，也不是加豁免（ALLOW 是給
+    # 「這台機器此刻一定在 22」的真的豁免，見該檔的檔頭）。
+    # 基線那兩處（`ssh_usage_case 3b1 ssh;`）沒被掃到，純粹因為 `ssh` 後面是 `;`
+    # 不是空白——所以**不要為了讓兩邊一致而去改基線**。
+    red=""; why=""
+    ssh_usage_case inj8a "ssh" || { red="${red} 3b-1"; why="${why} 3b-1:${LAST_WHY}"; }
+    ssh_usage_case inj8b "ssh" -not-a-target || { red="${red} 3b-2"; why="${why} 3b-2:${LAST_WHY}"; }
+    menu_case 'ls[[:space:]]' ls || { red="${red} 3b-3"; why="${why} 3b-3:${LAST_WHY}"; }
+    menu_case 'ssh[[:space:]]' "ssh" || { red="${red} 3b-4"; why="${why} 3b-4:${LAST_WHY}"; }
+    menu_case 'fwd-add[[:space:]]' fwd-add || { red="${red} 3b-5"; why="${why} 3b-5:${LAST_WHY}"; }
+    if usage_aware_case; then six="3b-6 仍綠"; else six="3b-6 也紅了(${LAST_WHY})"; fi
+    cp -p "$SANDBOX/mlp-fixed-keep2" "$REPO/$MLP"
+    if [[ "$red" == " 3b-1 3b-2 3b-3 3b-4 3b-5" && "$six" == "3b-6 仍綠" ]]; then
+        inj_ok "8. 拿掉四處的 repair → 3b-1..3b-5 轉紅（${why# }）／${six}——這五條量到的就是那四行字"
+    else
+        inj_bad "8. 拿掉 repair 後結果不是預期（紅的條目：[${red}]／${six}／原因:${why# }）——harness 問題"
     fi
 fi
 

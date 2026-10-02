@@ -134,7 +134,7 @@ main() {
     # Only units that need NEITHER a decryption key NOR root can ever be
     # converged here: pool-sync runs as the ordinary user from a systemd
     # user timer (no sudo), and providers deliberately carry no
-    # FILE_CRYPTO_KEY (N2). Today that is exactly one unit — pool-runtime.
+    # FILE_CRYPTO_KEY (N2). Today that is two units — pool-runtime and wol.
     local profile_json units unit unit_json install
     profile_json="${TMP_DIR}/repo/profiles/provider/${profile}/profile.json"
     if [[ ! -f "$profile_json" ]]; then
@@ -153,8 +153,8 @@ main() {
             log WARN "no unit.json for declared unit '${unit}' — skipping"
             continue
         fi
-        # 生產觸發條件：目前無人觸發。兩台 provider 的 profile 都只宣告
-        # pool-runtime 與 gh，兩者 needs_key 皆 false，所以這個 skip 不會
+        # 生產觸發條件：目前無人觸發。兩台 provider 的 profile 宣告的三個
+        # 單位 needs_key 皆 false，所以這個 skip 不會
         # 執行；它要等 provider profile 又宣告 rclone/standalonescripts
         # （唯二 needs_key=true 的 unit）才會第一次生效。
         if [[ "$(jq -r '.needs_key // false' "$unit_json" 2>/dev/null || true)" == "true" ]]; then
@@ -171,9 +171,10 @@ main() {
             # pool-sync runs as the ordinary user from a systemd user
             # timer — it has no root. Installing a needs_root unit would
             # fail (and then retry every 30 minutes); a missing `gh`
-            # binary is exactly such a case, so these units are left to
-            # registration/repair, which run with the credentials this
-            # timer does not have.
+            # binary is exactly such a case. Installing is left to
+            # registration/repair, which run with the credentials this timer
+            # does not have — but it still verifies one (see the capability
+            # declaration below).
             log INFO "skipped: ${unit} needs root, only handled at registration or by an admin"
             continue
         fi

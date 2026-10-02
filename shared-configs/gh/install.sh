@@ -88,8 +88,8 @@ cap_check() {
     local rc=0 repo out code one
     while IFS= read -r repo; do
         [ -n "$repo" ] || continue
-        # --include 讓失敗時也有狀態碼可讀；比對訊息文字是退而求其次（403 與
-        # rate limit 共用同一個狀態碼，文字反而分得開，見下面的 case）。
+        # --include 讓失敗時也有狀態碼可讀。拿不到狀態碼才比對文字（403 與 rate
+        # limit 共用同一個狀態碼，文字反而分得開）：無權存取／404 → 1；限流 → 2。
         out="$(GH_TOKEN="$token" gh api --include "repos/${repo}" --jq .full_name 2>&1)"
         if [ $? -eq 0 ]; then
             log INFO "github: ${repo} 可讀"
@@ -103,8 +103,6 @@ cap_check() {
             2*)          one=2 ;;
         esac
         if [ -z "$code" ]; then
-            # 拿不到狀態碼才比對文字。403 有兩種意思：無權存取、以及被 rate
-            # limit——限流時回 1 會讓 github 從三台機器的宣告裡同時消失。
             case "$out" in
                 *"rate limit"*|*"Rate limit"*|*"secondary rate"*) one=2 ;;
                 *403*|*"Resource not accessible"*|*"Not Found"*|*404*) one=1 ;;

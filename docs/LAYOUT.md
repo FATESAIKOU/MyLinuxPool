@@ -91,9 +91,12 @@ install.sh [--key <FILE_CRYPTO_KEY>] [--home <dir>] [--user <name>] [--check]
 
 ### 目前的 unit
 
+**每個帶 `unit.json` 的 `capability` 欄位就是一個能力鍵；`provides` 只是指令名清單，沒有程式讀它。**
+
 | unit | 內容 | needs_root |
 |---|---|---|
 | `pool-runtime` | `pool-resolve` `pool-tunnel` `pool-status` `pool-port-alloc` `pool-sync` + 3 個 systemd unit（`pool-tunnel.service`、`pool-sync.service`、`pool-sync.timer`） | false |
+| `worker-host` | 不安裝任何檔案；`--check` 以宣告的使用者跑 `docker info`，證明 `worker-host` 能力成立 | false |
 | `wol` | `pool-wol`（D7：從 `pool-runtime` 拆出來，自帶 `wol` 能力的判準） | false |
 | `rclone` | rclone 本體 + `rclone.conf.crypted` | true |
 | `gh` | gh 本體 + token 檔 + git credential helper | true |
@@ -157,8 +160,8 @@ profile.json      宣告
 {
   "name": "default",
   "role": "provider",
-  "shared_config": ["pool-runtime", "ssh-tunnel-client", "gh"],
-  "systemd_user_services": ["pool-tunnel.service"],
+  "shared_config": ["pool-runtime", "gh", "wol"],
+  "systemd_user_services": ["pool-tunnel.service", "pool-sync.timer"],
   "linger": true,
   "sudoers_rules": [
     "ALL=(root) NOPASSWD: /usr/bin/systemctl poweroff, /usr/sbin/ethtool"
