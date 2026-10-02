@@ -20,10 +20,10 @@
 
 ## 1. PR-A：單位與 runner
 
-- [ ] 1.1 紅燈：契約測試。至少要涵蓋 `worker-host`、`github`、`wol` 三個鍵各由一個單位實作；preflight 會擋重複的鍵、沒有單位的鍵、不是 object 的值；`shared-configs/wol/files/pool-wol` 與 `pool-runtime` 舊版逐位元組相同，而且 `pool-runtime` 已經不裝它
-- [ ] 1.2 紅燈：runner 的三態與參數傳遞（`MLP_CAPABILITY_PARAMS`）。`capability_declaration` 遇到 0、1、2 的組合要算對
-- [ ] 1.3 紅燈：各單位的 `--check` 判準（D5），用假的 `docker`、`gh`、`id`、`getent`
-- [ ] 1.4 實作 D1、D2、D3、D5、D7、preflight
+- [x] 1.1 紅燈：契約測試。至少要涵蓋 `worker-host`、`github`、`wol` 三個鍵各由一個單位實作；preflight 會擋重複的鍵、沒有單位的鍵、不是 object 的值；`shared-configs/wol/files/pool-wol` 與 `pool-runtime` 舊版逐位元組相同，而且 `pool-runtime` 已經不裝它
+- [x] 1.2 紅燈：runner 的三態與參數傳遞（`MLP_CAPABILITY_PARAMS`）。`capability_declaration` 遇到 0、1、2 的組合要算對
+- [x] 1.3 紅燈：各單位的 `--check` 判準（D5），用假的 `docker`、`gh`、`id`、`getent`
+- [x] 1.4 實作 D1、D2、D3、D5、D7、preflight
 - [ ] 1.5 review、閘門、PR-A
 
 ## 2. PR-B：自動宣告

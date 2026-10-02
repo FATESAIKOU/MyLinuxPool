@@ -65,10 +65,10 @@ pool-sync、register-provider、`mlp verify-capabilities` 只呼叫這三個函�
 | 單位 | 能力 | 誰安裝 | 參數 | `--check` |
 |---|---|---|---|---|
 | `worker-host`（新） | `worker-host` | register-provider | `{"runtime":"docker"}` | 以宣告的使用者身分跑 `docker info`，成功回 0。失敗的話：如果 `/etc/group` 的 docker 群組有這個使用者，但目前這個 process 的群組沒有 docker 的 gid，回 2；其他情況回 1。`runtime` 不是 `docker` 回 1 |
-| `gh` | `github` | register-provider | `{"repos":{"FATESAIKOU/MyBrain":["read"]}}` | **改寫**：對參數裡的每個 repo，用 `gh_token` 打一次 API 驗證權限。拒絕存取回 1；網路錯誤或 5xx 回 2 |
-| `wol`（新） | `wol` | pool-sync | `{"methods":["unicast"]}` | `~/.mylinuxpool/bin/pool-wol` 存在、可執行，並且支援參數列的每個 method。**不送封包**，因為 `pool-wol` 回 0 只代表封包送出去了 |
+| `gh` | `github` | register-provider | `{"repos":{"FATESAIKOU/MyBrain":["read"]}}` | **改寫**：`github` 的意思是「這台機器用 pool 的憑證（`~/.mylinuxpool/gh_token`）讀得到這些 repo」。沒有 token 回 1。對每個 repo 打一次 API：拒絕存取（404、無權的 403）回 1；rate limit、網路錯誤、5xx 回 2。多個 repo 時 1 優先，不會被後面的 2 蓋掉 |
+| `wol`（新） | `wol` | pool-sync | `{"methods":["unicast"]}` | `~/.mylinuxpool/bin/pool-wol` 存在、可執行、跟單位的 `files/pool-wol` 逐位元組相同（代表裝的是這一版，跟收斂迴圈的語意一致），而且這一版支援參數列的每個 method，否則回 1。**不送封包**，因為 `pool-wol` 回 0 只代表封包送出去了 |
 
-provider 的 `default` 與 `no-sudo` 兩個 profile 都列這三個能力；Gateway 的 profile 不列 `wol`。
+provider 的 `default` 與 `no-sudo` 兩個 profile 都列這三個能力。Gateway 不是 provider，它的 profile 不列 `capabilities`，`shared_config` 也不列 `wol` 單位。
 
 **D6. `mlp wake`：`via` 決定順序，`wol` 決定資格。**
 照 `via` 的順序走，沒宣告 `wol` 的那台直接略過，並印出原因，例如「via 裡有它，但它沒有宣告 wol」。略過的那台**照樣佔一個 `(n/m)` 的序號**。四態與時間預算都不動。如果 `via` 裡沒有任何一台宣告 `wol`，就明確報錯，不能靜靜結束。另外，`mlp verify-capabilities` 遇到 `via` 指向沒宣告 `wol` 的機器時，平常就要報出來。
@@ -87,6 +87,8 @@ provider 的 `default` 與 `no-sudo` 兩個 profile 都列這三個能力；Gate
 
 這樣 register-provider 和 pool-sync 寫的是同一個函式算出來的值，不會互相打架。
 
+register-provider 是先 `usermod -aG docker` 再驗證，而它當下這個 session 的群組還是舊的，所以 `capability_check` 要包在 `sudo -n -u <user>` 裡，在一個群組已經重新解析過的 process 裡跑，跟今天的 `docker info` 一樣（`register-provider.sh:774`）。不這樣做的話，`worker-host` 會回 2，每一台新註冊的機器都會失敗。
+
 **D9. 程式註解要少。** 理由寫在這份文件和 commit 裡。
 
 ## Risks / Trade-offs
@@ -94,7 +96,10 @@ provider 的 `default` 與 `no-sudo` 兩個 profile 都列這三個能力；Gate
 - **[宣告抖動]**：驗證暫時失敗時（例如 GitHub API 5xx），宣告的值不能跟著變。→ 用三態處理，「無法確認」就保留原值（使用者 2026-10-02 裁定）。代價是宣告停在舊值的時間可能比較久，這跟 fh-l 關機時宣告停在舊值是同一種取捨。
 - **[宣告一變，app 跟著變]**：能力真的壞掉時（例如 docker 停了），`worker-host` 會從宣告消失，app 的承載機選單就會少一台。這是設計上要的結果，但要先讓 MyAiEntry 知道。
 - **[fh-l 關機時，宣告停在上一次開機的值]**：使用者接受。app 挑機器時沒有看在不在線，而 fh-l 照字典序排第一。不過今天的 fallback 就是 fh-l，所以最後拿到的機器跟今天一樣，差別只在錯誤訊息。修法與落地順序已寫在 MyAiEntry#4。
-- **[剛註冊完，user manager 的群組是舊的]**：`docker info` 會失敗。`worker-host` 的 `--check` 會回 2，宣告維持 register-provider 寫的值。實測：兩台現有 provider 的 user manager 已經有 docker 群組。
+- **[剛註冊完，群組是舊的]**：
+  - pool-sync（user manager 比 usermod 早啟動）：`worker-host` 回 2，宣告維持 register-provider 寫的值。實測：兩台現有 provider 的 user manager 已經有 docker 群組。
+  - register-provider：照 D8，在 `sudo -n -u` 的新 process 裡驗證。
+- **[`pool-wol` 改版會重啟 tunnel]**：pool-sync 的 `changed` 是全域旗標，任何單位重裝都會重啟 pool-tunnel。`wol` 單位獨立出來之後，`pool-wol` 一改版，所有 provider 的下一個 tick 都會重啟一次 tunnel，進行中的 `mlp ssh`／`fwd` 會斷一次，之後自己恢復。這是既有的行為，這次不改。
 - **[pool-sync 多了一個寫入者]**：只 merge `capabilities` 這一個欄位。register-provider 和 pool-sync 用同一個函式算值（D8），兩邊同時寫的機率很低，就算同時寫，寫的也是同一個值。
 - **[`wol` 會直接顯示在 app 和 AI 看得到的文字裡]**（`承載機，提供能力：worker-host、github、wol。`）：要不要給它一個顯示名稱，由 app 那邊決定。已在 MyAiEntry#4 提醒。
 

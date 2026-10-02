@@ -1,0 +1,8 @@
+{
+  "name": "wol",
+  "description": "wol 能力：pool-wol 二進位",
+  "needs_key": false,
+  "needs_root": false,
+  "provides": ["pool-wol"],
+  "capability": "wol"
+}

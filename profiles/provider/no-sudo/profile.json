@@ -1,8 +1,15 @@
 {
   "name": "no-sudo",
   "role": "provider",
-  "shared_config": ["pool-runtime", "gh"],
-  "systemd_user_services": ["pool-tunnel.service", "pool-sync.timer"],
+  "shared_config": [
+    "pool-runtime",
+    "gh",
+    "wol"
+  ],
+  "systemd_user_services": [
+    "pool-tunnel.service",
+    "pool-sync.timer"
+  ],
   "linger": true,
   "sudoers_rules": []
 }

@@ -322,6 +322,83 @@ while IFS= read -r uj; do
 done < <(git ls-files 'shared-configs/*/unit.json')
 ok "unit needs_key 與 files/ 一致"
 
+# capability 契約（D1）：unit.json 的 capability 欄位
+#   1. 同一個鍵不能有兩個單位實作
+#   2. profile capabilities 裡的鍵必須有單位實作
+#   3. 值必須是 object（null／字串／陣列都不合法）
+# 這裡用 shell glob 而不是 git ls-files：新單位在 commit 之前就應該被驗到，
+# 而那正是最需要驗的時候（漏改測試常常就漏在還沒進版控的那一步）。
+cap_units=0
+cap_profiles=0
+for uj in shared-configs/*/unit.json; do
+    [ -f "$uj" ] || continue
+    k="$(python3 -c "import json,sys;print(json.load(open(sys.argv[1])).get('capability') or '')" "$uj" 2>/dev/null)"
+    [ -n "$k" ] || continue
+    cap_units=$((cap_units + 1))
+    # 每個鍵只報一次（報三次沒有新資訊，只會把別的問題擠出視線）。
+    first=1
+    others=""
+    for other in shared-configs/*/unit.json; do
+        [ "$other" = "$uj" ] && continue
+        [ -f "$other" ] || continue
+        ok2="$(python3 -c "import json,sys;print(json.load(open(sys.argv[1])).get('capability') or '')" "$other" 2>/dev/null)"
+        [ "$ok2" = "$k" ] || continue
+        if [ "$first" -eq 1 ]; then
+            first=0
+            others=" $(basename "$(dirname "$uj")")"
+        fi
+        others="${others} $(basename "$(dirname "$other")")"
+    done
+    [ -z "$others" ] || bad "capability '${k}' 有多個單位實作:${others}"
+done
+ok_counted "$cap_units" "個單位宣告了能力鍵"
+
+# profile capabilities 的鍵要對得到單位；值要是 object。
+for pf in profiles/*/*/profile.json; do
+    [ -f "$pf" ] || continue
+    python3 -c "import json,sys;c=json.load(open(sys.argv[1])).get('capabilities');sys.exit(0 if c else 1)" "$pf" 2>/dev/null \
+        && cap_profiles=$((cap_profiles + 1))
+    out="$(python3 - "$pf" <<'PYCAP'
+import json, os, sys
+pf = sys.argv[1]
+d = json.load(open(pf, encoding="utf-8"))
+caps = d.get("capabilities")
+if caps is None:
+    sys.exit(0)
+if not isinstance(caps, dict):
+    print("BAD\tcapabilities 必須是 object（key:object）")
+    sys.exit(0)
+impl = set()
+for uj in sorted(os.path.join("shared-configs", u, "unit.json")
+                 for u in os.listdir("shared-configs")
+                 if os.path.isfile(os.path.join("shared-configs", u, "unit.json"))):
+    try:
+        k = json.load(open(uj, encoding="utf-8")).get("capability")
+    except Exception:
+        continue
+    if k:
+        impl.add(k)
+for k, v in caps.items():
+    if not isinstance(v, dict):
+        print("BAD\tcapabilities.%s 的值是 %s，契約是 key:object" % (k, type(v).__name__))
+    if k not in impl:
+        print("BAD\tcapabilities.%s 沒有任何單位實作（capability 契約：宣告的能力要驗得到）" % k)
+PYCAP
+)"
+    if [ -n "$out" ]; then
+        while IFS= read -r line; do
+            [ -n "$line" ] && bad "${line}  (${pf})"
+        done <<< "$out"
+    fi
+done
+
+# 兩條 profile 規則共用同一個列舉結果，所以也用它防「空轉被當成通過」。
+if [ "$cap_profiles" -eq 0 ]; then
+    ok "沒有任何 profile 宣告能力鍵——下面兩條規則現在是空的（不是通過）"
+else
+    ok_counted "$cap_profiles" "個 profile 的能力宣告對得到單位且值是 object"
+fi
+
 # 執行位元
 # ssh-tunnel 拆成 client/server 時，新的 install.sh 帶著 644 進版控，
 # 於是 rotate 死在「missing or not executable」。語法檢查看不到檔案模式。

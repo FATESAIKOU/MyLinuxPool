@@ -56,7 +56,7 @@ TTL 內直接讀快取，不打 GitHub API。讀取失敗且快取存在時，
 
 **退出碼**：`3` var 不存在；`4` gh 未認證或 API 失敗且無快取；`5` hop 展開失敗。
 
-## 2. `pool/bin/pool-wol`
+## 2. `pool/bin/pool-wol`（由 `wol` 單位安裝）
 
 送 Wake-on-LAN magic packet。**必須用 unicast**，理由見 `ARCHITECTURE.md`。
 
@@ -319,8 +319,9 @@ cloud-init 只負責「開機後能被 ssh 進來」這件事，其餘交給 `pr
    > 現行機的 `/home/sshproxy/.ssh/id_rsa` 原本是 644（全系統可讀的私鑰），
    > 是實機發現的既有弱點，新機不可重蹈。
 4. **安裝 pool-runtime**：呼叫 `shared-configs/pool-runtime/install.sh`，
-   把 `pool-resolve`/`pool-tunnel`/`pool-wol`/`pool-status`/
-   `pool-port-alloc` 與 `pool-tunnel.service` 裝到 **`/home/fatesaikou/.mylinuxpool/bin/`**
+   把 `pool-resolve`/`pool-tunnel`/`pool-status`/`pool-port-alloc` 與
+   `pool-tunnel.service` 裝到 **`/home/fatesaikou/.mylinuxpool/bin/`**
+   （`pool-wol` 不再由這個單位安裝，改由 `wol` 單位提供）
    （見 `docs/LAYOUT.md`；這個 unit 自己管檔案的擁有者與權限，不再
    依賴上一步的 `chown -R`）。
    > **2026-09-14 補上的缺口**：`ARCHITECTURE.md` §5 step 4「安裝 Gateway

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # shared-configs/pool-runtime/install.sh — docs/LAYOUT.md §1
 #
-# Installs pool-resolve/pool-tunnel/pool-wol/pool-status/pool-port-alloc,
+# Installs pool-resolve/pool-tunnel/pool-status/pool-port-alloc,
 # pool-sync and tunnel-identity.sh to <home>/.mylinuxpool/bin/ (the
 # canonical location — POOL_RUNTIME_SPEC.md §0's state-dir layout, and
 # what pool-tunnel.service's ExecStart=%h/... already hardcodes) and the
@@ -70,7 +70,7 @@ UNIT_DIR="${HOME_DIR}/.config/systemd/user"
 # so it MUST ship with them: without it every one of them dies at source
 # time and the machine loses its tunnel (2026-09-16 — the test caught
 # this before it reached a provider, which is the only reason it did not).
-BINARIES="pool-resolve pool-tunnel pool-wol pool-status pool-port-alloc pool-sync"
+BINARIES="pool-resolve pool-tunnel pool-status pool-port-alloc pool-sync"
 # Sourced, not executed — so it ships WITHOUT the executable bit
 # (ops-scripts/preflight: only things nothing sources must be +x).
 LIBS="tunnel-identity.sh"
@@ -111,11 +111,11 @@ if [[ "$CHECK_ONLY" -eq 1 ]]; then
 fi
 
 mkdir -p "$BIN_DIR"
-cp -f "${FILES_DIR}"/pool-resolve "${FILES_DIR}"/pool-tunnel "${FILES_DIR}"/pool-wol \
+cp -f "${FILES_DIR}"/pool-resolve "${FILES_DIR}"/pool-tunnel \
       "${FILES_DIR}"/pool-status "${FILES_DIR}"/pool-port-alloc "${FILES_DIR}"/pool-sync \
       "${FILES_DIR}"/tunnel-identity.sh \
       "${BIN_DIR}/"
-chmod +x "${BIN_DIR}"/pool-resolve "${BIN_DIR}"/pool-tunnel "${BIN_DIR}"/pool-wol \
+chmod +x "${BIN_DIR}"/pool-resolve "${BIN_DIR}"/pool-tunnel \
          "${BIN_DIR}"/pool-status "${BIN_DIR}"/pool-port-alloc "${BIN_DIR}"/pool-sync
 
 mkdir -p "$UNIT_DIR"
