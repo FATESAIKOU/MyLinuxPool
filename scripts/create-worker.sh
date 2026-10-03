@@ -3,11 +3,9 @@
 # (spec: docs/POOL_RUNTIME_SPEC.md §10.4, docs/ARCHITECTURE.md §5).
 #
 # A function library, sourced by .github/workflows/create-worker.yml.
-# Every remote command still goes through .github/actions/pool-ssh (which
-# itself uses scripts/lib/ssh.sh) — this file only builds the command
-# STRINGS and does the pure decision-making; it never runs anything on a
-# remote node itself, and never calls gh / references ${{ }} / touches
-# $GITHUB_OUTPUT (docs/LAYOUT.md §3).
+# Remote commands go through .github/actions/pool-ssh; this file only builds
+# the command STRINGS and decides — it never runs anything on a remote node,
+# and never calls gh / touches $GITHUB_OUTPUT (docs/LAYOUT.md §3).
 
 set -uo pipefail
 
@@ -19,12 +17,9 @@ source "${SCRIPT_DIR}/lib/profile.sh"
 # shellcheck source=lib/ledger.sh
 source "${SCRIPT_DIR}/lib/ledger.sh"
 
-# A copy of this file may be sourced from an injected location where the
-# relative lib/ paths no longer resolve (e.g. a test that sed-mutates the
-# file and sources it from a temp dir). Without this fallback, log() would
-# be undefined and an ERROR call would hit macOS's /usr/bin/log with the
-# level word as a subcommand ("Unknown subcommand 'ERROR'"). Only defines
-# when the lib source above actually provided nothing.
+# Fallback only if the lib source above provided nothing: without it log()
+# would be undefined and an ERROR call would hit macOS's /usr/bin/log with
+# the level word as a subcommand ("Unknown subcommand 'ERROR'").
 declare -F log >/dev/null 2>&1 || log() { printf '[%s] %s\n' "$1" "${*:2}" >&2; }
 
 # create_worker_validate_name <value> <field-name>
@@ -40,7 +35,6 @@ create_worker_validate_name() {
 }
 
 # create_worker_compute_identity <provider> <image> <run_id> <name_input>
-#   Prints name=/image_tag=/container= lines.
 create_worker_compute_identity() {
     local provider="$1" image="$2" run_id="$3" name_input="$4"
     local name="$name_input"
@@ -75,23 +69,16 @@ sleep 1; done; \
 echo 'worker never produced a tunnel public key' >&2; exit 1"
 }
 
-# dispatch_refresh_and_wait lives in scripts/lib/refresh-wait.sh — the
-# SINGLE implementation of "dispatch refresh-authorized-keys.yml and wait
-# for it to actually complete" (RUNBOOK §7.12, fourth incident: the same
-# wait logic existed in create-worker.sh and register-client, only one of
-# them fixed). create_worker_dispatch_refresh_and_wait below is kept as a
-# thin alias so existing callers/tests keep working.
+# dispatch_refresh_and_wait lives in scripts/lib/refresh-wait.sh — the SINGLE
+# implementation of "dispatch refresh-authorized-keys.yml and wait for it to
+# actually complete" (RUNBOOK §7.12). The alias below keeps callers working.
 # shellcheck source=lib/refresh-wait.sh
 source "${SCRIPT_DIR}/lib/refresh-wait.sh"
 
 # create_worker_dispatch_refresh_and_wait [<timeout_seconds>]
-#   Thin alias of dispatch_refresh_and_wait (scripts/lib/refresh-wait.sh).
-#   Dispatches refresh-authorized-keys.yml and waits until the run is
-#   ACTUALLY completed. Returns 0 iff the run finished with conclusion ==
-#   "success"; non-zero on dispatch failure, timeout, or a non-success
-#   conclusion — with timeout and failure messages distinguishable.
-#   GH_REPO comes from the calling workflow's env (docs/LAYOUT.md §3:
-#   the workflow is the thin caller).
+#   Returns 0 iff the run finished with conclusion == "success"; non-zero on
+#   dispatch failure, timeout, or a non-success conclusion — with timeout and
+#   failure messages distinguishable.
 create_worker_dispatch_refresh_and_wait() {
     dispatch_refresh_and_wait "$@"
 }
@@ -100,8 +87,7 @@ create_worker_dispatch_refresh_and_wait() {
 #   Prints the name of every profile-declared secret NOT present in
 #   all_secrets_json, one per line. No values are ever printed — only
 #   presence is checked (a %q-quoted secret value must never cross a
-#   step-output boundary; see create_worker_build_run_cmd for where the
-#   actual values get used, in the same step that has them).
+#   step-output boundary; see create_worker_build_run_cmd).
 create_worker_missing_secrets() {
     local profile_json="$1" all_secrets_json="$2"
     local container_var secret_name val
@@ -114,11 +100,8 @@ create_worker_missing_secrets() {
 
 # create_worker_ledger_add <workers_json> <port> <provider> <image>
 #     <container> <created_at> <tunnel_public_key> <profile_json>
-#   Prints the new POOL_WORKERS array: ledger_add, plus the image profile's
-#   capabilities copied into the entry (CAPABILITY-DESIGN.md §3 — consumers
-#   reading POOL_WORKERS do not have to read the profile; a profile without
-#   the field yields `{}`, the "declared no capabilities" object, never
-#   null). A non-object capabilities is rejected rather than coerced.
+#   Prints the new POOL_WORKERS array, with the image profile's capabilities
+#   copied into the entry (`{}` when absent — never null).
 #   Worker capabilities are **not verified** here (spec.md:75) — this runs on
 #   an Actions runner, where a real check would call the GitHub API for a
 #   worker. So it copies the declaration and does not touch the runner.
@@ -133,7 +116,6 @@ create_worker_ledger_add() {
 }
 
 # create_worker_build_claim_cmd <port_lo> <port_hi> <provider> <image>
-#   Prints the command to run on the Gateway to claim a worker port.
 #   pool-port-alloc is installed at ~/.mylinuxpool/bin/ there
 #   (shared-configs/pool-runtime's install.sh, called from
 #   provision-gateway.sh) — called directly rather than shipping the
@@ -157,8 +139,6 @@ create_worker_build_claim_cmd() {
 # create_worker_build_run_cmd <container> <image_tag> <port> <gw_host> \
 #     <tunnel_user> <node_name> <authorized_keys_content> \
 #     <profile_json> <all_secrets_json>
-#   Prints the assembled `docker run ...` command line to stdout.
-#
 #   Everything that touches a secret VALUE happens in here — worker_key,
 #   and every profile-declared secret from all_secrets_json — precisely
 #   so no already-%q-quoted secret ever has to cross a step-output
@@ -256,13 +236,10 @@ create_worker_build_run_cmd() {
 }
 
 # create_worker_verify_reachable <gw_user> <gw_ip> <port> [max_tries]
-#   A bare SSH banner only proves *something* is listening and speaking
-#   SSH — it doesn't prove anyone can actually get in (2026-09-14
-#   incident: this reported success on a worker whose authorized_keys
-#   held only the tunnel identity, so the banner was real but every human
-#   login failed). Same lesson as pool-tunnel's own health check upgrade
-#   from `nc -z` to reading the banner (spec §3.2) — verify all the way to
-#   the thing that's actually being relied on: a real authenticated
+#   A bare SSH banner only proves *something* is listening and speaking SSH
+#   — it doesn't prove anyone can get in (2026-09-14 incident). Same lesson
+#   as pool-tunnel's `nc -z` → banner upgrade (spec §3.2): verify all the way
+#   to a real authenticated
 #   connection through the Gateway, running a command. Assumes the
 #   caller's ssh-agent already holds whatever identity is needed.
 create_worker_verify_reachable() {

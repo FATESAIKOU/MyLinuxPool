@@ -108,7 +108,6 @@ else
     bad "1.1a. unit.json 沒有 capability 欄位（D1/D5）：${missing} —— 一個都沒宣告時，後面的契約斷言都是空的"
 fi
 
-# 1.1b／1.1f：D5 的表列出的三個單位都必須存在、都有 --check、--check 都讀參數。
 for u in worker-host gh wol; do
     inst="$REPO_ROOT/shared-configs/$u/install.sh"
     if [[ ! -f "$inst" ]]; then
@@ -126,16 +125,7 @@ for u in worker-host gh wol; do
     ok "1.1b. shared-configs/${u} 有 install.sh 與 --check，且讀 MLP_CAPABILITY_PARAMS"
 done
 
-# 1.1x：**每個 install.sh 都必須可執行**（2026-10-02，PM 加的）。
-#   為什麼是一條斷言而不是文件裡一句話：pool-sync 的收斂迴圈是
-#   `if [[ ! -x "$install" ]] → log WARN → continue`，register-provider 的 step 3
-#   是 `[[ ! -x ]] → exit 1`。一個 644 的 install.sh 在**測試裡**完全正常
-#   （`bash install.sh` 一樣跑得動，PR-A 的每一條判準都照樣量得到），線上卻是
-#   「wol 永遠不被安裝 → 宣告裡的 wol 永遠不成立」。那正是 PR-A 上線時發生過的事。
-#   兩個來源都要看：
-#     磁碟上的 -x（工作樹現況，開發中與未 commit 的檔也在內）
-#     git index 的 mode（100755）——那是別人 clone 到的樣子。
-#   讀 index 用 `git ls-files -s`（唯讀；不動 index）。
+# 1.1x：磁碟的 -x 與 git index 的 mode 都要看（後者是別人 clone 到的樣子）。
 not_exec=""
 not_tracked=""
 for inst in "$REPO_ROOT"/shared-configs/*/install.sh; do
@@ -161,7 +151,6 @@ if [[ -n "$not_tracked" ]]; then
     bad "1.1y. 這些 install.sh 不在 git index 裡（clone 不會帶過去）：${not_tracked}"
 fi
 
-# 1.1c：兩個單位實作同一個鍵 → preflight 必須擋。
 #   副本注入 ＋ 未注入的同一份副本當對照，兩者輸出相減才不會把 preflight 的
 #   其他雜訊當成證據。
 C_BASE="$(make_repo_copy dupbase)"
@@ -197,7 +186,6 @@ else
     bad "1.1c. 副本裡 pool-runtime 與 rclone 都宣告 capability=wol，preflight 沒有擋（FAIL 條數 ${BASE_FAILS}→${COPY_FAILS}，rc=${PF_RC}）"
 fi
 
-# 1.1d：profile 宣告了沒有單位實作的鍵 → preflight 必須擋。
 C_NOUNIT="$(make_repo_copy nounit)"
 python3 - "$C_NOUNIT" <<'PYNOUNIT'
 import json, sys
@@ -214,7 +202,6 @@ else
     bad "1.1d. profile 宣告 capabilities.no-such-capability（沒有任何單位實作），preflight 沒有擋（FAIL 條數 ${BASE_FAILS}→${COPY_FAILS}，rc=${PF_RC}）"
 fi
 
-# 1.1e：值不是 object → preflight 必須擋。
 C_BADVAL="$(make_repo_copy badval)"
 python3 - "$C_BADVAL" <<'PYBADVAL'
 import json, sys
@@ -359,7 +346,6 @@ else
         bad "1.2f. profile 不存在時回 ${b1_missing}，預期 2"
     fi
 
-    # 1.2d：參數經 MLP_CAPABILITY_PARAMS 傳入，而且單位的回傳碼原樣回傳。
     : > "$SANDBOX/fakecap.log"
     fakeroot_call 'capability_check alpha "{\"k\":1}"' >/dev/null
     got_params="$(grep '^params=' "$SANDBOX/fakecap.log" 2>/dev/null | head -1)"
@@ -381,7 +367,6 @@ else
         bad "1.2d. capability_check 沒有原樣回傳三態：${prop}"
     fi
 
-    # 1.2e：0 納入、1 不納入、2 保留現有值。
     #   捕獲**只取 stdout**（見 fakeroot_out 的說明）：stderr 是日誌，而日誌行裡
     #   就有鍵名，合併的話「1 → 不納入 alpha」會因為 `capability alpha: rc=1`
     #   而假綠。順帶多加一個要求：stdout 必須是**可解析的 JSON object**——
@@ -473,7 +458,6 @@ chmod +x "$SHIMS/sudo"
 SUDO_LOG=""
 
 DOCKER_LOG="$SANDBOX/docker.log"
-# 1.3a：docker info 成功 → 0
 if [[ ! -f "$REPO_ROOT/shared-configs/worker-host/install.sh" ]]; then
     bad "1.3a. 缺 shared-configs/worker-host（D5 的新單位）：docker info 成功時應回 0"
 else
@@ -494,7 +478,6 @@ else
     fi
 fi
 
-# 1.3c：docker info 失敗且使用者不在 /etc/group 的 docker 群組 → 1
 if [[ ! -f "$REPO_ROOT/shared-configs/worker-host/install.sh" ]]; then
     bad "1.3c. 缺 shared-configs/worker-host：docker 掛掉且使用者不在 docker 群組時應回 1"
 else
@@ -506,7 +489,6 @@ else
     fi
 fi
 
-# 1.3b：docker info 失敗、/etc/group 有這個使用者，但這個 process 沒有 docker gid → 2
 if [[ ! -f "$REPO_ROOT/shared-configs/worker-host/install.sh" ]]; then
     bad "1.3b. 缺 shared-configs/worker-host：群組變更還沒生效時應回 2（D5 的「無法確認」）"
 elif ! grep -qE 'getent' "$REPO_ROOT/shared-configs/worker-host/install.sh"; then
@@ -521,7 +503,6 @@ else
     fi
 fi
 
-# 1.3d：runtime 不是 docker → 1，而且不該去跑 docker info
 if [[ ! -f "$REPO_ROOT/shared-configs/worker-host/install.sh" ]]; then
     bad "1.3d. 缺 shared-configs/worker-host：runtime=podman 應回 1 且不跑 docker info"
 else
@@ -581,7 +562,6 @@ mkdir -p "$SANDBOX/home/.mylinuxpool"
 printf 'fake-token-for-tests\n' > "$SANDBOX/home/.mylinuxpool/gh_token"
 GH_PARAMS='{"repos":{"owner/repo-a":["read"],"owner/repo-b":["read"]}}'
 
-# 1.3e：每個 repo 都讀得到 → 0，而且真的每個 repo 都打了一次
 : > "$GH_LOG"
 run_unit_check "$REPO_ROOT" gh "$GH_PARAMS" FAKE_GH_MODE=ok GH_LOG="$GH_LOG"
 n_ok="$(grep -c 'repo-a' "$GH_LOG" 2>/dev/null || true)"
@@ -592,7 +572,6 @@ else
     bad "1.3e. gh：應該回 0 且每個 repo 各打一次，卻回 ${UNIT_RC}（repo-a ${n_ok:-0} 次、repo-b ${n_ok2:-0} 次）——今天的 check_installed 只有 \`command -v gh\`，不看宣告的 repo"
 fi
 
-# 1.3f：拒絕存取 → 1
 run_unit_check "$REPO_ROOT" gh "$GH_PARAMS" FAKE_GH_MODE=deny GH_LOG="$GH_LOG"
 if [[ "$UNIT_RC" -eq 1 ]]; then
     ok "1.3f. gh：拒絕存取 → 1"
@@ -614,7 +593,6 @@ else
     bad "1.3g2. 預期 2，實際 ${UNIT_RC}（out=[${UNIT_OUT}]）"
 fi
 
-# 1.3g：網路錯誤或 5xx → 2
 run_unit_check "$REPO_ROOT" gh "$GH_PARAMS" FAKE_GH_MODE=http5xx GH_LOG="$GH_LOG"
 if [[ "$UNIT_RC" -eq 2 ]]; then
     ok "1.3g. gh：5xx → 2（D2 的「無法確認」）"
@@ -643,7 +621,6 @@ SHIMPY
 chmod +x "$SHIMS/python3"
 WOL_LOG="$SANDBOX/wol.log"
 
-# 1.3h：存在、可執行、與本單位的 files/pool-wol 相同、支援 unicast → 0
 if [[ ! -f "$REPO_ROOT/shared-configs/wol/install.sh" ]]; then
     bad "1.3h. 缺 shared-configs/wol（D7 從 pool-runtime 拆出的新單位）：應回 0"
 else
@@ -656,8 +633,7 @@ else
     fi
 fi
 
-# 1.3h2：安裝的不是這一版 → 1（不是 2）。照 design D5：裝的是別版就是「這版的
-#   能力沒有成立」，是確定不成立，屬於 CAP_RC_NO；回 2 會讓宣告停在舊值。
+# 1.3h2：回 2 會讓宣告停在舊值，所以「確定不成立」不能用回 2。
 if [[ ! -f "$REPO_ROOT/shared-configs/wol/install.sh" ]]; then
     bad "1.3h2. 缺 shared-configs/wol：內容不同時應回 1"
 else
@@ -673,9 +649,7 @@ else
     chmod +x "$SANDBOX/home/.mylinuxpool/bin/pool-wol"
 fi
 
-# 1.3i：整個檢查過程不得以送封包的方式呼叫 pool-wol。
-#   真的 pool-wol 的第一個引數是 MAC、送出封包；所以只要 argv 的第一個引數
-#   長得像 MAC，就是送封包。這個判斷不需要知道實作怎麼問「支不支援 unicast」。
+# 1.3i：只要 argv 第一個引數長得像 MAC 就是送封包——不用知道實作怎麼問 unicast。
 if [[ ! -f "$REPO_ROOT/shared-configs/wol/install.sh" ]]; then
     bad "1.3i. 缺 shared-configs/wol：無法驗證「檢查時不送封包」"
 else
@@ -689,9 +663,7 @@ else
     fi
 fi
 
-# 1.3j：沒有 token → 1（D5：沒有 token 回 1）。
-#   假件刻意讓「沒有 token 的 API 呼叫」也回成功，所以單元若沒有提早回 1，
-#   就會真的去呼叫、拿到成功、回 0。
+# 1.3j：假件讓「沒有 token 的 API 呼叫」也成功，單元才非提早回 1 不可。
 GH_TOK="$SANDBOX/home/.mylinuxpool/gh_token"
 mv "$GH_TOK" "$SANDBOX/gh_token.saved" 2>/dev/null || true
 run_unit_check "$REPO_ROOT" gh "$GH_PARAMS" FAKE_GH_IGNORE_TOKEN=1 GH_LOG="$GH_LOG"
@@ -702,8 +674,7 @@ else
 fi
 mv "$SANDBOX/gh_token.saved" "$GH_TOK" 2>/dev/null || true
 
-# 1.3k：rate limit（403 加上 API rate limit exceeded）→ 2，不是 1。
-#   GitHub 的 403 同時代表「無權」與「被限流」，結論相反，所以不能只看 403。
+# 1.3k：GitHub 的 403 同時代表無權與限流，結論相反，不能只看 403。
 run_unit_check "$REPO_ROOT" gh "$GH_PARAMS" FAKE_GH_MODE=ratelimit GH_LOG="$GH_LOG"
 if [[ "$UNIT_RC" -eq 2 ]]; then
     ok "1.3k. gh：rate limit（403 + API rate limit exceeded）→ 2（D5：限流是無法確認，宣告要保留）"
@@ -711,8 +682,7 @@ else
     bad "1.3k. gh：rate limit 應回 2，卻回 ${UNIT_RC}——403 被當成「無權」了，限流會把能力從宣告裡刪掉"
 fi
 
-# 1.3l／1.3m：兩個 repo 時「1 優先」，順序不影響結論。
-#   兩種順序各一格：today 的 rc 是迴圈裡逐次覆寫的，誰在最後誰贏。
+# 1.3l／1.3m：兩種順序各一格，因為迴圈裡是逐次覆寫，誰在最後誰贏。
 GH_PARAMS2='{"repos":{"owner/r1-a":["read"],"owner/r1-b":["read"]}}'
 for order in "deny,http5xx" "http5xx,deny"; do
     first="${order%%,*}"; second="${order#*,}"
@@ -769,11 +739,10 @@ fi
 
 echo "=== 注入 ==="
 
-# INJ-G2：把 gh 單位的 `2*)` 那一格改回 `one=0` → 1.3g2 必須轉紅。
-#   1.3g2 在產品碼修好之後是綠的；沒有這條注入就沒有辦法證明它是因為
-#   「`2*)` 那一格被改成 2」才綠的，而不是因為假 gh 壞掉所以單元根本沒跑到迴圈。
-# run_unit_check 走的是 <root>/shared-configs/<unit>/install.sh，所以突變檔要放
-# 在那個形狀裡（第一版直接放 <root>/install.sh → rc=127 → 注入看起來沒生效）。
+# INJ-G2：突變檔要放在 <root>/shared-configs/<unit>/install.sh 的形狀裡。
+#   放錯位置時會回 rc=127（bash: No such file or directory）——形狀錯了，不是注入失效。
+#   這條注入是為了分開 1.3g2 綠的兩種原因：真的因為 `2*)` 那格是 2，還是因為
+#   假 gh 壞掉所以單元根本沒跑到迴圈。沒有它，1.3g2 可能假綠而沒有人會發現。
 GH_MUT="$SANDBOX/gh-inj-root"
 mkdir -p "$GH_MUT/shared-configs/gh/files"
 cp "$REPO_ROOT/shared-configs/gh/install.sh" "$GH_MUT/shared-configs/gh/install.sh"
@@ -798,8 +767,7 @@ else
 fi
 
 
-# INJ-1：假 docker 改成成功 → 1.3c（應該是 1）必須轉紅。
-#   證明 1.3c 真的在看 docker 的結果，不是無論如何都回 1。
+# INJ-1：證明 1.3c 真的在看 docker 的結果，不是無論如何都回 1。
 if [[ ! -f "$REPO_ROOT/shared-configs/worker-host/install.sh" ]]; then
     inj_bad "INJ-1. 缺 shared-configs/worker-host，沒有東西可注入"
 else
@@ -815,7 +783,6 @@ else
     fi
 fi
 
-# INJ-2：假 gh 改成全部可讀 → 1.3f（應該是 1）必須轉紅。
 if true; then
     run_unit_check "$REPO_ROOT" gh "$GH_PARAMS" FAKE_GH_MODE=deny GH_LOG="$GH_LOG"; denied="$UNIT_RC"
     run_unit_check "$REPO_ROOT" gh "$GH_PARAMS" FAKE_GH_MODE=ok GH_LOG="$GH_LOG"; allowed="$UNIT_RC"
@@ -841,7 +808,6 @@ else
     fi
 fi
 
-# INJ-4：假單位的 --check 無視 MLP_CAPABILITY_PARAMS → 1.2d 必須轉紅。
 if [[ "$RUNNER_OK" -ne 1 ]]; then
     inj_bad "INJ-4. 缺 runner，capability_check 沒有把參數傳給單位的路徑可注入"
 else
@@ -858,13 +824,8 @@ else
     fi
 fi
 
-# ===========================================================================
-# INJ-F～I：把 review 抓到的那四個洞**逐一放回去**，證明新加的斷言抓得到。
-#   review §4「弄壞 #3 沒有牙」就是因為沒有任何斷言讀 capability_plan 的 unit 欄。
-#   下面每一條都用形狀錨點（那一行的程式碼），不是註解。
-# ===========================================================================
+# INJ-F～I：逐一放回 review 抓到的四個洞。下面每一條都錨程式碼行，不錨註解。
 
-# INJ-F：把 capability_unit_for 的呼叫改回兩個引數（review §6 B1 的原狀）。
 if [[ ! -r "$FAKEROOT/scripts/lib/capability.sh" ]]; then
     inj_bad "INJ-F. 沙箱裡沒有 runner，無法注入"
 else
@@ -916,7 +877,6 @@ gh_run_mut() {  # gh_run_mut <root> <參數> [額外環境…]
     printf '%s' "$rc"
 }
 
-# INJ-G：拿掉「沒有憑證就回 1」的提早 return（review §2.3 的原狀）。
 python3 - "$REPO_ROOT/shared-configs/gh/install.sh" "$SANDBOX/injG-gh.sh" <<'INJG'
 import re, sys
 lines = open(sys.argv[1], encoding="utf-8").read().split("\n")
@@ -947,7 +907,6 @@ else
     fi
 fi
 
-# INJ-H：拿掉 rate limit 的那一行（403 會被當成無權 → 1）。
 python3 - "$REPO_ROOT/shared-configs/gh/install.sh" "$SANDBOX/injH-gh.sh" <<'INJH'
 import re, sys
 lines = open(sys.argv[1], encoding="utf-8").read().split("\n")
@@ -970,7 +929,6 @@ else
     fi
 fi
 
-# INJ-I：把「1 一旦出現就不被 2 蓋掉」改回「最後一次贏」。
 python3 - "$REPO_ROOT/shared-configs/gh/install.sh" "$SANDBOX/injI-gh.sh" <<'INJI'
 import re, sys
 lines = open(sys.argv[1], encoding="utf-8").read().split("\n")

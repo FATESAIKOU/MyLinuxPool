@@ -1,9 +1,6 @@
 #!/usr/bin/env bash
-# scripts/lib/capability.sh — 共用 runner（D3）。判準只寫這一份，其他元件只呼叫。
-#   capability_plan <profile.json>            每行「鍵⇥單位⇥參數⇥0|1|2」，單位欄沒有就是「-」
-#   capability_check <鍵> <參數JSON>          跑該單位 --check，原樣回傳 0/1/2（D2 三態）
-#   capability_declaration <profile> <現有>   0 納入、1 不納入、2 保留現有值
-# 單位每次從 shared-configs/*/unit.json 現場查，不建快取。
+# scripts/lib/capability.sh — 共用 runner（D3）。判準只寫這一份，其他元件只呼叫。單位現場查 shared-configs/*/unit.json，不建快取。
+# 三個函式：capability_plan <profile>（每行「鍵⇥單位⇥參數⇥0|1|2」，單位欄沒有就是「-」）／capability_check <鍵> <參數>（跑該單位 --check，原樣回傳 0/1/2，D2 三態）／capability_declaration <profile> <現有>（0 納入、1 不納入、2 保留現有值）。
 
 # 找 repo 根：優先環境變數（測試沙箱用），否則從自己的路徑推。
 capability_repo_root() {
@@ -13,7 +10,6 @@ capability_repo_root() {
     ( cd "$(dirname "$here")/../.." 2>/dev/null && pwd )
 }
 
-# 某個鍵由哪個單位實作（現場查 unit.json）。回 0 時印單位目錄名。
 capability_unit_for() {
     local key="${1:-}" uj
     local root
@@ -28,7 +24,6 @@ capability_unit_for() {
     return 1
 }
 
-# capability_check <鍵> <參數JSON> — 單位的回傳碼原樣回傳。
 capability_check() {
     local key="${1:-}" params="${2:-{\}}"
     local root unit
@@ -42,7 +37,6 @@ capability_check() {
         bash "$root/shared-configs/$unit/install.sh" --check >/dev/null 2>&1
 }
 
-# capability_plan <profile.json>
 capability_plan() {
     local profile="${1:-}" root key params unit rc
     root="$(capability_repo_root)"
@@ -71,7 +65,6 @@ capability_plan() {
     done
 }
 
-# 所有單位宣告的鍵（去重、換行）。
 capability_all_keys() {
     local root="${1:-}" uj k
     root="${root:-$(capability_repo_root)}"
@@ -82,7 +75,6 @@ capability_all_keys() {
     done | sort -u
 }
 
-# capability_declaration <profile.json> <現有宣告JSON>
 capability_declaration() {
     local profile="${1:-}" existing="${2:-{\}}"
     local root key params unit rc

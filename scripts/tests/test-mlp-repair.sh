@@ -83,12 +83,11 @@
 # providers/workers" is defined as:
 #   * `mlp ls`: prints the existing gateway/provider/worker table exactly
 #     as before (unaffected), prints ONE line to STDERR
-#     ("mlp: NODE_GATEWAY.ports.repair not configured — skipping repair
-#     section"), and EXITS 0 — the parts of `ls` that could succeed, did.
-#     Under the merged-table format below (user UI change), "no repair
-#     section" means "zero rows with TYPE=repair", not a separate block —
-#     there was never a distinct block to omit in the first place once
-#     repair rows are just rows in the one table.
+#     ("mlp: NODE_GATEWAY.ports.repair not configured — repair hosts will
+#     not be listed"), and EXITS 0 — the parts of `ls` that could succeed, did.
+#     With the merged-table format, "no repair hosts" means "zero rows with
+#     TYPE=repair", not a separate block — there was never a distinct block to
+#     omit in the first place once repair rows are just rows in the one table.
 #   * `mlp ssh <name>` (name, not a bare port): if provider/worker
 #     resolution already failed, AND the range is unconfigured, this is
 #     LOUD (an extra stderr line naming NODE_GATEWAY.ports.repair as the
